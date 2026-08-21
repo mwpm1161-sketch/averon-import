@@ -45,6 +45,7 @@ class SpecificationRow(BaseModel):
     bbox: BoundingBox | dict[str, Any] | None = None
     confidences: dict[str, float] = Field(default_factory=dict)
     ocr_sources: dict[str, str] = Field(default_factory=dict)
+    ocr_evidence: dict[str, dict[str, Any]] = Field(default_factory=dict)
     source_row: int | str | None = None
     edited: bool = False
     selected: bool | None = None
