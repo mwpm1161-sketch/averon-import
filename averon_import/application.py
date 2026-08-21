@@ -15,6 +15,7 @@ from averon_import.api.export import router as export_router
 from averon_import.api.recognition import router as recognition_router
 from averon_import.api.system import router as system_router
 from averon_import.core.constants import APP_NAME, APP_VERSION, DEVELOPER
+from averon_import.ocr.tesseract_provider import EvidenceTesseractOcrProvider
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
 from averon_import.services.pdf_service import PdfService
@@ -38,10 +39,12 @@ def default_data_dir() -> Path:
 
 def create_services(data_dir: Path) -> AppServices:
     pdf = PdfService()
+    recognition = RecognitionService(pdf)
+    recognition.ocr = EvidenceTesseractOcrProvider(recognition.detector)
     return AppServices(
         pdf=pdf,
         workspace=WorkspaceService(data_dir),
-        recognition=RecognitionService(pdf),
+        recognition=recognition,
         export=ExcelExportService(),
         jobs=JobService(max_workers=1),
     )
