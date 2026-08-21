@@ -1,0 +1,3 @@
+AI providers are extension points.
+
+Yandex and Ollama implementations follow after foundation review.
