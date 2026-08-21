@@ -3,6 +3,8 @@ from averon_import.ai.provider import AiProviderError, OpenAICompatibleProvider
 from averon_import.ai.service import AiCorrectionService
 from averon_import.ai.router import AIRouter, AIRouteDecision
 from averon_import.ai.validator import AICorrectionValidator
+from averon_import.ai.batch import AIBatchProcessor
+from averon_import.ai.stats import AIPipelineStats
 
 __all__ = [
     "AiCorrectionService",
@@ -13,4 +15,6 @@ __all__ = [
     "AIRouter",
     "AIRouteDecision",
     "AICorrectionValidator",
+    "AIBatchProcessor",
+    "AIPipelineStats",
 ]
