@@ -9,6 +9,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
+from averon_import.ai.ollama import OllamaProvider
+from averon_import.ai.service import AiService
+from averon_import.api.ai import router as ai_router
 from averon_import.api.dependencies import AppServices
 from averon_import.api.documents import router as documents_router
 from averon_import.api.export import router as export_router
@@ -37,6 +40,24 @@ def default_data_dir() -> Path:
     return (PROJECT_DIR / "data").resolve()
 
 
+def create_ai_service() -> AiService:
+    enabled = os.environ.get("AVERON_AI_ENABLED", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled:
+        return AiService(enabled=False)
+
+    model = os.environ.get("AVERON_AI_MODEL", "").strip()
+    if not model:
+        return AiService(enabled=True)
+
+    provider = OllamaProvider(
+        model,
+        base_url=os.environ.get("AVERON_OLLAMA_URL", "http://127.0.0.1:11434").strip(),
+    )
+    return AiService(provider, enabled=True)
+
+
 def create_services(data_dir: Path) -> AppServices:
     pdf = PdfService()
     recognition = RecognitionService(pdf)
@@ -47,6 +68,7 @@ def create_services(data_dir: Path) -> AppServices:
         recognition=recognition,
         export=ExcelExportService(),
         jobs=JobService(max_workers=1),
+        ai=create_ai_service(),
     )
 
 
@@ -63,6 +85,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.include_router(documents_router)
     app.include_router(recognition_router)
     app.include_router(export_router)
+    app.include_router(ai_router)
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
