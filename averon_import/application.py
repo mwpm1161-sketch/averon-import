@@ -16,6 +16,7 @@ from averon_import.api.dependencies import AppServices
 from averon_import.api.documents import router as documents_router
 from averon_import.api.export import router as export_router
 from averon_import.api.recognition import router as recognition_router
+from averon_import.api.suppliers import router as suppliers_router
 from averon_import.api.system import router as system_router
 from averon_import.core.constants import APP_NAME, APP_VERSION, DEVELOPER
 from averon_import.ocr.tesseract_provider import EvidenceTesseractOcrProvider
@@ -24,6 +25,7 @@ from averon_import.services.jobs import JobService
 from averon_import.services.pdf_service import PdfService
 from averon_import.services.recognition import RecognitionService
 from averon_import.services.workspace import WorkspaceService
+from averon_import.suppliers.service import SupplierSearchService
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
@@ -46,11 +48,9 @@ def create_ai_service() -> AiService:
     }
     if not enabled:
         return AiService(enabled=False)
-
     model = os.environ.get("AVERON_AI_MODEL", "").strip()
     if not model:
         return AiService(enabled=True)
-
     provider = OllamaProvider(
         model,
         base_url=os.environ.get("AVERON_OLLAMA_URL", "http://127.0.0.1:11434").strip(),
@@ -69,6 +69,7 @@ def create_services(data_dir: Path) -> AppServices:
         export=ExcelExportService(),
         jobs=JobService(max_workers=1),
         ai=create_ai_service(),
+        suppliers=SupplierSearchService(),
     )
 
 
@@ -86,17 +87,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.include_router(recognition_router)
     app.include_router(export_router)
     app.include_router(ai_router)
+    app.include_router(suppliers_router)
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
         return app.state.templates.TemplateResponse(
             request=request,
             name="index.html",
-            context={
-                "app_name": APP_NAME,
-                "version": APP_VERSION,
-                "developer": DEVELOPER,
-            },
+            context={"app_name": APP_NAME, "version": APP_VERSION, "developer": DEVELOPER},
         )
 
     @app.get("/favicon.ico")
