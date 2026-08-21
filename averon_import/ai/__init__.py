@@ -5,6 +5,7 @@ from averon_import.ai.router import AIRouter, AIRouteDecision
 from averon_import.ai.validator import AICorrectionValidator
 from averon_import.ai.batch import AIBatchProcessor
 from averon_import.ai.stats import AIPipelineStats
+from averon_import.ai.pipeline import AIPipeline, AIPipelineResult
 
 __all__ = [
     "AiCorrectionService",
@@ -17,4 +18,6 @@ __all__ = [
     "AICorrectionValidator",
     "AIBatchProcessor",
     "AIPipelineStats",
+    "AIPipeline",
+    "AIPipelineResult",
 ]
