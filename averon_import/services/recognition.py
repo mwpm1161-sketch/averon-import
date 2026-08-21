@@ -8,6 +8,7 @@ from typing import Callable
 import cv2
 
 from averon_import.core.constants import BASE_COLUMNS
+from averon_import.core.review import critical_confidence
 from averon_import.ocr.base import OcrProvider
 from averon_import.services.ocr_engine import TesseractOcrEngine
 from averon_import.services.pdf_service import PdfService
@@ -65,10 +66,8 @@ class RecognitionService:
                 if table.column_count == 9 and table.row_count >= 5:
                     candidates.append(page_number)
             except TableDetectionError:
-                # A page without a matching GOST table is a normal outcome.
                 pass
             except Exception as exc:
-                # Unexpected detector failures must remain visible for diagnostics.
                 errors.append({"page": page_number, "error": str(exc)})
             progress(page_number, page_count, f"Проверена страница {page_number}")
         return {"pages": candidates, "errors": errors}
@@ -109,10 +108,6 @@ class RecognitionService:
                     row_type = self._classify_row(values)
                     name = values.get("name", "").strip()
                     position = values.get("position", "").strip()
-                    # A short standalone row directly below a recognized section
-                    # is normally a system code (П1, В2, К1 and similar). Even
-                    # when the narrow GOST font is read as Ш/И/01, preserve the
-                    # source text but classify the row correctly for review.
                     nonempty_fields = [
                         key for key, value in values.items() if str(value).strip()
                     ]
@@ -138,8 +133,6 @@ class RecognitionService:
 
                     if row_type == "section":
                         current_section = name.rstrip(":*") or position
-                        # A system belongs to its section. Never leak the last
-                        # system code into a newly encountered section.
                         current_system = ""
                     elif row_type == "system":
                         current_system = name or position
@@ -177,6 +170,7 @@ class RecognitionService:
                         "row_type": row_type,
                         "page": page_number,
                         "confidence": confidence,
+                        "critical_confidence": critical_confidence(values, raw["confidences"]),
                         "status": status,
                         "bbox": raw["bbox"],
                         "confidences": raw["confidences"],
@@ -213,13 +207,6 @@ class RecognitionService:
 
     @staticmethod
     def _repair_continuation_rows(raw_rows: list[dict]) -> list[dict]:
-        """Conservatively merge OCR fragments split into a following table row.
-
-        A row is merged only when it has no independent position/quantity/unit
-        and clearly looks like a continuation: the name starts with lower-case
-        text, the previous name ends with punctuation, or the current row only
-        contains a secondary field. Bullet/component rows are preserved.
-        """
         repaired: list[dict] = []
         for current in raw_rows:
             values = current.get("values", {})
