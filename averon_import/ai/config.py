@@ -18,6 +18,8 @@ class AIConfig:
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = ""
     yandex_model: str = ""
+    yandex_folder_id: str = ""
+    yandex_api_key: str = ""
 
     @classmethod
     def from_environment(cls) -> "AIConfig":
@@ -28,4 +30,6 @@ class AIConfig:
             ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", ""),
             yandex_model=os.getenv("YANDEX_MODEL", ""),
+            yandex_folder_id=os.getenv("YANDEX_FOLDER_ID", ""),
+            yandex_api_key=os.getenv("YANDEX_API_KEY", ""),
         )
