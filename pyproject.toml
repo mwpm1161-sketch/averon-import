@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "averon-import"
+version = "1.0.0rc6"
+description = "Локальное распознавание спецификаций PDF с проверкой и экспортом в Excel"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  {name = "Андриянов Степан Владимирович - НВСС"}
+]
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.34,<1.0",
+  "python-multipart>=0.0.20,<1.0",
+  "Jinja2>=3.1,<4.0",
+  "PyMuPDF>=1.24,<2.0",
+  "opencv-python-headless>=4.10,<5.0",
+  "numpy>=1.26,<3.0",
+  "Pillow>=10.4,<12.0",
+  "pytesseract>=0.3.13,<1.0",
+  "openpyxl>=3.1,<4.0",
+  "rapidfuzz>=3.10,<4.0",
+  "pydantic>=2.9,<3.0"
+]
+
+[project.scripts]
+averon-import = "averon_import.main:cli"
+
+[tool.setuptools.package-data]
+averon_import = ["templates/*.html", "static/*", "models/*.txt", "models/tessdata_best/*"]

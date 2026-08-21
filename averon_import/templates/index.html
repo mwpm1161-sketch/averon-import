@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="toast-root" class="toast-root"></div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span>A</span></div>
+        <div><strong>Averon</strong><small>Import</small></div>
+      </div>
+      <nav class="steps" aria-label="Этапы работы">
+        <button class="step active" data-step="upload"><span>1</span><div><b>Документ</b><small>Загрузка PDF</small></div></button>
+        <button class="step" data-step="pages"><span>2</span><div><b>Страницы</b><small>Выбор таблиц</small></div></button>
+        <button class="step" data-step="recognition"><span>3</span><div><b>Распознавание</b><small>OCR и структура</small></div></button>
+        <button class="step" data-step="review"><span>4</span><div><b>Проверка</b><small>Редактирование</small></div></button>
+        <button class="step" data-step="export"><span>5</span><div><b>Экспорт</b><small>Excel и копирование</small></div></button>
+      </nav>
+      <div class="sidebar-card">
+        <span class="status-dot" id="ocr-dot"></span>
+        <div><b id="ocr-title">Проверка OCR…</b><small id="ocr-text">Tesseract</small></div>
+      </div>
+      <div class="sidebar-footer">
+        <span>Версия {{ version }}</span>
+        <span>{{ developer }}</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Импорт спецификации</h1>
+          <p id="page-subtitle">Перенос таблиц из PDF в редактируемый Excel</p>
+        </div>
+        <div class="top-actions">
+          <button class="button ghost" id="new-document-button" hidden>Новый документ</button>
+          <button class="button ghost" id="help-button">Справка</button>
+        </div>
+      </header>
+
+      <section id="upload-view" class="view visible">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <span class="eyebrow">Локальная обработка</span>
+            <h2>Спецификация из PDF — в готовую таблицу</h2>
+            <p>Выберите страницы, проверьте распознанные данные и экспортируйте только нужные столбцы. Документ не покидает компьютер.</p>
+            <div class="feature-list">
+              <div><span>01</span><p><b>Ручной контроль</b><small>Страницы, область таблицы, строки и столбцы</small></p></div>
+              <div><span>02</span><p><b>Инженерная проверка</b><small>PDF и редактируемая таблица рядом</small></p></div>
+              <div><span>03</span><p><b>Гибкий результат</b><small>Копирование или оформленный XLSX</small></p></div>
+            </div>
+          </div>
+          <label class="upload-card" id="drop-zone">
+            <input type="file" id="pdf-file" accept="application/pdf,.pdf" hidden>
+            <div class="upload-icon">PDF</div>
+            <h3>Перетащите спецификацию сюда</h3>
+            <p>или выберите PDF-файл на компьютере</p>
+            <span class="button primary">Выбрать PDF</span>
+            <small>До 250 МБ · обработка выполняется локально</small>
+          </label>
+        </div>
+      </section>
+
+      <section id="pages-view" class="view">
+        <div class="document-strip">
+          <div class="file-icon">PDF</div>
+          <div class="document-info"><b id="document-name">Документ</b><small id="document-meta"></small></div>
+          <div class="spacer"></div>
+          <button class="button ghost" id="suggest-pages">Найти спецификацию</button>
+          <button class="button ghost" id="select-all-pages">Выбрать все</button>
+          <button class="button ghost" id="clear-pages">Снять выбор</button>
+        </div>
+
+        <div class="pages-layout">
+          <div class="panel page-controls">
+            <div class="panel-heading"><div><h3>Страницы для распознавания</h3><p>Укажите диапазон или отметьте миниатюры</p></div><span class="badge" id="selected-pages-badge">0 выбрано</span></div>
+            <label class="field-label" for="page-range">Диапазон страниц</label>
+            <div class="inline-field">
+              <input class="input" id="page-range" placeholder="Например: 18-25, 31, 40-42">
+              <button class="button secondary" id="apply-range">Применить</button>
+            </div>
+            <p class="hint">Номера указываются так же, как в PDF. Можно выбрать несколько диапазонов через запятую.</p>
+            <div class="divider"></div>
+            <div class="ocr-mode-section">
+              <div><b>Качество распознавания</b><p>Точный режим лучше читает мелкий инженерный шрифт, но работает заметно дольше.</p></div>
+              <label class="ocr-mode-card">
+                <input type="radio" name="ocr-mode" value="standard">
+                <span><b>Стандартный</b><small>Быстрее · для хороших PDF и предварительной проверки</small></span>
+              </label>
+              <label class="ocr-mode-card recommended" id="accurate-mode-card">
+                <input type="radio" name="ocr-mode" value="accurate" checked>
+                <span><b>Точный инженерный</b><small>tessdata_best · раздельное чтение столбцов · инженерный словарь</small></span>
+                <em>Рекомендуется</em>
+              </label>
+              <p class="mode-status" id="accurate-mode-status"></p>
+            </div>
+            <div class="divider"></div>
+            <div class="crop-section">
+              <div><b>Область таблицы</b><p>Необязательно. Выделите таблицу, если на странице есть штамп или другие элементы.</p></div>
+              <div class="crop-actions">
+                <button class="button ghost" id="crop-button">Выбрать область</button>
+                <button class="button text" id="clear-crop" hidden>Сбросить</button>
+              </div>
+              <div class="crop-preview" id="crop-preview">
+                <img id="crop-image" alt="Предпросмотр страницы">
+                <div id="crop-box" class="crop-box" hidden></div>
+                <div class="crop-placeholder" id="crop-placeholder">Выберите страницу для предпросмотра</div>
+              </div>
+            </div>
+            <div class="panel-footer">
+              <button class="button primary wide" id="recognize-button" disabled>Распознать выбранные страницы</button>
+            </div>
+          </div>
+          <div class="panel thumbnails-panel">
+            <div class="panel-heading"><div><h3>Миниатюры документа</h3><p>Нажмите на страницу, чтобы выбрать её</p></div></div>
+            <div class="thumbnail-grid" id="thumbnail-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="processing-view" class="view">
+        <div class="processing-card">
+          <div class="spinner"></div>
+          <span class="eyebrow">Averon OCR</span>
+          <h2 id="processing-title">Распознаём спецификацию</h2>
+          <p id="processing-message">Подготовка страниц…</p>
+          <div class="progress"><span id="processing-progress"></span></div>
+          <div class="processing-stats"><span id="processing-count">0 / 0</span><span>Не закрывайте окно</span></div>
+        </div>
+      </section>
+
+      <section id="review-view" class="view review-view">
+        <div class="summary-row">
+          <div class="summary-card"><small>Строк распознано</small><b id="summary-total">0</b></div>
+          <div class="summary-card"><small>Готово</small><b id="summary-ready">0</b></div>
+          <div class="summary-card warning"><small>Требует проверки</small><b id="summary-review">0</b></div>
+          <div class="summary-card"><small>Выбрано для экспорта</small><b id="summary-selected">0</b></div>
+        </div>
+
+        <div class="review-toolbar">
+          <div class="search-field"><span>⌕</span><input id="table-search" placeholder="Поиск по распознанным данным"></div>
+          <select class="select" id="type-filter"><option value="">Все типы строк</option></select>
+          <select class="select" id="status-filter"><option value="">Все статусы</option></select>
+          <div class="spacer"></div>
+          <button class="button ghost" id="copy-selected">Копировать выбранное</button>
+          <button class="button ghost" id="save-button">Сохранить правки</button>
+          <button class="button primary" id="open-export">Экспорт</button>
+        </div>
+
+        <div class="split-workspace" id="split-workspace">
+          <div class="pdf-pane">
+            <div class="pane-header"><div><b>Исходный PDF</b><small id="preview-page-label">Страница —</small></div><div class="zoom-actions"><button id="zoom-out">−</button><span id="zoom-label">100%</span><button id="zoom-in">+</button></div></div>
+            <div class="pdf-stage" id="pdf-stage">
+              <div class="pdf-image-wrap" id="pdf-image-wrap">
+                <img id="pdf-preview" alt="Страница PDF">
+                <div id="row-highlight" class="row-highlight" hidden></div>
+              </div>
+            </div>
+          </div>
+          <div class="table-pane">
+            <div class="table-scroll">
+              <table class="data-table" id="result-table">
+                <thead id="result-head"></thead>
+                <tbody id="result-body"></tbody>
+              </table>
+              <div class="empty-table" id="empty-table" hidden>Нет строк по текущему фильтру</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="modal" id="export-modal">
+    <form method="dialog" class="modal-card" id="export-form">
+      <div class="modal-header"><div><span class="eyebrow">Настройка результата</span><h2>Экспорт в Excel</h2><p>Выберите нужные столбцы и расположите их в требуемом порядке.</p></div><button class="icon-button" value="cancel" aria-label="Закрыть">×</button></div>
+      <div class="modal-grid">
+        <div>
+          <label class="field-label">Столбцы Excel</label>
+          <div class="column-list" id="export-columns"></div>
+          <p class="hint">Перетаскивайте строки за значок слева.</p>
+        </div>
+        <div class="export-options">
+          <label class="field-label" for="export-filename">Имя файла</label>
+          <input class="input" id="export-filename" value="averon_import.xlsx">
+          <label class="field-label" for="export-sheet">Название листа</label>
+          <input class="input" id="export-sheet" value="Спецификация">
+          <label class="check-row"><input type="checkbox" id="export-headers" checked><span>Добавить заголовки столбцов</span></label>
+          <label class="check-row"><input type="checkbox" id="export-items-only" checked><span>Экспортировать только позиции и компоненты</span></label>
+          <div class="export-note"><b>В Excel попадут исправленные данные</b><p>Строки со статусом «Требует проверки» будут подсвечены.</p></div>
+        </div>
+      </div>
+      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button secondary" type="button" id="copy-export">Копировать таблицу</button><button class="button primary" type="button" id="download-excel">Скачать XLSX</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="help-modal">
+    <div class="modal-card help-card">
+      <div class="modal-header"><div><span class="eyebrow">Документация</span><h2>Как работать с Averon Import</h2></div><button class="icon-button" id="close-help">×</button></div>
+      <ol class="help-steps">
+        <li><span>1</span><div><b>Загрузите PDF</b><p>Документ сохраняется только в локальной папке программы.</p></div></li>
+        <li><span>2</span><div><b>Выберите страницы</b><p>Введите диапазон или отметьте миниатюры. При необходимости выделите область таблицы.</p></div></li>
+        <li><span>3</span><div><b>Проверьте распознавание</b><p>Кликните по строке таблицы — исходная строка подсветится в PDF.</p></div></li>
+        <li><span>4</span><div><b>Исправьте данные</b><p>Редактируйте ячейки, типы строк и статусы прямо в таблице.</p></div></li>
+        <li><span>5</span><div><b>Скопируйте или экспортируйте</b><p>Выберите нужные строки и столбцы, затем скачайте XLSX.</p></div></li>
+      </ol>
+      <div class="about-box"><b>Averon Import {{ version }}</b><p>{{ developer }}</p></div>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
