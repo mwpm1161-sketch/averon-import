@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from averon_import.version import DISPLAY_VERSION
+
 APP_NAME = "Averon Import"
-APP_VERSION = "1.0.0-rc7"
+APP_VERSION = DISPLAY_VERSION
 DEVELOPER = "Андриянов Степан Владимирович - НВСС"
 
 BASE_COLUMNS = [

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from averon_import.core.result_schema import migrate_result
+
 
 @dataclass(slots=True)
 class Workspace:
@@ -58,6 +60,13 @@ class WorkspaceService:
         if not root.exists():
             raise FileNotFoundError(document_id)
         return Workspace(document_id, root)
+
+    def read_result(self, workspace: Workspace) -> dict[str, Any] | None:
+        return migrate_result(self.read_json(workspace.result_path))
+
+    def write_result(self, workspace: Workspace, data: dict[str, Any]) -> None:
+        migrated = migrate_result(data)
+        self.write_json(workspace.result_path, migrated)
 
     @staticmethod
     def read_json(path: Path, default=None):

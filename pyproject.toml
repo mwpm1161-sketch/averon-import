@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "averon-import"
-version = "1.0.0rc6"
+dynamic = ["version"]
 description = "Локальное распознавание спецификаций PDF с проверкой и экспортом в Excel"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,3 +31,6 @@ averon-import = "averon_import.main:cli"
 
 [tool.setuptools.package-data]
 averon_import = ["templates/*.html", "static/*", "models/*.txt", "models/tessdata_best/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "averon_import.version.PACKAGE_VERSION"}

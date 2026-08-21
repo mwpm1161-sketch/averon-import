@@ -91,7 +91,7 @@ def save_results(
         existing = services.workspace.read_result(workspace) or {}
         rows = [row.model_dump(mode="json") for row in request.rows]
         existing["rows"] = rows
-        existing["summary"] = services.recognition.summary(
+        existing["summary"] = services.recognition._summary(
             rows, existing.get("errors", [])
         )
         services.workspace.write_result(workspace, existing)

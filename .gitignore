@@ -10,9 +10,11 @@ __pycache__/
 .env
 .env.*
 *.log
+setup_log.txt
 
 workspace/
 workspaces/
+/data/
 temp/
 tmp/
 
