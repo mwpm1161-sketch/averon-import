@@ -17,7 +17,7 @@
       <nav class="steps" aria-label="Этапы работы">
         <button class="step active" data-step="upload"><span>1</span><div><b>Документ</b><small>Загрузка PDF</small></div></button>
         <button class="step" data-step="pages"><span>2</span><div><b>Страницы</b><small>Выбор таблиц</small></div></button>
-        <button class="step" data-step="recognition"><span>3</span><div><b>Распознавание</b><small>OCR и структура</small></div></button>
+        <button class="step" data-step="recognition"><span>3</span><div><b>Распознавание</b><small>OCR, ИИ и структура</small></div></button>
         <button class="step" data-step="review"><span>4</span><div><b>Проверка</b><small>Редактирование</small></div></button>
         <button class="step" data-step="export"><span>5</span><div><b>Экспорт</b><small>Excel и копирование</small></div></button>
       </nav>
@@ -46,13 +46,13 @@
       <section id="upload-view" class="view visible">
         <div class="hero-grid">
           <div class="hero-copy">
-            <span class="eyebrow">Локальная обработка</span>
+            <span class="eyebrow">Локальная обработка PDF</span>
             <h2>Спецификация из PDF — в готовую таблицу</h2>
-            <p>Выберите страницы, проверьте распознанные данные и экспортируйте только нужные столбцы. Документ не покидает компьютер.</p>
+            <p>PDF и OCR обрабатываются локально. При выборе внешнего AI в облако отправляются только распознанные строки спецификации, а не исходный PDF.</p>
             <div class="feature-list">
               <div><span>01</span><p><b>Ручной контроль</b><small>Страницы, область таблицы, строки и столбцы</small></p></div>
               <div><span>02</span><p><b>Инженерная проверка</b><small>PDF и редактируемая таблица рядом</small></p></div>
-              <div><span>03</span><p><b>Гибкий результат</b><small>Копирование или оформленный XLSX</small></p></div>
+              <div><span>03</span><p><b>Гибкий результат</b><small>OCR, локальный AI или Yandex Cloud и экспорт XLSX</small></p></div>
             </div>
           </div>
           <label class="upload-card" id="drop-zone">
@@ -61,7 +61,7 @@
             <h3>Перетащите спецификацию сюда</h3>
             <p>или выберите PDF-файл на компьютере</p>
             <span class="button primary">Выбрать PDF</span>
-            <small>До 250 МБ · обработка выполняется локально</small>
+            <small>До 250 МБ · исходный PDF хранится локально</small>
           </label>
         </div>
       </section>
@@ -100,6 +100,23 @@
               <p class="mode-status" id="accurate-mode-status"></p>
             </div>
             <div class="divider"></div>
+            <div class="ocr-mode-section">
+              <div><b>Финальная AI-проверка</b><p>После OCR модель проверит распознанные строки. Исходные значения сохраняются для аудита, AI-изменения остаются на ручной проверке.</p></div>
+              <label class="ocr-mode-card">
+                <input type="radio" name="ai-provider" value="off" checked>
+                <span><b>Без ИИ</b><small>Только OCR и инженерные правила Averon Import</small></span>
+              </label>
+              <label class="ocr-mode-card" id="local-ai-card">
+                <input type="radio" name="ai-provider" value="local">
+                <span><b>Локальная модель</b><small>OpenAI-compatible API · Ollama / LM Studio / локальный сервер</small></span>
+              </label>
+              <label class="ocr-mode-card" id="yandex-ai-card">
+                <input type="radio" name="ai-provider" value="yandex">
+                <span><b>Yandex Cloud AI Studio</b><small>Внешний API · в облако отправляются только строки OCR</small></span>
+              </label>
+              <p class="mode-status" id="ai-provider-status"></p>
+            </div>
+            <div class="divider"></div>
             <div class="crop-section">
               <div><b>Область таблицы</b><p>Необязательно. Выделите таблицу, если на странице есть штамп или другие элементы.</p></div>
               <div class="crop-actions">
@@ -126,7 +143,7 @@
       <section id="processing-view" class="view">
         <div class="processing-card">
           <div class="spinner"></div>
-          <span class="eyebrow">Averon OCR</span>
+          <span class="eyebrow">Averon OCR + AI</span>
           <h2 id="processing-title">Распознаём спецификацию</h2>
           <p id="processing-message">Подготовка страниц…</p>
           <div class="progress"><span id="processing-progress"></span></div>
@@ -203,9 +220,9 @@
     <div class="modal-card help-card">
       <div class="modal-header"><div><span class="eyebrow">Документация</span><h2>Как работать с Averon Import</h2></div><button class="icon-button" id="close-help">×</button></div>
       <ol class="help-steps">
-        <li><span>1</span><div><b>Загрузите PDF</b><p>Документ сохраняется только в локальной папке программы.</p></div></li>
-        <li><span>2</span><div><b>Выберите страницы</b><p>Введите диапазон или отметьте миниатюры. При необходимости выделите область таблицы.</p></div></li>
-        <li><span>3</span><div><b>Проверьте распознавание</b><p>Кликните по строке таблицы — исходная строка подсветится в PDF.</p></div></li>
+        <li><span>1</span><div><b>Загрузите PDF</b><p>Исходный документ сохраняется только в локальной папке программы.</p></div></li>
+        <li><span>2</span><div><b>Выберите страницы и режим</b><p>Настройте OCR и при необходимости финальную AI-проверку: локальную или Yandex Cloud.</p></div></li>
+        <li><span>3</span><div><b>Проверьте распознавание</b><p>AI-изменения не считаются автоматически подтверждёнными. Кликните по строке — исходник подсветится в PDF.</p></div></li>
         <li><span>4</span><div><b>Исправьте данные</b><p>Редактируйте ячейки, типы строк и статусы прямо в таблице.</p></div></li>
         <li><span>5</span><div><b>Скопируйте или экспортируйте</b><p>Выберите нужные строки и столбцы, затем скачайте XLSX.</p></div></li>
       </ol>
