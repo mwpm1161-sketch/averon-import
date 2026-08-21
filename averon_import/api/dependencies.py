@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from fastapi import Request
 
+from averon_import.ai.service import AiService
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
 from averon_import.services.pdf_service import PdfService
@@ -18,6 +19,7 @@ class AppServices:
     recognition: RecognitionService
     export: ExcelExportService
     jobs: JobService
+    ai: AiService
 
 
 def get_services(request: Request) -> AppServices:

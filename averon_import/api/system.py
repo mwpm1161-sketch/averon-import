@@ -23,6 +23,7 @@ def health(services: AppServices = Depends(get_services)):
         "app": APP_NAME,
         "version": APP_VERSION,
         "ocr": TesseractOcrEngine.health(),
+        "ai": services.ai.health(),
         "data_dir": str(services.workspace.data_dir),
     }
 
