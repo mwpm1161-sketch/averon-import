@@ -17,9 +17,8 @@ from averon_import.ai.schemas import AIReviewResult
 class YandexAIProvider(AIProvider):
     """Cloud AI adapter.
 
-    The first implementation is a safe boundary: it validates configuration
-    and keeps cloud calls behind one provider. Real transport can be swapped in
-    without changing recognition or review code.
+    Transport is isolated here so cloud integration does not leak into OCR or
+    recognition code.
     """
 
     config: AIConfig
@@ -36,19 +35,16 @@ class YandexAIProvider(AIProvider):
         if not self.config.allow_cloud:
             return AIReviewResult(
                 provider=self.name,
-                status="disabled",
-                message="Cloud AI is disabled by policy",
+                reason="Cloud AI is disabled by policy",
             )
 
         if not self.config.yandex_model:
             return AIReviewResult(
                 provider=self.name,
-                status="not_configured",
-                message="Yandex model is not configured",
+                reason="Yandex model is not configured",
             )
 
         return AIReviewResult(
             provider=self.name,
-            status="not_implemented",
-            message="Yandex transport will be added behind this boundary",
+            reason="Yandex transport placeholder; API client will be added next",
         )
