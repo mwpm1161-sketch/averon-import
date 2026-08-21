@@ -41,6 +41,7 @@ class SpecificationRow(BaseModel):
     row_type: str = "item"
     page: int = Field(ge=1)
     confidence: float = Field(default=0.0, ge=0, le=100)
+    critical_confidence: float = Field(default=0.0, ge=0, le=100)
     status: str = "review"
     bbox: BoundingBox | dict[str, Any] | None = None
     confidences: dict[str, float] = Field(default_factory=dict)
