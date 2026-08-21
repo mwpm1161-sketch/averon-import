@@ -8,9 +8,13 @@ from typing import Callable
 import cv2
 
 from averon_import.core.constants import BASE_COLUMNS
+from averon_import.ocr.base import OcrProvider
 from averon_import.services.ocr_engine import TesseractOcrEngine
 from averon_import.services.pdf_service import PdfService
-from averon_import.services.table_detector import GostSpecificationDetector
+from averon_import.services.table_detector import (
+    GostSpecificationDetector,
+    TableDetectionError,
+)
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -25,11 +29,16 @@ class RecognitionService:
     )
     SYSTEM_RE = re.compile(r"^(?:[ПВКЕВBPK]{1,4}\s*\d+(?:[.,]\d+)?|К\d+(?:\.\d+)*)$", re.I)
 
-    def __init__(self, pdf_service: PdfService):
+    def __init__(
+        self,
+        pdf_service: PdfService,
+        *,
+        detector: GostSpecificationDetector | None = None,
+        ocr: OcrProvider | None = None,
+    ):
         self.pdf_service = pdf_service
-        self.detector = GostSpecificationDetector()
-        self.ocr = TesseractOcrEngine(self.detector)
-
+        self.detector = detector or GostSpecificationDetector()
+        self.ocr: OcrProvider = ocr or TesseractOcrEngine(self.detector)
 
     def suggest_pages(
         self,
@@ -47,15 +56,20 @@ class RecognitionService:
             if not image_path.exists():
                 self.pdf_service.render_page_to_path(pdf_path, page_number, image_path, dpi=dpi)
             image = cv2.imread(str(image_path))
+            if image is None:
+                errors.append({"page": page_number, "error": "Не удалось прочитать изображение страницы"})
+                progress(page_number, page_count, f"Проверена страница {page_number}")
+                continue
             try:
                 table = self.detector.detect(image)
                 if table.column_count == 9 and table.row_count >= 5:
                     candidates.append(page_number)
+            except TableDetectionError:
+                # A page without a matching GOST table is a normal outcome.
+                pass
             except Exception as exc:
-                # A page without a matching table is normal and is not treated
-                # as a user-facing error. Keep only unexpected image failures.
-                if image is None:
-                    errors.append({"page": page_number, "error": str(exc)})
+                # Unexpected detector failures must remain visible for diagnostics.
+                errors.append({"page": page_number, "error": str(exc)})
             progress(page_number, page_count, f"Проверена страница {page_number}")
         return {"pages": candidates, "errors": errors}
 
@@ -124,6 +138,9 @@ class RecognitionService:
 
                     if row_type == "section":
                         current_section = name.rstrip(":*") or position
+                        # A system belongs to its section. Never leak the last
+                        # system code into a newly encountered section.
+                        current_system = ""
                     elif row_type == "system":
                         current_system = name or position
 
@@ -142,6 +159,16 @@ class RecognitionService:
                         system_text = (name or position).replace(" ", "")
                         if not self.SYSTEM_RE.fullmatch(system_text):
                             status = "review"
+                    evidence = {
+                        key: {
+                            "raw_text": raw.get("raw_values", {}).get(key, values.get(key, "")),
+                            "normalized_text": values.get(key, ""),
+                            "final_text": values.get(key, ""),
+                            "confidence": raw.get("confidences", {}).get(key, 0.0),
+                            "source": raw.get("ocr_sources", {}).get(key, "none"),
+                        }
+                        for key in (column["key"] for column in BASE_COLUMNS)
+                    }
                     row = {
                         "id": uuid.uuid4().hex,
                         **values,
@@ -154,6 +181,7 @@ class RecognitionService:
                         "bbox": raw["bbox"],
                         "confidences": raw["confidences"],
                         "ocr_sources": raw.get("ocr_sources", {}),
+                        "ocr_evidence": evidence,
                         "source_row": raw["source_row"],
                         "edited": False,
                     }
@@ -211,7 +239,7 @@ class RecognitionService:
             )
             should_merge = bool(
                 repaired and not independent and not starts_component
-                and (secondary_only or previous_punct)
+                and (secondary_only or starts_lower or previous_punct)
             )
             if not should_merge:
                 repaired.append(current)
@@ -229,6 +257,10 @@ class RecognitionService:
                 previous.setdefault("confidences", {})[key] = round(
                     (old_conf + new_conf) / (2 if old_conf and new_conf else 1), 1
                 )
+                raw_value = str(current.get("raw_values", {}).get(key, "")).strip()
+                if raw_value:
+                    old_raw = str(previous.setdefault("raw_values", {}).get(key, "")).strip()
+                    previous["raw_values"][key] = f"{old_raw} {raw_value}".strip()
             first_box = previous.get("bbox", {})
             second_box = current.get("bbox", {})
             if first_box and second_box:
