@@ -17,6 +17,7 @@ class RecognitionRequest(BaseModel):
     crop: CropArea | None = None
     dpi: int = Field(default=300, ge=150, le=400)
     ocr_mode: Literal["standard", "accurate"] = "standard"
+    ai_provider: Literal["off", "local", "yandex"] = "off"
 
 
 class SaveRowsRequest(BaseModel):

@@ -16,6 +16,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from averon_import import __version__
+from averon_import.ai import AiCorrectionService
 from averon_import.core.constants import (
     ALL_COLUMNS,
     APP_NAME,
@@ -55,6 +56,7 @@ pdf_service = PdfService()
 workspace_service = WorkspaceService(DATA_DIR)
 recognition_service = RecognitionService(pdf_service)
 export_service = ExcelExportService()
+ai_service = AiCorrectionService.from_env()
 job_service = JobService(max_workers=1)
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
@@ -81,6 +83,7 @@ def health():
         "app": APP_NAME,
         "version": __version__,
         "ocr": TesseractOcrEngine.health(),
+        "ai": ai_service.health(),
         "data_dir": str(DATA_DIR),
     }
 
@@ -97,6 +100,7 @@ def config():
             "standard": "Стандартный",
             "accurate": "Точный инженерный",
         },
+        "ai": ai_service.public_config(),
     }
 
 
@@ -203,6 +207,12 @@ def recognize(document_id: str, request: RecognitionRequest):
         raise HTTPException(400, f"Некорректные страницы: {invalid}")
     crop = request.crop.model_dump() if request.crop else None
 
+    if request.ai_provider != "off":
+        try:
+            ai_service.ensure_provider(request.ai_provider)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     def run(progress):
         result = recognition_service.recognize(
             workspace.pdf_path,
@@ -213,6 +223,18 @@ def recognize(document_id: str, request: RecognitionRequest):
             progress,
             ocr_mode=request.ocr_mode,
         )
+        if request.ai_provider == "off":
+            result["ai"] = {
+                "enabled": False,
+                "provider": "off",
+                "status": "disabled",
+                "warnings": [],
+            }
+        else:
+            result = ai_service.correct_result(result, request.ai_provider, progress)
+            result["summary"] = recognition_service._summary(
+                result.get("rows", []), result.get("errors", [])
+            )
         workspace_service.write_json(workspace.result_path, result)
         return result
 
