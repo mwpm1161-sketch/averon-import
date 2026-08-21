@@ -1,0 +1,2 @@
+class AIProviderError(Exception):
+    pass
