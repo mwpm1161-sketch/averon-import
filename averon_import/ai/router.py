@@ -11,7 +11,10 @@ class AIRouter:
         if not self.config.enabled:
             return None
 
-        if self.config.provider in self.providers:
-            return self.providers[self.config.provider]
+        return self.providers.get(self.config.provider)
 
-        return None
+    def require_provider(self) -> AIProvider:
+        provider = self.select_provider()
+        if provider is None:
+            raise RuntimeError("AI provider is not available")
+        return provider
