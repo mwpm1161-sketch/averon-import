@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+from averon_import.core.models import SpecificationRow
 
 
 class CropArea(BaseModel):
@@ -20,12 +22,12 @@ class RecognitionRequest(BaseModel):
 
 
 class SaveRowsRequest(BaseModel):
-    rows: list[dict[str, Any]]
+    rows: list[SpecificationRow]
 
 
 class ExportRequest(BaseModel):
     columns: list[str]
-    rows: list[dict[str, Any]]
+    rows: list[SpecificationRow]
     include_headers: bool = True
     only_exportable: bool = True
     filename: str = "averon_import.xlsx"
