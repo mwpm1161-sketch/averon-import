@@ -14,6 +14,7 @@ const state = {
   exportSelected: new Set(),
   ocrMode: "accurate",
   ocrHealth: null,
+  aiProvider: "off",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -74,6 +75,7 @@ async function boot() {
     $("#ocr-title").textContent = ocr.available && ocr.russian ? "OCR готов" : "OCR требует настройки";
     $("#ocr-text").textContent = ocr.available ? `${ocr.version}${ocr.russian ? " · русский язык" : " · нет rus"}` : "Tesseract не найден";
     initializeOcrMode(ocr);
+    initializeAiProvider(health.ai);
     populateFilters();
     initializeExportColumns();
     await resumeLastDocument();
@@ -107,6 +109,58 @@ function initializeOcrMode(ocr) {
       localStorage.setItem("averonOcrMode", state.ocrMode);
     });
   });
+}
+
+function initializeAiProvider(aiHealth) {
+  const providers = state.config?.ai?.providers || {};
+  const local = document.querySelector('input[name="ai-provider"][value="local"]');
+  const yandex = document.querySelector('input[name="ai-provider"][value="yandex"]');
+  const off = document.querySelector('input[name="ai-provider"][value="off"]');
+  const localConfigured = Boolean(providers.local?.configured && aiHealth?.providers?.local?.configured);
+  const yandexConfigured = Boolean(providers.yandex?.configured && aiHealth?.providers?.yandex?.configured);
+
+  local.disabled = !localConfigured;
+  yandex.disabled = !yandexConfigured;
+  $("#local-ai-card").classList.toggle("disabled", !localConfigured);
+  $("#yandex-ai-card").classList.toggle("disabled", !yandexConfigured);
+
+  const saved = localStorage.getItem("averonAiProvider");
+  const allowed = new Set(["off"]);
+  if (localConfigured) allowed.add("local");
+  if (yandexConfigured) allowed.add("yandex");
+  state.aiProvider = allowed.has(saved) ? saved : "off";
+  (document.querySelector(`input[name="ai-provider"][value="${state.aiProvider}"]`) || off).checked = true;
+  updateAiProviderStatus();
+
+  document.querySelectorAll('input[name="ai-provider"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      state.aiProvider = input.value;
+      localStorage.setItem("averonAiProvider", state.aiProvider);
+      updateAiProviderStatus();
+    });
+  });
+}
+
+function updateAiProviderStatus() {
+  const status = $("#ai-provider-status");
+  const providers = state.config?.ai?.providers || {};
+  if (state.aiProvider === "local") {
+    const provider = providers.local || {};
+    status.textContent = `Локальная модель: ${provider.model || "не задана"}. Соединение будет проверено при запуске.`;
+    status.className = "mode-status ok";
+    return;
+  }
+  if (state.aiProvider === "yandex") {
+    const provider = providers.yandex || {};
+    status.textContent = `Yandex Cloud: ${provider.model || "модель не задана"}. PDF в облако не отправляется.`;
+    status.className = "mode-status warning";
+    return;
+  }
+  const yandexReady = Boolean(providers.yandex?.configured);
+  status.textContent = yandexReady
+    ? "AI выключен. Можно выбрать локальную модель или Yandex Cloud."
+    : "AI выключен. Yandex Cloud появится после настройки API-ключа и модели.";
+  status.className = "mode-status";
 }
 
 function populateFilters() {
@@ -283,8 +337,13 @@ async function startRecognition() {
   if (!pages.length) return;
   setView("processing");
   $("#processing-progress").style.width = "0%";
-  $("#processing-title").textContent = state.ocrMode === "accurate" ? "Точное инженерное распознавание" : "Распознаём спецификацию";
-  $("#processing-message").textContent = state.ocrMode === "accurate" ? "Читаем столбцы раздельно и проверяем сомнительные ячейки…" : "Подготовка страниц…";
+  const withAi = state.aiProvider !== "off";
+  $("#processing-title").textContent = withAi
+    ? "OCR и финальная AI-проверка"
+    : (state.ocrMode === "accurate" ? "Точное инженерное распознавание" : "Распознаём спецификацию");
+  $("#processing-message").textContent = state.ocrMode === "accurate"
+    ? "Читаем столбцы раздельно и проверяем сомнительные ячейки…"
+    : "Подготовка страниц…";
   try {
     const job = await api(`/api/documents/${state.document.document_id}/recognize`, {
       method:"POST",
@@ -294,6 +353,7 @@ async function startRecognition() {
         crop:state.crop,
         dpi:state.ocrMode === "accurate" ? 350 : 300,
         ocr_mode:state.ocrMode,
+        ai_provider:state.aiProvider,
       }),
     });
     await pollJob(job.id);
@@ -339,7 +399,14 @@ function loadResult(result) {
       .slice(0, 2)
       .join("; ");
     toast(`Не удалось обработать страницы: ${pages}${details ? `. Причина: ${details}` : ""}`, "error");
-  } else toast("Распознавание завершено", "success");
+  } else if (result.ai?.enabled && ["failed", "partial"].includes(result.ai.status)) {
+    const warning = result.ai.warnings?.[0] || "AI-проверка завершилась с ошибкой";
+    toast(`OCR сохранён. ${warning}`, "error");
+  } else if (result.ai?.enabled) {
+    toast(`OCR и AI завершены · исправлено строк: ${result.ai.changed_rows || 0}`, "success");
+  } else {
+    toast("Распознавание завершено", "success");
+  }
 }
 
 const displayColumns = [
@@ -430,7 +497,7 @@ function options(map, selected) {
 }
 
 function escapeHtml(value) {
-  return value.replace(/[&<>'"]/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
+  return value.replace(/[&<>'"]/g, (char) => ({"&":"&amp;","<":"&lt;","'":"&#39;",'"':"&quot;"}[char]));
 }
 
 function autoHeight(element) {
