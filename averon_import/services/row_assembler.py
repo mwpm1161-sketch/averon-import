@@ -1,0 +1,214 @@
+"""Provider-independent assembly of OCR rows into final Averon rows.
+
+Consumes the internal OCR DTO only (``OcrRow`` / its ``as_dict`` wire shape)
+and applies the historical RecognitionService semantics verbatim: continuation
+repair, classification, section/system tracking, component blocks, statuses,
+confidences and service fields. Heuristics and thresholds must stay identical
+between providers; text normalization deliberately does NOT happen here —
+providers are responsible for returning already normalized cell text.
+"""
+
+from __future__ import annotations
+
+import re
+import uuid
+
+from averon_import.services.ocr.base import OcrRow
+
+
+class SpecificationRowAssembler:
+    SECTION_WORDS = (
+        "вентиляц",
+        "кондиционир",
+        "отоплен",
+        "теплоснабжен",
+        "холодоснабжен",
+    )
+    SYSTEM_RE = re.compile(r"^(?:[ПВКЕВBPK]{1,4}\s*\d+(?:[.,]\d+)?|К\d+(?:\.\d+)*)$", re.I)
+
+    def __init__(self):
+        self.current_section = ""
+        self.current_system = ""
+        self.component_block_active = False
+
+    def build_page(self, page: int, raw_rows: list[OcrRow]) -> list[dict]:
+        """Convenience composition of prepare + build_row for one page."""
+        prepared = self.prepare(raw_rows)
+        return [self.build_row(page, raw) for raw in prepared]
+
+    def prepare(self, raw_rows: list[OcrRow]) -> list[dict]:
+        return self.repair_continuation_rows([row.as_dict() for row in raw_rows])
+
+    def build_row(self, page: int, raw: dict) -> dict:
+        values = raw["values"]
+        row_type = self.classify_row(values)
+        name = values.get("name", "").strip()
+        position = values.get("position", "").strip()
+        # A short standalone row directly below a recognized section
+        # is normally a system code (П1, В2, К1 and similar). Even
+        # when the narrow GOST font is read as Ш/И/01, preserve the
+        # source text but classify the row correctly for review.
+        nonempty_fields = [
+            key for key, value in values.items() if str(value).strip()
+        ]
+        if (
+            row_type == "note"
+            and self.current_section
+            and len(nonempty_fields) == 1
+            and nonempty_fields[0] in {"name", "position"}
+            and len(name or position) <= 5
+        ):
+            row_type = "system"
+
+        has_independent_amount = bool(
+            values.get("unit") or values.get("quantity") or values.get("manufacturer")
+        )
+        if self.component_block_active and not has_independent_amount and row_type not in {"section", "system"}:
+            if values.get("name") or values.get("type_mark"):
+                row_type = "component"
+        if self.component_block_active and has_independent_amount:
+            self.component_block_active = False
+        if row_type == "item" and "компл" in name.lower() and values.get("quantity"):
+            self.component_block_active = True
+
+        if row_type == "section":
+            self.current_section = name.rstrip(":*") or position
+        elif row_type == "system":
+            self.current_system = name or position
+
+        confidence_values = [
+            value
+            for key, value in raw["confidences"].items()
+            if values.get(key, "").strip()
+        ]
+        confidence = (
+            round(sum(confidence_values) / len(confidence_values), 1)
+            if confidence_values
+            else 0.0
+        )
+        status = self.status_for(values, confidence, row_type)
+        if row_type == "system":
+            system_text = (name or position).replace(" ", "")
+            if not self.SYSTEM_RE.fullmatch(system_text):
+                status = "review"
+        return {
+            "id": uuid.uuid4().hex,
+            **values,
+            "section": self.current_section,
+            "system": self.current_system,
+            "row_type": row_type,
+            "page": page,
+            "confidence": confidence,
+            "status": status,
+            "bbox": raw["bbox"],
+            "confidences": raw["confidences"],
+            "ocr_sources": raw.get("ocr_sources", {}),
+            "source_row": raw["source_row"],
+            "edited": False,
+        }
+
+    @staticmethod
+    def repair_continuation_rows(raw_rows: list[dict]) -> list[dict]:
+        """Conservatively merge OCR fragments split into a following table row.
+
+        A row is merged only when it has no independent position/quantity/unit
+        and clearly looks like a continuation: the name starts with lower-case
+        text, the previous name ends with punctuation, or the current row only
+        contains a secondary field. Bullet/component rows are preserved.
+        """
+        repaired: list[dict] = []
+        for current in raw_rows:
+            values = current.get("values", {})
+            name = str(values.get("name", "")).strip()
+            independent = any(str(values.get(key, "")).strip() for key in (
+                "position", "type_mark", "code", "manufacturer", "unit", "quantity", "mass"
+            ))
+            starts_component = bool(re.match(r"^[\-–—•]", name))
+            secondary_only = (
+                not name
+                and any(str(values.get(key, "")).strip() for key in ("type_mark", "code", "note"))
+            )
+            starts_lower = bool(name and name[:1].islower())
+            previous_punct = bool(
+                repaired
+                and str(repaired[-1].get("values", {}).get("name", "")).rstrip().endswith((",", ";", "-"))
+            )
+            should_merge = bool(
+                repaired and not independent and not starts_component
+                and (secondary_only or previous_punct)
+            )
+            if not should_merge:
+                repaired.append(current)
+                continue
+
+            previous = repaired[-1]
+            for key, value in values.items():
+                value = str(value).strip()
+                if not value:
+                    continue
+                old = str(previous["values"].get(key, "")).strip()
+                previous["values"][key] = f"{old} {value}".strip()
+                old_conf = float(previous.get("confidences", {}).get(key, 0) or 0)
+                new_conf = float(current.get("confidences", {}).get(key, 0) or 0)
+                previous.setdefault("confidences", {})[key] = round(
+                    (old_conf + new_conf) / (2 if old_conf and new_conf else 1), 1
+                )
+            first_box = previous.get("bbox", {})
+            second_box = current.get("bbox", {})
+            if first_box and second_box:
+                bottom = max(
+                    first_box.get("y", 0) + first_box.get("height", 0),
+                    second_box.get("y", 0) + second_box.get("height", 0),
+                )
+                first_box["height"] = bottom - first_box.get("y", 0)
+            previous["source_row"] = f"{previous.get('source_row')}+{current.get('source_row')}"
+        return repaired
+
+    def classify_row(self, values: dict[str, str]) -> str:
+        name = values.get("name", "").strip()
+        position = values.get("position", "").strip()
+        quantity = values.get("quantity", "").strip()
+        unit = values.get("unit", "").strip()
+        type_mark = values.get("type_mark", "").strip()
+        manufacturer = values.get("manufacturer", "").strip()
+
+        low = name.lower()
+        if any(word in low for word in self.SECTION_WORDS) and not quantity:
+            return "section"
+        if (
+            self.SYSTEM_RE.fullmatch(name.replace(" ", ""))
+            or self.SYSTEM_RE.fullmatch(position.replace(" ", ""))
+        ) and not quantity and not unit:
+            return "system"
+        if re.match(r"^[\-–—•]", name):
+            return "component"
+        if quantity or unit or type_mark or manufacturer:
+            return "item"
+        if name or position:
+            return "note"
+        return "skip"
+
+    @staticmethod
+    def status_for(values: dict[str, str], confidence: float, row_type: str) -> str:
+        if row_type in {"section", "system", "note", "component"}:
+            return "recognized" if confidence >= 55 else "review"
+        critical_present = bool(values.get("name")) and bool(
+            values.get("quantity") or values.get("unit")
+        )
+        if not critical_present:
+            return "review" if values.get("name") else "unrecognized"
+        return "recognized" if confidence >= 68 else "review"
+
+    @staticmethod
+    def summary(rows: list[dict], errors: list[dict]) -> dict:
+        status_counts: dict[str, int] = {}
+        type_counts: dict[str, int] = {}
+        for row in rows:
+            status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+            type_counts[row["row_type"]] = type_counts.get(row["row_type"], 0) + 1
+        return {
+            "total_rows": len(rows),
+            "status_counts": status_counts,
+            "type_counts": type_counts,
+            "page_errors": len(errors),
+        }

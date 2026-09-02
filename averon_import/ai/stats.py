@@ -7,6 +7,8 @@ from dataclasses import dataclass
 class AIPipelineStats:
     total_rows: int = 0
     skipped_rows: int = 0
+    skipped_confident: int = 0
+    skipped_rule_fixed: int = 0
     rule_fixed_rows: int = 0
     ai_rows: int = 0
     accepted_rows: int = 0
@@ -17,6 +19,8 @@ class AIPipelineStats:
         return {
             "total_rows": self.total_rows,
             "skipped_rows": self.skipped_rows,
+            "skipped_confident": self.skipped_confident,
+            "skipped_rule_fixed": self.skipped_rule_fixed,
             "rule_fixed_rows": self.rule_fixed_rows,
             "ai_rows": self.ai_rows,
             "accepted_rows": self.accepted_rows,

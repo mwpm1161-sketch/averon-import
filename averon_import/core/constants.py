@@ -4,6 +4,8 @@ APP_NAME = "Averon Import"
 APP_VERSION = "1.0.0-rc7"
 DEVELOPER = "Андриянов Степан Владимирович - НВСС"
 
+PROCESSING_MODES = ("local", "cloud", "hybrid")
+
 BASE_COLUMNS = [
     {"key": "position", "title": "Позиция", "width": 14},
     {"key": "name", "title": "Наименование и техническая характеристика", "width": 56},

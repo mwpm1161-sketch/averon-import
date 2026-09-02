@@ -13,10 +13,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.requests import Request
+from typing import Literal
 
 from averon_import import __version__
-from averon_import.ai import AiCorrectionService
+from averon_import.ai import AiCorrectionService, SmartAIIntegration
 from averon_import.core.constants import (
     ALL_COLUMNS,
     APP_NAME,
@@ -27,11 +29,25 @@ from averon_import.core.constants import (
     STATUSES,
 )
 from averon_import.core.schemas import ExportRequest, RecognitionRequest, SaveRowsRequest
+from averon_import.services.app_settings import (
+    PROCESSING_MODES,
+    AppSettingsService,
+)
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
-from averon_import.services.ocr_engine import TesseractOcrEngine
+from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.pdf_service import PdfService
+from averon_import.services.processing_coordinator import (
+    ProcessOptions,
+    ProcessingCoordinator,
+    ProcessingError,
+)
 from averon_import.services.recognition import RecognitionService
+from averon_import.services.secrets import (
+    YANDEX_API_KEY,
+    create_secret_store,
+    resolve_secret,
+)
 from averon_import.services.workspace import WorkspaceService
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -57,7 +73,21 @@ workspace_service = WorkspaceService(DATA_DIR)
 recognition_service = RecognitionService(pdf_service)
 export_service = ExcelExportService()
 ai_service = AiCorrectionService.from_env()
+smart_ai = SmartAIIntegration(service=ai_service)
 job_service = JobService(max_workers=1)
+app_settings_service = AppSettingsService(DATA_DIR)
+secret_store = create_secret_store(DATA_DIR)
+yandex_vision_provider = YandexVisionProvider(
+    settings_service=app_settings_service,
+    secret_store=secret_store,
+    cache_dir=DATA_DIR / "ocr_cache",
+)
+coordinator = ProcessingCoordinator(
+    pdf_service,
+    smart_ai=smart_ai,
+    settings_service=app_settings_service,
+    providers={"cloud": yandex_vision_provider},
+)
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
@@ -82,9 +112,15 @@ def health():
     return {
         "app": APP_NAME,
         "version": __version__,
-        "ocr": TesseractOcrEngine.health(),
+        "ocr": coordinator.ocr_health(),
+        "cloud_ocr": yandex_vision_provider.health(),
         "ai": ai_service.health(),
         "data_dir": str(DATA_DIR),
+        "settings": {
+            "warnings": app_settings_service.warnings_snapshot(),
+            "secret_backend": secret_store.backend_name,
+            "secret_insecure": secret_store.is_insecure,
+        },
     }
 
 
@@ -101,7 +137,96 @@ def config():
             "accurate": "Точный инженерный",
         },
         "ai": ai_service.public_config(),
+        "settings": {
+            "processing_mode": app_settings_service.settings.processing_mode,
+            "processing_modes": list(PROCESSING_MODES),
+            "available_processing_modes": coordinator.available_processing_modes(),
+            "processing_status": coordinator.mode_status(),
+            "warnings": app_settings_service.warnings_snapshot(),
+        },
     }
+
+
+class LocalSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    base_url: str | None = None
+    model: str | None = None
+
+
+class YandexSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    folder_id: str | None = None
+    vision_model: str | None = None
+    llm_model: str | None = None
+    vision_base_url: str | None = None
+    llm_base_url: str | None = None
+    chunk_pages: int | None = None
+    request_timeout_s: float | None = None
+    operation_timeout_s: float | None = None
+
+
+class PipelineSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool | None = None
+    rules_enabled: bool | None = None
+    validation_enabled: bool | None = None
+    batch_size: int | None = None
+    min_confidence: float | None = None
+
+
+class SettingsUpdate(BaseModel):
+    """api_key is write-only: it goes to the SecretStore and is never returned."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    processing_mode: Literal["local", "cloud", "hybrid"] | None = None
+    local: LocalSettingsUpdate | None = None
+    yandex: YandexSettingsUpdate | None = None
+    pipeline: PipelineSettingsUpdate | None = None
+    api_key: str | None = None
+    delete_yandex_api_key: bool = False
+
+
+def _settings_public() -> dict:
+    payload = app_settings_service.public()
+    payload["yandex"]["api_key_configured"] = (
+        resolve_secret(os.environ.get("AVERON_YANDEX_AI_API_KEY"), secret_store, YANDEX_API_KEY)
+        is not None
+    )
+    payload["secret_backend"] = secret_store.backend_name
+    payload["secret_insecure"] = secret_store.is_insecure
+    return payload
+
+
+@app.get("/api/settings")
+def get_settings():
+    return _settings_public()
+
+
+@app.put("/api/settings")
+def put_settings(request: SettingsUpdate):
+    if request.api_key is not None and request.api_key.strip():
+        secret_store.set(YANDEX_API_KEY, request.api_key.strip())
+    if request.delete_yandex_api_key:
+        secret_store.delete(YANDEX_API_KEY)
+    patch = request.model_dump(exclude_none=True, exclude={"api_key", "delete_yandex_api_key"})
+    patch = {key: value for key, value in patch.items() if value}
+    try:
+        app_settings_service.update(patch)
+    except ValidationError as exc:
+        first = exc.errors()[0] if exc.errors() else {}
+        location = ".".join(str(part) for part in first.get("loc", ()))
+        raise HTTPException(400, f"Недопустимые настройки {location}: {first.get('msg', '')}") from exc
+    return _settings_public()
+
+
+@app.delete("/api/settings/yandex-api-key")
+def delete_yandex_api_key():
+    secret_store.delete(YANDEX_API_KEY)
+    return {"deleted": True}
 
 
 @app.post("/api/documents")
@@ -213,28 +338,24 @@ def recognize(document_id: str, request: RecognitionRequest):
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    try:
+        coordinator.resolve(request.processing_mode, ai_provider=request.ai_provider)
+    except ProcessingError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    options = ProcessOptions(
+        pages_dir=workspace.pages_dir,
+        pages=pages,
+        crop=crop,
+        dpi=request.dpi,
+        ocr_mode=request.ocr_mode,
+        ai_provider=request.ai_provider,
+    )
+
     def run(progress):
-        result = recognition_service.recognize(
-            workspace.pdf_path,
-            workspace.pages_dir,
-            pages,
-            crop,
-            request.dpi,
-            progress,
-            ocr_mode=request.ocr_mode,
+        result = coordinator.process_document(
+            workspace.pdf_path, request.processing_mode, options, progress
         )
-        if request.ai_provider == "off":
-            result["ai"] = {
-                "enabled": False,
-                "provider": "off",
-                "status": "disabled",
-                "warnings": [],
-            }
-        else:
-            result = ai_service.correct_result(result, request.ai_provider, progress)
-            result["summary"] = recognition_service._summary(
-                result.get("rows", []), result.get("errors", [])
-            )
         workspace_service.write_json(workspace.result_path, result)
         return result
 

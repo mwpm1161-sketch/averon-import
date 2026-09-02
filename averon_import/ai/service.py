@@ -8,6 +8,7 @@ from typing import Any
 from averon_import.ai.config import AiSettings
 from averon_import.ai.provider import AiProviderError, OpenAICompatibleProvider
 from averon_import.ai.schemas import AiCorrectionResponse
+from averon_import.ai.validator import AICorrectionValidator
 from averon_import.core.constants import BASE_COLUMNS
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -41,6 +42,7 @@ class AiCorrectionService:
         providers: dict[str, Any] | None = None,
     ) -> None:
         self.settings = settings or AiSettings.from_env()
+        self.validator = AICorrectionValidator()
         self.providers = providers or {
             "local": OpenAICompatibleProvider(
                 self.settings.local,
@@ -169,8 +171,8 @@ class AiCorrectionService:
             return False
         return any(str(row.get(key, "")).strip() for key in EDITABLE_FIELDS)
 
-    @staticmethod
     def _apply_response(
+        self,
         batch: list[dict], response: AiCorrectionResponse, provider: Any
     ) -> tuple[int, int]:
         by_id = {str(row.get("id")): row for row in batch}
@@ -189,6 +191,8 @@ class AiCorrectionService:
                 new = str(proposed or "").strip()
                 # Blank source fields must never be hallucinated by the model.
                 if not old.strip() or not new or _same_text(old, new):
+                    continue
+                if not self.validator.validate(old, new):
                     continue
                 original_changes[key] = old
                 applied_changes[key] = new

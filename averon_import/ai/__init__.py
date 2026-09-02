@@ -6,6 +6,7 @@ from averon_import.ai.validator import AICorrectionValidator
 from averon_import.ai.batch import AIBatchProcessor
 from averon_import.ai.stats import AIPipelineStats
 from averon_import.ai.pipeline import AIPipeline, AIPipelineResult
+from averon_import.ai.integration import SmartAIIntegration
 
 __all__ = [
     "AiCorrectionService",
@@ -20,4 +21,5 @@ __all__ = [
     "AIPipelineStats",
     "AIPipeline",
     "AIPipelineResult",
+    "SmartAIIntegration",
 ]

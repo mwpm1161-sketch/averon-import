@@ -13,7 +13,7 @@ class AIRouter:
     Conservative by design: good OCR is not sent to the model.
     """
 
-    def __init__(self, min_confidence: float = 0.95):
+    def __init__(self, min_confidence: float = 0.85):
         self.min_confidence = min_confidence
 
     def decide(self, confidence: float | None, has_rule_candidate: bool = False) -> AIRouteDecision:

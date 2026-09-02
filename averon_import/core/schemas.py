@@ -18,6 +18,7 @@ class RecognitionRequest(BaseModel):
     dpi: int = Field(default=300, ge=150, le=400)
     ocr_mode: Literal["standard", "accurate"] = "standard"
     ai_provider: Literal["off", "local", "yandex"] = "off"
+    processing_mode: Literal["local", "cloud", "hybrid"] | None = None
 
 
 class SaveRowsRequest(BaseModel):
