@@ -10,6 +10,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from averon_import.core.constants import COLUMN_BY_KEY
 from averon_import.core.normalizers import as_excel_number
+from averon_import.services.review_policy import critical_blockers_for_row, critical_field_count
 
 
 class ExcelExportService:
@@ -25,6 +26,24 @@ class ExcelExportService:
         valid_columns = [column for column in columns if column in COLUMN_BY_KEY]
         if not valid_columns:
             raise ValueError("Не выбрано ни одного столбца для экспорта")
+
+        if only_exportable:
+            unresolved = sum(
+                critical_field_count(row)
+                for row in rows
+                if row.get("selected", True) is not False
+                and row.get("row_type") not in {"section", "system", "skip"}
+                and not (
+                    row.get("row_type") == "note"
+                    and not row.get("structured_table")
+                )
+                and critical_blockers_for_row(row)
+            )
+            if unresolved:
+                raise ValueError(
+                    f"Не проверено {unresolved} критичных значений. "
+                    "Перед экспортом подтвердите их."
+                )
 
         workbook = Workbook()
         sheet = workbook.active
@@ -51,12 +70,13 @@ class ExcelExportService:
 
         exported_count = 0
         for row in rows:
-            if only_exportable and row.get("row_type") in {
-                "section",
-                "system",
-                "note",
-                "skip",
-            }:
+            if only_exportable and (
+                row.get("row_type") in {"section", "system", "skip"}
+                or (
+                    row.get("row_type") == "note"
+                    and not row.get("structured_table")
+                )
+            ):
                 continue
             if row.get("selected") is False:
                 continue

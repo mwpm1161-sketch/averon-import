@@ -209,7 +209,7 @@ def normalize_cell(key: str, value: str | None) -> str:
         compact = re.sub(r"[^а-яёa-z0-9²³]+", "", low)
         mapping = {
             "шт": "шт.", "шг": "шт.", "шм": "шт.", "wm": "шт.", "штт": "шт.",
-            "м": "м", "мп": "м", "м2": "м²", "м²": "м²",
+            "м": "м", "m": "м", "мп": "м", "м2": "м²", "м²": "м²",
             "компл": "компл.", "комплект": "компл.", "комп": "компл.",
             "компд": "компл.", "комплд": "компл.", "компп": "компл.",
             "кг": "кг", "м3": "м³", "м³": "м³",
@@ -218,6 +218,26 @@ def normalize_cell(key: str, value: str | None) -> str:
         text = mapping.get(compact, text)
     text = re.sub(r"(?i)\bвозд\.\s*Клапана\b", "возд.клапана", text)
     return text
+
+
+def numeric_cell_metadata(value: str | None) -> dict[str, object]:
+    """Return the numeric candidate without hiding OCR contamination.
+
+    The shared normalizer still produces the display candidate for backwards
+    compatibility, but callers can now distinguish a clean number from a
+    candidate obtained by stripping letters, units, or line breaks.
+    """
+    raw_value = "" if value is None else str(value)
+    candidate = normalize_cell("quantity", raw_value)
+    compact_raw = clean_text(raw_value).replace(" ", "")
+    numeric_suspect = bool(compact_raw) and not re.fullmatch(
+        r"-?\d+(?:[.,]\d+)?", compact_raw
+    )
+    return {
+        "raw_value": raw_value,
+        "normalized_candidate": candidate,
+        "numeric_suspect": numeric_suspect,
+    }
 
 
 def engineering_plausibility(key: str, value: str) -> float:

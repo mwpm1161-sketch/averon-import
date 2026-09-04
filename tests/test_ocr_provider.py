@@ -135,7 +135,10 @@ def test_recognition_service_accepts_injected_provider():
         key = "stub"
 
         def recognize(self, pdf_path, pages, **kwargs):
-            return OcrResult(provider=self.key, pages=[
+            return OcrResult(provider=self.key, stats={
+                "primary_requests": 2,
+                "secondary_requests": 1,
+            }, pages=[
                 PageOcrResult(page=p, rows=[OcrRow(
                     source_row=index,
                     values={"position": str(index), "name": "Насос", "quantity": "2"},
@@ -158,6 +161,11 @@ def test_recognition_service_accepts_injected_provider():
     assert result["summary"]["total_rows"] == 2
     assert result["errors"] == []
     assert result["ocr_mode"] == "standard"
+    assert result["ocr_stats"] == {
+        "primary_requests": 2,
+        "secondary_requests": 1,
+        "unresolved_critical": 0,
+    }
     assert result["page_tables"] == {"1": {}, "2": {}}
     assert service.ocr.key == "stub"
 

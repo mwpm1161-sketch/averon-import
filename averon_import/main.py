@@ -43,6 +43,7 @@ from averon_import.services.processing_coordinator import (
     ProcessingError,
 )
 from averon_import.services.recognition import RecognitionService
+from averon_import.services.review_policy import refresh_rows
 from averon_import.services.secrets import (
     YANDEX_API_KEY,
     create_secret_store,
@@ -165,6 +166,7 @@ class YandexSettingsUpdate(BaseModel):
     chunk_pages: int | None = None
     request_timeout_s: float | None = None
     operation_timeout_s: float | None = None
+    language_codes: list[str] | None = None
 
 
 class PipelineSettingsUpdate(BaseModel):
@@ -192,9 +194,16 @@ class SettingsUpdate(BaseModel):
 
 def _settings_public() -> dict:
     payload = app_settings_service.public()
+    api_key_configured = None
+    for env_name in ("AVERON_YANDEX_VISION_API_KEY", "AVERON_YANDEX_AI_API_KEY"):
+        raw = os.environ.get(env_name)
+        if raw and raw.strip():
+            api_key_configured = resolve_secret(raw, secret_store, YANDEX_API_KEY)
+            break
+    if api_key_configured is None:
+        api_key_configured = resolve_secret(None, secret_store, YANDEX_API_KEY)
     payload["yandex"]["api_key_configured"] = (
-        resolve_secret(os.environ.get("AVERON_YANDEX_AI_API_KEY"), secret_store, YANDEX_API_KEY)
-        is not None
+        api_key_configured is not None
     )
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
@@ -213,7 +222,7 @@ def put_settings(request: SettingsUpdate):
     if request.delete_yandex_api_key:
         secret_store.delete(YANDEX_API_KEY)
     patch = request.model_dump(exclude_none=True, exclude={"api_key", "delete_yandex_api_key"})
-    patch = {key: value for key, value in patch.items() if value}
+    patch = {key: value for key, value in patch.items() if value is not None}
     try:
         app_settings_service.update(patch)
     except ValidationError as exc:
@@ -388,9 +397,10 @@ def save_results(document_id: str, request: SaveRowsRequest):
     try:
         workspace = workspace_service.get(document_id)
         existing = workspace_service.read_json(workspace.result_path, default={})
-        existing["rows"] = request.rows
+        rows = refresh_rows(request.rows)
+        existing["rows"] = rows
         existing["summary"] = recognition_service._summary(
-            request.rows, existing.get("errors", [])
+            rows, existing.get("errors", [])
         )
         workspace_service.write_json(workspace.result_path, existing)
         return {"saved": True, "summary": existing["summary"]}

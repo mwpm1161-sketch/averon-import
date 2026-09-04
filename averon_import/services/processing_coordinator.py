@@ -64,7 +64,7 @@ class CloudOCRNotConfigured:
     ):
         raise OcrProviderError(
             "Облачный режим не настроен: укажите folder_id и API ключ "
-            "Yandex Vision в настройках. Пока доступен локальный режим."
+            "Yandex Vision в настройках. Для распознавания настройте Yandex Cloud."
         )
 
 
@@ -129,7 +129,7 @@ class ProcessingCoordinator:
     def default_mode(self) -> str:
         settings = self._settings_service.settings if self._settings_service else None
         mode = getattr(settings, "processing_mode", None)
-        return mode if mode in PROCESSING_MODES else "local"
+        return mode if mode in PROCESSING_MODES else "cloud"
 
     def resolve(
         self,

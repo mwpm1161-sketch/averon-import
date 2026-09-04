@@ -4,6 +4,7 @@ Implements the provider-neutral OcrProvider contract on top of the official
 Vision OCR async REST API (v1 routes):
 
     POST {vision_base_url}/ocr/v1/recognizeTextAsync    (submit, NOT idempotent)
+    POST {vision_base_url}/ocr/v1/recognizeText         (single-page sync)
     GET  {vision_base_url}/ocr/v1/getRecognition?operationId=<id>
 
 getRecognition answers with JSONL: one JSON object per PDF page, each of the
@@ -19,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -38,17 +40,26 @@ from averon_import.services.ocr.reconstruction import (
     page_geometry,
     reconstruct_page_rows,
 )
+from averon_import.services.ocr.critical_verification import attach_secondary_candidates
+from averon_import.services.review_policy import CRITICAL_FIELDS, critical_field_count, is_critical_values
 from averon_import.services.secrets import YANDEX_API_KEY, resolve_secret
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_PIXELS = 20_000_000
+SECONDARY_DPI = 600
+SECONDARY_PADDING_RATIO = 0.01
 MAX_PAGES_PER_REQUEST = 200
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 FAIL_FAST_STATUSES = {400, 401, 403}
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def _submit_path() -> str:
     return "/ocr/v1/recognizeTextAsync"
+
+
+def _sync_path() -> str:
+    return "/ocr/v1/recognizeText"
 
 
 def _recognition_path() -> str:
@@ -211,10 +222,17 @@ class YandexVisionProvider:
 
     # ------------------------------------------------------------------- cache
 
-    def _cache_key(self, source_digest: bytes, window: list[int], config: dict) -> str:
+    def _cache_key(
+        self,
+        source_digest: bytes,
+        window: list[int],
+        config: dict,
+        strategy: str = "async",
+    ) -> str:
         digest = hashlib.sha256()
         digest.update(b"yandex-vision-ocr\x00")
         digest.update(f"{CACHE_VERSION}\x00".encode())
+        digest.update(f"{strategy}\x00".encode("utf-8"))
         digest.update(config["vision_base_url"].encode("utf-8"))
         digest.update(f"\x00{config['vision_model']}\x00".encode("utf-8"))
         digest.update(config["folder_id"].encode("utf-8"))
@@ -246,13 +264,15 @@ class YandexVisionProvider:
             self._drop_quietly(path)
             return None
 
-    def _cache_save(self, key: str, pages_payload: list) -> None:
+    def _cache_save(
+        self, key: str, pages_payload: list, *, model: str | None = None
+    ) -> None:
         if not self._cache_dir:
             return
         payload = {
             "version": CACHE_VERSION,
             "provider": self.key,
-            "model": self._yandex_settings()["vision_model"],
+            "model": model or self._yandex_settings()["vision_model"],
             "cache_key": key,
             "pages": pages_payload,
         }
@@ -331,6 +351,8 @@ class YandexVisionProvider:
         cancel: threading.Event | None,
         warnings: list[str],
         allow_submit_retry: bool = False,
+        allow_not_ready_404: bool = False,
+        timeout_error_message: str | None = None,
     ) -> _HttpResponse:
         attempt = 0
         while True:
@@ -351,10 +373,18 @@ class YandexVisionProvider:
                 failure = exc
             if failure.status in FAIL_FAST_STATUSES:
                 raise self._config_error(failure.status) from None
+            if (
+                allow_not_ready_404
+                and failure.status == 404
+                and self._is_not_ready_404(failure.message)
+            ):
+                raise failure
             retryable = failure.status in RETRYABLE_STATUSES or failure.status == 0
             limit = self._submit_attempts if allow_submit_retry else None
             if not (retryable and (limit is None or attempt < limit)):
                 if failure.status == 0:
+                    if timeout_error_message:
+                        raise OcrProviderError(timeout_error_message) from None
                     raise OcrProviderError(
                         "Нет связи с Yandex Vision после повторов. Если запрос "
                         "всё же был принят сервисом, операция продолжится по "
@@ -396,6 +426,10 @@ class YandexVisionProvider:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _is_not_ready_404(message: str) -> bool:
+        return "operation data is not ready" in str(message).lower()
 
     @staticmethod
     def _config_error(status: int) -> OcrProviderError:
@@ -492,23 +526,228 @@ class YandexVisionProvider:
             )
         return operation_id
 
-    def _recognition_url(self, operation_id: str, recognition_base: str) -> str:
-        return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
-
-    def _poll_once(
-        self, operation_id: str, recognition_base: str, config: dict, api_key: str, cancel
-    ) -> _HttpResponse:
-        warnings: list[str] = []
-        return self._request_with_retry(
-            "GET",
-            self._recognition_url(operation_id, recognition_base),
-            body=None,
+    def _recognize_sync(
+        self,
+        content: bytes,
+        config: dict,
+        api_key: str,
+        cancel: threading.Event | None,
+        warnings: list[str],
+        progress: Callable[[str], None] | None = None,
+        mime_type: str = "application/pdf",
+    ) -> list[dict]:
+        if progress:
+            progress("Yandex OCR: отправляем страницу")
+        body = json.dumps(
+            {
+                "folderId": config["folder_id"],
+                "mimeType": mime_type,
+                "model": config["vision_model"],
+                "languageCodes": list(config["language_codes"]),
+                "content": base64.b64encode(content).decode("ascii"),
+            }
+        ).encode("utf-8")
+        if progress:
+            progress("Yandex OCR: распознаём страницу")
+        response = self._request_with_retry(
+            "POST",
+            f"{config['vision_base_url']}{_sync_path()}",
+            body=body,
             api_key=api_key,
             folder_id=config["folder_id"],
             timeout=config["request_timeout_s"],
             cancel=cancel,
             warnings=warnings,
+            allow_submit_retry=True,
+            timeout_error_message=(
+                "Синхронный OCR Yandex Vision превысил timeout "
+                f"({config['request_timeout_s']} c)."
+            ),
         )
+        if not response.body.strip():
+            raise OcrProviderError(
+                "Синхронный OCR Yandex Vision вернул пустой ответ."
+            )
+        try:
+            payload = response.json()
+        except _HttpFailure as exc:
+            raise OcrProviderError(
+                f"Синхронный OCR Yandex Vision вернул некорректный JSON: "
+                f"{exc.message[:300]}"
+            ) from None
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(
+            result.get("textAnnotation"), dict
+        ):
+            raise OcrProviderError(
+                "Ответ синхронного OCR Yandex Vision не содержит "
+                "result.textAnnotation."
+            )
+        if progress:
+            progress("Yandex OCR: результат получен")
+        return [result]
+
+    @staticmethod
+    def _bbox_from_vertices(box: dict | None) -> tuple[float, float, float, float] | None:
+        vertices = (box or {}).get("vertices") if isinstance(box, dict) else None
+        if not isinstance(vertices, list):
+            return None
+        points: list[tuple[float, float]] = []
+        for vertex in vertices:
+            if not isinstance(vertex, dict):
+                continue
+            try:
+                points.append((float(vertex.get("x", 0)), float(vertex.get("y", 0))))
+            except (TypeError, ValueError):
+                continue
+        if not points:
+            return None
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _render_secondary_table_crop(
+        self, pdf_path: Path, page_number: int, primary_payload: dict
+    ) -> tuple[bytes, dict]:
+        annotation = primary_payload.get("textAnnotation") or {}
+        try:
+            page_width = float(annotation.get("width") or 0)
+            page_height = float(annotation.get("height") or 0)
+        except (TypeError, ValueError):
+            page_width = page_height = 0.0
+        tables = [table for table in annotation.get("tables") or [] if isinstance(table, dict)]
+        table = max(tables, key=lambda item: len(item.get("cells") or []), default=None)
+        table_box = self._bbox_from_vertices((table or {}).get("boundingBox"))
+        if page_width <= 0 or page_height <= 0 or table_box is None:
+            raise OcrProviderError(
+                "Вторичная проверка Yandex Vision невозможна: отсутствует "
+                "геометрия primary table."
+            )
+        pad_x = (table_box[2] - table_box[0]) * SECONDARY_PADDING_RATIO
+        pad_y = (table_box[3] - table_box[1]) * SECONDARY_PADDING_RATIO
+        crop = {
+            "x": max(0.0, (table_box[0] - pad_x) / page_width),
+            "y": max(0.0, (table_box[1] - pad_y) / page_height),
+            "width": min(1.0, (table_box[2] + pad_x) / page_width)
+            - max(0.0, (table_box[0] - pad_x) / page_width),
+            "height": min(1.0, (table_box[3] + pad_y) / page_height)
+            - max(0.0, (table_box[1] - pad_y) / page_height),
+        }
+        with fitz.open(pdf_path) as document:
+            page = document[page_number - 1]
+            clip = fitz.Rect(
+                page.rect.x0 + crop["x"] * page.rect.width,
+                page.rect.y0 + crop["y"] * page.rect.height,
+                page.rect.x0 + (crop["x"] + crop["width"]) * page.rect.width,
+                page.rect.y0 + (crop["y"] + crop["height"]) * page.rect.height,
+            )
+            dpi = float(SECONDARY_DPI)
+            while dpi >= 72:
+                scale = dpi / 72.0
+                pixels = clip.width * scale * clip.height * scale
+                if pixels > MAX_IMAGE_PIXELS:
+                    dpi *= math.sqrt(MAX_IMAGE_PIXELS / pixels) * 0.995
+                    continue
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False
+                )
+                content = pixmap.tobytes("png")
+                if len(content) <= self._max_file_bytes:
+                    return content, crop
+                dpi *= 0.9
+        raise OcrProviderError(
+            "Область таблицы не удалось подготовить в лимитах Yandex Vision "
+            f"({self._max_file_bytes // (1024 * 1024)} МБ / {MAX_IMAGE_PIXELS} MP)."
+        )
+
+    def _secondary_verify_page(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        primary_payload: dict,
+        primary_rows: list,
+        source_digest: bytes,
+        config: dict,
+        api_key: str,
+        cancel: threading.Event | None,
+        warnings: list[str],
+        stats: dict[str, int],
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        missing = any(
+            is_critical_values(row.values)
+            and any(
+                not str(row.values.get(field, "") or "").strip()
+                and isinstance((row.metadata.get("cell_bboxes") or {}).get(field), dict)
+                for field in CRITICAL_FIELDS
+            )
+            for row in primary_rows
+        )
+        if not missing:
+            return
+        try:
+            content, crop = self._render_secondary_table_crop(
+                pdf_path, page_number, primary_payload
+            )
+            secondary_config = {**config, "vision_model": "table"}
+            key = self._cache_key(
+                source_digest, [page_number], secondary_config, strategy="secondary-table"
+            )
+            cached = self._cache_load(key, warnings)
+            if cached is not None:
+                pages_payload = cached.get("pages") or []
+            else:
+                stats["secondary_requests"] += 1
+                if progress:
+                    progress(
+                        "Yandex OCR: проверяем критичные поля вторым проходом"
+                    )
+                pages_payload = self._recognize_sync(
+                    content,
+                    secondary_config,
+                    api_key,
+                    cancel,
+                    warnings,
+                    progress=None,
+                    mime_type="image/png",
+                )
+                self._cache_save(key, pages_payload, model="table")
+            if not pages_payload:
+                return
+            result = attach_secondary_candidates(
+                primary_rows, pages_payload[0], crop=crop
+            )
+            stats["secondary_candidates"] += result["secondary_candidates"]
+            stats["secondary_recovered"] += result["secondary_recovered"]
+        except (OcrProviderError, OSError, ValueError) as exc:
+            warnings.append(
+                f"[{self.key}] вторичная проверка critical-полей не выполнена: "
+                f"{str(exc)[:300]}"
+            )
+
+    def _recognition_url(self, operation_id: str, recognition_base: str) -> str:
+        return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
+
+    def _poll_once(
+        self, operation_id: str, recognition_base: str, config: dict, api_key: str, cancel
+    ) -> _HttpResponse | None:
+        warnings: list[str] = []
+        try:
+            return self._request_with_retry(
+                "GET",
+                self._recognition_url(operation_id, recognition_base),
+                body=None,
+                api_key=api_key,
+                folder_id=config["folder_id"],
+                timeout=config["request_timeout_s"],
+                cancel=cancel,
+                warnings=warnings,
+                allow_not_ready_404=True,
+            )
+        except _HttpFailure as exc:
+            if exc.status == 404 and self._is_not_ready_404(exc.message):
+                return None
+            raise
 
     def _parse_jsonl(self, body: bytes) -> tuple[dict | None, list[dict]]:
         """Split a getRecognition JSONL answer into status line + page payloads.
@@ -557,42 +796,48 @@ class YandexVisionProvider:
         config: dict,
         api_key: str,
         cancel: threading.Event | None,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict]:
-        deadline = self._now() + config["operation_timeout_s"]
+        started = self._now()
+        deadline = started + config["operation_timeout_s"]
         interval = self._poll_interval_s
         while True:
             self._check_cancel(cancel)
             response = self._poll_once(
                 operation_id, recognition_base, config, api_key, cancel
             )
-            status, objects = self._parse_jsonl(response.body)
-            if status is None:
-                return self._page_payloads(objects)
-            state = str(status.get("state") or "").lower() or (
-                "done" if status.get("done") else ""
-            )
-            if state == "error" or isinstance(status.get("error"), dict):
-                error = status.get("error") or {}
-                message = str(error.get("message", "неизвестная ошибка"))
-                raise OcrProviderError(
-                    f"Операция Yandex Vision завершилась ошибкой: {message[:300]}"
+            if response is not None and response.body.strip():
+                status, objects = self._parse_jsonl(response.body)
+                if status is None:
+                    return self._page_payloads(objects)
+                state = str(status.get("state") or "").lower() or (
+                    "done" if status.get("done") else ""
                 )
-            if state in ("", "pending", "running"):
-                if self._now() > deadline:
+                if state == "error" or isinstance(status.get("error"), dict):
+                    error = status.get("error") or {}
+                    message = str(error.get("message", "неизвестная ошибка"))
                     raise OcrProviderError(
-                        f"Превышено время ожидания операции Yandex Vision "
-                        f"({int(config['operation_timeout_s'])} c). Идентификатор "
-                        "операции сохранён — при следующем запуске опрос будет "
-                        "продолжен без повторной отправки документа."
+                        f"Операция Yandex Vision завершилась ошибкой: {message[:300]}"
                     )
-                self._sleep(interval)
-                interval = min(interval * 2, self._poll_interval_max_s)
-                continue
-            if state == "done":
-                return self._page_payloads(objects)
-            raise OcrProviderError(
-                f"Неизвестное состояние операции Yandex Vision: {state[:100]}"
-            )
+                if state == "done":
+                    return self._page_payloads(objects)
+                if state not in ("", "pending", "running"):
+                    raise OcrProviderError(
+                        f"Неизвестное состояние операции Yandex Vision: {state[:100]}"
+                    )
+            if self._now() > deadline:
+                raise OcrProviderError(
+                    f"Превышено время ожидания операции Yandex Vision "
+                    f"({int(config['operation_timeout_s'])} c). Идентификатор "
+                    "операции сохранён — при следующем запуске опрос будет "
+                    "продолжен без повторной отправки документа."
+                )
+            if progress:
+                elapsed = max(0, int(self._now() - started))
+                progress(f"Yandex OCR: ожидаем результат, {elapsed} с")
+            self._sleep(interval)
+            interval = min(interval * 2, self._poll_interval_max_s)
+            continue
 
     # ---------------------------------------------------------------- pipeline
 
@@ -618,16 +863,41 @@ class YandexVisionProvider:
         planned = self._plan_chunks(pdf_path, requested)
         total_chunks = len(planned)
         collected: list[tuple[int, dict]] = []
+        warnings_by_page: dict[int, list[str]] = {}
+        stats = {
+            "primary_requests": 0,
+            "secondary_requests": 0,
+            "secondary_candidates": 0,
+            "secondary_recovered": 0,
+            "unresolved_critical": 0,
+        }
 
         for index, (window, content) in enumerate(planned):
             self._check_cancel(cancel)
             on_progress(index, total_chunks, f"Облачное распознавание: страницы {window[0]}–{window[-1]}")
             warnings: list[str] = []
             parsed = self._recognize_chunk(
-                window, content, source_digest, config, api_key, cancel, warnings
+                window,
+                content,
+                source_digest,
+                config,
+                api_key,
+                cancel,
+                warnings,
+                progress=lambda message: on_progress(index, total_chunks, message),
+                stats=stats,
             )
             mapped = self._map_pages_to_numbers(parsed, window, warnings)
             collected.extend(mapped)
+            # Keep the mutable page warning list available while the primary
+            # payload is being reconstructed and optionally verified. This
+            # prevents a secondary-pass warning from being dropped before it
+            # reaches the page result.
+            for number in window:
+                page_warnings = warnings_by_page.setdefault(number, [])
+                for warning in warnings:
+                    if warning not in page_warnings:
+                        page_warnings.append(warning)
             for warning in warnings:
                 for number in window:
                     collected.append((number, {"_warning": warning}))
@@ -643,11 +913,47 @@ class YandexVisionProvider:
                     target.errors.append(warning)
                 continue
             rows = reconstruct_page_rows(payload, self.key)
+            self._secondary_verify_page(
+                pdf_path,
+                number,
+                payload,
+                rows,
+                source_digest,
+                config,
+                api_key,
+                cancel,
+                warnings_by_page.setdefault(number, []),
+                stats,
+                progress=lambda message: on_progress(0, total_chunks, message),
+            )
+            for message in warnings_by_page.get(number, []):
+                if message not in target.errors:
+                    target.errors.append(message)
             target.rows.extend(rows)
             geometry = page_geometry(payload)
             if geometry:
                 target.geometry = geometry
-        return OcrResult(provider=self.key, pages=[by_page[number] for number in requested])
+        stats["unresolved_critical"] = sum(
+            critical_field_count(row)
+            for page in by_page.values()
+            for row in [
+                {
+                    "row_type": "item",
+                    "name": raw.values.get("name", ""),
+                    "quantity": raw.values.get("quantity", ""),
+                    "unit": raw.values.get("unit", ""),
+                    "mass": raw.values.get("mass", ""),
+                    "ocr_metadata": raw.metadata,
+                    "review_reasons": raw.metadata.get("review_reasons", []),
+                }
+                for raw in page.rows
+            ]
+        )
+        return OcrResult(
+            provider=self.key,
+            pages=[by_page[number] for number in requested],
+            stats=stats,
+        )
 
     def _recognize_chunk(
         self,
@@ -658,15 +964,33 @@ class YandexVisionProvider:
         api_key: str,
         cancel: threading.Event | None,
         warnings: list[str],
+        progress: Callable[[str], None] | None = None,
+        stats: dict[str, int] | None = None,
     ) -> list:
-        key = self._cache_key(source_digest, window, config)
+        strategy = "sync" if len(window) == 1 else "async"
+        key = self._cache_key(source_digest, window, config, strategy=strategy)
         cached = self._cache_load(key, warnings)
         if cached is not None:
             return cached.get("pages") or []
+        if strategy == "sync":
+            if stats is not None:
+                stats["primary_requests"] += 1
+            pages_payload = self._recognize_sync(
+                content,
+                config,
+                api_key,
+                cancel,
+                warnings,
+                progress=progress,
+            )
+            self._cache_save(key, pages_payload)
+            return pages_payload
         pending = self._pending_load(key)
         operation_id = pending["operation_id"] if pending else None
         recognition_base = str(pending.get("recognition_base") or "").strip() if pending else ""
         if operation_id is None:
+            if stats is not None:
+                stats["primary_requests"] += 1
             operation_id = self._submit(content, config, api_key, cancel, warnings)
             recognition_base = config["vision_base_url"]
             self._pending_save(key, operation_id, window, recognition_base)
@@ -676,6 +1000,7 @@ class YandexVisionProvider:
             config,
             api_key,
             cancel,
+            progress=progress,
         )
         self._pending_delete(key)
         if not pages_payload:

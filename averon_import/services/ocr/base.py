@@ -28,15 +28,19 @@ class OcrRow:
     confidences: dict[str, float]
     sources: dict[str, str]
     bbox: dict
+    metadata: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
-        return {
+        payload = {
             "source_row": self.source_row,
             "values": dict(self.values),
             "confidences": dict(self.confidences),
             "ocr_sources": dict(self.sources),
             "bbox": dict(self.bbox),
         }
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
 
 
 @dataclass(slots=True)
@@ -46,6 +50,7 @@ class PageOcrResult:
     geometry: dict | None = None
     errors: list[str] = field(default_factory=list)
     provides_confidence: bool = True
+    stats: dict = field(default_factory=dict)
 
     def as_raw_rows(self) -> list[dict]:
         return [row.as_dict() for row in self.rows]
@@ -55,6 +60,7 @@ class PageOcrResult:
 class OcrResult:
     provider: str
     pages: list[PageOcrResult] = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
 
     def page(self, number: int) -> PageOcrResult | None:
         for item in self.pages:

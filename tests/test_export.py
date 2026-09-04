@@ -29,3 +29,23 @@ def test_export_selected_columns(tmp_path):
     assert sheet["A2"].value == "Воздуховод 500×500"
     assert sheet["C2"].value == 12.5
     assert workbook["Сведения"]["B5"].value == "Андриянов Степан Владимирович - НВСС"
+
+
+def test_export_keeps_structured_text_rows(tmp_path):
+    target = tmp_path / "structured-note.xlsx"
+    ExcelExportService().export(
+        [{
+            "name": "с электромеханическим приводом 220В",
+            "row_type": "note",
+            "structured_table": True,
+            "status": "review",
+            "selected": True,
+        }],
+        ["name", "quantity"],
+        target,
+    )
+
+    workbook = load_workbook(target)
+    sheet = workbook["Спецификация"]
+    assert sheet.max_row == 2
+    assert sheet["A2"].value == "с электромеханическим приводом 220В"

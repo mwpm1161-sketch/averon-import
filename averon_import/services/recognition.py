@@ -8,6 +8,7 @@ import cv2
 from averon_import.services.ocr import OcrProvider, TesseractOcrAdapter
 from averon_import.services.pdf_service import PdfService
 from averon_import.services.row_assembler import SpecificationRowAssembler
+from averon_import.services.review_policy import critical_field_count
 from averon_import.services.table_detector import GostSpecificationDetector
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -97,6 +98,10 @@ class RecognitionService:
                 f"Причина: {detail or 'неизвестная ошибка'}"
             )
 
+        ocr_stats = dict(getattr(ocr_result, "stats", {}) or {})
+        ocr_stats["unresolved_critical"] = sum(
+            critical_field_count(row) for row in all_rows
+        )
         return {
             "pages": pages,
             "rows": all_rows,
@@ -104,6 +109,7 @@ class RecognitionService:
             "errors": errors,
             "summary": self._summary(all_rows, errors),
             "ocr_mode": ocr_mode,
+            "ocr_stats": ocr_stats,
         }
 
     @staticmethod

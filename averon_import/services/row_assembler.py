@@ -14,6 +14,11 @@ import re
 import uuid
 
 from averon_import.services.ocr.base import OcrRow
+from averon_import.services.review_policy import (
+    critical_blockers_for_row,
+    critical_field_count,
+    refresh_review_state,
+)
 
 
 class SpecificationRowAssembler:
@@ -41,6 +46,7 @@ class SpecificationRowAssembler:
 
     def build_row(self, page: int, raw: dict) -> dict:
         values = raw["values"]
+        metadata = raw.get("metadata") or {}
         row_type = self.classify_row(values)
         name = values.get("name", "").strip()
         position = values.get("position", "").strip()
@@ -86,12 +92,19 @@ class SpecificationRowAssembler:
             if confidence_values
             else 0.0
         )
-        status = self.status_for(values, confidence, row_type)
+        review_reasons = list(metadata.get("review_reasons") or [])
+        if metadata.get("provider") == "yandex_vision" and not raw["confidences"]:
+            if "no_confidence" not in review_reasons:
+                review_reasons.append("no_confidence")
+        if "numeric_suspect" in review_reasons:
+            status = "review"
+        else:
+            status = self.status_for(values, confidence, row_type)
         if row_type == "system":
             system_text = (name or position).replace(" ", "")
             if not self.SYSTEM_RE.fullmatch(system_text):
                 status = "review"
-        return {
+        result = {
             "id": uuid.uuid4().hex,
             **values,
             "section": self.current_section,
@@ -105,7 +118,17 @@ class SpecificationRowAssembler:
             "ocr_sources": raw.get("ocr_sources", {}),
             "source_row": raw["source_row"],
             "edited": False,
+            "ocr_metadata": metadata,
+            "structured_table": bool(metadata.get("structured_table")),
+            "provider_has_explicit_rows": bool(metadata.get("provider_has_explicit_rows")),
+            "source_table_index": metadata.get("source_table_index"),
+            "source_row_index": metadata.get("source_row_index"),
+            "review_reasons": review_reasons,
+            "review_reason": ", ".join(review_reasons),
         }
+        result["value_candidates"] = dict(metadata.get("value_candidates") or {})
+        refresh_review_state(result)
+        return result
 
     @staticmethod
     def repair_continuation_rows(raw_rows: list[dict]) -> list[dict]:
@@ -119,6 +142,7 @@ class SpecificationRowAssembler:
         repaired: list[dict] = []
         for current in raw_rows:
             values = current.get("values", {})
+            metadata = current.get("metadata") or {}
             name = str(values.get("name", "")).strip()
             independent = any(str(values.get(key, "")).strip() for key in (
                 "position", "type_mark", "code", "manufacturer", "unit", "quantity", "mass"
@@ -134,7 +158,10 @@ class SpecificationRowAssembler:
                 and str(repaired[-1].get("values", {}).get("name", "")).rstrip().endswith((",", ";", "-"))
             )
             should_merge = bool(
-                repaired and not independent and not starts_component
+                repaired
+                and not metadata.get("provider_has_explicit_rows")
+                and not metadata.get("structured_table")
+                and not independent and not starts_component
                 and (secondary_only or previous_punct)
             )
             if not should_merge:
@@ -171,6 +198,10 @@ class SpecificationRowAssembler:
         unit = values.get("unit", "").strip()
         type_mark = values.get("type_mark", "").strip()
         manufacturer = values.get("manufacturer", "").strip()
+        identity_fields = any(
+            values.get(key, "").strip()
+            for key in ("name", "position", "type_mark", "code", "manufacturer")
+        )
 
         low = name.lower()
         if any(word in low for word in self.SECTION_WORDS) and not quantity:
@@ -182,6 +213,8 @@ class SpecificationRowAssembler:
             return "system"
         if re.match(r"^[\-–—•]", name):
             return "component"
+        if (quantity or unit or values.get("note") or values.get("mass")) and not identity_fields:
+            return "skip"
         if quantity or unit or type_mark or manufacturer:
             return "item"
         if name or position:
@@ -211,4 +244,6 @@ class SpecificationRowAssembler:
             "status_counts": status_counts,
             "type_counts": type_counts,
             "page_errors": len(errors),
+            "unresolved_critical": sum(critical_field_count(row) for row in rows),
+            "critical_rows": sum(bool(critical_blockers_for_row(row)) for row in rows),
         }

@@ -58,7 +58,7 @@ class PipelineTuningSettings(BaseModel):
 class AppSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    processing_mode: Literal["local", "cloud", "hybrid"] = "local"  # type: ignore[valid-type]
+    processing_mode: Literal["local", "cloud", "hybrid"] = "cloud"  # type: ignore[valid-type]
     local: LocalAiSettings = Field(default_factory=LocalAiSettings)
     yandex: YandexCloudSettings = Field(default_factory=YandexCloudSettings)
     pipeline: PipelineTuningSettings = Field(default_factory=PipelineTuningSettings)

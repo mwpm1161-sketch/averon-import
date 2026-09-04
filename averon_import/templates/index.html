@@ -17,13 +17,13 @@
       <nav class="steps" aria-label="Этапы работы">
         <button class="step active" data-step="upload"><span>1</span><div><b>Документ</b><small>Загрузка PDF</small></div></button>
         <button class="step" data-step="pages"><span>2</span><div><b>Страницы</b><small>Выбор таблиц</small></div></button>
-        <button class="step" data-step="recognition"><span>3</span><div><b>Распознавание</b><small>OCR, ИИ и структура</small></div></button>
+        <button class="step" data-step="recognition"><span>3</span><div><b>Распознавание</b><small>Yandex Vision OCR</small></div></button>
         <button class="step" data-step="review"><span>4</span><div><b>Проверка</b><small>Редактирование</small></div></button>
         <button class="step" data-step="export"><span>5</span><div><b>Экспорт</b><small>Excel и копирование</small></div></button>
       </nav>
       <div class="sidebar-card">
         <span class="status-dot" id="ocr-dot"></span>
-        <div><b id="ocr-title">Проверка OCR…</b><small id="ocr-text">Tesseract</small></div>
+        <div><b id="ocr-title">Проверка Yandex Vision…</b><small id="ocr-text">Облачный OCR</small></div>
       </div>
       <div class="sidebar-footer">
         <span>Версия {{ version }}</span>
@@ -39,6 +39,7 @@
         </div>
         <div class="top-actions">
           <button class="button ghost" id="new-document-button" hidden>Новый документ</button>
+          <button class="button ghost" id="settings-button">Настройки</button>
           <button class="button ghost" id="help-button">Справка</button>
         </div>
       </header>
@@ -46,13 +47,13 @@
       <section id="upload-view" class="view visible">
         <div class="hero-grid">
           <div class="hero-copy">
-            <span class="eyebrow">Локальная обработка PDF</span>
+            <span class="eyebrow">Облачное распознавание · Yandex Vision OCR</span>
             <h2>Спецификация из PDF — в готовую таблицу</h2>
-            <p>PDF и OCR обрабатываются локально. При выборе внешнего AI в облако отправляются только распознанные строки спецификации, а не исходный PDF.</p>
+            <p>Исходный PDF хранится локально. Для распознавания выбранных страниц используется Yandex Vision OCR, а результат остаётся в редактируемой таблице до экспорта в Excel.</p>
             <div class="feature-list">
               <div><span>01</span><p><b>Ручной контроль</b><small>Страницы, область таблицы, строки и столбцы</small></p></div>
               <div><span>02</span><p><b>Инженерная проверка</b><small>PDF и редактируемая таблица рядом</small></p></div>
-              <div><span>03</span><p><b>Гибкий результат</b><small>OCR, локальный AI или Yandex Cloud и экспорт XLSX</small></p></div>
+              <div><span>03</span><p><b>Гибкий результат</b><small>Проверка строк, ручные правки и экспорт XLSX</small></p></div>
             </div>
           </div>
           <label class="upload-card" id="drop-zone">
@@ -86,36 +87,12 @@
             </div>
             <p class="hint">Номера указываются так же, как в PDF. Можно выбрать несколько диапазонов через запятую.</p>
             <div class="divider"></div>
-            <div class="ocr-mode-section">
-              <div><b>Качество распознавания</b><p>Точный режим лучше читает мелкий инженерный шрифт, но работает заметно дольше.</p></div>
-              <label class="ocr-mode-card">
-                <input type="radio" name="ocr-mode" value="standard">
-                <span><b>Стандартный</b><small>Быстрее · для хороших PDF и предварительной проверки</small></span>
-              </label>
-              <label class="ocr-mode-card recommended" id="accurate-mode-card">
-                <input type="radio" name="ocr-mode" value="accurate" checked>
-                <span><b>Точный инженерный</b><small>tessdata_best · раздельное чтение столбцов · инженерный словарь</small></span>
-                <em>Рекомендуется</em>
-              </label>
-              <p class="mode-status" id="accurate-mode-status"></p>
+            <div class="cloud-ocr-card">
+              <div><b>Облачное распознавание</b><p>Текущий профиль: Yandex Vision OCR · модель таблиц · выбранные страницы отправляются в Yandex Cloud.</p></div>
+              <p class="mode-status" id="yandex-ocr-status">Проверяем подключение…</p>
+              <div class="cloud-ocr-settings"><span>Языки: <b id="yandex-language-codes">ru, en</b></span><span>AI: <b>выключен</b></span></div>
             </div>
-            <div class="divider"></div>
-            <div class="ocr-mode-section">
-              <div><b>Финальная AI-проверка</b><p>После OCR модель проверит распознанные строки. Исходные значения сохраняются для аудита, AI-изменения остаются на ручной проверке.</p></div>
-              <label class="ocr-mode-card">
-                <input type="radio" name="ai-provider" value="off" checked>
-                <span><b>Без ИИ</b><small>Только OCR и инженерные правила Averon Import</small></span>
-              </label>
-              <label class="ocr-mode-card" id="local-ai-card">
-                <input type="radio" name="ai-provider" value="local">
-                <span><b>Локальная модель</b><small>OpenAI-compatible API · Ollama / LM Studio / локальный сервер</small></span>
-              </label>
-              <label class="ocr-mode-card" id="yandex-ai-card">
-                <input type="radio" name="ai-provider" value="yandex">
-                <span><b>Yandex Cloud AI Studio</b><small>Внешний API · в облако отправляются только строки OCR</small></span>
-              </label>
-              <p class="mode-status" id="ai-provider-status"></p>
-            </div>
+            <div class="ai-disabled-note"><b>AI-проверка будет доступна после настройки модели</b><span>Сейчас выполняются только Yandex Vision OCR и инженерные правила Averon Import.</span></div>
             <div class="divider"></div>
             <div class="crop-section">
               <div><b>Область таблицы</b><p>Необязательно. Выделите таблицу, если на странице есть штамп или другие элементы.</p></div>
@@ -143,7 +120,7 @@
       <section id="processing-view" class="view">
         <div class="processing-card">
           <div class="spinner"></div>
-          <span class="eyebrow">Averon OCR + AI</span>
+          <span class="eyebrow">Averon · Yandex Vision OCR</span>
           <h2 id="processing-title">Распознаём спецификацию</h2>
           <p id="processing-message">Подготовка страниц…</p>
           <div class="progress"><span id="processing-progress"></span></div>
@@ -155,7 +132,8 @@
         <div class="summary-row">
           <div class="summary-card"><small>Строк распознано</small><b id="summary-total">0</b></div>
           <div class="summary-card"><small>Готово</small><b id="summary-ready">0</b></div>
-          <div class="summary-card warning"><small>Требует проверки</small><b id="summary-review">0</b></div>
+          <div class="summary-card warning"><small>Требуют проверки</small><b id="summary-critical">0</b></div>
+          <div class="summary-card"><small>Статус review</small><b id="summary-review">0</b></div>
           <div class="summary-card"><small>Выбрано для экспорта</small><b id="summary-selected">0</b></div>
         </div>
 
@@ -163,6 +141,14 @@
           <div class="search-field"><span>⌕</span><input id="table-search" placeholder="Поиск по распознанным данным"></div>
           <select class="select" id="type-filter"><option value="">Все типы строк</option></select>
           <select class="select" id="status-filter"><option value="">Все статусы</option></select>
+          <select class="select" id="review-filter">
+            <option value="">Все</option>
+            <option value="critical">Требуют проверки</option>
+            <option value="quantity-missing">Не распознано количество</option>
+            <option value="unit-missing">Не распознана единица</option>
+            <option value="numeric-suspect">Подозрительные числа</option>
+            <option value="verified">Проверено</option>
+          </select>
           <div class="spacer"></div>
           <button class="button ghost" id="copy-selected">Копировать выбранное</button>
           <button class="button ghost" id="save-button">Сохранить правки</button>
@@ -209,10 +195,38 @@
           <input class="input" id="export-sheet" value="Спецификация">
           <label class="check-row"><input type="checkbox" id="export-headers" checked><span>Добавить заголовки столбцов</span></label>
           <label class="check-row"><input type="checkbox" id="export-items-only" checked><span>Экспортировать только позиции и компоненты</span></label>
-          <div class="export-note"><b>В Excel попадут исправленные данные</b><p>Строки со статусом «Требует проверки» будут подсвечены.</p></div>
+          <div class="export-safety" id="export-safety" role="status"></div>
+          <div class="export-note"><b>В Excel попадут исправленные данные</b><p>Строки со статусом «Требует проверки» будут подсвечены. Неточность OCR без критичного blocker сама по себе экспорт не блокирует.</p></div>
         </div>
       </div>
       <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button secondary" type="button" id="copy-export">Копировать таблицу</button><button class="button primary" type="button" id="download-excel">Скачать XLSX</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="settings-modal">
+    <form method="dialog" class="modal-card settings-card" id="settings-form">
+      <div class="modal-header"><div><span class="eyebrow">Yandex Cloud</span><h2>Настройки распознавания</h2><p>API-ключ записывается в защищённое хранилище и никогда не показывается обратно.</p></div><button class="icon-button" value="cancel" aria-label="Закрыть">×</button></div>
+      <div class="settings-grid">
+        <div>
+          <label class="field-label" for="settings-folder-id">Folder ID</label>
+          <input class="input" id="settings-folder-id" autocomplete="off">
+        </div>
+        <div>
+          <label class="field-label" for="settings-vision-model">Vision model</label>
+          <select class="select" id="settings-vision-model"><option value="table">table</option></select>
+        </div>
+        <div>
+          <label class="field-label" for="settings-language-codes">Языки OCR</label>
+          <input class="input" id="settings-language-codes" placeholder="ru,en">
+          <p class="hint">Через запятую, например: ru,en</p>
+        </div>
+        <div>
+          <label class="field-label" for="settings-api-key">API key</label>
+          <input class="input" id="settings-api-key" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
+        </div>
+      </div>
+      <p class="mode-status" id="settings-connection"></p>
+      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="save-settings">Сохранить</button></div>
     </form>
   </dialog>
 
@@ -221,7 +235,7 @@
       <div class="modal-header"><div><span class="eyebrow">Документация</span><h2>Как работать с Averon Import</h2></div><button class="icon-button" id="close-help">×</button></div>
       <ol class="help-steps">
         <li><span>1</span><div><b>Загрузите PDF</b><p>Исходный документ сохраняется только в локальной папке программы.</p></div></li>
-        <li><span>2</span><div><b>Выберите страницы и режим</b><p>Настройте OCR и при необходимости финальную AI-проверку: локальную или Yandex Cloud.</p></div></li>
+        <li><span>2</span><div><b>Выберите страницы</b><p>Отметьте 1–2 страницы для первого smoke-test. Распознавание выполняется через Yandex Vision OCR.</p></div></li>
         <li><span>3</span><div><b>Проверьте распознавание</b><p>AI-изменения не считаются автоматически подтверждёнными. Кликните по строке — исходник подсветится в PDF.</p></div></li>
         <li><span>4</span><div><b>Исправьте данные</b><p>Редактируйте ячейки, типы строк и статусы прямо в таблице.</p></div></li>
         <li><span>5</span><div><b>Скопируйте или экспортируйте</b><p>Выберите нужные строки и столбцы, затем скачайте XLSX.</p></div></li>

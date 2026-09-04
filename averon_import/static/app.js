@@ -12,10 +12,15 @@ const state = {
   dirty: false,
   exportOrder: [],
   exportSelected: new Set(),
-  ocrMode: "accurate",
+  ocrMode: "standard",
   ocrHealth: null,
   aiProvider: "off",
+  reviewFilter: "",
+  settings: null,
 };
+
+const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
+const CRITICAL_LABELS = {quantity:"Количество", unit:"Единица", mass:"Масса"};
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -67,15 +72,17 @@ function bytes(value) {
 
 async function boot() {
   try {
-    state.config = await api("/api/config");
-    const health = await api("/api/health");
-    const ocr = health.ocr;
+    const [config, health, settings] = await Promise.all([
+      api("/api/config"),
+      api("/api/health"),
+      api("/api/settings"),
+    ]);
+    state.config = config;
+    state.settings = settings;
+    const ocr = health.cloud_ocr;
     state.ocrHealth = ocr;
-    $("#ocr-dot").classList.add(ocr.available && ocr.russian ? "ok" : "bad");
-    $("#ocr-title").textContent = ocr.available && ocr.russian ? "OCR готов" : "OCR требует настройки";
-    $("#ocr-text").textContent = ocr.available ? `${ocr.version}${ocr.russian ? " · русский язык" : " · нет rus"}` : "Tesseract не найден";
-    initializeOcrMode(ocr);
-    initializeAiProvider(health.ai);
+    updateCloudStatus();
+    initializeSettings(settings);
     populateFilters();
     initializeExportColumns();
     await resumeLastDocument();
@@ -84,83 +91,59 @@ async function boot() {
   }
 }
 
-function initializeOcrMode(ocr) {
-  const accurate = document.querySelector('input[name="ocr-mode"][value="accurate"]');
-  const standard = document.querySelector('input[name="ocr-mode"][value="standard"]');
-  const status = $("#accurate-mode-status");
-  const card = $("#accurate-mode-card");
-  const saved = localStorage.getItem("averonOcrMode");
-  const available = Boolean(ocr?.accurate_models);
-  accurate.disabled = !available;
-  card.classList.toggle("disabled", !available);
-  if (available) {
-    status.textContent = "Точная модель установлена и готова к работе.";
-    status.className = "mode-status ok";
-    state.ocrMode = saved === "standard" ? "standard" : "accurate";
-  } else {
-    status.textContent = "Точная модель не установлена. Запустите install_accurate_ocr_models.bat и перезапустите программу.";
-    status.className = "mode-status warning";
-    state.ocrMode = "standard";
-  }
-  (state.ocrMode === "accurate" ? accurate : standard).checked = true;
-  document.querySelectorAll('input[name="ocr-mode"]').forEach((input) => {
-    input.addEventListener("change", () => {
-      state.ocrMode = input.value;
-      localStorage.setItem("averonOcrMode", state.ocrMode);
-    });
-  });
+function updateCloudStatus() {
+  const ocr = state.ocrHealth || {};
+  const ready = Boolean(ocr.available);
+  $("#ocr-dot").classList.toggle("ok", ready);
+  $("#ocr-dot").classList.toggle("bad", !ready);
+  $("#ocr-title").textContent = ready ? "Yandex Vision готов" : "Yandex Vision не настроен";
+  $("#ocr-text").textContent = ready ? "Облачный OCR · подключено" : "Для распознавания настройте Yandex Cloud";
+  const status = $("#yandex-ocr-status");
+  status.textContent = ready
+    ? "Подключено. Можно запускать распознавание выбранных страниц."
+    : "Не настроено. Укажите Folder ID и API key в настройках.";
+  status.className = ready ? "mode-status ok" : "mode-status warning";
+  $("#yandex-language-codes").textContent = (state.settings?.yandex?.language_codes || ["ru", "en"]).join(", ");
 }
 
-function initializeAiProvider(aiHealth) {
-  const providers = state.config?.ai?.providers || {};
-  const local = document.querySelector('input[name="ai-provider"][value="local"]');
-  const yandex = document.querySelector('input[name="ai-provider"][value="yandex"]');
-  const off = document.querySelector('input[name="ai-provider"][value="off"]');
-  const localConfigured = Boolean(providers.local?.configured && aiHealth?.providers?.local?.configured);
-  const yandexConfigured = Boolean(providers.yandex?.configured && aiHealth?.providers?.yandex?.configured);
-
-  local.disabled = !localConfigured;
-  yandex.disabled = !yandexConfigured;
-  $("#local-ai-card").classList.toggle("disabled", !localConfigured);
-  $("#yandex-ai-card").classList.toggle("disabled", !yandexConfigured);
-
-  const saved = localStorage.getItem("averonAiProvider");
-  const allowed = new Set(["off"]);
-  if (localConfigured) allowed.add("local");
-  if (yandexConfigured) allowed.add("yandex");
-  state.aiProvider = allowed.has(saved) ? saved : "off";
-  (document.querySelector(`input[name="ai-provider"][value="${state.aiProvider}"]`) || off).checked = true;
-  updateAiProviderStatus();
-
-  document.querySelectorAll('input[name="ai-provider"]').forEach((input) => {
-    input.addEventListener("change", () => {
-      state.aiProvider = input.value;
-      localStorage.setItem("averonAiProvider", state.aiProvider);
-      updateAiProviderStatus();
-    });
-  });
+function initializeSettings(settings) {
+  $("#settings-folder-id").value = settings?.yandex?.folder_id || "";
+  $("#settings-vision-model").value = settings?.yandex?.vision_model || "table";
+  $("#settings-language-codes").value = (settings?.yandex?.language_codes || ["ru", "en"]).join(",");
+  const ready = Boolean(state.ocrHealth?.available);
+  $("#settings-connection").textContent = ready
+    ? "Yandex Vision подключён."
+    : "Yandex Vision не настроен. API key не отображается и не возвращается сервером.";
+  $("#settings-connection").className = ready ? "mode-status ok" : "mode-status warning";
 }
 
-function updateAiProviderStatus() {
-  const status = $("#ai-provider-status");
-  const providers = state.config?.ai?.providers || {};
-  if (state.aiProvider === "local") {
-    const provider = providers.local || {};
-    status.textContent = `Локальная модель: ${provider.model || "не задана"}. Соединение будет проверено при запуске.`;
-    status.className = "mode-status ok";
-    return;
-  }
-  if (state.aiProvider === "yandex") {
-    const provider = providers.yandex || {};
-    status.textContent = `Yandex Cloud: ${provider.model || "модель не задана"}. PDF в облако не отправляется.`;
-    status.className = "mode-status warning";
-    return;
-  }
-  const yandexReady = Boolean(providers.yandex?.configured);
-  status.textContent = yandexReady
-    ? "AI выключен. Можно выбрать локальную модель или Yandex Cloud."
-    : "AI выключен. Yandex Cloud появится после настройки API-ключа и модели.";
-  status.className = "mode-status";
+async function saveSettings() {
+  const codes = $("#settings-language-codes").value.split(",").map((value) => value.trim()).filter(Boolean);
+  if (!codes.length) { toast("Укажите хотя бы один язык OCR", "error"); return; }
+  const apiKey = $("#settings-api-key").value.trim();
+  const payload = {
+    processing_mode: "cloud",
+    yandex: {
+      folder_id: $("#settings-folder-id").value.trim(),
+      vision_model: $("#settings-vision-model").value,
+      language_codes: codes,
+    },
+  };
+  if (apiKey) payload.api_key = apiKey;
+  try {
+    state.settings = await api("/api/settings", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const health = await api("/api/health");
+    state.ocrHealth = health.cloud_ocr;
+    $("#settings-api-key").value = "";
+    initializeSettings(state.settings);
+    updateCloudStatus();
+    $("#settings-modal").close();
+    toast("Настройки Yandex Vision сохранены", "success");
+  } catch (error) { toast(error.message, "error"); }
 }
 
 function populateFilters() {
@@ -275,7 +258,8 @@ function updatePageSelection() {
     node.classList.toggle("previewing", state.previewPage === page);
   });
   $("#selected-pages-badge").textContent = `${state.selectedPages.size} выбрано`;
-  $("#recognize-button").disabled = state.selectedPages.size === 0;
+  const recognizeButton = $("#recognize-button");
+  if (recognizeButton) recognizeButton.disabled = state.selectedPages.size === 0;
   if (state.selectedPages.size) {
     $("#page-range").value = compactRanges([...state.selectedPages].sort((a,b)=>a-b));
   }
@@ -337,13 +321,8 @@ async function startRecognition() {
   if (!pages.length) return;
   setView("processing");
   $("#processing-progress").style.width = "0%";
-  const withAi = state.aiProvider !== "off";
-  $("#processing-title").textContent = withAi
-    ? "OCR и финальная AI-проверка"
-    : (state.ocrMode === "accurate" ? "Точное инженерное распознавание" : "Распознаём спецификацию");
-  $("#processing-message").textContent = state.ocrMode === "accurate"
-    ? "Читаем столбцы раздельно и проверяем сомнительные ячейки…"
-    : "Подготовка страниц…";
+  $("#processing-title").textContent = "Облачное распознавание";
+  $("#processing-message").textContent = "Подготовка страниц для Yandex Vision OCR…";
   try {
     const job = await api(`/api/documents/${state.document.document_id}/recognize`, {
       method:"POST",
@@ -351,9 +330,10 @@ async function startRecognition() {
       body:JSON.stringify({
         pages,
         crop:state.crop,
-        dpi:state.ocrMode === "accurate" ? 350 : 300,
-        ocr_mode:state.ocrMode,
-        ai_provider:state.aiProvider,
+        dpi:300,
+        ocr_mode:"standard",
+        ai_provider:"off",
+        processing_mode:"cloud",
       }),
     });
     await pollJob(job.id);
@@ -380,12 +360,100 @@ async function pollJob(jobId) {
   }
 }
 
+function isYandexCriticalRow(row) {
+  return row?.ocr_metadata?.provider === "yandex_vision"
+    && ["item", "component"].includes(row.row_type)
+    && ["name", "position", "type_mark", "code", "manufacturer"]
+      .some((key) => String(row[key] ?? "").trim());
+}
+
+function missingCriticalFields(row) {
+  if (!isYandexCriticalRow(row)) return [];
+  return CRITICAL_FIELDS.filter((key) => !String(row[key] ?? "").trim());
+}
+
+function numericSuspectFields(row) {
+  if (row.status === "verified" && !missingCriticalFields(row).length) return [];
+  const normalization = row?.ocr_metadata?.normalization || {};
+  const edited = new Set(row?.edited_fields || []);
+  return CRITICAL_FIELDS.filter((key) => {
+    if (!["quantity", "mass"].includes(key)) return false;
+    const details = normalization[key];
+    if (!details?.numeric_suspect) return false;
+    if (!edited.has(key)) return true;
+    return !/^-?\d+(?:[.,]\d+)?$/.test(String(row[key] ?? "").trim());
+  });
+}
+
+function criticalBlockers(row) {
+  const missing = missingCriticalFields(row);
+  const suspect = numericSuspectFields(row);
+  const explicitlyVerified = row.status === "verified" && !missing.length;
+  const reasons = new Set([
+    ...(row?.review_reasons || []),
+    ...(row?.critical_blockers || []),
+  ]);
+  const conflictFields = new Set(row?.ocr_metadata?.secondary_conflict_fields || []);
+  const edited = new Set(row?.edited_fields || []);
+  const conflictActive = reasons.has("secondary_conflict")
+    && ![...conflictFields].some((field) => edited.has(field));
+  const blockers = [];
+  if (missing.length) blockers.push("critical_value_missing");
+  if (suspect.length && !explicitlyVerified) blockers.push("numeric_suspect");
+  if (reasons.has("ambiguous_columns") && !explicitlyVerified) blockers.push("ambiguous_columns");
+  if (conflictActive && !explicitlyVerified) blockers.push("secondary_conflict");
+  return [...new Set(blockers)];
+}
+
+function criticalFieldCount(row) {
+  const missing = missingCriticalFields(row);
+  const suspect = row.status === "verified" && !missing.length
+    ? []
+    : numericSuspectFields(row).filter((field) => !missing.includes(field));
+  const blockers = criticalBlockers(row);
+  return missing.length + suspect.length
+    || (blockers.some((reason) => ["ambiguous_columns", "secondary_conflict"].includes(reason)) ? 1 : 0)
+    || (blockers.includes("numeric_suspect") ? 1 : 0);
+}
+
+function refreshClientReview(row) {
+  const missing = missingCriticalFields(row);
+  const suspect = numericSuspectFields(row);
+  const reasons = new Set(row.review_reasons || []);
+  const previousBlockers = new Set(row.critical_blockers || []);
+  const edited = new Set(row.edited_fields || []);
+  const conflicts = new Set(row.ocr_metadata?.secondary_conflict_fields || []);
+  reasons.delete("critical_value_missing");
+  reasons.delete("numeric_suspect");
+  if (missing.length) reasons.add("critical_value_missing");
+  if (suspect.length) reasons.add("numeric_suspect");
+  if (!(conflicts.size && [...conflicts].some((field) => edited.has(field)))) {
+    if (previousBlockers.has("secondary_conflict")) reasons.add("secondary_conflict");
+  } else {
+    reasons.delete("secondary_conflict");
+  }
+  if (row.status === "verified" && !missing.length) {
+    reasons.delete("ambiguous_columns");
+    reasons.delete("secondary_conflict");
+  }
+  row.critical_fields = missing;
+  row.review_reasons = [...reasons];
+  row.critical_blockers = criticalBlockers(row);
+  if (row.critical_blockers.length && ["recognized", "verified"].includes(row.status)) row.status = "review";
+  return row;
+}
+
 function loadResult(result) {
   state.result = result;
   state.rows = result.rows.map((row) => ({
     ...row,
-    selected: row.selected ?? ["item","component"].includes(row.row_type),
+    selected: row.selected ?? (
+      ["item", "component"].includes(row.row_type)
+      || (row.row_type === "note" && row.structured_table)
+    ),
   }));
+  state.rows.forEach(refreshClientReview);
+  state.reviewFilter = "";
   state.dirty = false;
   buildResultHeader();
   renderRows();
@@ -435,9 +503,17 @@ function filteredRows() {
   const query = $("#table-search").value.trim().toLowerCase();
   const type = $("#type-filter").value;
   const status = $("#status-filter").value;
+  const reviewFilter = $("#review-filter").value;
   return state.rows.filter((row) => {
     if (type && row.row_type !== type) return false;
     if (status && row.status !== status) return false;
+    const missing = missingCriticalFields(row);
+    const blockers = criticalBlockers(row);
+    if (reviewFilter === "critical" && !blockers.length) return false;
+    if (reviewFilter === "quantity-missing" && !missing.includes("quantity")) return false;
+    if (reviewFilter === "unit-missing" && !missing.includes("unit")) return false;
+    if (reviewFilter === "numeric-suspect" && !blockers.includes("numeric_suspect")) return false;
+    if (reviewFilter === "verified" && row.status !== "verified") return false;
     if (query && !displayColumns.some((key) => String(row[key] ?? "").toLowerCase().includes(query))) return false;
     return true;
   });
@@ -461,21 +537,52 @@ function renderRows() {
     input.addEventListener("input", () => {
       const row = rowById(input.dataset.id);
       row[input.dataset.key] = input.value;
+      row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
       if (row.status !== "verified") row.status = "edited";
       row.edited = true;
+      refreshClientReview(row);
       autoHeight(input); markDirty(); updateSummary();
     });
     input.addEventListener("focus", () => selectRow(input.dataset.id));
   });
   body.querySelectorAll(".cell-select").forEach((select) => select.addEventListener("change", () => {
-    const row = rowById(select.dataset.id); row[select.dataset.key] = select.value; row.edited = true; markDirty(); updateSummary(); renderRows();
+    const row = rowById(select.dataset.id);
+    row[select.dataset.key] = select.value;
+    row.edited_fields = [...new Set([...(row.edited_fields || []), select.dataset.key])];
+    row.edited = true;
+    if (select.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
+    refreshClientReview(row);
+    markDirty(); updateSummary(); renderRows();
+  }));
+  body.querySelectorAll(".candidate-accept").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = rowById(button.dataset.id);
+    const candidate = row?.value_candidates?.[button.dataset.key];
+    if (!row || !candidate?.value_candidate) return;
+    row[button.dataset.key] = candidate.value_candidate;
+    row.edited_fields = [...new Set([...(row.edited_fields || []), button.dataset.key])];
+    row.edited = true;
+    row.status = "edited";
+    refreshClientReview(row);
+    markDirty(); updateSummary(); renderRows();
+    toast(`${CRITICAL_LABELS[button.dataset.key]} принято из secondary OCR`, "success");
+  }));
+  body.querySelectorAll(".candidate-edit").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = rowById(button.dataset.id);
+    if (!row) return;
+    selectRow(row.id);
+    const input = [...body.querySelectorAll(`.cell-input[data-id="${row.id}"]`)]
+      .find((element) => element.dataset.key === button.dataset.key);
+    if (input) { input.focus(); input.select(); }
   }));
 }
 
 function rowHtml(row) {
   const active = row.id === state.activeRowId ? "active" : "";
   const review = ["review","unrecognized"].includes(row.status) ? "review" : "";
-  return `<tr data-id="${row.id}" class="${active} ${review}">
+  const critical = criticalBlockers(row).length ? "critical-review" : "";
+  return `<tr data-id="${row.id}" class="${active} ${review} ${critical}">
     <td class="selector"><input class="row-select" data-id="${row.id}" type="checkbox" ${row.selected ? "checked" : ""}></td>
     ${displayColumns.map((key) => cellHtml(row,key)).join("")}
   </tr>`;
@@ -489,7 +596,23 @@ function cellHtml(row, key) {
     return `<td><div class="confidence"><span><i style="width:${Math.max(0,Math.min(100,value))}%"></i></span>${value.toFixed(0)}%</div></td>`;
   }
   if (key === "page") return `<td><span class="status-pill">${escapeHtml(String(row.page ?? ""))}</span></td>`;
-  return `<td><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(String(row[key] ?? ""))}</textarea></td>`;
+  const value = String(row[key] ?? "");
+  if (!CRITICAL_FIELDS.includes(key) || !isYandexCriticalRow(row)) {
+    return `<td><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
+  }
+  const missing = missingCriticalFields(row).includes(key);
+  const suspect = numericSuspectFields(row).includes(key);
+  const candidate = row.value_candidates?.[key];
+  let annotation = "";
+  if (candidate?.value_candidate) {
+    annotation = `<div class="secondary-candidate">Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
+      <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;
+  } else if (missing) {
+    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small>`;
+  } else if (suspect) {
+    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small>`;
+  }
+  return `<td><div class="critical-cell"><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea>${annotation}</div></td>`;
 }
 
 function options(map, selected) {
@@ -497,7 +620,7 @@ function options(map, selected) {
 }
 
 function escapeHtml(value) {
-  return value.replace(/[&<>'"]/g, (char) => ({"&":"&amp;","<":"&lt;","'":"&#39;",'"':"&quot;"}[char]));
+  return String(value ?? "").replace(/[&<>'"]/g, (char) => ({"&":"&amp;","<":"&lt;","'":"&#39;",'"':"&quot;"}[char]));
 }
 
 function autoHeight(element) {
@@ -534,14 +657,33 @@ function positionHighlight(row) {
 function updateSummary() {
   const ready = state.rows.filter((r) => ["recognized","verified","edited"].includes(r.status)).length;
   const review = state.rows.filter((r) => ["review","unrecognized"].includes(r.status)).length;
+  const critical = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
   const selected = state.rows.filter((r) => r.selected).length;
   $("#summary-total").textContent = state.rows.length;
   $("#summary-ready").textContent = ready;
+  $("#summary-critical").textContent = critical;
   $("#summary-review").textContent = review;
   $("#summary-selected").textContent = selected;
+  updateExportSafety();
 }
 
-function markDirty() { state.dirty = true; $("#save-button").textContent = "Сохранить правки •"; }
+function updateExportSafety() {
+  const node = $("#export-safety");
+  if (!node) return;
+  const unresolved = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
+  node.classList.toggle("blocked", unresolved > 0);
+  node.textContent = unresolved
+    ? `Не проверено ${unresolved} критичных значений. Перед экспортом подтвердите их.`
+    : "Критичные значения проверены. Экспорт разрешён.";
+  const button = $("#download-excel");
+  if (button) button.disabled = unresolved > 0 && $("#export-items-only")?.checked !== false;
+}
+
+function markDirty() {
+  state.dirty = true;
+  $("#save-button").textContent = "Сохранить правки •";
+  updateExportSafety();
+}
 
 async function saveRows(showToast = true) {
   if (!state.document || !state.rows.length) return;
@@ -553,7 +695,10 @@ async function saveRows(showToast = true) {
 }
 
 function copyRows(rows, columns, includeHeader = true) {
-  const selected = rows.filter((row) => row.selected && !["section","system","note","skip"].includes(row.row_type));
+  const selected = rows.filter((row) => row.selected && (
+    ["item", "component"].includes(row.row_type)
+    || (row.row_type === "note" && row.structured_table)
+  ));
   if (!selected.length) { toast("Нет выбранных строк", "error"); return; }
   if (!columns.length) { toast("Не выбраны столбцы", "error"); return; }
   const header = columns.map((key) => state.config.columns.find((c)=>c.key===key)?.title || key).join("\t");
@@ -600,7 +745,14 @@ function renderExportColumns() {
 async function downloadExcel() {
   const columns = selectedExportColumns();
   if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
-  await saveRows(false);
+  if ($("#export-items-only").checked) {
+    const unresolved = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
+    if (unresolved) {
+      toast(`Не проверено ${unresolved} критичных значений. Перед экспортом подтвердите их.`, "error");
+      updateExportSafety();
+      return;
+    }
+  }
   const payload = {
     columns, rows:state.rows,
     include_headers:$("#export-headers").checked,
@@ -609,6 +761,7 @@ async function downloadExcel() {
     sheet_name:$("#export-sheet").value,
   };
   try {
+    await saveRows(false);
     const response = await api(`/api/documents/${state.document.document_id}/export`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     const blob = await response.blob();
     const url=URL.createObjectURL(blob); const link=document.createElement("a");
@@ -651,10 +804,17 @@ function setupEvents() {
   $("#clear-pages").addEventListener("click",()=>{state.selectedPages.clear();updatePageSelection();});
   $("#recognize-button").addEventListener("click",startRecognition);
   $("#new-document-button").addEventListener("click",resetApp);
+  $("#settings-button").addEventListener("click",()=>{
+    initializeSettings(state.settings || {});
+    $("#settings-modal").showModal();
+  });
+  $("#save-settings").addEventListener("click",saveSettings);
   $("#table-search").addEventListener("input",renderRows); $("#type-filter").addEventListener("change",renderRows); $("#status-filter").addEventListener("change",renderRows);
+  $("#review-filter").addEventListener("change",(event)=>{state.reviewFilter=event.target.value;renderRows();});
   $("#save-button").addEventListener("click",()=>saveRows().catch((e)=>toast(e.message,"error")));
   $("#copy-selected").addEventListener("click",()=>copyRows(state.rows,state.config.default_export_columns));
-  $("#open-export").addEventListener("click",()=>{renderExportColumns();$("#export-modal").showModal();});
+  $("#open-export").addEventListener("click",()=>{renderExportColumns();updateExportSafety();$("#export-modal").showModal();});
+  $("#export-items-only").addEventListener("change",updateExportSafety);
   $("#copy-export").addEventListener("click",()=>copyRows(state.rows,selectedExportColumns(),$("#export-headers").checked));
   $("#download-excel").addEventListener("click",downloadExcel);
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());

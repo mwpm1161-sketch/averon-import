@@ -14,6 +14,7 @@ from averon_import.core.constants import BASE_COLUMNS
 from averon_import.services.ocr.base import OcrProviderError
 from averon_import.services.ocr.reconstruction import reconstruct_page_rows
 from averon_import.services.ocr.yandex_vision import (
+    _HttpFailure,
     YandexVisionProvider,
     _HttpResponse,
 )
@@ -21,9 +22,10 @@ from averon_import.services.pdf_service import PdfService
 from averon_import.services.processing_coordinator import ProcessingCoordinator
 from averon_import.services.secrets import MemorySecretStore
 
-API_KEY = "SUPERSECRET-KEY-VALUE"
+API_KEY = "test-key"
 BASE_URL = "https://ocr.test/api"
 SUBMIT_ROUTE = "/ocr/v1/recognizeTextAsync"
+SYNC_ROUTE = "/ocr/v1/recognizeText"
 RECOGNITION_ROUTE = "/ocr/v1/getRecognition"
 BASE_KEYS = {column["key"] for column in BASE_COLUMNS}
 
@@ -142,6 +144,10 @@ def geometry_page_payload() -> dict:
     }
 
 
+def sync_response(page_payload: dict) -> _HttpResponse:
+    return json_response(200, {"result": page_payload})
+
+
 def json_response(status: int, payload: dict, headers: dict | None = None) -> _HttpResponse:
     return _HttpResponse(status, json.dumps(payload).encode("utf-8"), headers or {})
 
@@ -153,9 +159,12 @@ def jsonl_response(status: int, objects: list[dict], headers: dict | None = None
     return _HttpResponse(status, ("\n" + body + "\n\n").encode("utf-8"), headers or {})
 
 
-SUBMIT_OP = json_response(200, {"id": "op-123"})
-POLL_NOT_DONE = jsonl_response(200, [{"done": False}])
+SUBMIT_OP = json_response(200, {"id": "op-123", "done": False})
+POLL_NOT_DONE = _HttpResponse(200, b"")
 DONE_ONE_PAGE = jsonl_response(200, [table_page_payload()])
+DONE_TWO_PAGES = jsonl_response(200, [table_page_payload(), table_page_payload()])
+SYNC_ONE_PAGE = sync_response(table_page_payload())
+SYNC_GEOMETRY_PAGE = sync_response(geometry_page_payload())
 
 
 class FakeHttp:
@@ -289,7 +298,10 @@ def test_health_makes_no_network_requests_and_hides_secret(monkeypatch, tmp_path
 
 def test_pdf_chunking_respects_chunk_pages(tmp_path):
     pdf = make_pdf(tmp_path / "doc.pdf", 5)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE] * 3)
+    http = FakeHttp(
+        script=[SUBMIT_OP, POLL_NOT_DONE, DONE_TWO_PAGES] * 2
+        + [SYNC_ONE_PAGE]
+    )
     provider = ready_provider(
         http=http,
         cache_dir=tmp_path / "cache",
@@ -308,7 +320,7 @@ def test_oversized_chunk_shrinks_until_it_fits(tmp_path):
     limit = (size_two + size_three) // 2
     assert size_two <= limit < size_three
 
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE] * 6)
+    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_TWO_PAGES] * 3)
     provider = ready_provider(
         http=http,
         cache_dir=None,
@@ -332,7 +344,7 @@ def test_single_page_overflow_raises_clear_error(tmp_path):
 
 def test_selected_pages_preserve_original_numbers(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_TWO_PAGES, SYNC_ONE_PAGE])
     provider = ready_provider(
         http=http,
         cache_dir=tmp_path / "cache",
@@ -346,20 +358,39 @@ def test_selected_pages_preserve_original_numbers(tmp_path):
 # ------------------------------------------------------------ v1 REST contract
 
 
-def test_submit_and_poll_use_official_v1_routes(tmp_path):
+def test_single_page_uses_sync_route_without_async_polling(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
+    updates: list[str] = []
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
-    provider.recognize(pdf, [1])
+    provider.recognize(pdf, [1], progress=lambda _i, _t, message: updates.append(message))
+    assert http.submit_calls()[0]["url"] == f"{BASE_URL}{SYNC_ROUTE}"
+    assert http.get_calls() == []
+    assert updates[-3:] == [
+        "Yandex OCR: отправляем страницу",
+        "Yandex OCR: распознаём страницу",
+        "Yandex OCR: результат получен",
+    ]
+
+
+def test_two_pages_keep_async_submit_and_direct_polling(tmp_path):
+    pdf = any_pdf(tmp_path)
+    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_TWO_PAGES])
+    provider = ready_provider(
+        http=http,
+        cache_dir=tmp_path / "cache",
+        settings=FakeSettingsService(chunk_pages=2),
+    )
+    result = provider.recognize(pdf, [1, 2])
+    assert result.pages[0].rows and result.pages[1].rows
     assert http.submit_calls()[0]["url"] == f"{BASE_URL}{SUBMIT_ROUTE}"
-    for call in http.get_calls():
-        assert call["url"] == f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123"
-    assert http.get_calls()
+    assert all(call["url"] != f"{BASE_URL}{SYNC_ROUTE}" for call in http.submit_calls())
+    assert len(http.get_calls()) == 2
 
 
 def test_auth_headers_api_key_and_folder_id(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
     provider.recognize(pdf, [1])
     for call in http.calls:
@@ -371,12 +402,12 @@ def test_auth_headers_api_key_and_folder_id(tmp_path):
 
 def test_language_codes_sent_and_configurable(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
     provider.recognize(pdf, [1])
     assert http.submitted_language_codes() == [["ru", "en"]]
 
-    http_ru = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http_ru = FakeHttp(script=[SYNC_ONE_PAGE])
     provider_ru = ready_provider(
         http=http_ru,
         cache_dir=None,
@@ -384,6 +415,74 @@ def test_language_codes_sent_and_configurable(tmp_path):
     )
     provider_ru.recognize(make_pdf(tmp_path / "other.pdf", 12), [2])
     assert http_ru.submitted_language_codes() == [["ru"]]
+
+
+def test_multiple_missing_critical_cells_use_one_secondary_request(tmp_path):
+    cells = [table_cell(title, 0, column) for column, title in enumerate(HEADER_TITLES)]
+    row_values = ["1", "Клапан обратный", "V-1", "", "", "шт.", "", "", ""]
+    cells.extend(
+        table_cell(text, 1, column)
+        for column, text in enumerate(row_values)
+    )
+    primary = {
+        "page": {"width": 595, "height": 842},
+        "textAnnotation": {
+            "width": 595,
+            "height": 842,
+            "tables": [{
+                "rowCount": 2,
+                "columnCount": 9,
+                "boundingBox": {"vertices": [
+                    {"x": 20, "y": 35}, {"x": 575, "y": 35},
+                    {"x": 575, "y": 75}, {"x": 20, "y": 75},
+                ]},
+                "cells": cells,
+            }],
+        },
+    }
+    http = FakeHttp(script=[sync_response(primary), SYNC_ONE_PAGE])
+    provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
+
+    result = provider.recognize(any_pdf(tmp_path), [1])
+
+    assert len(http.submit_calls()) == 2
+    secondary_body = json.loads(http.submit_calls()[1]["body"])
+    assert secondary_body["mimeType"] == "image/png"
+    assert secondary_body["model"] == "table"
+    assert result.stats["primary_requests"] == 1
+    assert result.stats["secondary_requests"] == 1
+    assert result.stats["secondary_candidates"] == 0
+
+
+def test_sync_and_async_cache_strategies_are_isolated(tmp_path):
+    pdf = any_pdf(tmp_path)
+    provider = ready_provider(http=FakeHttp(script=[]), cache_dir=tmp_path / "cache")
+    source_digest = hashlib.sha256(pdf.read_bytes()).digest()
+    config = provider._yandex_settings()
+    sync_key = provider._cache_key(source_digest, [1], config, strategy="sync")
+    async_key = provider._cache_key(source_digest, [1], config, strategy="async")
+    assert sync_key != async_key
+
+
+def test_sync_pending_metadata_does_not_trigger_async_polling(tmp_path):
+    pdf = any_pdf(tmp_path)
+    cache_dir = tmp_path / "cache"
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
+    provider = ready_provider(http=http, cache_dir=cache_dir)
+    source_digest = hashlib.sha256(pdf.read_bytes()).digest()
+    async_key = provider._cache_key(
+        source_digest, [1], provider._yandex_settings(), strategy="async"
+    )
+    (cache_dir / "pending" / f"{async_key}.json").write_text(
+        json.dumps({"operation_id": "old-op", "pages": [1]}),
+        encoding="utf-8",
+    )
+
+    result = provider.recognize(pdf, [1])
+
+    assert result.pages[0].rows
+    assert [call["url"] for call in http.submit_calls()] == [f"{BASE_URL}{SYNC_ROUTE}"]
+    assert http.get_calls() == []
 
 
 def test_jsonl_multi_page_yields_one_result_per_line(tmp_path):
@@ -414,14 +513,14 @@ def test_pending_metadata_carries_operation_id_and_recognition_base(tmp_path):
             observed.append(json.loads(path.read_text(encoding="utf-8")))
         return POLL_NOT_DONE
 
-    http = FakeHttp(script=[SUBMIT_OP, snapshot_pending, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SUBMIT_OP, snapshot_pending, DONE_TWO_PAGES])
     provider = ready_provider(http=http, cache_dir=cache_dir)
-    result = provider.recognize(pdf, [1])
+    result = provider.recognize(pdf, [1, 2])
     assert result.pages[0].rows
     assert len(observed) == 1
     assert observed[0]["operation_id"] == "op-123"
     assert observed[0]["recognition_base"] == BASE_URL
-    assert observed[0]["pages"] == [1]
+    assert observed[0]["pages"] == [1, 2]
     assert list((cache_dir / "pending").glob("*.json")) == []
 
 
@@ -431,7 +530,7 @@ def test_pending_metadata_carries_operation_id_and_recognition_base(tmp_path):
 def test_table_cells_primary_map_to_base_columns(tmp_path):
     from averon_import.core.normalizers import normalize_cell
 
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
     result = provider.recognize(any_pdf(tmp_path), [7])
     page_result = result.pages[0]
@@ -446,6 +545,19 @@ def test_table_cells_primary_map_to_base_columns(tmp_path):
     assert first.values.get("quantity") == normalize_cell("quantity", "5")
     assert first.confidences == {}
     assert all(value == "yandex_vision" for value in first.sources.values())
+
+
+def test_sync_geometry_fallback_maps_rows_without_confidence(tmp_path):
+    http = FakeHttp(script=[SYNC_GEOMETRY_PAGE])
+    provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
+
+    result = provider.recognize(any_pdf(tmp_path), [7])
+
+    page_result = result.pages[0]
+    assert page_result.rows
+    assert page_result.rows[0].values["position"] == "1."
+    assert page_result.rows[0].values["quantity"] == "5"
+    assert all(row.confidences == {} for row in page_result.rows)
 
 
 def test_table_spans_are_respected_in_primary_path():
@@ -578,7 +690,7 @@ def test_normalization_applied_exactly_once(tmp_path):
 
 def test_cache_hit_avoids_second_network_call(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
     first = provider.recognize(pdf, [1])
     calls_after_first = len(http.calls)
@@ -616,14 +728,14 @@ def test_cache_key_changes_with_language_codes(tmp_path):
 
 def test_cached_format_matches_jsonl_page_payloads(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
     cache_dir = tmp_path / "cache"
     provider = ready_provider(http=http, cache_dir=cache_dir)
     provider.recognize(pdf, [1])
     files = list((cache_dir / "results").glob("*.json"))
     assert len(files) == 1
     stored = json.loads(files[0].read_text(encoding="utf-8"))
-    assert stored["version"] == 2
+    assert stored["version"] == 3
     assert stored["provider"] == "yandex_vision"
     assert isinstance(stored["pages"], list)
     for payload in stored["pages"]:
@@ -632,7 +744,7 @@ def test_cached_format_matches_jsonl_page_payloads(tmp_path):
 
 def test_corrupted_or_outdated_cache_is_ignored_with_warning(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE] * 3)
+    http = FakeHttp(script=[SYNC_ONE_PAGE] * 3)
     cache_dir = tmp_path / "cache"
     provider = ready_provider(http=http, cache_dir=cache_dir)
     provider.recognize(pdf, [1])
@@ -674,14 +786,31 @@ def test_http_429_is_retried_then_succeeds(tmp_path):
     pdf = any_pdf(tmp_path)
     http = FakeHttp(script=[
         (429, {"message": "rate limited"}, {"Retry-After": "0"}),
-        SUBMIT_OP,
-        POLL_NOT_DONE,
-        DONE_ONE_PAGE,
+        SYNC_ONE_PAGE,
     ])
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
     result = provider.recognize(pdf, [1])
     assert len(http.submit_calls()) == 2
     assert result.pages[0].rows
+
+
+def test_sync_network_timeout_retries_then_returns_clear_error(tmp_path):
+    http = FakeHttp(
+        script=[
+            _HttpFailure(0, "request timed out"),
+            _HttpFailure(0, "request timed out"),
+        ]
+    )
+    provider = ready_provider(
+        http=http,
+        cache_dir=tmp_path / "cache",
+        submit_attempts=2,
+    )
+
+    with pytest.raises(OcrProviderError, match="Синхронный OCR.*timeout"):
+        provider.recognize(any_pdf(tmp_path), [1])
+
+    assert len(http.submit_calls()) == 2
 
 
 def test_http_500_retries_limited_then_raises(tmp_path):
@@ -723,7 +852,7 @@ def test_polling_errors_are_retryable_but_timeout_wins(tmp_path):
         http=http,
     )
     with pytest.raises(OcrProviderError, match="время ожидания"):
-        provider.recognize(pdf, [1])
+        provider.recognize(pdf, [1, 2])
     assert len([c for c in http.calls if c["method"] == "GET"]) == 3
 
 
@@ -733,10 +862,102 @@ def test_operation_error_state_raises_clear_message(tmp_path):
     http = FakeHttp(script=[SUBMIT_OP, failed])
     provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
     with pytest.raises(OcrProviderError, match="quota exceeded"):
-        provider.recognize(pdf, [1])
+        provider.recognize(pdf, [1, 2])
 
 
 # ----------------------------------------------------------- async operations
+
+
+def test_direct_polling_pending_pending_success_reports_progress(tmp_path):
+    pdf = any_pdf(tmp_path)
+    clock = TickingClock()
+    http = FakeHttp(
+        script=[
+            SUBMIT_OP,
+            POLL_NOT_DONE,
+            POLL_NOT_DONE,
+            DONE_TWO_PAGES,
+        ]
+    )
+    updates: list[tuple[int, int, str]] = []
+    provider = YandexVisionProvider(
+        settings_service=FakeSettingsService(operation_timeout_s=30.0),
+        secret_store=keyed_store(),
+        cache_dir=tmp_path / "cache",
+        poll_interval_s=1.0,
+        sleep_fn=sleeper(clock),
+        now_fn=clock,
+        http=http,
+    )
+
+    result = provider.recognize(
+        pdf,
+        [1, 2],
+        progress=lambda index, total, message: updates.append((index, total, message)),
+    )
+
+    assert result.pages[0].rows
+    assert [call["url"] for call in http.get_calls()] == [
+        f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123",
+        f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123",
+        f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123",
+    ]
+    assert clock.value == 3.0
+    assert updates[-2:] == [
+        (0, 1, "Yandex OCR: ожидаем результат, 0 с"),
+        (0, 1, "Yandex OCR: ожидаем результат, 1 с"),
+    ]
+
+
+def test_transient_not_ready_recognition_404_is_polled_again(tmp_path):
+    pdf = any_pdf(tmp_path)
+    not_ready = (
+        404,
+        {"error": {"grpcCode": 5, "message": "operation data is not ready"}},
+        {},
+    )
+    http = FakeHttp(
+        script=[SUBMIT_OP, not_ready, not_ready, DONE_TWO_PAGES]
+    )
+    provider = ready_provider(
+        http=http,
+        cache_dir=tmp_path / "cache",
+        poll_interval_s=1.0,
+    )
+
+    result = provider.recognize(pdf, [1, 2])
+
+    assert result.pages[0].rows
+    assert [call["url"] for call in http.get_calls()] == [
+        f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123",
+        f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123",
+        f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123",
+    ]
+
+
+def test_empty_recognition_body_is_pending(tmp_path):
+    pdf = any_pdf(tmp_path)
+    http = FakeHttp(script=[SUBMIT_OP, _HttpResponse(200, b""), DONE_TWO_PAGES])
+    provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
+
+    result = provider.recognize(pdf, [1, 2])
+
+    assert result.pages[0].rows
+    assert len(http.get_calls()) == 2
+
+
+def test_other_recognition_404_remains_fatal(tmp_path):
+    pdf = any_pdf(tmp_path)
+    http = FakeHttp(
+        script=[
+            SUBMIT_OP,
+            (404, {"error": {"message": "operation not found"}}, {}),
+        ]
+    )
+    provider = ready_provider(http=http, cache_dir=tmp_path / "cache")
+
+    with pytest.raises(OcrProviderError, match="HTTP 404"):
+        provider.recognize(pdf, [1, 2])
 
 
 def test_restart_resumes_polling_without_new_submit(tmp_path):
@@ -760,15 +981,15 @@ def test_restart_resumes_polling_without_new_submit(tmp_path):
 
     first_http, first_provider = make([SUBMIT_OP, POLL_NOT_DONE, POLL_NOT_DONE, POLL_NOT_DONE])
     with pytest.raises(OcrProviderError, match="время ожидания"):
-        first_provider.recognize(pdf, [1])
+        first_provider.recognize(pdf, [1, 2])
     assert len(first_http.submit_calls()) == 1
 
-    second_http, second_provider = make([POLL_NOT_DONE, POLL_NOT_DONE, DONE_ONE_PAGE])
-    result = second_provider.recognize(pdf, [1])
+    second_http, second_provider = make([POLL_NOT_DONE, DONE_TWO_PAGES])
+    result = second_provider.recognize(pdf, [1, 2])
     assert second_http.submit_calls() == []
-    assert [call["method"] for call in second_http.calls][:2] == ["GET", "GET"]
+    assert [call["method"] for call in second_http.calls] == ["GET", "GET"]
     for call in second_http.get_calls():
-        assert RECOGNITION_ROUTE in call["url"]
+        assert call["url"] == f"{BASE_URL}{RECOGNITION_ROUTE}?operationId=op-123"
     assert result.pages[0].rows
 
 
@@ -789,7 +1010,7 @@ def test_cancellation_between_poll_iterations(tmp_path):
         http=http,
     )
     with pytest.raises(OcrProviderError, match="отменено"):
-        provider.recognize(pdf, [1], cancel=cancel)
+        provider.recognize(pdf, [1, 2], cancel=cancel)
 
 
 # ------------------------------------------------------------ secret hygiene
@@ -810,7 +1031,7 @@ def test_api_key_never_leaks_into_results_errors_or_cache(tmp_path):
 
 def test_successful_result_payload_contains_no_secret(tmp_path):
     pdf = any_pdf(tmp_path)
-    http = FakeHttp(script=[SUBMIT_OP, POLL_NOT_DONE, DONE_ONE_PAGE])
+    http = FakeHttp(script=[SYNC_ONE_PAGE])
     cache_dir = tmp_path / "cache"
     provider = ready_provider(http=http, cache_dir=cache_dir)
     result = provider.recognize(pdf, [1])

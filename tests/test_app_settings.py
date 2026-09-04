@@ -28,7 +28,7 @@ SECRET_VALUE = "yc-test-key-12345"
 
 def test_defaults_match_documented_values():
     settings = AppSettings()
-    assert settings.processing_mode == "local"
+    assert settings.processing_mode == "cloud"
     assert settings.local.base_url == "http://127.0.0.1:11434/v1"
     assert settings.local.model == "qwen3:8b"
     assert settings.yandex.folder_id == ""
@@ -70,7 +70,7 @@ def test_env_overrides_settings_file(monkeypatch, tmp_path):
 def test_invalid_json_falls_back_to_defaults_with_warning(tmp_path):
     (tmp_path / "settings.json").write_text("{not valid json", encoding="utf-8")
     service = AppSettingsService(tmp_path)
-    assert service.settings.processing_mode == "local"
+    assert service.settings.processing_mode == "cloud"
     assert service.warnings and "повреждён" in service.warnings[0]
 
 
@@ -91,7 +91,7 @@ def test_unknown_keys_ignored_and_file_secrets_scrubbed(tmp_path):
 def test_invalid_processing_mode_in_file_falls_back(tmp_path):
     (tmp_path / "settings.json").write_text('{"processing_mode": "teleport"}', encoding="utf-8")
     service = AppSettingsService(tmp_path)
-    assert service.settings.processing_mode == "local"
+    assert service.settings.processing_mode == "cloud"
     assert service.warnings
 
 
@@ -111,7 +111,18 @@ def test_update_rejects_invalid_processing_mode(tmp_path):
     service = AppSettingsService(tmp_path)
     with pytest.raises(ValidationError):
         service.update({"processing_mode": "banana"})
-    assert service.settings.processing_mode == "local"
+    assert service.settings.processing_mode == "cloud"
+
+
+def test_settings_api_preserves_explicit_boolean_false(api):
+    app_module, _, service = api
+    assert service.settings.pipeline.enabled is True
+    app_module.put_settings(app_module.SettingsUpdate(
+        pipeline=app_module.PipelineSettingsUpdate(enabled=False),
+    ))
+    assert service.settings.pipeline.enabled is False
+    persisted = json.loads(service.path.read_text(encoding="utf-8"))
+    assert persisted["pipeline"]["enabled"] is False
 
 
 def test_processing_modes_constant():

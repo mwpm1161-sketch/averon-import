@@ -149,18 +149,19 @@ def test_settings_processing_mode_influences_resolver():
     assert isinstance(explicit.resolve("local").ocr, TesseractOcrAdapter)
 
 
-def test_legacy_default_without_settings_is_local():
-    coordinator = _coordinator()
+def test_default_without_settings_is_cloud():
+    cloud = StubProvider()
+    coordinator = _coordinator(providers={"cloud": cloud})
     plan = coordinator.resolve(None)
-    assert plan.profile == "local"
-    assert isinstance(plan.ocr, TesseractOcrAdapter)
+    assert plan.profile == "cloud"
+    assert plan.ocr is cloud
 
 
 def test_local_mode_rejects_cloud_llm_combination():
-    coordinator = _coordinator()
+    coordinator = _coordinator(providers={"cloud": StubProvider()})
     with pytest.raises(ProcessingError, match="локальн"):
-        coordinator.resolve(None, ai_provider="yandex")
-    assert coordinator.resolve(None, ai_provider="local").ai_provider_key == "local"
+        coordinator.resolve("local", ai_provider="yandex")
+    assert coordinator.resolve("local", ai_provider="local").ai_provider_key == "local"
 
 
 def test_process_document_does_not_mutate_shared_state():
@@ -173,7 +174,7 @@ def test_process_document_does_not_mutate_shared_state():
         smart_ai=FakeSmartAI(),
         providers={"local": stub},
     )
-    result = coordinator.process_document(Path("doc.pdf"), None, _options())
+    result = coordinator.process_document(Path("doc.pdf"), "local", _options())
     assert len(stub.calls) == 1
     assert legacy_singleton.ocr is marker_before
     assert result["rows"][0]["position"] == "1"
@@ -182,8 +183,8 @@ def test_process_document_does_not_mutate_shared_state():
 def test_process_document_local_uses_injected_provider_and_assembles_rows():
     stub = StubProvider()
     coordinator = _coordinator(providers={"local": stub})
-    first = coordinator.process_document(Path("doc.pdf"), None, _options(pages=[1, 2]))
-    second = coordinator.process_document(Path("doc.pdf"), None, _options(pages=[3]))
+    first = coordinator.process_document(Path("doc.pdf"), "local", _options(pages=[1, 2]))
+    second = coordinator.process_document(Path("doc.pdf"), "local", _options(pages=[3]))
     assert [call["pages"] for call in stub.calls] == [[1, 2], [3]]
     assert len(first["rows"]) == 2
     assert first["summary"]["total_rows"] == 2
