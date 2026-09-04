@@ -63,6 +63,9 @@ class RecognitionService:
         page_tables: dict[str, dict] = {}
         errors: list[dict] = []
         assembler = SpecificationRowAssembler()
+        pages = sorted({int(page) for page in pages})
+        if not pages:
+            raise ValueError("Не выбраны страницы для распознавания.")
 
         ocr_result = self.ocr.recognize(
             pdf_path,
@@ -77,6 +80,7 @@ class RecognitionService:
         for page_result in ocr_result.pages:
             page_number = page_result.page
             try:
+                assembler.begin_page(page_number)
                 raw_rows = assembler.prepare(page_result.rows)
                 page_tables[str(page_number)] = page_result.geometry or {}
                 for raw in raw_rows:

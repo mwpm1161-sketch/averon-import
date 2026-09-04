@@ -35,9 +35,24 @@ class SpecificationRowAssembler:
         self.current_section = ""
         self.current_system = ""
         self.component_block_active = False
+        self.previous_page: int | None = None
+        self.context_unresolved = True
+
+    def begin_page(self, page: int) -> None:
+        """Start a page with context carry restricted to adjacent pages."""
+        page = int(page)
+        if self.previous_page is None or (
+            page != self.previous_page and page != self.previous_page + 1
+        ):
+            self.current_section = ""
+            self.current_system = ""
+            self.component_block_active = False
+            self.context_unresolved = True
+        self.previous_page = page
 
     def build_page(self, page: int, raw_rows: list[OcrRow]) -> list[dict]:
         """Convenience composition of prepare + build_row for one page."""
+        self.begin_page(page)
         prepared = self.prepare(raw_rows)
         return [self.build_row(page, raw) for raw in prepared]
 
@@ -45,6 +60,7 @@ class SpecificationRowAssembler:
         return self.repair_continuation_rows([row.as_dict() for row in raw_rows])
 
     def build_row(self, page: int, raw: dict) -> dict:
+        self.begin_page(page)
         values = raw["values"]
         metadata = raw.get("metadata") or {}
         row_type = self.classify_row(values)
@@ -79,6 +95,9 @@ class SpecificationRowAssembler:
 
         if row_type == "section":
             self.current_section = name.rstrip(":*") or position
+            self.current_system = ""
+            self.component_block_active = False
+            self.context_unresolved = False
         elif row_type == "system":
             self.current_system = name or position
 
@@ -93,6 +112,9 @@ class SpecificationRowAssembler:
             else 0.0
         )
         review_reasons = list(metadata.get("review_reasons") or [])
+        if self.context_unresolved and row_type not in {"section", "system", "skip"}:
+            if "context_missing" not in review_reasons:
+                review_reasons.append("context_missing")
         if metadata.get("provider") == "yandex_vision" and not raw["confidences"]:
             if "no_confidence" not in review_reasons:
                 review_reasons.append("no_confidence")
@@ -123,6 +145,13 @@ class SpecificationRowAssembler:
             "provider_has_explicit_rows": bool(metadata.get("provider_has_explicit_rows")),
             "source_table_index": metadata.get("source_table_index"),
             "source_row_index": metadata.get("source_row_index"),
+            "source_subrow_index": metadata.get("source_subrow_index"),
+            "source_cell_refs": list(metadata.get("source_cell_refs") or []),
+            "split_evidence": list(metadata.get("split_evidence") or []),
+            "structural_ambiguity": bool(metadata.get("structural_ambiguity")),
+            "secondary_conflict_fields": list(
+                metadata.get("secondary_conflict_fields") or []
+            ),
             "review_reasons": review_reasons,
             "review_reason": ", ".join(review_reasons),
         }

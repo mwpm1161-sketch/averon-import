@@ -122,6 +122,55 @@ def test_section_carries_across_pages_and_ids_unique():
     assert [r["page"] for r in (*page1, *page2)] == [1, 2]
 
 
+@pytest.mark.parametrize("page_gap", [30, 50])
+def test_non_adjacent_page_gap_resets_section_system_and_component_context(page_gap):
+    assembler = SpecificationRowAssembler()
+    assembler.build_page(18, [mkrow(0, {"name": "Вентиляция:"})])
+    assembler.build_page(19, [mkrow(1, {"name": "П1"})])
+
+    rows = assembler.build_page(page_gap, [mkrow(
+        2, {"name": "Клапан обратный", "quantity": "2"}
+    )])
+
+    assert rows[0]["section"] == ""
+    assert rows[0]["system"] == ""
+    assert "context_missing" in rows[0]["review_reasons"]
+
+
+def test_adjacent_page_context_carry_is_allowed():
+    assembler = SpecificationRowAssembler()
+    assembler.build_page(18, [mkrow(0, {"name": "Вентиляция:"})])
+    assembler.build_page(19, [mkrow(1, {"name": "П1"})])
+
+    row = assembler.build_page(20, [mkrow(
+        2, {"name": "Клапан обратный", "quantity": "2"}
+    )])[0]
+
+    assert row["section"] == "Вентиляция"
+    assert row["system"] == "П1"
+    assert "context_missing" not in row["review_reasons"]
+
+
+def test_new_section_resets_previous_system_and_component_block():
+    assembler = SpecificationRowAssembler()
+    assembler.build_page(1, [
+        mkrow(0, {"name": "Вентиляция:"}),
+        mkrow(1, {"name": "П1"}),
+        mkrow(2, {"name": "Комплект вентиляции", "unit": "компл.", "quantity": "1"}),
+    ])
+
+    rows = assembler.build_page(2, [
+        mkrow(0, {"name": "Отопление:"}),
+        mkrow(1, {"name": "Радиатор", "quantity": "2"}),
+    ])
+
+    assert rows[0]["section"] == "Отопление"
+    assert rows[0]["system"] == ""
+    assert rows[1]["section"] == "Отопление"
+    assert rows[1]["system"] == ""
+    assert rows[1]["row_type"] == "item"
+
+
 def test_malformed_raw_row_raises_and_service_keeps_prior_rows():
     class BadRow(OcrRow):
         def as_dict(self):
@@ -205,3 +254,19 @@ def test_service_path_and_direct_assembler_produce_identical_rows():
     assert via_service["summary"]["total_rows"] == len(via_direct)
     assert via_service["rows"][2]["confidence"] == 75.5
     assert via_service["rows"][2]["row_type"] == "item"
+
+
+def test_recognition_normalizes_selected_pages_before_provider_call():
+    class RecordingProvider(FixedProvider):
+        def recognize(self, pdf_path, pages, **kwargs):
+            self.received_pages = list(pages)
+            return super().recognize(pdf_path, pages, **kwargs)
+
+    provider = RecordingProvider({1: [], 2: []})
+    result = RecognitionService(PdfService(), ocr=provider).recognize(
+        Path("doc.pdf"), Path("pages"), [2, 1, 2], None, 300,
+        lambda c, t, m: None,
+    )
+
+    assert provider.received_pages == [1, 2]
+    assert result["pages"] == [1, 2]

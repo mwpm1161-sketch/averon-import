@@ -157,6 +157,24 @@ def test_primary_secondary_conflict_is_preserved_for_review():
     assert "secondary_conflict" in critical_blockers_for_row(final)
 
 
+def test_manual_edit_of_conflicting_field_clears_secondary_blocker():
+    quantity_box = box(0.70, 0.20, 0.10, 0.05)
+    row = primary_row(quantity="2", cell_bboxes={"quantity": quantity_box})
+    attach_secondary_candidates([row], secondary_payload([("6", quantity_box)]))
+
+    final = assembled(row)
+    assert final["secondary_conflict_fields"] == ["quantity"]
+    assert "secondary_conflict" in final["review_reasons"]
+
+    final["quantity"] = "6"
+    final["edited_fields"] = ["quantity"]
+    final["status"] = "edited"
+    refresh_review_state(final)
+
+    assert "secondary_conflict" not in critical_blockers_for_row(final)
+    assert "secondary_conflict" not in final["review_reasons"]
+
+
 def test_manual_correction_clears_missing_blocker():
     row = assembled(primary_row(quantity="", unit="", mass=""))
     assert "critical_value_missing" in critical_blockers_for_row(row)

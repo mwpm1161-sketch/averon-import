@@ -463,9 +463,23 @@ class YandexVisionProvider:
                 return target.tobytes()
 
     def _plan_chunks(
-        self, pdf_path: Path, pages: list[int]
+        self,
+        pdf_path: Path,
+        pages: list[int],
+        *,
+        one_page_per_request: bool = False,
     ) -> list[tuple[list[int], bytes]]:
-        target = max(1, min(int(self._yandex_settings()["chunk_pages"]), self._max_pages_per_request))
+        configured_target = max(
+            1,
+            min(
+                int(self._yandex_settings()["chunk_pages"]),
+                self._max_pages_per_request,
+            ),
+        )
+        # Production Yandex processing is deliberately page-oriented while
+        # the multi-page async implementation remains available to explicit
+        # internal callers for future investigation.
+        target = 1 if one_page_per_request else configured_target
         chunks: list[tuple[list[int], bytes]] = []
         index = 0
         while index < len(pages):
@@ -673,7 +687,7 @@ class YandexVisionProvider:
         warnings: list[str],
         stats: dict[str, int],
         progress: Callable[[str], None] | None = None,
-    ) -> None:
+    ) -> tuple[dict, dict] | None:
         missing = any(
             is_critical_values(row.values)
             and any(
@@ -684,7 +698,7 @@ class YandexVisionProvider:
             for row in primary_rows
         )
         if not missing:
-            return
+            return None
         try:
             content, crop = self._render_secondary_table_crop(
                 pdf_path, page_number, primary_payload
@@ -713,17 +727,14 @@ class YandexVisionProvider:
                 )
                 self._cache_save(key, pages_payload, model="table")
             if not pages_payload:
-                return
-            result = attach_secondary_candidates(
-                primary_rows, pages_payload[0], crop=crop
-            )
-            stats["secondary_candidates"] += result["secondary_candidates"]
-            stats["secondary_recovered"] += result["secondary_recovered"]
+                return None
+            return pages_payload[0], crop
         except (OcrProviderError, OSError, ValueError) as exc:
             warnings.append(
                 f"[{self.key}] вторичная проверка critical-полей не выполнена: "
                 f"{str(exc)[:300]}"
             )
+            return None
 
     def _recognition_url(self, operation_id: str, recognition_base: str) -> str:
         return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
@@ -855,15 +866,17 @@ class YandexVisionProvider:
     ) -> OcrResult:
         config = self._ensure_ready()
         api_key = self.effective_api_key() or ""
-        requested = [int(page) for page in (pages or [])]
+        requested = sorted({int(page) for page in (pages or [])})
         if not requested:
             raise OcrProviderError("Не выбраны страницы для облачного распознавания.")
         on_progress = progress or (lambda *args, **kwargs: None)
         source_digest = hashlib.sha256(Path(pdf_path).read_bytes()).digest()
-        planned = self._plan_chunks(pdf_path, requested)
-        total_chunks = len(planned)
-        collected: list[tuple[int, dict]] = []
-        warnings_by_page: dict[int, list[str]] = {}
+        planned = self._plan_chunks(
+            pdf_path,
+            requested,
+            one_page_per_request=True,
+        )
+        total_pages = len(requested)
         stats = {
             "primary_requests": 0,
             "secondary_requests": 0,
@@ -871,10 +884,19 @@ class YandexVisionProvider:
             "secondary_recovered": 0,
             "unresolved_critical": 0,
         }
+        by_page: dict[int, PageOcrResult] = {
+            number: PageOcrResult(page=number, provides_confidence=False)
+            for number in requested
+        }
 
         for index, (window, content) in enumerate(planned):
             self._check_cancel(cancel)
-            on_progress(index, total_chunks, f"Облачное распознавание: страницы {window[0]}–{window[-1]}")
+            page_number = window[0]
+            on_progress(
+                index,
+                total_pages,
+                f"Yandex OCR: страница {index + 1} из {total_pages} — {page_number}",
+            )
             warnings: list[str] = []
             parsed = self._recognize_chunk(
                 window,
@@ -884,55 +906,73 @@ class YandexVisionProvider:
                 api_key,
                 cancel,
                 warnings,
-                progress=lambda message: on_progress(index, total_chunks, message),
+                progress=lambda message, page_index=index: on_progress(
+                    page_index, total_pages, message
+                ),
                 stats=stats,
             )
             mapped = self._map_pages_to_numbers(parsed, window, warnings)
-            collected.extend(mapped)
-            # Keep the mutable page warning list available while the primary
-            # payload is being reconstructed and optionally verified. This
-            # prevents a secondary-pass warning from being dropped before it
-            # reaches the page result.
-            for number in window:
-                page_warnings = warnings_by_page.setdefault(number, [])
-                for warning in warnings:
-                    if warning not in page_warnings:
-                        page_warnings.append(warning)
-            for warning in warnings:
+            for message in warnings:
                 for number in window:
-                    collected.append((number, {"_warning": warning}))
-
-        by_page: dict[int, PageOcrResult] = {}
-        for number in requested:
-            by_page[number] = PageOcrResult(page=number, provides_confidence=False)
-        for number, payload in collected:
-            target = by_page.setdefault(number, PageOcrResult(page=number, provides_confidence=False))
-            warning = payload.get("_warning")
-            if warning:
-                if warning not in target.errors:
-                    target.errors.append(warning)
-                continue
-            rows = reconstruct_page_rows(payload, self.key)
-            self._secondary_verify_page(
-                pdf_path,
-                number,
-                payload,
-                rows,
-                source_digest,
-                config,
-                api_key,
-                cancel,
-                warnings_by_page.setdefault(number, []),
-                stats,
-                progress=lambda message: on_progress(0, total_chunks, message),
+                    target = by_page.setdefault(
+                        number,
+                        PageOcrResult(page=number, provides_confidence=False),
+                    )
+                    if message not in target.errors:
+                        target.errors.append(message)
+            for number, payload in mapped:
+                target = by_page.setdefault(
+                    number,
+                    PageOcrResult(page=number, provides_confidence=False),
+                )
+                rows = reconstruct_page_rows(payload, self.key)
+                secondary = self._secondary_verify_page(
+                    pdf_path,
+                    number,
+                    payload,
+                    rows,
+                    source_digest,
+                    config,
+                    api_key,
+                    cancel,
+                    warnings,
+                    stats,
+                    progress=lambda message, page_index=index: on_progress(
+                        page_index, total_pages, message
+                    ),
+                )
+                if secondary is not None:
+                    secondary_payload, secondary_crop = secondary
+                    rows = reconstruct_page_rows(
+                        payload,
+                        self.key,
+                        secondary_payload=secondary_payload,
+                        secondary_crop=secondary_crop,
+                    )
+                    secondary_result = attach_secondary_candidates(
+                        rows,
+                        secondary_payload,
+                        crop=secondary_crop,
+                    )
+                    stats["secondary_candidates"] += secondary_result[
+                        "secondary_candidates"
+                    ]
+                    stats["secondary_recovered"] += secondary_result[
+                        "secondary_recovered"
+                    ]
+                for message in warnings:
+                    if message not in target.errors:
+                        target.errors.append(message)
+                target.rows.extend(rows)
+                geometry = page_geometry(payload)
+                if geometry:
+                    target.geometry = geometry
+            on_progress(
+                index + 1,
+                total_pages,
+                f"Yandex OCR: страница {index + 1} из {total_pages} — "
+                f"{page_number} готова",
             )
-            for message in warnings_by_page.get(number, []):
-                if message not in target.errors:
-                    target.errors.append(message)
-            target.rows.extend(rows)
-            geometry = page_geometry(payload)
-            if geometry:
-                target.geometry = geometry
         stats["unresolved_critical"] = sum(
             critical_field_count(row)
             for page in by_page.values()
