@@ -524,6 +524,10 @@ def _tail_service_rows(
         last_position == len(data_rows) - 1
         and not name_text
         and nonempty_count <= 1
+        # A one-cell final row immediately after the data band can be a
+        # partially OCR'd item.  Off-schema occupancy alone is not proof of a
+        # detached service/title block; require visible structural separation.
+        and previous_blank_count >= 2
     )
     if is_large_tail or is_off_schema_tail:
         return {last_row.row_index}

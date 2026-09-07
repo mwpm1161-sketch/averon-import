@@ -18,6 +18,7 @@ from averon_import.services.ocr.raster_grid import (
 from averon_import.services.ocr.reconstruction import reconstruct_page_rows
 from averon_import.services.recognition import RecognitionService
 from averon_import.services.pdf_service import PdfService
+from averon_import.services.row_assembler import SpecificationRowAssembler
 
 
 def _status(page: int, output: str, *, blockers=None, reason: str | None = None) -> dict:
@@ -235,6 +236,87 @@ def test_outside_grid_stamp_does_not_poison_body_assignment():
     assert diagnostics["outside_grid_word_count"] >= 1
     assert diagnostics.get("unassigned_body_rows", []) == []
     assert rows
+
+
+def _tail_partial_ocr_payload(field: str) -> dict:
+    headers = ["Позиция", "Наименование", "Тип, марка", "Ед. изм.", "Количество"]
+    first = ["1", "Насос-1", "N1", "шт.", "1"]
+    second = ["", "", "", "", ""]
+    second[{"quantity": 4, "unit": 3, "type_mark": 2}[field]] = {
+        "quantity": "2",
+        "unit": "шт.",
+        "type_mark": "N2",
+    }[field]
+    cells = [
+        {
+            "text": text,
+            "rowIndex": row,
+            "columnIndex": column,
+            "rowSpan": 1,
+            "columnSpan": 1,
+            "boundingBox": {"vertices": [
+                {"x": column * 200, "y": row * 100},
+                {"x": (column + 1) * 200, "y": row * 100},
+                {"x": (column + 1) * 200, "y": row * 100 + 90},
+                {"x": column * 200, "y": row * 100 + 90},
+            ]},
+        }
+        for row, row_values in enumerate((headers, first, second))
+        for column, text in enumerate(row_values)
+    ]
+    words = []
+    for row, row_values in enumerate((headers, first, second)):
+        for column, text in enumerate(row_values):
+            if not text:
+                continue
+            left = column * 200 + 8
+            top = row * 100 + 12
+            words.append({
+                "text": text,
+                "boundingBox": {"vertices": [
+                    {"x": left, "y": top}, {"x": left + 80, "y": top},
+                    {"x": left + 80, "y": top + 28}, {"x": left, "y": top + 28},
+                ]},
+            })
+    return {
+        "page": {"width": 1000, "height": 300},
+        "textAnnotation": {
+            "fullText": "Спецификация оборудования",
+            "blocks": [{"lines": [{"words": words}]}],
+            "tables": [{"rowCount": 3, "columnCount": 5, "cells": cells}],
+        },
+    }
+
+
+@pytest.mark.parametrize("field", ["quantity", "unit", "type_mark"])
+def test_partially_ocrd_final_item_row_is_not_dropped_as_service_tail(tmp_path, field):
+    diagnostics: dict = {}
+    rows = reconstruct_page_rows(
+        _tail_partial_ocr_payload(field),
+        "yandex_vision",
+        physical_grid=_normalized_grid(3, 5),
+        reconstruction_mode="geometry",
+        diagnostics=diagnostics,
+    )
+    partial = [row for row in rows if row.metadata.get("source_row_index") == 2]
+    assert len(partial) == 1
+    assert partial[0].values[field]
+    assert diagnostics["selected_mode"] == "geometry_first"
+    assert not any(
+        event.get("source_row_index") == 2
+        and event.get("drop_reason") == "trailing_service_block"
+    for event in diagnostics.get("events", [])
+    )
+    status = page_status_from_diagnostics(1, diagnostics, row_count=len(rows))
+    assert status.output_status == "USABLE"
+    assembled = SpecificationRowAssembler().build_page(1, rows)
+    with pytest.raises(ValueError, match="Не проверено"):
+        ExcelExportService().export(
+            assembled,
+            ["name", "type_mark", "unit", "quantity"],
+            tmp_path / "blocked.xlsx",
+            page_statuses={"1": status.as_dict()},
+        )
 
 
 def _raster_with_rows(values: list[str]) -> tuple[RasterGridPage, PhysicalGrid]:
