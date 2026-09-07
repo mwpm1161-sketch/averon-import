@@ -11,7 +11,18 @@ CRITICAL_REASONS = {
     "critical_value_missing",
     "numeric_suspect",
     "ambiguous_columns",
+    "ambiguous_table_schema",
     "secondary_conflict",
+    "structural_ambiguity",
+    "structural_disagreement",
+    "structural_boundary_conflict",
+    "word_assignment_ambiguity",
+    "physical_row_unresolved",
+    "unsupported_table_schema",
+    "schema_unknown",
+    "structural_layout_ambiguous",
+    "structural_schema_ambiguous",
+    "physical_row_loss_suspected",
 }
 
 
@@ -24,11 +35,28 @@ def is_critical_row(row: dict) -> bool:
     metadata = row.get("ocr_metadata") or {}
     if metadata.get("provider") != "yandex_vision":
         return False
-    if row.get("row_type") not in {"item", "component"}:
+    structural_reasons = {
+        "structural_ambiguity",
+        "structural_disagreement",
+        "structural_boundary_conflict",
+        "word_assignment_ambiguity",
+    }
+    row_reasons = set(_as_list(row.get("review_reasons")))
+    if (
+        row.get("structured_table")
+        and row_reasons.intersection(structural_reasons)
+    ):
+        return any(str(row.get(key, "") or "").strip() for key in (
+            "name", "position", "type_mark", "code", "manufacturer", "note",
+        ))
+    if row.get("row_type") not in {"item", "component", "item_candidate"}:
         return False
-    return any(str(row.get(key, "") or "").strip() for key in (
+    product_evidence = any(str(row.get(key, "") or "").strip() for key in (
         "name", "position", "type_mark", "code", "manufacturer",
     ))
+    if product_evidence:
+        return True
+    return any(str(row.get(key, "") or "").strip() for key in ("unit", "quantity", "mass"))
 
 
 def is_critical_values(values: dict) -> bool:
@@ -84,7 +112,22 @@ def critical_blockers_for_row(row: dict) -> list[str]:
     blockers: list[str] = []
     if missing or "critical_value_missing" in reasons:
         blockers.append("critical_value_missing")
-    for reason in ("numeric_suspect", "ambiguous_columns", "secondary_conflict"):
+    for reason in (
+        "numeric_suspect",
+        "ambiguous_columns",
+        "ambiguous_table_schema",
+        "secondary_conflict",
+        "structural_ambiguity",
+        "structural_disagreement",
+        "structural_boundary_conflict",
+        "word_assignment_ambiguity",
+        "physical_row_unresolved",
+        "unsupported_table_schema",
+        "schema_unknown",
+        "structural_layout_ambiguous",
+        "structural_schema_ambiguous",
+        "physical_row_loss_suspected",
+    ):
         if reason in reasons:
             blockers.append(reason)
     return blockers
@@ -102,7 +145,21 @@ def critical_field_count(row: dict) -> int:
         count = max(count, len(_as_list(row.get("critical_fields"))) or 1)
     if not count and any(
         reason in blockers
-        for reason in ("ambiguous_columns", "secondary_conflict")
+        for reason in (
+            "ambiguous_columns",
+            "ambiguous_table_schema",
+            "secondary_conflict",
+            "structural_ambiguity",
+            "structural_disagreement",
+            "structural_boundary_conflict",
+            "word_assignment_ambiguity",
+            "physical_row_unresolved",
+            "unsupported_table_schema",
+            "schema_unknown",
+            "structural_layout_ambiguous",
+            "structural_schema_ambiguous",
+            "physical_row_loss_suspected",
+        )
     ):
         count = 1
     return count

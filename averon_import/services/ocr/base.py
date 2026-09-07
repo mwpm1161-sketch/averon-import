@@ -51,9 +51,21 @@ class PageOcrResult:
     errors: list[str] = field(default_factory=list)
     provides_confidence: bool = True
     stats: dict = field(default_factory=dict)
+    page_status: dict = field(default_factory=dict)
 
     def as_raw_rows(self) -> list[dict]:
         return [row.as_dict() for row in self.rows]
+
+    def as_dict(self) -> dict:
+        return {
+            "page": self.page,
+            "rows": self.as_raw_rows(),
+            "geometry": dict(self.geometry or {}),
+            "errors": list(self.errors),
+            "provides_confidence": self.provides_confidence,
+            "stats": dict(self.stats),
+            "page_status": dict(self.page_status or {}),
+        }
 
 
 @dataclass(slots=True)
@@ -67,6 +79,13 @@ class OcrResult:
             if item.page == number:
                 return item
         return None
+
+    def as_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "pages": [page.as_dict() for page in self.pages],
+            "stats": dict(self.stats),
+        }
 
 
 class OcrProvider(Protocol):

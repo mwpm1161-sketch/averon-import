@@ -28,6 +28,9 @@ class SpecificationRowAssembler:
         "отоплен",
         "теплоснабжен",
         "холодоснабжен",
+        "водоснабжен",
+        "канализац",
+        "оборудован",
     )
     SYSTEM_RE = re.compile(r"^(?:[ПВКЕВBPK]{1,4}\s*\d+(?:[.,]\d+)?|К\d+(?:\.\d+)*)$", re.I)
 
@@ -112,6 +115,8 @@ class SpecificationRowAssembler:
             else 0.0
         )
         review_reasons = list(metadata.get("review_reasons") or [])
+        if row_type == "item_candidate" and "physical_row_unresolved" not in review_reasons:
+            review_reasons.append("physical_row_unresolved")
         if self.context_unresolved and row_type not in {"section", "system", "skip"}:
             if "context_missing" not in review_reasons:
                 review_reasons.append("context_missing")
@@ -231,9 +236,17 @@ class SpecificationRowAssembler:
             values.get(key, "").strip()
             for key in ("name", "position", "type_mark", "code", "manufacturer")
         )
+        product_evidence = any(
+            values.get(key, "").strip()
+            for key in ("type_mark", "code", "manufacturer", "unit", "mass")
+        )
 
         low = name.lower()
-        if any(word in low for word in self.SECTION_WORDS) and not quantity:
+        if (
+            any(word in low for word in self.SECTION_WORDS)
+            and not quantity
+            and not product_evidence
+        ):
             return "section"
         if (
             self.SYSTEM_RE.fullmatch(name.replace(" ", ""))
@@ -243,8 +256,11 @@ class SpecificationRowAssembler:
         if re.match(r"^[\-–—•]", name):
             return "component"
         if (quantity or unit or values.get("note") or values.get("mass")) and not identity_fields:
-            return "skip"
-        if quantity or unit or type_mark or manufacturer:
+            # A physical body row with amount evidence is not a harmless
+            # separator. Preserve it as a reviewable candidate so page/export
+            # safety can account for the missing identity field.
+            return "item_candidate"
+        if quantity or unit or type_mark or values.get("code") or manufacturer or values.get("mass"):
             return "item"
         if name or position:
             return "note"
@@ -252,6 +268,8 @@ class SpecificationRowAssembler:
 
     @staticmethod
     def status_for(values: dict[str, str], confidence: float, row_type: str) -> str:
+        if row_type == "item_candidate":
+            return "unrecognized"
         if row_type in {"section", "system", "note", "component"}:
             return "recognized" if confidence >= 55 else "review"
         critical_present = bool(values.get("name")) and bool(

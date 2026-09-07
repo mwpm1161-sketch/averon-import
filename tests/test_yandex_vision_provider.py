@@ -578,7 +578,10 @@ def test_table_cells_primary_map_to_base_columns(tmp_path):
     result = provider.recognize(any_pdf(tmp_path), [7])
     page_result = result.pages[0]
     assert page_result.provides_confidence is False
-    assert page_result.geometry == {"width": 595, "height": 842}
+    assert page_result.geometry["width"] == 595
+    assert page_result.geometry["height"] == 842
+    assert page_result.geometry["reconstruction"]["selected_mode"] == "table_fallback"
+    assert page_result.geometry["reconstruction"]["fallback_reason"] == "physical_grid_unavailable"
     rows = page_result.rows
     assert len(rows) == 2
     first = rows[0]
@@ -597,10 +600,10 @@ def test_sync_geometry_fallback_maps_rows_without_confidence(tmp_path):
     result = provider.recognize(any_pdf(tmp_path), [7])
 
     page_result = result.pages[0]
-    assert page_result.rows
-    assert page_result.rows[0].values["position"] == "1."
-    assert page_result.rows[0].values["quantity"] == "5"
-    assert all(row.confidences == {} for row in page_result.rows)
+    # Geometry mode no longer silently falls back to legacy words when the
+    # page has no trustworthy physical/table structure.
+    assert page_result.rows == []
+    assert page_result.geometry["reconstruction"]["selected_mode"] == "no_spec_output"
 
 
 def test_table_spans_are_respected_in_primary_path():
@@ -658,9 +661,7 @@ def test_direct_positional_mapping_when_header_unrecognised():
     }
     rows = reconstruct_page_rows(payload, "yandex_vision")
     data = [row for row in rows if row.values.get("name") == "Болт М12"]
-    assert data
-    assert data[0].values["quantity"] == "10"
-    assert data[0].values["position"] == "1"
+    assert data == []
 
 
 def test_unmappable_narrow_table_returns_nothing_instead_of_guesses():

@@ -31,6 +31,6 @@ def test_mixed_gost_and_diameter_are_normalized():
 
 
 def test_common_cyrillic_model_codes_are_normalized():
-    assert normalize_cell("type_mark", "APH 1100x800").startswith("АРН 1100×800")
-    assert normalize_cell("type_mark", "KBK 355") == "КВК 355"
-    assert normalize_cell("type_mark", "6APC1500") == "6АРС1500"
+    assert normalize_cell("type_mark", "APH 1100x800") == "APH 1100×800"
+    assert normalize_cell("type_mark", "KBK 355") == "KBK 355"
+    assert normalize_cell("type_mark", "6APC1500") == "6APC1500"

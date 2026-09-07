@@ -535,7 +535,7 @@ def test_ambiguous_unit_anchor_keeps_table_path_and_marks_local_review():
     assert len(rows) == 1
     assert rows[0].metadata["structured_table"] is True
     assert rows[0].values["unit"] == "шт."
-    assert rows[0].values["mass"] == "1.5"
+    assert rows[0].values.get("mass", "") == ""
     assert "ambiguous_columns" in rows[0].metadata["review_reasons"]
 
 
@@ -561,8 +561,8 @@ def test_fragmented_header_uses_table_grid_and_geometry_for_merged_rows():
     assert not any("служебный нижний блок" in str(row.values) for row in rows)
 
     outer = next(row for row in rows if row.values.get("name") == "Наружная решетка")
-    slot = next(row for row in rows if row.values.get("type_mark") == "6АРС2000")
-    assert outer.values["type_mark"] == "АРН 1100×800"
+    slot = next(row for row in rows if row.values.get("type_mark") == "6APC2000")
+    assert outer.values["type_mark"] == "APH 1100×800"
     assert outer.values["unit"] == "шт."
     assert "quantity" not in outer.values
     assert slot.values["name"] == "Щелевая решетка с КСД приточная"
@@ -654,8 +654,7 @@ def test_ambiguous_table_fallback_has_review_reason_instead_of_a_guess():
         },
     }
     rows = reconstruct_page_rows(payload, "yandex_vision")
-    assert rows
-    assert "ambiguous_columns" in rows[0].metadata["review_reasons"]
+    assert rows == []
 
 
 def test_structured_rows_with_same_name_are_not_continuation_merged():

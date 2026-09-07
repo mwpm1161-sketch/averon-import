@@ -68,7 +68,6 @@ EXACT_OCR_REPLACEMENTS = {
     "dud": "диф.",
     "pene": "реле",
     "pewemka": "решетка",
-    "apkmuka": "Арктика",
     "kqhoabhoy": "канальной",
     "kqhoabhou": "канальной",
     "damyuk": "датчик",
@@ -79,7 +78,6 @@ EXACT_OCR_REPLACEMENTS = {
     "кональной": "канальной",
     "канальноцу": "канальной",
     "щелебая": "щелевая",
-    "нахимобскии": "Нахимовский",
     "kaanaha": "клапана",
     "nod": "под",
     "ubem": "цвет",
@@ -188,16 +186,9 @@ def normalize_cell(key: str, value: str | None) -> str:
         text = correct_engineering_text(text)
     if key == "manufacturer":
         text = correct_engineering_text(text)
-        text = re.sub(r"(?i)нахимобскии", "Нахимовский", text)
         text = re.sub(r"^0{2,3}(?=\s|$)", "ООО", text)
     if key in {"type_mark", "code", "manufacturer"}:
         text = re.sub(r"(?i)(?<!\w)[гgr][оo0][сcs][тt](?=\s*\d)", "ГОСТ", text)
-    if key == "type_mark":
-        text = re.sub(r"(?i)\bAPH(?=\s*\d)", "АРН", text)
-        text = re.sub(r"(?i)\bKBK(?=\s*\d)", "КВК", text)
-        text = re.sub(r"(?i)\b6APC(?=\d)", "6АРС", text)
-        text = re.sub(r"SOLARIS Lite [XХ]P(?=\s)", "SOLARIS Lite XP", text, flags=re.IGNORECASE)
-        text = re.sub(r"(SOLARIS Lite XP \d+-\d+/)\\\.(\d+)", r"\1V.\2", text, flags=re.IGNORECASE)
     if key in {"quantity", "mass"}:
         text = text.replace(" ", "").replace(",", ".")
         text = re.sub(r"[^0-9.\-]", "", text)

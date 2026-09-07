@@ -9,8 +9,18 @@ from averon_import.services.ocr.base import (
     ProgressCallback,
 )
 from averon_import.services.ocr.reconstruction import reconstruct_page_rows
+from averon_import.services.ocr.physical_grid import (
+    AmbiguousWord,
+    PhysicalGrid,
+    PhysicalGridCell,
+    PhysicalGridDetection,
+    PhysicalGridDetector,
+    validate_physical_grid,
+)
+from averon_import.services.ocr.raster_grid import RasterRuledTableGridDetector
 from averon_import.services.ocr.tesseract_adapter import TesseractOcrAdapter
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
+from averon_import.services.ocr.page_contract import PageExtractionStatus
 
 _PROVIDER_FACTORIES: dict[str, type] = {"tesseract": TesseractOcrAdapter}
 
@@ -34,9 +44,17 @@ __all__ = [
     "OcrRow",
     "PageOcrResult",
     "ProgressCallback",
+    "AmbiguousWord",
+    "PhysicalGrid",
+    "PhysicalGridCell",
+    "PhysicalGridDetection",
+    "PhysicalGridDetector",
+    "RasterRuledTableGridDetector",
     "TesseractOcrAdapter",
     "YandexVisionProvider",
     "reconstruct_page_rows",
+    "validate_physical_grid",
     "register_provider",
     "create_ocr_provider",
+    "PageExtractionStatus",
 ]

@@ -8,11 +8,11 @@ Vision OCR async REST API (v1 routes):
     GET  {vision_base_url}/ocr/v1/getRecognition?operationId=<id>
 
 getRecognition answers with JSONL: one JSON object per PDF page, each of the
-shape ``{"page": {...}, "textAnnotation": {...}}``. Tables inside
-``textAnnotation`` are the primary reconstruction source; blocks/lines/words
-geometry is only a fallback (see ``reconstruction.py``). The API key is
-resolved through SecretStore/env and is never persisted in caches, results,
-logs or error messages.
+shape ``{"page": {...}, "textAnnotation": {...}}``. High-confidence raster
+grids provide physical structure, while ``blocks/lines/words`` provide text.
+Yandex tables remain structural evidence and the retained fallback. The API
+key is resolved through SecretStore/env and is never persisted in caches,
+results, logs or error messages.
 """
 
 from __future__ import annotations
@@ -36,11 +36,27 @@ from averon_import.services.ocr.base import (
     OcrResult,
     PageOcrResult,
 )
+from averon_import.services.ocr.page_contract import page_status_from_diagnostics
 from averon_import.services.ocr.reconstruction import (
+    collect_words,
     page_geometry,
     reconstruct_page_rows,
 )
-from averon_import.services.ocr.critical_verification import attach_secondary_candidates
+from averon_import.services.ocr.critical_verification import (
+    attach_exact_cell_candidate,
+    attach_secondary_candidates,
+)
+from averon_import.services.ocr.physical_grid import (
+    PhysicalGridDetection,
+    validate_physical_grid,
+)
+from averon_import.services.ocr.raster_grid import (
+    RasterGridPage,
+    RasterRuledTableGridDetector,
+    crop_has_glyph,
+    encode_png,
+    prepare_exact_cell_crop,
+)
 from averon_import.services.review_policy import CRITICAL_FIELDS, critical_field_count, is_critical_values
 from averon_import.services.secrets import YANDEX_API_KEY, resolve_secret
 
@@ -52,6 +68,7 @@ MAX_PAGES_PER_REQUEST = 200
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 FAIL_FAST_STATUSES = {400, 401, 403}
 CACHE_VERSION = 3
+EXACT_CELL_FIELDS = ("quantity",)
 
 
 def _submit_path() -> str:
@@ -134,6 +151,8 @@ class YandexVisionProvider:
         submit_attempts: int = 2,
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], float] = time.monotonic,
+        grid_detector=None,
+        reconstruction_mode: str = "geometry",
         env_keys: tuple[str, ...] = (
             "AVERON_YANDEX_VISION_API_KEY",
             "AVERON_YANDEX_AI_API_KEY",
@@ -149,6 +168,12 @@ class YandexVisionProvider:
         self._submit_attempts = submit_attempts
         self._sleep = sleep_fn
         self._now = now_fn
+        self._grid_detector = grid_detector or RasterRuledTableGridDetector()
+        self._reconstruction_mode = (
+            reconstruction_mode
+            if reconstruction_mode in {"table", "shadow", "geometry"}
+            else "geometry"
+        )
         self._env_keys = env_keys
         if cache_dir is not None:
             cache_dir = Path(cache_dir)
@@ -204,6 +229,7 @@ class YandexVisionProvider:
             "vision_base_url": config["vision_base_url"],
             "chunk_pages": config["chunk_pages"],
             "language_codes": config["language_codes"],
+            "reconstruction_mode": self._reconstruction_mode,
         }
 
     def _ensure_ready(self) -> dict:
@@ -736,6 +762,185 @@ class YandexVisionProvider:
             )
             return None
 
+    def _detect_grid_page(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        payload: dict,
+        warnings: list[str],
+    ) -> tuple[PhysicalGridDetection | None, RasterGridPage | None]:
+        if self._reconstruction_mode == "table":
+            return None, None
+        annotation = payload.get("textAnnotation")
+        if not isinstance(annotation, dict) or not collect_words(annotation):
+            return None, None
+        try:
+            analyze_page = getattr(self._grid_detector, "analyze_page", None)
+            if callable(analyze_page):
+                raster = analyze_page(pdf_path, page_number)
+                return raster.detection, raster
+            detection = self._grid_detector.detect_page(pdf_path, page_number)
+            return detection, None
+        except (OSError, ValueError, RuntimeError) as exc:
+            warnings.append(
+                f"[{self.key}] CV grid недоступен, используется table fallback: "
+                f"{str(exc)[:240]}"
+            )
+            return None, None
+
+    @staticmethod
+    def _isolated_page_text(payload: dict) -> str:
+        annotation = payload.get("textAnnotation") if isinstance(payload, dict) else None
+        if not isinstance(annotation, dict):
+            return ""
+        full_text = str(annotation.get("fullText") or "").strip()
+        if full_text:
+            return full_text
+        return " ".join(
+            str(word.get("text") or "").strip()
+            for word in collect_words(annotation)
+            if str(word.get("text") or "").strip()
+        )
+
+    def _exact_cell_verify_page(
+        self,
+        page_number: int,
+        raster: RasterGridPage | None,
+        rows: list,
+        config: dict,
+        api_key: str,
+        cancel: threading.Event | None,
+        warnings: list[str],
+        stats: dict[str, int],
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        if (
+            self._reconstruction_mode != "geometry"
+            or raster is None
+            or not raster.detection.high_confidence
+            or raster.detection.grid is None
+        ):
+            return
+        grid = raster.detection.grid
+        if validate_physical_grid(grid):
+            return
+        actual_requests = 0
+        for row in rows:
+            if not is_critical_values(row.values):
+                continue
+            row_metadata = row.metadata if isinstance(row.metadata, dict) else {}
+            schema_assessment = row_metadata.get("schema_assessment")
+            # Exact-cell OCR is an optional verification pass, never a way to
+            # bypass an unknown schema.  Missing metadata is fail-closed just
+            # like an explicit UNKNOWN/AMBIGUOUS/UNSUPPORTED assessment.
+            if not isinstance(schema_assessment, dict) or str(
+                schema_assessment.get("status") or ""
+            ).lower() != "supported":
+                continue
+            if any(
+                row_metadata.get(key)
+                for key in (
+                    "structural_ambiguity",
+                    "structural_disagreement",
+                    "word_assignment_ambiguity",
+                    "weak_critical_assignment",
+                )
+            ):
+                continue
+            if set(row_metadata.get("review_reasons") or {}).intersection(
+                {
+                    "ambiguous_table_schema",
+                    "structural_schema_ambiguous",
+                    "unsupported_table_schema",
+                    "schema_unknown",
+                }
+            ):
+                continue
+            if set(row_metadata.get("ambiguous_fields") or {}).intersection(
+                set(EXACT_CELL_FIELDS)
+            ):
+                continue
+            refs = row.metadata.get("physical_grid_cells") or {}
+            for field in EXACT_CELL_FIELDS:
+                if str(row.values.get(field, "") or "").strip():
+                    continue
+                ref = refs.get(field)
+                if not isinstance(ref, dict):
+                    continue
+                try:
+                    grid_row = int(ref["row_index"])
+                    grid_column = int(ref["column_index"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                cell = grid.cell(grid_row, grid_column)
+                if cell is None:
+                    continue
+                crop = prepare_exact_cell_crop(raster, cell, scale=2)
+                if not crop_has_glyph(crop):
+                    continue
+                stats["exact_cell_checked"] += 1
+                try:
+                    content = encode_png(crop)
+                    if len(content) > self._max_file_bytes:
+                        raise OcrProviderError(
+                            "Exact-cell PNG превышает лимит Yandex Vision."
+                        )
+                    cell_config = {**config, "vision_model": "page"}
+                    content_digest = hashlib.sha256(content).digest()
+                    key = self._cache_key(
+                        content_digest,
+                        [page_number],
+                        cell_config,
+                        strategy="critical-cell-2x-v1",
+                    )
+                    cached = self._cache_load(key, warnings)
+                    if cached is not None:
+                        pages_payload = cached.get("pages") or []
+                    else:
+                        if actual_requests:
+                            self._check_cancel(cancel)
+                            self._sleep(2.0)
+                        actual_requests += 1
+                        stats["exact_cell_requests"] += 1
+                        if progress:
+                            progress(
+                                "Yandex OCR: проверяем точную критичную ячейку"
+                            )
+                        pages_payload = self._recognize_sync(
+                            content,
+                            cell_config,
+                            api_key,
+                            cancel,
+                            warnings,
+                            progress=None,
+                            mime_type="image/png",
+                        )
+                        self._cache_save(key, pages_payload, model="page")
+                    if not pages_payload:
+                        continue
+                    raw_value = self._isolated_page_text(pages_payload[0])
+                    if attach_exact_cell_candidate(
+                        row,
+                        field,
+                        raw_value,
+                        bbox=cell.as_bbox(),
+                    ):
+                        stats["exact_cell_candidates"] += 1
+                except OcrProviderError as exc:
+                    # Cancellation is a job-level decision, not a recoverable
+                    # failure of one optional verification candidate.
+                    if cancel is not None and cancel.is_set():
+                        raise
+                    warnings.append(
+                        f"[{self.key}] exact-cell проверка {field} не выполнена: "
+                        f"{str(exc)[:240]}"
+                    )
+                except (OSError, ValueError) as exc:
+                    warnings.append(
+                        f"[{self.key}] exact-cell проверка {field} не выполнена: "
+                        f"{str(exc)[:240]}"
+                    )
+
     def _recognition_url(self, operation_id: str, recognition_base: str) -> str:
         return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
 
@@ -882,6 +1087,15 @@ class YandexVisionProvider:
             "secondary_requests": 0,
             "secondary_candidates": 0,
             "secondary_recovered": 0,
+            "geometry_high_confidence_pages": 0,
+            "geometry_selected_pages": 0,
+            "geometry_fallback_pages": 0,
+            "geometry_shadow_pages": 0,
+            "geometry_structural_disagreements": 0,
+            "geometry_shadow_field_differences": 0,
+            "exact_cell_checked": 0,
+            "exact_cell_requests": 0,
+            "exact_cell_candidates": 0,
             "unresolved_critical": 0,
         }
         by_page: dict[int, PageOcrResult] = {
@@ -925,7 +1139,40 @@ class YandexVisionProvider:
                     number,
                     PageOcrResult(page=number, provides_confidence=False),
                 )
-                rows = reconstruct_page_rows(payload, self.key)
+                grid_detection, raster = self._detect_grid_page(
+                    pdf_path, number, payload, warnings
+                )
+                physical_grid = (
+                    grid_detection.grid if grid_detection is not None else None
+                )
+                if grid_detection is not None and grid_detection.high_confidence:
+                    stats["geometry_high_confidence_pages"] += 1
+                reconstruction_diagnostics: dict = {}
+                rows = reconstruct_page_rows(
+                    payload,
+                    self.key,
+                    physical_grid=physical_grid,
+                    reconstruction_mode=self._reconstruction_mode,
+                    diagnostics=reconstruction_diagnostics,
+                )
+                if grid_detection is not None and physical_grid is None:
+                    reconstruction_diagnostics["geometry_source"] = (
+                        grid_detection.source
+                    )
+                    reconstruction_diagnostics["grid_confidence"] = 0.0
+                    reconstruction_diagnostics["candidate_count"] = (
+                        grid_detection.candidate_count
+                    )
+                    reconstruction_diagnostics["selected_candidate"] = (
+                        grid_detection.selected_candidate
+                    )
+                    if grid_detection.reasons:
+                        reconstruction_diagnostics["fallback_reason"] = (
+                            grid_detection.reasons[0]
+                        )
+                    reconstruction_diagnostics["detector_reasons"] = list(
+                        grid_detection.reasons
+                    )
                 secondary = self._secondary_verify_page(
                     pdf_path,
                     number,
@@ -948,6 +1195,9 @@ class YandexVisionProvider:
                         self.key,
                         secondary_payload=secondary_payload,
                         secondary_crop=secondary_crop,
+                        physical_grid=physical_grid,
+                        reconstruction_mode=self._reconstruction_mode,
+                        diagnostics=reconstruction_diagnostics,
                     )
                     secondary_result = attach_secondary_candidates(
                         rows,
@@ -960,11 +1210,47 @@ class YandexVisionProvider:
                     stats["secondary_recovered"] += secondary_result[
                         "secondary_recovered"
                     ]
+                self._exact_cell_verify_page(
+                    number,
+                    raster,
+                    rows,
+                    config,
+                    api_key,
+                    cancel,
+                    warnings,
+                    stats,
+                    progress=lambda message, page_index=index: on_progress(
+                        page_index, total_pages, message
+                    ),
+                )
+                target.page_status = page_status_from_diagnostics(
+                    number,
+                    reconstruction_diagnostics,
+                    row_count=len(rows),
+                ).as_dict()
+                selected_mode = reconstruction_diagnostics.get("selected_mode")
+                if selected_mode == "geometry_first":
+                    stats["geometry_selected_pages"] += 1
+                elif selected_mode == "table_shadow":
+                    stats["geometry_shadow_pages"] += 1
+                elif self._reconstruction_mode != "table":
+                    stats["geometry_fallback_pages"] += 1
+                structural = reconstruction_diagnostics.get("structural_evidence") or {}
+                if structural.get("has_disagreement"):
+                    stats["geometry_structural_disagreements"] += 1
+                shadow_diff = reconstruction_diagnostics.get("shadow_diff") or {}
+                stats["geometry_shadow_field_differences"] += int(
+                    shadow_diff.get("field_difference_count") or 0
+                )
                 for message in warnings:
                     if message not in target.errors:
                         target.errors.append(message)
                 target.rows.extend(rows)
                 geometry = page_geometry(payload)
+                if grid_detection is not None:
+                    geometry["physical_grid"] = grid_detection.as_dict()
+                if reconstruction_diagnostics:
+                    geometry["reconstruction"] = reconstruction_diagnostics
                 if geometry:
                     target.geometry = geometry
             on_progress(

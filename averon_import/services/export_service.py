@@ -22,12 +22,30 @@ class ExcelExportService:
         sheet_name: str = "Спецификация",
         include_headers: bool = True,
         only_exportable: bool = True,
+        page_statuses: dict | list[dict] | None = None,
     ) -> Path:
         valid_columns = [column for column in columns if column in COLUMN_BY_KEY]
         if not valid_columns:
             raise ValueError("Не выбрано ни одного столбца для экспорта")
 
         if only_exportable:
+            page_blockers = []
+            status_items = (
+                page_statuses.values()
+                if isinstance(page_statuses, dict)
+                else (page_statuses or [])
+            )
+            for status in status_items:
+                if not isinstance(status, dict):
+                    continue
+                page = status.get("page", "?")
+                for blocker in status.get("blockers") or []:
+                    page_blockers.append(f"страница {page}: {blocker}")
+            if page_blockers:
+                raise ValueError(
+                    "Экспорт заблокирован проверками страниц: "
+                    + "; ".join(page_blockers[:8])
+                )
             unresolved = sum(
                 critical_field_count(row)
                 for row in rows

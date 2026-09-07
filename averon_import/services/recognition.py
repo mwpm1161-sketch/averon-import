@@ -39,7 +39,10 @@ class RecognitionService:
             image = cv2.imread(str(image_path))
             try:
                 table = self.detector.detect(image)
-                if table.column_count == 9 and table.row_count >= 5:
+                # Page suggestion is intentionally schema-neutral.  The
+                # provider/reconstruction safety gate decides whether a
+                # detected table is a supported specification later.
+                if table.column_count >= 3 and table.row_count >= 5:
                     candidates.append(page_number)
             except Exception as exc:
                 # A page without a matching table is normal and is not treated
@@ -61,6 +64,7 @@ class RecognitionService:
     ) -> dict:
         all_rows: list[dict] = []
         page_tables: dict[str, dict] = {}
+        page_statuses: dict[str, dict] = {}
         errors: list[dict] = []
         assembler = SpecificationRowAssembler()
         pages = sorted({int(page) for page in pages})
@@ -83,6 +87,16 @@ class RecognitionService:
                 assembler.begin_page(page_number)
                 raw_rows = assembler.prepare(page_result.rows)
                 page_tables[str(page_number)] = page_result.geometry or {}
+                page_statuses[str(page_number)] = dict(page_result.page_status or {})
+                if page_result.errors and not page_statuses[str(page_number)]:
+                    page_statuses[str(page_number)] = {
+                        "page": page_number,
+                        "layout_status": "FAILED",
+                        "schema_status": "UNKNOWN",
+                        "output_status": "NO_SPEC_OUTPUT",
+                        "blockers": ["ocr_page_error"],
+                        "diagnostics": {"errors": list(page_result.errors)},
+                    }
                 for raw in raw_rows:
                     all_rows.append(assembler.build_row(page_number, raw))
             except Exception as exc:
@@ -110,6 +124,7 @@ class RecognitionService:
             "pages": pages,
             "rows": all_rows,
             "page_tables": page_tables,
+            "page_statuses": page_statuses,
             "errors": errors,
             "summary": self._summary(all_rows, errors),
             "ocr_mode": ocr_mode,

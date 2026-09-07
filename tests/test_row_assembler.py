@@ -11,13 +11,14 @@ from averon_import.services.recognition import RecognitionService
 from averon_import.services.row_assembler import SpecificationRowAssembler
 
 
-def mkrow(source_row, values, confidences=None, sources=None, bbox=None):
+def mkrow(source_row, values, confidences=None, sources=None, bbox=None, metadata=None):
     return OcrRow(
         source_row=source_row,
         values={k: str(v) for k, v in values.items()},
         confidences=confidences or {k: 90.0 for k in values},
         sources=sources or {},
         bbox=bbox or {"x": 0.1, "y": 0.25, "width": 0.8, "height": 0.25},
+        metadata=metadata or {},
     )
 
 
@@ -48,6 +49,23 @@ def test_item_row_basic_fields_and_confidence():
     assert row["bbox"] == {"x": 0.05, "y": 0.3, "width": 0.9, "height": 0.2}
     assert row["ocr_sources"] == {"position": "page-mixed"}
     assert row["position"] == "12" and row["name"] == "Вентиль"
+
+
+def test_product_evidence_wins_over_section_keyword_when_quantity_missing():
+    assembler = SpecificationRowAssembler()
+    rows = assembler.build_page(47, [mkrow(
+        6,
+        {
+            "name": "Решетка вентиляционная внутренняя",
+            "type_mark": "PP300×300",
+            "manufacturer": "ЭРА",
+            "unit": "шт.",
+        },
+        metadata={"provider": "yandex_vision"},
+    )])
+    assert rows[0]["row_type"] == "item"
+    assert rows[0]["status"] == "review"
+    assert "quantity" in rows[0]["critical_fields"]
 
 
 def test_continuation_row_merge():

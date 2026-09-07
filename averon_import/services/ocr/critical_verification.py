@@ -1,7 +1,8 @@
 """BBox-only secondary verification for critical Yandex OCR fields.
 
-The primary table remains authoritative. A secondary result is kept as a
-manual-review candidate only; it never fills a missing value automatically.
+Primary reconstructed values remain authoritative. Secondary table and exact
+cell results are manual-review candidates only; they never fill a missing
+value automatically.
 """
 
 from __future__ import annotations
@@ -204,6 +205,61 @@ def attach_secondary_candidates(
                     reasons.append("recovered_by_secondary_ocr")
             metadata["review_reasons"] = reasons
     return stats
+
+
+def attach_exact_cell_candidate(
+    row: OcrRow,
+    field: str,
+    raw_value: str,
+    *,
+    bbox: dict,
+    source: str = "yandex_exact_cell_2x",
+) -> bool:
+    """Attach an isolated-cell result as review evidence, never as a value."""
+    if field not in CRITICAL_FIELDS or str(row.values.get(field, "") or "").strip():
+        return False
+    value = _candidate_value(field, raw_value)
+    if value is None:
+        return False
+    metadata = row.metadata
+    candidates = dict(metadata.get("value_candidates") or {})
+    existing = candidates.get(field)
+    evidence = {
+        "value_candidate": value,
+        "raw_value": str(raw_value),
+        "bbox": dict(bbox),
+        "candidate_source": source,
+        "review_reason": "recovered_by_exact_cell_ocr",
+        "auto_trusted": False,
+    }
+    if isinstance(existing, dict):
+        if existing.get("value_candidate") == value:
+            sources = list(existing.get("evidence_sources") or [])
+            for item in (existing.get("candidate_source"), source):
+                if item and item not in sources:
+                    sources.append(item)
+            existing = dict(existing)
+            existing["evidence_sources"] = sources
+            existing["auto_trusted"] = False
+            candidates[field] = existing
+        else:
+            alternatives = list(metadata.get("alternative_value_candidates") or [])
+            alternatives.append({"field": field, **evidence})
+            metadata["alternative_value_candidates"] = alternatives
+            reasons = list(metadata.get("review_reasons") or [])
+            if "secondary_conflict" not in reasons:
+                reasons.append("secondary_conflict")
+            metadata["review_reasons"] = reasons
+            metadata["value_candidates"] = candidates
+            return True
+    else:
+        candidates[field] = evidence
+    metadata["value_candidates"] = candidates
+    reasons = list(metadata.get("review_reasons") or [])
+    if "recovered_by_exact_cell_ocr" not in reasons:
+        reasons.append("recovered_by_exact_cell_ocr")
+    metadata["review_reasons"] = reasons
+    return True
 
 
 def record_secondary_conflict(row: OcrRow, field: str, candidate: dict) -> None:

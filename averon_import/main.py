@@ -426,6 +426,7 @@ def export(document_id: str, request: ExportRequest):
     filename = safe_filename(request.filename)
     output = workspace.exports_dir / filename
     try:
+        stored_result = workspace_service.read_json(workspace.result_path, default={})
         export_service.export(
             rows=request.rows,
             columns=request.columns,
@@ -433,6 +434,7 @@ def export(document_id: str, request: ExportRequest):
             sheet_name=request.sheet_name,
             include_headers=request.include_headers,
             only_exportable=request.only_exportable,
+            page_statuses=stored_result.get("page_statuses") or {},
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
