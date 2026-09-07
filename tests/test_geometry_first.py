@@ -1010,6 +1010,33 @@ def test_mixed_header_and_product_line_is_not_trusted_as_header(mixed_line):
     assert header_rows == set()
 
 
+@pytest.mark.parametrize(
+    "mixed_header",
+    [
+        "Наименование,\nНасос",
+        "Наименование:\nКлапан",
+        "Наименование,\nОборудование",
+    ],
+)
+def test_capitalized_line_after_header_punctuation_is_not_consumed(mixed_header):
+    headers = [
+        "Позиция", mixed_header, "Тип, марка", "Код",
+        "Изготовитель", "Единица измерения", "Количество", "Масса",
+    ]
+    detected = _build_detected_table(
+        {"columnCount": len(headers), "cells": [
+            _schema_table_cell(text, 0, column, len(headers))
+            for column, text in enumerate(headers)
+        ]},
+        "yandex_table",
+        0,
+    )
+    assert detected is not None
+    mapping, header_rows = _table_header_mapping(detected)
+    assert mapping is None
+    assert header_rows == set()
+
+
 def test_first_physical_body_rows_are_not_consumed_as_header_rows():
     headers = ["Позиция", "Наименование", "Тип, марка", "Ед. изм.", "Количество"]
     body_rows = [

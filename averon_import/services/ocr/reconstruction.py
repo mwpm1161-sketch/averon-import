@@ -314,13 +314,17 @@ def _looks_like_body_row(
         if compact in known_units:
             return True
         normalized = line.strip()
-        return bool(
-            (
-                previous_line.strip().endswith(("-", ",", ":", ";"))
-                or (normalized[:1].islower() and normalized.endswith("-"))
+        if normalized[:1].islower() and normalized.endswith("-"):
+            return bool(re.fullmatch(r"[а-яёa-z]+", compact))
+        previous = previous_line.strip()
+        if previous.endswith("-"):
+            return bool(re.fullmatch(r"[а-яёa-z]+", compact))
+        if previous.endswith((",", ":", ";")):
+            return bool(
+                normalized[:1].islower()
+                and re.fullmatch(r"[а-яёa-z]+", compact)
             )
-            and re.fullmatch(r"[а-яёa-z]+", compact)
-        )
+        return False
 
     def line_has_body_evidence(
         line: str,
@@ -333,14 +337,14 @@ def _looks_like_body_row(
         compact = re.sub(r"[^а-яёa-z0-9]+", "", normalized.lower())
         if re.fullmatch(r"-?\d+(?:[.,]\d+)?", normalized):
             return True
-        if is_header_qualifier(normalized, previous_line, cell_header_keys):
-            return False
-        if compact in known_units:
-            return True
         if any(
             compact == word or compact.startswith(word)
             for word in product_words
-        ):
+        ) and normalized[:1].isupper():
+            return True
+        if is_header_qualifier(normalized, previous_line, cell_header_keys):
+            return False
+        if compact in known_units:
             return True
         # A header label can contain several anchor words and punctuation;
         # an ordinary product/value line does not.  This also catches a body
