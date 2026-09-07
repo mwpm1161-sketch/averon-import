@@ -369,6 +369,37 @@ def test_structured_system_remains_system():
     assert row["row_type"] == "system"
 
 
+@pytest.mark.parametrize("values", [{"position": "2"}, {"name": "Насос"}])
+def test_structured_short_identity_row_is_not_loose_system(tmp_path, values):
+    rows = SpecificationRowAssembler().build_page(
+        1,
+        [
+            _structured_ocr_row({"name": "Водоснабжение"}),
+            _structured_ocr_row(values),
+        ],
+    )
+    row = rows[1]
+    assert row["row_type"] == "item_candidate"
+    assert "physical_row_unresolved" in row["review_reasons"]
+    with pytest.raises(ValueError, match="Не проверено"):
+        ExcelExportService().export(
+            rows,
+            ["position", "name", "unit", "quantity", "mass"],
+            tmp_path / "blocked.xlsx",
+        )
+
+
+def test_structured_confirmed_short_system_remains_system():
+    rows = SpecificationRowAssembler().build_page(
+        1,
+        [
+            _structured_ocr_row({"name": "Водоснабжение"}),
+            _structured_ocr_row({"name": "К1"}),
+        ],
+    )
+    assert rows[1]["row_type"] == "system"
+
+
 def test_structured_bullet_component_remains_component():
     row = SpecificationRowAssembler().build_page(
         1, [_structured_ocr_row({"name": "- датчик температуры"})]

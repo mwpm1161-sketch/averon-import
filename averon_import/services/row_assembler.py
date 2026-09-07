@@ -76,12 +76,21 @@ class SpecificationRowAssembler:
         nonempty_fields = [
             key for key, value in values.items() if str(value).strip()
         ]
+        structured_geometry = (
+            metadata.get("structured_table")
+            and metadata.get("provider_has_explicit_rows")
+            and metadata.get("reconstruction_mode") == "geometry_first"
+        )
         if (
             row_type == "note"
             and self.current_section
             and len(nonempty_fields) == 1
             and nonempty_fields[0] in {"name", "position"}
             and len(name or position) <= 5
+            and (
+                not structured_geometry
+                or self.SYSTEM_RE.fullmatch((name or position).replace(" ", ""))
+            )
         ):
             row_type = "system"
 
