@@ -266,24 +266,81 @@ def _looks_like_body_row(
     discovery must never interpret a product word such as ``Изделие`` as a
     new header merely because an anchor is a substring of it.
     """
-    texts = [
-        _cell_text(cell).strip()
-        for column in range(max(column_count, 1))
-        for cell in [_cell_covering(grid, row, column)]
-        if cell and _cell_text(cell).strip()
-    ]
-    if not texts:
+    row_cells: list[DetectedCell | dict] = []
+    seen_cells: set[int] = set()
+    for column in range(max(column_count, 1)):
+        cell = _cell_covering(grid, row, column)
+        if not cell or not _cell_text(cell).strip() or id(cell) in seen_cells:
+            continue
+        seen_cells.add(id(cell))
+        row_cells.append(cell)
+    if not row_cells:
         return False
+    texts = [_cell_text(cell).strip() for cell in row_cells]
     known_units = {"шт", "м", "м2", "м3", "кг", "компл", "пм", "л", "кт"}
+    product_words = {"изделие", "оборудование", "материал"}
 
-    def line_has_body_evidence(line: str) -> bool:
+    # A real header is strong only when independent cells contribute several
+    # distinct anchors.  This prevents a merged/header-like product cell from
+    # making the whole row look safe merely because one substring matched.
+    anchored_cells = [
+        (_cell_text(cell), _match_header_keys(_cell_text(cell)))
+        for cell in row_cells
+        if _match_header_keys(_cell_text(cell))
+    ]
+    row_header_keys = {
+        key
+        for _text, keys in anchored_cells
+        for key in keys
+    }
+    strong_header = len(anchored_cells) >= 3 and len(row_header_keys) >= 3
+
+    def is_header_qualifier(
+        line: str,
+        previous_line: str,
+        cell_header_keys: tuple[str, ...],
+    ) -> bool:
+        """Recognize safe OCR/header continuations inside an anchored cell.
+
+        Yandex frequently splits a wrapped label at a hyphen (``Коли-`` /
+        ``чество``) and emits a unit qualifier on its own line (``кг.``).
+        Those fragments are not body evidence when the same cell is part of a
+        strong multi-column header.  Product text, numeric values, and other
+        ordinary lines deliberately do not match this narrow rule.
+        """
+        if not strong_header or not cell_header_keys:
+            return False
+        compact = re.sub(r"[^а-яёa-z0-9]+", "", line.strip().lower())
+        if compact in known_units:
+            return True
+        normalized = line.strip()
+        return bool(
+            (
+                previous_line.strip().endswith(("-", ",", ":", ";"))
+                or (normalized[:1].islower() and normalized.endswith("-"))
+            )
+            and re.fullmatch(r"[а-яёa-z]+", compact)
+        )
+
+    def line_has_body_evidence(
+        line: str,
+        previous_line: str,
+        cell_header_keys: tuple[str, ...],
+    ) -> bool:
         normalized = line.strip()
         if not normalized:
             return False
         compact = re.sub(r"[^а-яёa-z0-9]+", "", normalized.lower())
         if re.fullmatch(r"-?\d+(?:[.,]\d+)?", normalized):
             return True
+        if is_header_qualifier(normalized, previous_line, cell_header_keys):
+            return False
         if compact in known_units:
+            return True
+        if any(
+            compact == word or compact.startswith(word)
+            for word in product_words
+        ):
             return True
         # A header label can contain several anchor words and punctuation;
         # an ordinary product/value line does not.  This also catches a body
@@ -291,16 +348,18 @@ def _looks_like_body_row(
         # the header row.
         return not bool(_match_header_keys(normalized))
 
-    if any(
-        line_has_body_evidence(line)
-        for text in texts
-        for line in text.splitlines()
-    ):
-        return True
+    for text, cell_header_keys in [
+        (_cell_text(cell), _match_header_keys(_cell_text(cell)))
+        for cell in row_cells
+    ]:
+        previous_line = ""
+        for line in text.splitlines():
+            if line_has_body_evidence(line, previous_line, cell_header_keys):
+                return True
+            previous_line = line
     # These words are valid header anchors too, but when they appear as a
     # populated product cell alongside other body cells they are evidence of
     # an item, not proof that the row is a header.
-    product_words = {"изделие", "оборудование", "материал"}
     if any(
         re.sub(r"[^а-яёa-z0-9]+", "", text.lower()) in product_words
         for text in texts

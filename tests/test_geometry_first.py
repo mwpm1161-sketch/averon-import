@@ -30,6 +30,8 @@ from averon_import.services.ocr.raster_grid import (
     prepare_exact_cell_crop,
 )
 from averon_import.services.ocr.reconstruction import (
+    _build_detected_table,
+    _table_header_mapping,
     reconstruct_page_rows,
     rows_from_physical_grid,
 )
@@ -922,6 +924,90 @@ def test_header_scan_stops_before_body_word_that_contains_an_anchor():
     assert len(rows) == 1
     assert rows[0].values["name"] == "Изделие специальное"
     assert rows[0].metadata["source_row_index"] == 1
+
+
+def test_real_multiline_mass_header_maps_supported_schema():
+    headers = [
+        "Позиция",
+        "Наименование и техническая характеристика",
+        "Тип, марка,\nобозначение документа,\nопросного листа",
+        "Код обору-\nдования,\nизделия,\nматериала",
+        "Завод-\nизготовитель\n(поставщик)",
+        "Еди-\nница\nизме-\nрения",
+        "Коли-\nчество",
+        "Масса единицы,\nкг.\nПримечания",
+    ]
+    values = ["1", "Насос-1", "N1", "C1", "Завод", "шт.", "1", "2"]
+    payload = {
+        "page": {"width": 3000, "height": 300},
+        "textAnnotation": {"tables": [{
+            "rowCount": 2,
+            "columnCount": len(headers),
+            "cells": [
+                _schema_table_cell(text, row, column, len(headers))
+                for row, row_values in enumerate((headers, values))
+                for column, text in enumerate(row_values)
+            ],
+        }]},
+    }
+    detected = _build_detected_table(
+        payload["textAnnotation"]["tables"][0], "yandex_table", 0
+    )
+    assert detected is not None
+    mapping, header_rows = _table_header_mapping(detected)
+    assert mapping is not None
+    assert header_rows == {0}
+
+    diagnostics: dict = {}
+    rows = reconstruct_page_rows(payload, "yandex_vision", diagnostics=diagnostics)
+
+    assert diagnostics["schema"]["status"] == SUPPORTED
+    assert len(rows) == 1
+    assert rows[0].values["name"] == "Насос-1"
+    assert rows[0].values["quantity"] == "1"
+
+
+def test_header_unit_qualifier_is_not_body_evidence():
+    headers = [
+        "Позиция", "Наименование", "Тип, марка", "Код",
+        "Изготовитель", "Единица измерения", "Количество",
+        "Масса единицы,\nкг.",
+    ]
+    detected = _build_detected_table(
+        {"columnCount": len(headers), "cells": [
+            _schema_table_cell(text, 0, column, len(headers))
+            for column, text in enumerate(headers)
+        ]},
+        "yandex_table",
+        0,
+    )
+    assert detected is not None
+    mapping, header_rows = _table_header_mapping(detected)
+    assert mapping is not None
+    assert header_rows == {0}
+
+
+@pytest.mark.parametrize(
+    "mixed_line",
+    ["Насос-1", "Изделие специальное", "Оборудование вентиляции"],
+)
+def test_mixed_header_and_product_line_is_not_trusted_as_header(mixed_line):
+    headers = [
+        "Позиция", f"Наименование\n{mixed_line}", "Тип, марка", "Код",
+        "Изготовитель", "Единица измерения", "Количество", "Масса",
+    ]
+    detected = _build_detected_table(
+        {"columnCount": len(headers), "cells": [
+            _schema_table_cell(text, 0, column, len(headers))
+            for column, text in enumerate(headers)
+        ]},
+        "yandex_table",
+        0,
+    )
+    assert detected is not None
+    mapping, header_rows = _table_header_mapping(detected)
+    assert mapping is None
+    assert header_rows == set()
 
 
 def test_first_physical_body_rows_are_not_consumed_as_header_rows():
