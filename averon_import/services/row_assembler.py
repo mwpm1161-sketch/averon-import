@@ -96,6 +96,20 @@ class SpecificationRowAssembler:
         if row_type == "item" and "компл" in name.lower() and values.get("quantity"):
             self.component_block_active = True
 
+        # In a provider-structured specification, a physical body row that
+        # contains only identity evidence is not a harmless free-text note.
+        # Keep proven sections, systems and bullet components on their
+        # existing paths; all other identity-only structured rows remain
+        # reviewable candidates until critical values are resolved.
+        if (
+            row_type == "note"
+            and metadata.get("structured_table")
+            and metadata.get("provider_has_explicit_rows")
+            and metadata.get("reconstruction_mode") == "geometry_first"
+            and (name or position)
+        ):
+            row_type = "item_candidate"
+
         if row_type == "section":
             self.current_section = name.rstrip(":*") or position
             self.current_system = ""

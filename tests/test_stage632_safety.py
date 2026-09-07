@@ -319,6 +319,78 @@ def test_partially_ocrd_final_item_row_is_not_dropped_as_service_tail(tmp_path, 
         )
 
 
+def _structured_ocr_row(values: dict[str, str]) -> OcrRow:
+    return OcrRow(
+        source_row=1,
+        values=values,
+        confidences={},
+        sources={},
+        bbox={},
+        metadata={
+            "provider": "yandex_vision",
+            "structured_table": True,
+            "provider_has_explicit_rows": True,
+            "reconstruction_mode": "geometry_first",
+            "schema_assessment": {"status": "supported"},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"name": "Насос НЦ-50"},
+        {"position": "2"},
+    ],
+)
+def test_structured_identity_only_body_row_is_export_blocked(tmp_path, values):
+    row = SpecificationRowAssembler().build_page(1, [_structured_ocr_row(values)])[0]
+    assert row["row_type"] == "item_candidate"
+    assert "physical_row_unresolved" in row["review_reasons"]
+    with pytest.raises(ValueError, match="Не проверено"):
+        ExcelExportService().export(
+            [row],
+            ["position", "name", "unit", "quantity", "mass"],
+            tmp_path / "blocked.xlsx",
+        )
+
+
+def test_structured_section_remains_section():
+    row = SpecificationRowAssembler().build_page(
+        1, [_structured_ocr_row({"name": "Водоснабжение"})]
+    )[0]
+    assert row["row_type"] == "section"
+
+
+def test_structured_system_remains_system():
+    row = SpecificationRowAssembler().build_page(
+        1, [_structured_ocr_row({"name": "К1"})]
+    )[0]
+    assert row["row_type"] == "system"
+
+
+def test_structured_bullet_component_remains_component():
+    row = SpecificationRowAssembler().build_page(
+        1, [_structured_ocr_row({"name": "- датчик температуры"})]
+    )[0]
+    assert row["row_type"] == "component"
+
+
+def test_unstructured_ordinary_note_remains_note():
+    row = SpecificationRowAssembler().build_page(
+        1,
+        [OcrRow(
+            source_row=1,
+            values={"name": "Примечание к чертежу"},
+            confidences={},
+            sources={},
+            bbox={},
+            metadata={"provider": "yandex_vision"},
+        )],
+    )[0]
+    assert row["row_type"] == "note"
+
+
 def _raster_with_rows(values: list[str]) -> tuple[RasterGridPage, PhysicalGrid]:
     grid = _normalized_grid(len(values), 3)
     image = np.full((len(values) * 100, 300), 255, dtype=np.uint8)
