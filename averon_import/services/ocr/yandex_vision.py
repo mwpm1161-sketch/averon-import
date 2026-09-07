@@ -55,6 +55,7 @@ from averon_import.services.ocr.raster_grid import (
     RasterRuledTableGridDetector,
     crop_has_glyph,
     encode_png,
+    physical_row_raster_witness,
     prepare_exact_cell_crop,
 )
 from averon_import.services.review_policy import CRITICAL_FIELDS, critical_field_count, is_critical_values
@@ -1210,6 +1211,29 @@ class YandexVisionProvider:
                     stats["secondary_recovered"] += secondary_result[
                         "secondary_recovered"
                     ]
+                if (
+                    raster is not None
+                    and physical_grid is not None
+                    and reconstruction_diagnostics.get("selected_mode") == "geometry_first"
+                ):
+                    covered_rows = {
+                        int(row.metadata.get("source_row_index"))
+                        for row in rows
+                        if isinstance(row.metadata, dict)
+                        and str(row.metadata.get("source_row_index", "")).lstrip("-").isdigit()
+                    }
+                    witness = physical_row_raster_witness(
+                        raster,
+                        physical_grid,
+                        reconstruction_diagnostics.get("physical_body_row_indexes"),
+                        covered_rows,
+                    )
+                    reconstruction_diagnostics["physical_row_coverage"] = witness
+                    if witness.get("suspected_loss_rows"):
+                        reconstruction_diagnostics["physical_row_loss_suspected"] = True
+                        reconstruction_diagnostics["physical_row_loss_rows"] = list(
+                            witness["suspected_loss_rows"]
+                        )
                 self._exact_cell_verify_page(
                     number,
                     raster,

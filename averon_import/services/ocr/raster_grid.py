@@ -61,6 +61,109 @@ def _vertical_coverage(mask: np.ndarray, x: int, top: int, bottom: int) -> float
     return float(np.count_nonzero(occupied) / max(1, bottom - top))
 
 
+def physical_row_raster_witness(
+    raster: RasterGridPage,
+    grid: PhysicalGrid,
+    body_row_indexes: set[int] | list[int] | tuple[int, ...] | None,
+    covered_row_indexes: set[int] | list[int] | tuple[int, ...] | None,
+) -> dict:
+    """Compare non-line raster evidence with reconstructed physical rows.
+
+    This is deliberately a witness, not an OCR decision.  It only says that
+    a selected body band contains visible ink after the detected rules are
+    removed and that no geometry output row references that band.
+    """
+    grayscale = raster.grayscale
+    line_mask = raster.line_mask
+    if grayscale.ndim != 2 or line_mask.shape != grayscale.shape:
+        return {
+            "available": False,
+            "body_row_indexes": [],
+            "raster_nonempty_rows": [],
+            "covered_row_indexes": [],
+            "suspected_loss_rows": [],
+        }
+    body_rows = {
+        int(value) for value in (body_row_indexes or [])
+        if isinstance(value, (int, np.integer)) or str(value).lstrip("-").isdigit()
+    }
+    covered_rows = {
+        int(value) for value in (covered_row_indexes or [])
+        if isinstance(value, (int, np.integer)) or str(value).lstrip("-").isdigit()
+    }
+    if not body_rows:
+        return {
+            "available": True,
+            "body_row_indexes": [],
+            "raster_nonempty_rows": [],
+            "covered_row_indexes": sorted(covered_rows),
+            "suspected_loss_rows": [],
+        }
+    height, width = grayscale.shape
+    ink = grayscale < 220
+    # The detector's line mask is intentionally expanded a little so a rule's
+    # antialiased edge cannot be mistaken for a glyph component.
+    expanded_lines = cv2.dilate(
+        (line_mask > 0).astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+    ) > 0
+    ink[expanded_lines] = False
+    row_metrics: dict[str, dict[str, int | float | bool]] = {}
+    nonempty: set[int] = set()
+    for row_index in sorted(body_rows):
+        if not 0 <= row_index < grid.row_count:
+            continue
+        left, top, right, bottom = grid.bounds
+        x0 = max(0, min(width, int(round(left * width))))
+        x1 = max(x0, min(width, int(round(right * width))))
+        y0 = max(0, min(height, int(round(grid.y_boundaries[row_index] * height))))
+        y1 = max(y0, min(height, int(round(grid.y_boundaries[row_index + 1] * height))))
+        crop = (ink[y0:y1, x0:x1]).astype(np.uint8) * 255
+        component_count = 0
+        meaningful_area = 0
+        if crop.size:
+            count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                crop, 8
+            )
+            cell_area = max(1, (x1 - x0) * (y1 - y0))
+            minimum_area = max(4, int(cell_area * 0.00001))
+            for component in stats[1:count]:
+                component_width = int(component[cv2.CC_STAT_WIDTH])
+                component_height = int(component[cv2.CC_STAT_HEIGHT])
+                area = int(component[cv2.CC_STAT_AREA])
+                if area < minimum_area:
+                    continue
+                # A remaining page-sized stroke is more likely a detector
+                # defect than a glyph.  Normal text components stay well
+                # inside the physical row band.
+                if component_width >= (x1 - x0) * 0.85 and component_height <= 4:
+                    continue
+                if component_height >= (y1 - y0) * 0.85 and component_width <= 4:
+                    continue
+                component_count += 1
+                meaningful_area += area
+        is_nonempty = bool(
+            component_count
+            and meaningful_area >= max(8, int(max(1, (x1 - x0) * (y1 - y0)) * 0.00002))
+        )
+        row_metrics[str(row_index)] = {
+            "component_count": component_count,
+            "meaningful_ink_area": meaningful_area,
+            "nonempty": is_nonempty,
+        }
+        if is_nonempty:
+            nonempty.add(row_index)
+    suspected = sorted(nonempty - covered_rows)
+    return {
+        "available": True,
+        "body_row_indexes": sorted(body_rows),
+        "raster_nonempty_rows": sorted(nonempty),
+        "covered_row_indexes": sorted(covered_rows),
+        "suspected_loss_rows": suspected,
+        "row_metrics": row_metrics,
+    }
+
+
 class RasterRuledTableGridDetector:
     """Detect a dominant ruled table without assuming a schema column count."""
 
@@ -267,6 +370,33 @@ class RasterRuledTableGridDetector:
             < offset_y + y + item_height / 2
             < image_height * 0.95
         ]
+        # A divider with one missing physical column segment can be split
+        # into contour fragments too short for the broad-contour filter
+        # above. Recover only its Y candidate from the horizontal projection;
+        # per-column support below remains the trust decision. Text cannot
+        # enter this mask because it was opened with a long horizontal kernel.
+        horizontal_projection = np.count_nonzero(horizontal > 0, axis=1)
+        projection_threshold = max(1, int(region_width * 0.45))
+        projection_mask = (horizontal_projection >= projection_threshold).astype(np.uint8)
+        existing_y_min = min(y_values, default=None)
+        existing_y_max = max(y_values, default=None)
+        projection_count, projection_labels, _projection_stats, _ = cv2.connectedComponentsWithStats(
+            projection_mask, 8
+        )
+        for projection_index in range(1, projection_count):
+            _x, projection_y, _projection_width, projection_height = cv2.boundingRect(
+                np.uint8(projection_labels == projection_index)
+            )
+            if projection_height <= 0:
+                continue
+            center = projection_y + projection_height / 2
+            if (
+                existing_y_min is not None
+                and existing_y_max is not None
+                and existing_y_min <= center <= existing_y_max
+                and image_height * 0.01 < offset_y + center < image_height * 0.95
+            ):
+                y_values.append(center)
         contours, _hierarchy = cv2.findContours(
             vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -432,6 +562,21 @@ class RasterRuledTableGridDetector:
         unsupported_span_segments = sum(1 for value in segment_support if value < 0.55)
         if unsupported_span_segments:
             reasons.append("merged_cell_span_ambiguity")
+        horizontal_segment_support = [
+            _horizontal_coverage(
+                horizontal,
+                y,
+                x_lines[column_index],
+                x_lines[column_index + 1],
+            )
+            for y in y_lines[1:-1]
+            for column_index in range(len(x_lines) - 1)
+        ]
+        unsupported_horizontal_span_segments = sum(
+            1 for value in horizontal_segment_support if value < 0.55
+        )
+        if unsupported_horizontal_span_segments:
+            reasons.append("merged_cell_span_ambiguity")
         high_confidence = confidence >= self.high_confidence_threshold and not reasons
         if not high_confidence and not reasons:
             reasons.append("confidence_below_threshold")
@@ -471,6 +616,7 @@ class RasterRuledTableGridDetector:
             "small_row_gap_count": len(small_row_gaps),
             "small_column_gap_count": len(small_column_gaps),
             "unsupported_span_segment_count": unsupported_span_segments,
+            "unsupported_horizontal_span_segment_count": unsupported_horizontal_span_segments,
             "minimum_horizontal_boundary_support": round(
                 min(horizontal_scores, default=0.0), 4
             ),

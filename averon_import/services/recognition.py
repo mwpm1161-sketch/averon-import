@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Callable
 
@@ -83,6 +84,8 @@ class RecognitionService:
         total = len(pages)
         for page_result in ocr_result.pages:
             page_number = page_result.page
+            page_rows: list[dict] = []
+            assembler_state = deepcopy(getattr(assembler, "__dict__", {}))
             try:
                 assembler.begin_page(page_number)
                 raw_rows = assembler.prepare(page_result.rows)
@@ -98,8 +101,31 @@ class RecognitionService:
                         "diagnostics": {"errors": list(page_result.errors)},
                     }
                 for raw in raw_rows:
-                    all_rows.append(assembler.build_row(page_number, raw))
+                    page_rows.append(assembler.build_row(page_number, raw))
+                all_rows.extend(page_rows)
             except Exception as exc:
+                # A failed page is atomic: neither partially built rows nor
+                # assembler context from that page may leak into the result.
+                page_rows.clear()
+                if hasattr(assembler, "__dict__"):
+                    assembler.__dict__.clear()
+                    assembler.__dict__.update(assembler_state)
+                existing_status = dict(page_statuses.get(str(page_number)) or {})
+                existing_status.update({
+                    "page": page_number,
+                    "output_status": "NO_SPEC_OUTPUT",
+                })
+                existing_status.setdefault("layout_status", "FAILED")
+                existing_status.setdefault("schema_status", "UNKNOWN")
+                blockers = list(existing_status.get("blockers") or [])
+                if "assembly_error" not in blockers:
+                    blockers.append("assembly_error")
+                existing_status["blockers"] = blockers
+                diagnostics = existing_status.get("diagnostics")
+                diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+                diagnostics["assembly_error"] = str(exc)[:500]
+                existing_status["diagnostics"] = diagnostics
+                page_statuses[str(page_number)] = existing_status
                 errors.append({"page": page_number, "error": str(exc)})
             for message in page_result.errors:
                 errors.append({"page": page_number, "error": message})

@@ -23,24 +23,54 @@ class ExcelExportService:
         include_headers: bool = True,
         only_exportable: bool = True,
         page_statuses: dict | list[dict] | None = None,
+        enforce_safety: bool = True,
     ) -> Path:
         valid_columns = [column for column in columns if column in COLUMN_BY_KEY]
         if not valid_columns:
             raise ValueError("Не выбрано ни одного столбца для экспорта")
 
-        if only_exportable:
+        if enforce_safety:
             page_blockers = []
-            status_items = (
+            status_items = list(
                 page_statuses.values()
                 if isinstance(page_statuses, dict)
                 else (page_statuses or [])
             )
+            if page_statuses is not None and not status_items and rows:
+                page_blockers.append(
+                    "страница ?: output_status=UNKNOWN; reason=missing_page_status"
+                )
+            status_pages: set[str] = set()
             for status in status_items:
                 if not isinstance(status, dict):
                     continue
                 page = status.get("page", "?")
+                status_pages.add(str(page))
+                output_status = str(status.get("output_status") or "").upper()
+                diagnostics = status.get("diagnostics")
+                diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+                reasons = [str(item) for item in (status.get("blockers") or []) if str(item)]
+                if diagnostics.get("fallback_reason"):
+                    reasons.append(f"reason={diagnostics['fallback_reason']}")
+                if output_status != "USABLE":
+                    detail = ", ".join(dict.fromkeys(reasons)) or "нет безопасного результата"
+                    page_blockers.append(
+                        f"страница {page}: output_status={output_status or 'UNKNOWN'}; {detail}"
+                    )
                 for blocker in status.get("blockers") or []:
-                    page_blockers.append(f"страница {page}: {blocker}")
+                    if output_status == "USABLE":
+                        page_blockers.append(f"страница {page}: {blocker}")
+            if page_statuses is not None:
+                row_pages = {
+                    str(row.get("page"))
+                    for row in rows
+                    if row.get("page") is not None
+                }
+                for page in sorted(row_pages - status_pages):
+                    page_blockers.append(
+                        f"страница {page}: output_status=UNKNOWN; "
+                        "reason=missing_page_status"
+                    )
             if page_blockers:
                 raise ValueError(
                     "Экспорт заблокирован проверками страниц: "

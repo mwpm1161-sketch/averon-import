@@ -1834,6 +1834,27 @@ def rows_from_physical_grid(
             return max(0, grid.row_count - 1)
         return None
 
+    def body_row_for_word(word: SpatialWord) -> int | None:
+        """Return the physical row for a word whose center is in the grid.
+
+        This intentionally uses the table X+Y membership rather than the
+        stricter cell-overlap threshold.  A very wide or clipped OCR box can
+        therefore be classified as an unassigned body word, while a stamp
+        outside the selected grid remains ignored.
+        """
+        center_x, center_y = word.center
+        if (
+            center_x < grid_left - membership_tolerance_x
+            or center_x > grid_right + membership_tolerance_x
+            or center_y < grid_top - membership_tolerance_y
+            or center_y > grid_bottom + membership_tolerance_y
+        ):
+            return None
+        for row_index in range(grid.row_count):
+            if grid.y_boundaries[row_index] <= center_y < grid.y_boundaries[row_index + 1]:
+                return row_index
+        return max(0, grid.row_count - 1) if center_y <= grid_bottom else None
+
     weak_critical: dict[tuple[int, int], list[dict[str, object]]] = {}
     filtered_assigned: dict[tuple[int, int], list[SpatialWord]] = {}
     for cell_key, cell_words in initial_assigned.items():
@@ -1881,6 +1902,19 @@ def rows_from_physical_grid(
                 diagnostics["assignment_safety"] = "schema_unsupported"
             return []
         return None
+    dropped_physical_rows = {
+        int(event.get("source_row_index"))
+        for event in local_diagnostics.get("events", [])
+        if isinstance(event, dict)
+        and event.get("drop_reason") == "trailing_service_block"
+        and str(event.get("source_row_index", "")).lstrip("-").isdigit()
+    }
+    physical_body_rows = {
+        row_index
+        for row_index in range(grid.row_count)
+        if row_index not in preflight_header_rows
+        and row_index not in dropped_physical_rows
+    }
     evidence = _primary_structural_evidence(payload, grid, width, height)
     conflict_rows: set[int] = set()
     for conflict in evidence.get("row_boundary_conflicts") or []:
@@ -1930,24 +1964,35 @@ def rows_from_physical_grid(
         for cell_key, values in filtered_assigned.items()
         if values and cell_key[0] not in preflight_header_rows
     }
+    unassigned_body_rows = {
+        row_index
+        for word in unassigned
+        for row_index in [body_row_for_word(word)]
+        if row_index is not None
+        and row_index not in preflight_header_rows
+        and row_index in physical_body_rows
+    }
+    # A single word inside a physical body row can be a critical value that
+    # failed cell assignment (for example a quantity beside an assigned
+    # name).  Do not let the presence of another assigned word make that row
+    # look complete.  Words outside the selected grid never enter this set.
     unresolved_body_rows = (
-        (ambiguous_rows | {
-            grid_row_for_word(word)
-            for word in unassigned
-            if grid_row_for_word(word) is not None
-            and grid_row_for_word(word) not in preflight_header_rows
-        })
-        - body_rows_with_filtered_words
+        (ambiguous_rows - body_rows_with_filtered_words)
+        | unassigned_body_rows
     )
     if unresolved_body_rows:
         if diagnostics is not None:
             diagnostics["assignment_safety"] = "fallback_required"
             diagnostics["assignment_fallback_reason"] = "ambiguous_or_unassigned_row"
             diagnostics["unresolved_body_rows"] = sorted(unresolved_body_rows)
+            diagnostics["unassigned_body_rows"] = sorted(unassigned_body_rows)
         return None
     if diagnostics is not None:
         diagnostics["assignment_safety"] = "geometry_usable"
         diagnostics["body_row_count"] = len(body_rows_with_words)
+        diagnostics["physical_body_row_indexes"] = sorted(physical_body_rows)
+        diagnostics["physical_header_row_indexes"] = sorted(preflight_header_rows)
+        diagnostics["physical_dropped_row_indexes"] = sorted(dropped_physical_rows)
         diagnostics["weak_critical_assignment_count"] = sum(
             len(values) for values in weak_critical.values()
         )
@@ -2046,6 +2091,7 @@ def rows_from_physical_grid(
             ),
             "ambiguous_word_count": len(ambiguous),
             "unassigned_word_count": len(unassigned),
+            "unassigned_body_row_count": len(unassigned_body_rows),
             "ambiguous_words": [
                 {
                     "text": item.word.text[:160],

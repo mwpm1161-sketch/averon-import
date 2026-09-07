@@ -112,6 +112,10 @@ def page_status_from_diagnostics(
         status.add_blocker("structural_boundary_conflict")
     if data.get("assignment_safety") == "fallback_required":
         status.add_blocker("physical_row_loss_suspected")
+    if data.get("physical_row_loss_suspected"):
+        status.add_blocker("physical_row_loss_suspected")
+    if data.get("assembly_error"):
+        status.add_blocker("assembly_error")
     if (
         row_count
         and not status.blockers
