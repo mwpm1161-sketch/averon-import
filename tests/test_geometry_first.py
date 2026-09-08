@@ -492,10 +492,12 @@ def test_geometry_mode_uses_grid_words_and_skips_incomplete_numbering_row():
     assert all(row.metadata["reconstruction_mode"] == "geometry_first" for row in rows)
     assert all("structural_disagreement" in row.metadata["review_reasons"] for row in rows)
     assert diagnostics["structural_evidence"]["column_count_conflict"] is True
-    assert diagnostics["schema"]["status"] == SUPPORTED
+    # The synthetic provider boundary conflict is now visible to SchemaGate;
+    # physical rows remain available, but the page is review-only.
+    assert diagnostics["schema"]["status"] == AMBIGUOUS
     assert diagnostics["header_mapping"]["mapping_status"] == "trusted"
     assert diagnostics["header_mapping"]["selected_mapping"]["6"] == ["quantity"]
-    assert page_status_from_diagnostics(18, diagnostics, row_count=len(rows)).schema_status == SUPPORTED.upper()
+    assert page_status_from_diagnostics(18, diagnostics, row_count=len(rows)).schema_status == AMBIGUOUS.upper()
 
 
 def test_shadow_mode_returns_legacy_rows_and_records_diff():

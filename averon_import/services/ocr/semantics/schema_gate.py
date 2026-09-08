@@ -29,6 +29,9 @@ class SchemaGateEvidence:
     safe_relevant_structure: bool = True
     illegal_critical_combination: bool = False
     structural_reasons: tuple[str, ...] = ()
+    critical_boundary_conflicts: tuple[Any, ...] = ()
+    material_column_conflict: bool = False
+    unsafe_physical_column_anchoring: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -36,6 +39,9 @@ class SchemaGateEvidence:
             "safe_relevant_structure": self.safe_relevant_structure,
             "illegal_critical_combination": self.illegal_critical_combination,
             "structural_reasons": list(self.structural_reasons),
+            "critical_boundary_conflicts": list(self.critical_boundary_conflicts),
+            "material_column_conflict": self.material_column_conflict,
+            "unsafe_physical_column_anchoring": self.unsafe_physical_column_anchoring,
         }
 
 
@@ -97,6 +103,13 @@ class SchemaGate:
         mapped_fields = _fields(mapping)
         reasons: list[str] = list(mapping.reasons)
         decision: list[str] = []
+        structural_blockers: list[str] = []
+        if evidence.critical_boundary_conflicts:
+            structural_blockers.append("critical_boundary_conflicts")
+        if evidence.material_column_conflict:
+            structural_blockers.append("material_column_conflict")
+        if evidence.unsafe_physical_column_anchoring:
+            structural_blockers.append("unsafe_physical_column_anchoring")
         illegal = bool(evidence.illegal_critical_combination)
         multi_field_columns = [
             column for column, values in mapping.mapping.items()
@@ -128,6 +141,7 @@ class SchemaGate:
         if evidence.header_body_conflict or "header_body_conflict" in mapping.reasons:
             reasons.append("header_body_conflict")
         reasons.extend(evidence.structural_reasons)
+        reasons.extend(structural_blockers)
         if family.negative_evidence:
             reasons.append(
                 "negative_document_family:" + ",".join(
@@ -162,20 +176,30 @@ class SchemaGate:
             return SchemaAssessment(UNSUPPORTED, **base, reasons=tuple(dict.fromkeys(reasons)), decision_reasons=("confirmed_other_table",))
         if mapping.status != "trusted":
             decision.append("mapping_not_trusted")
-            status = AMBIGUOUS if mapping.mapping else UNSUPPORTED
-        elif missing_core or illegal or evidence.header_body_conflict or not evidence.safe_relevant_structure:
+            # A supported-family signal does not turn an unavailable/ambiguous
+            # mapper into an unsupported table.  The physical evidence remains
+            # reviewable, but no semantic rows are accepted.
+            status = AMBIGUOUS
+        elif missing_core or illegal or evidence.header_body_conflict or not evidence.safe_relevant_structure or structural_blockers:
             status = AMBIGUOUS
             decision.append("critical_schema_evidence_incomplete")
         elif family.family == "SUPPORTED_SPECIFICATION":
-            status = SUPPORTED
-            decision.append("positive_family_evidence")
+            if "semantic_coverage_too_low" in reasons:
+                status = UNSUPPORTED
+                decision.append("semantic_coverage_too_low")
+            else:
+                status = SUPPORTED
+                decision.append("positive_family_evidence")
         elif family.family == AMBIGUOUS_FAMILY:
             canonical_ready = (
-                "family_context_missing" in family.reasons
+                family.reasons == ("family_context_missing",)
+                and not family.negative_evidence
                 and len(mapped_fields) >= 6
                 and not duplicate_fields
                 and not multi_field_columns
                 and mapping.status == "trusted"
+                and not missing_core
+                and "semantic_coverage_too_low" not in reasons
             )
             if canonical_ready:
                 status = SUPPORTED

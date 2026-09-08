@@ -9,6 +9,7 @@ input to this contract.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Any, Iterable
 
 
@@ -96,15 +97,13 @@ def bounded_context_from_words(
 ) -> BoundedFamilyContext:
     """Collect only nearby text above ``table_bounds``.
 
-    The distance is derived from the table height and page height rather than
-    from a document/page number.  At most the nearest contiguous line cluster
-    is retained, which prevents unrelated page prose from becoming family
-    evidence.
+    The distance is derived from nearby text geometry and hard-capped to a
+    small page-relative region.  Table height is deliberately not allowed to
+    expand the context: a tall table must not make distant page prose look
+    like its caption.
     """
     left, top, right, _bottom = table_bounds
-    table_height = max(1.0, table_bounds[3] - top)
-    distance_limit = max(table_height * 0.75, page_height * 0.08)
-    candidates: list[tuple[float, float, str, int, Bounds]] = []
+    raw_candidates: list[tuple[float, float, str, int, Bounds]] = []
     for index, word in enumerate(words):
         bounds = _word_bounds(word)
         text = str(word.get("text") or "").strip()
@@ -117,14 +116,27 @@ def bounded_context_from_words(
         if overlap / max(1e-9, word_right - word_left) < 0.35:
             continue
         distance = top - word_bottom
-        if distance > distance_limit:
-            continue
         center = (word_top + word_bottom) / 2.0
-        candidates.append((center, distance, text, index, bounds))
+        raw_candidates.append((center, distance, text, index, bounds))
+    if not raw_candidates:
+        candidates: list[tuple[float, float, str, int, Bounds]] = []
+    else:
+        heights = [max(1.0, item[4][3] - item[4][1]) for item in raw_candidates]
+        nearby_height = max(1.0, float(median(heights)))
+        page_cap = page_height * 0.12 if page_height > 0 else nearby_height * 8.0
+        # Six nearby glyph heights permits a caption plus a compact title
+        # cluster, while the page-relative cap is an absolute upper bound.
+        distance_limit = min(page_cap, nearby_height * 6.0)
+        candidates = [item for item in raw_candidates if item[1] <= distance_limit]
     candidates.sort(key=lambda item: (item[0], item[3]))
     groups: list[list[tuple[float, float, str, int, Bounds]]] = []
+    line_height = max(
+        1.0,
+        float(median([max(1.0, item[4][3] - item[4][1]) for item in candidates]))
+        if candidates else 1.0,
+    )
     for item in candidates:
-        if not groups or item[0] - groups[-1][-1][0] > max(8.0, table_height * 0.035):
+        if not groups or item[0] - groups[-1][-1][0] > max(1.5 * line_height, 1.0):
             groups.append([item])
         else:
             groups[-1].append(item)
@@ -139,7 +151,7 @@ def bounded_context_from_words(
         for group in groups:
             if group is nearest:
                 continue
-            if nearest_top - max(item[0] for item in group) <= max(12.0, table_height * 0.10):
+            if nearest_top - max(item[0] for item in group) <= max(3.0 * line_height, 1.0):
                 selected.append(group)
         for group_index, group in enumerate(sorted(selected, key=lambda value: min(item[0] for item in value))):
             region_bounds = _union(item[4] for item in group) or (0.0, 0.0, 0.0, 0.0)

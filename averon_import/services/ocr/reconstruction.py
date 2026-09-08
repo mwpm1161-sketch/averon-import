@@ -1175,6 +1175,45 @@ def _record_diagnostic(diagnostics: dict | None, **entry) -> None:
     diagnostics.setdefault("events", []).append(entry)
 
 
+def _schema_gate_structural_evidence(
+    structural: dict | None,
+    *,
+    header_body_conflict: bool = False,
+) -> SchemaGateEvidence:
+    """Translate only schema-relevant geometry evidence into the gate.
+
+    Provider metadata disagreement (for example a harmless 10-vs-9 column
+    count) remains diagnostic.  Critical boundaries and explicitly marked
+    unsafe physical anchoring are different: they make the semantic schema
+    review-only while physical evidence is still retained.
+    """
+    evidence = structural if isinstance(structural, dict) else {}
+    critical = tuple(evidence.get("critical_boundary_conflicts") or ())
+    material = bool(
+        evidence.get("material_column_conflict")
+        or evidence.get("relevant_material_column_conflict")
+    )
+    unsafe = bool(
+        evidence.get("unsafe_physical_column_anchoring")
+        or evidence.get("unsafe_column_anchoring")
+    )
+    reasons: list[str] = []
+    if critical:
+        reasons.append("critical_boundary_conflicts")
+    if material:
+        reasons.append("material_column_conflict")
+    if unsafe:
+        reasons.append("unsafe_physical_column_anchoring")
+    return SchemaGateEvidence(
+        header_body_conflict=header_body_conflict,
+        safe_relevant_structure=not unsafe,
+        structural_reasons=tuple(reasons),
+        critical_boundary_conflicts=critical,
+        material_column_conflict=material,
+        unsafe_physical_column_anchoring=unsafe,
+    )
+
+
 def rows_from_tables(
     tables: list,
     denominator_x: float,
@@ -1245,14 +1284,6 @@ def rows_from_tables(
         # fullText must never become family or schema evidence.
     )
     family = DEFAULT_TABLE_FAMILY_CLASSIFIER.assess(family_context)
-    schema = DEFAULT_SCHEMA_GATE.assess(
-        column_count=table.column_count,
-        mapping=mapping_result,
-        family=family,
-        structural=SchemaGateEvidence(
-            header_body_conflict="header_body_conflict" in mapping_result.reasons,
-        ),
-    )
     if physical_evidence is None:
         physical_evidence = _physical_snapshot_for_table(
             table, mapping_result, words
@@ -1260,6 +1291,15 @@ def rows_from_tables(
     physical_evidence.family_assessment = family.as_dict()
     if precomputed_structural_evidence is not None:
         physical_evidence.structural_evidence = dict(precomputed_structural_evidence)
+    schema = DEFAULT_SCHEMA_GATE.assess(
+        column_count=table.column_count,
+        mapping=mapping_result,
+        family=family,
+        structural=_schema_gate_structural_evidence(
+            precomputed_structural_evidence,
+            header_body_conflict="header_body_conflict" in mapping_result.reasons,
+        ),
+    )
     if diagnostics is not None:
         diagnostics["family"] = family.as_dict()
         diagnostics["schema"] = schema.as_dict()
