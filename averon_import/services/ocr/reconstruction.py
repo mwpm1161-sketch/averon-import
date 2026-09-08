@@ -1693,11 +1693,54 @@ def _grid_as_detected_table(
     }
 
 
+def _structural_x_tolerance(grid: PhysicalGrid, width: float) -> float:
+    """Return one bounded X tolerance for provider/grid edge comparison."""
+    gaps = [
+        right - left
+        for left, right in zip(grid.x_boundaries, grid.x_boundaries[1:])
+        if right > left
+    ]
+    smallest_column = min(gaps or [1.0])
+    pixel_floor = 4.0 / max(width, 1.0)
+    pixel_target = 20.0 / max(width, 1.0)
+    return min(
+        smallest_column * 0.20,
+        max(pixel_floor, pixel_target, smallest_column * 0.16),
+    )
+
+
+def _cluster_boundaries(values: list[float], tolerance: float) -> list[float]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or value - (sum(groups[-1]) / len(groups[-1])) > tolerance:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [round(sum(group) / len(group), 6) for group in groups]
+
+
+def _critical_boundary_indexes(
+    grid: PhysicalGrid,
+    mapping: dict[int, tuple[str, ...]] | None,
+) -> set[int]:
+    critical = {"unit", "quantity", "mass"}
+    mapping = mapping or {}
+    indexes: set[int] = set()
+    for boundary_index in range(1, len(grid.x_boundaries) - 1):
+        adjacent = set(mapping.get(boundary_index - 1, ())) | set(
+            mapping.get(boundary_index, ())
+        )
+        if adjacent.intersection(critical):
+            indexes.add(boundary_index)
+    return indexes
+
+
 def _primary_structural_evidence(
     payload: dict,
     grid: PhysicalGrid,
     width: float,
     height: float,
+    mapping: dict[int, tuple[str, ...]] | None = None,
 ) -> dict:
     annotation = payload.get("textAnnotation")
     annotation = annotation if isinstance(annotation, dict) else {}
@@ -1707,9 +1750,19 @@ def _primary_structural_evidence(
             "available": False,
             "has_disagreement": False,
             "material_disagreement": False,
+            "material_column_disagreement": False,
+            "informational_column_disagreement": False,
             "row_boundary_conflicts": [],
             "column_boundary_conflicts": [],
             "column_count_conflict": False,
+            "provider_x_boundaries_raw": [],
+            "provider_x_boundaries_clustered": [],
+            "missing_grid_internal_boundaries": [],
+            "extra_provider_internal_boundaries": [],
+            "extra_provider_outer_boundaries": [],
+            "critical_boundary_conflicts": [],
+            "material_disagreement_reasons": [],
+            "informational_disagreement_reasons": [],
         }
     table = max(tables, key=lambda item: len(item.get("cells") or []))
     grouped: dict[int, list[tuple[float, float, float, float]]] = {}
@@ -1746,29 +1799,73 @@ def _primary_structural_evidence(
     column_conflict = bool(
         provider_columns and provider_columns != grid.column_count
     )
-    provider_x_edges = sorted({
+    provider_x_edges_raw = sorted({
         round(edge / width, 6)
         for boxes in grouped.values()
         for box in boxes
         for edge in (box[0], box[2])
     })
     grid_x_edges = [round(value, 6) for value in grid.x_boundaries]
-    boundary_tolerance = max(20.0 / width, 0.012)
-    column_boundary_conflicts = [
+    boundary_tolerance = _structural_x_tolerance(grid, width)
+    provider_x_edges_clustered = _cluster_boundaries(
+        provider_x_edges_raw, boundary_tolerance
+    )
+    missing_grid_internal_boundaries = [
         boundary
         for boundary in grid_x_edges[1:-1]
-        if not provider_x_edges
-        or min(abs(boundary - candidate) for candidate in provider_x_edges)
+        if not provider_x_edges_clustered
+        or min(
+            abs(boundary - candidate)
+            for candidate in provider_x_edges_clustered
+        )
         > boundary_tolerance
     ]
+    unmatched_provider = [
+        boundary
+        for boundary in provider_x_edges_clustered
+        if not grid_x_edges
+        or min(abs(boundary - candidate) for candidate in grid_x_edges)
+        > boundary_tolerance
+    ]
+    grid_left, grid_right = grid.x_boundaries[0], grid.x_boundaries[-1]
+    extra_provider_internal_boundaries = [
+        boundary
+        for boundary in unmatched_provider
+        if grid_left + boundary_tolerance < boundary < grid_right - boundary_tolerance
+    ]
+    extra_provider_outer_boundaries = [
+        boundary
+        for boundary in unmatched_provider
+        if boundary not in extra_provider_internal_boundaries
+    ]
     column_boundary_count_conflict = bool(
-        provider_x_edges
-        and len(provider_x_edges) != len(grid_x_edges)
+        provider_x_edges_raw
+        and len(provider_x_edges_raw) != len(grid_x_edges)
     )
-    material_disagreement = bool(
-        column_conflict
-        or column_boundary_conflicts
-        or column_boundary_count_conflict
+    critical_indexes = _critical_boundary_indexes(grid, mapping)
+    critical_boundary_conflicts = [
+        boundary
+        for boundary_index, boundary in enumerate(grid_x_edges)
+        if boundary_index in critical_indexes
+        and boundary in missing_grid_internal_boundaries
+    ]
+    for boundary in extra_provider_internal_boundaries:
+        containing_column = next(
+            (
+                index
+                for index, (left, right) in enumerate(
+                    zip(grid.x_boundaries, grid.x_boundaries[1:])
+                )
+                if left + boundary_tolerance < boundary < right - boundary_tolerance
+            ),
+            None,
+        )
+        if containing_column is not None and set(
+            (mapping or {}).get(containing_column, ())
+        ).intersection({"unit", "quantity", "mass"}):
+            critical_boundary_conflicts.append(boundary)
+    critical_boundary_conflicts = sorted(
+        {round(value, 6) for value in critical_boundary_conflicts}
     )
     # Vision's table model may collapse a trailing optional note column into
     # the mass cell while the physical grid correctly preserves it.  That is
@@ -1776,18 +1873,48 @@ def _primary_structural_evidence(
     # boundary shift.  The rule is generic: exactly one trailing provider
     # column is missing and the provider still agrees on the outer right edge.
     trailing_optional_collapse = bool(
-        len(column_boundary_conflicts) == 1
-        and abs(column_boundary_conflicts[0] - grid.x_boundaries[-2]) <= boundary_tolerance
-        and provider_x_edges
-        and abs(provider_x_edges[-1] - grid.x_boundaries[-1]) <= boundary_tolerance
+        len(missing_grid_internal_boundaries) == 1
+        and abs(missing_grid_internal_boundaries[0] - grid.x_boundaries[-2]) <= boundary_tolerance
+        and provider_x_edges_clustered
+        and abs(provider_x_edges_clustered[-1] - grid.x_boundaries[-1]) <= boundary_tolerance
         and all(
-            min(abs(edge - candidate) for candidate in provider_x_edges)
+            min(abs(edge - candidate) for candidate in provider_x_edges_clustered)
             <= boundary_tolerance
             for edge in grid.x_boundaries[1:-2]
         )
     )
     if trailing_optional_collapse:
-        material_disagreement = False
+        missing_grid_internal_boundaries = []
+        critical_boundary_conflicts = []
+    material_reasons: list[str] = []
+    if missing_grid_internal_boundaries:
+        material_reasons.append("missing_grid_internal_boundary")
+    if extra_provider_internal_boundaries:
+        material_reasons.append("extra_provider_internal_boundary")
+    if critical_boundary_conflicts:
+        material_reasons.append("critical_boundary_conflict")
+    material_column_disagreement = bool(material_reasons)
+    informational_reasons: list[str] = []
+    if column_conflict:
+        informational_reasons.append("provider_column_count_mismatch")
+    if column_boundary_count_conflict:
+        informational_reasons.append("provider_boundary_count_mismatch")
+    if len(provider_x_edges_raw) != len(provider_x_edges_clustered):
+        informational_reasons.append("provider_bbox_edge_jitter")
+    if extra_provider_outer_boundaries:
+        informational_reasons.append("extra_provider_outer_boundary")
+    if unique_conflicts:
+        informational_reasons.append("provider_row_merge")
+    if trailing_optional_collapse:
+        informational_reasons.append("trailing_optional_collapse")
+    informational_column_disagreement = bool(
+        column_conflict
+        or column_boundary_count_conflict
+        or extra_provider_outer_boundaries
+        or len(provider_x_edges_raw) != len(provider_x_edges_clustered)
+        or trailing_optional_collapse
+    )
+    material_disagreement = material_column_disagreement
     return {
         "available": True,
         "provider_row_count": provider_rows,
@@ -1797,16 +1924,116 @@ def _primary_structural_evidence(
         "row_boundary_conflicts": unique_conflicts,
         "row_boundary_conflict_count": len(unique_conflicts),
         "column_count_conflict": column_conflict,
-        "provider_x_boundaries": provider_x_edges,
+        "provider_x_boundaries": provider_x_edges_raw,
+        "provider_x_boundaries_raw": provider_x_edges_raw,
+        "provider_x_boundaries_clustered": provider_x_edges_clustered,
         "grid_x_boundaries": grid_x_edges,
-        "column_boundary_conflicts": column_boundary_conflicts,
-        "column_boundary_conflict_count": len(column_boundary_conflicts),
+        "column_boundary_conflicts": missing_grid_internal_boundaries,
+        "column_boundary_conflict_count": len(missing_grid_internal_boundaries),
+        "missing_grid_internal_boundaries": missing_grid_internal_boundaries,
+        "extra_provider_internal_boundaries": extra_provider_internal_boundaries,
+        "extra_provider_outer_boundaries": extra_provider_outer_boundaries,
+        "critical_boundary_conflicts": critical_boundary_conflicts,
+        "boundary_tolerance": round(boundary_tolerance, 6),
         "column_boundary_count_conflict": column_boundary_count_conflict,
         "trailing_optional_collapse": trailing_optional_collapse,
+        "material_column_disagreement": material_column_disagreement,
+        "informational_column_disagreement": informational_column_disagreement,
         "material_disagreement": material_disagreement,
+        "material_disagreement_reasons": material_reasons,
+        "informational_disagreement_reasons": informational_reasons,
         "has_disagreement": bool(
-            unique_conflicts or material_disagreement
+            unique_conflicts
+            or material_disagreement
+            or informational_column_disagreement
         ),
+    }
+
+
+def target_cell_structural_safety(
+    row: OcrRow,
+    field: str,
+    grid: PhysicalGrid,
+) -> dict:
+    """Evaluate structural trust for one physical target cell."""
+    metadata = row.metadata if isinstance(row.metadata, dict) else {}
+    reasons: list[str] = []
+    schema = metadata.get("schema_assessment")
+    if not isinstance(schema, dict) or str(schema.get("status") or "").lower() != "supported":
+        reasons.append("schema_not_supported")
+    if not grid.high_confidence or validate_physical_grid(grid):
+        reasons.append("physical_grid_untrusted")
+    ref = (metadata.get("physical_grid_cells") or {}).get(field)
+    cell = None
+    if isinstance(ref, dict):
+        try:
+            cell = grid.cell(int(ref["row_index"]), int(ref["column_index"]))
+        except (KeyError, TypeError, ValueError):
+            cell = None
+    if cell is None:
+        reasons.append("physical_cell_missing")
+    if cell is not None:
+        ambiguous_cells = {
+            (int(item.get("row_index", -1)), int(item.get("column_index", -1)))
+            for item in metadata.get("ambiguous_physical_cells") or []
+            if isinstance(item, dict)
+        }
+        if (cell.row_index, cell.column_index) in ambiguous_cells:
+            reasons.append("local_word_assignment_ambiguity")
+        elif metadata.get("word_assignment_ambiguity") and not metadata.get(
+            "ambiguous_physical_cells"
+        ):
+            reasons.append("unlocalized_word_assignment_ambiguity")
+        weak_fields = set(metadata.get("weak_critical_fields") or [])
+        ambiguous_fields = set(metadata.get("ambiguous_fields") or [])
+        if field in ambiguous_fields and not ambiguous_cells and field not in weak_fields:
+            reasons.append("unlocalized_field_ambiguity")
+        if field in weak_fields:
+            reasons.append("weak_target_assignment")
+        elif metadata.get("weak_critical_assignment") and not weak_fields:
+            reasons.append("unlocalized_weak_assignment")
+        evidence = metadata.get("structural_evidence") or {}
+        tolerance = float(evidence.get("boundary_tolerance") or 1e-6)
+        touching = [
+            float(value)
+            for value in evidence.get("missing_grid_internal_boundaries") or []
+            if abs(float(value) - cell.bounds[0]) <= tolerance
+            or abs(float(value) - cell.bounds[2]) <= tolerance
+        ]
+        splitting = [
+            float(value)
+            for value in evidence.get("extra_provider_internal_boundaries") or []
+            if cell.bounds[0] + tolerance < float(value) < cell.bounds[2] - tolerance
+        ]
+        if touching or splitting:
+            reasons.append("material_column_conflict_at_target")
+        material_rows = evidence.get("material_row_boundary_conflicts") or []
+        if any(
+            abs(float(value) - cell.bounds[1]) <= tolerance
+            or abs(float(value) - cell.bounds[3]) <= tolerance
+            for value in material_rows
+        ):
+            reasons.append("material_row_conflict_at_target")
+        detailed_material = any(
+            key in evidence
+            for key in (
+                "missing_grid_internal_boundaries",
+                "extra_provider_internal_boundaries",
+                "material_row_boundary_conflicts",
+            )
+        )
+        if evidence.get("material_disagreement") and not detailed_material:
+            reasons.append("unlocalized_material_disagreement")
+    if metadata.get("structural_ambiguity") and not metadata.get(
+        "ambiguous_physical_cells"
+    ):
+        reasons.append("unlocalized_structural_ambiguity")
+    return {
+        "safe": not reasons,
+        "field": str(field),
+        "reasons": list(dict.fromkeys(reasons)),
+        "row_index": cell.row_index if cell is not None else None,
+        "column_index": cell.column_index if cell is not None else None,
     }
 
 
@@ -2042,7 +2269,17 @@ def rows_from_physical_grid(
         if row_index not in preflight_header_rows
         and row_index not in dropped_physical_rows
     }
-    evidence = _primary_structural_evidence(payload, grid, width, height)
+    mapping: dict[int, tuple[str, ...]] = {}
+    if rows:
+        raw_mapping = rows[0].metadata.get("column_mapping") or {}
+        for column, keys in raw_mapping.items():
+            try:
+                mapping[int(column)] = tuple(str(key) for key in keys)
+            except (TypeError, ValueError):
+                continue
+    evidence = _primary_structural_evidence(
+        payload, grid, width, height, mapping=mapping
+    )
     conflict_rows: set[int] = set()
     for conflict in evidence.get("row_boundary_conflicts") or []:
         nearest = min(
@@ -2052,14 +2289,6 @@ def rows_from_physical_grid(
         )
         if nearest:
             conflict_rows.update({nearest - 1, nearest})
-    mapping: dict[int, tuple[str, ...]] = {}
-    if rows:
-        raw_mapping = rows[0].metadata.get("column_mapping") or {}
-        for column, keys in raw_mapping.items():
-            try:
-                mapping[int(column)] = tuple(str(key) for key in keys)
-            except (TypeError, ValueError):
-                continue
     ambiguous_rows = {
         cell.row_index
         for item in ambiguous
@@ -2079,6 +2308,11 @@ def rows_from_physical_grid(
         field
         for column in ambiguous_columns
         for field in mapping.get(column, ())
+    }
+    ambiguous_cell_keys = {
+        (cell.row_index, cell.column_index)
+        for item in ambiguous
+        for _ratio, cell in item.candidates
     }
     body_rows_with_words = {
         row_index
@@ -2182,6 +2416,12 @@ def rows_from_physical_grid(
             set(ambiguous_fields).union(row_weak_fields)
         ) if row_ambiguity else []
         metadata["weak_critical_assignment"] = bool(row_weak_fields)
+        metadata["weak_critical_fields"] = sorted(row_weak_fields)
+        metadata["ambiguous_physical_cells"] = [
+            {"row_index": row_index, "column_index": column_index}
+            for row_index, column_index in sorted(ambiguous_cell_keys)
+            if row_index == grid_row
+        ]
         metadata["structural_disagreement"] = disagreement
         metadata["informational_structural_disagreement"] = informational_disagreement
         if disagreement or row_ambiguity:

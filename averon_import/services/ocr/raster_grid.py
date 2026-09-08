@@ -938,6 +938,36 @@ def crop_has_glyph(
     )
 
 
+def crop_has_isolated_glyph(crop: np.ndarray) -> bool:
+    """Require an interior glyph component for identity-cell loss evidence.
+
+    This is intentionally stricter than the paid exact-cell precheck: a long
+    border remnant or text leaking across a neighboring cell must not create
+    an identity blocker.
+    """
+    _threshold, binary = cv2.threshold(
+        crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+    height, width = crop.shape[:2]
+    for index, stat in enumerate(stats[1:count], start=1):
+        component_width = int(stat[cv2.CC_STAT_WIDTH])
+        component_height = int(stat[cv2.CC_STAT_HEIGHT])
+        area = int(stat[cv2.CC_STAT_AREA])
+        center_x, center_y = centroids[index]
+        if (
+            area >= 8
+            and component_width >= 2
+            and component_height >= 4
+            and component_width <= width * 0.45
+            and component_height <= height * 0.60
+            and width * 0.10 <= center_x <= width * 0.90
+            and height * 0.10 <= center_y <= height * 0.90
+        ):
+            return True
+    return False
+
+
 def encode_png(image: np.ndarray) -> bytes:
     ok, encoded = cv2.imencode(".png", image)
     if not ok:

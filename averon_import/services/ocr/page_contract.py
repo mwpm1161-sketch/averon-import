@@ -114,6 +114,8 @@ def page_status_from_diagnostics(
         status.add_blocker("physical_row_loss_suspected")
     if data.get("physical_row_loss_suspected"):
         status.add_blocker("physical_row_loss_suspected")
+    if int(data.get("identity_cell_missing_count") or 0) > 0:
+        status.add_blocker("identity_cell_missing")
     if data.get("assembly_error"):
         status.add_blocker("assembly_error")
     if (

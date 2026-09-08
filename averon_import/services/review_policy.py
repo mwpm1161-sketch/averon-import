@@ -23,6 +23,7 @@ CRITICAL_REASONS = {
     "structural_layout_ambiguous",
     "structural_schema_ambiguous",
     "physical_row_loss_suspected",
+    "identity_cell_missing",
 }
 
 
@@ -40,6 +41,7 @@ def is_critical_row(row: dict) -> bool:
         "structural_disagreement",
         "structural_boundary_conflict",
         "word_assignment_ambiguity",
+        "identity_cell_missing",
     }
     row_reasons = set(_as_list(row.get("review_reasons")))
     if (
@@ -127,6 +129,7 @@ def critical_blockers_for_row(row: dict) -> list[str]:
         "structural_layout_ambiguous",
         "structural_schema_ambiguous",
         "physical_row_loss_suspected",
+        "identity_cell_missing",
     ):
         if reason in reasons:
             blockers.append(reason)
@@ -159,6 +162,7 @@ def critical_field_count(row: dict) -> int:
             "structural_layout_ambiguous",
             "structural_schema_ambiguous",
             "physical_row_loss_suspected",
+            "identity_cell_missing",
         )
     ):
         count = 1
@@ -173,6 +177,30 @@ def refresh_review_state(row: dict) -> dict:
     previous_blockers = _as_list(row.get("critical_blockers"))
     reasons.extend(reason for reason in previous_blockers if reason not in reasons)
     edited_fields = set(_as_list(row.get("edited_fields")))
+    metadata = row.get("ocr_metadata") or {}
+    identity_flagged = bool(
+        "identity_cell_missing" in reasons
+        or "identity_cell_missing" in previous_blockers
+        or (
+            isinstance(metadata, dict)
+            and metadata.get("identity_cell_missing")
+        )
+    )
+    identity_resolved = bool(
+        identity_flagged
+        and "position" in edited_fields
+        and str(row.get("position", "") or "").strip()
+    )
+    if identity_resolved:
+        reasons = [reason for reason in reasons if reason != "identity_cell_missing"]
+        previous_blockers = [
+            reason for reason in previous_blockers
+            if reason != "identity_cell_missing"
+        ]
+        if isinstance(metadata, dict):
+            metadata["identity_cell_missing"] = False
+    elif identity_flagged and "identity_cell_missing" not in reasons:
+        reasons.append("identity_cell_missing")
     conflict_fields = set(_as_list(row.get("secondary_conflict_fields")))
     if (
         "secondary_conflict" in edited_fields

@@ -41,6 +41,7 @@ from averon_import.services.ocr.reconstruction import (
     collect_words,
     page_geometry,
     reconstruct_page_rows,
+    target_cell_structural_safety,
 )
 from averon_import.services.ocr.critical_verification import (
     attach_exact_cell_candidate,
@@ -54,6 +55,7 @@ from averon_import.services.ocr.raster_grid import (
     RasterGridPage,
     RasterRuledTableGridDetector,
     crop_has_glyph,
+    crop_has_isolated_glyph,
     encode_png,
     physical_row_raster_witness,
     prepare_exact_cell_crop,
@@ -830,24 +832,6 @@ class YandexVisionProvider:
             if not is_critical_values(row.values):
                 continue
             row_metadata = row.metadata if isinstance(row.metadata, dict) else {}
-            schema_assessment = row_metadata.get("schema_assessment")
-            # Exact-cell OCR is an optional verification pass, never a way to
-            # bypass an unknown schema.  Missing metadata is fail-closed just
-            # like an explicit UNKNOWN/AMBIGUOUS/UNSUPPORTED assessment.
-            if not isinstance(schema_assessment, dict) or str(
-                schema_assessment.get("status") or ""
-            ).lower() != "supported":
-                continue
-            if any(
-                row_metadata.get(key)
-                for key in (
-                    "structural_ambiguity",
-                    "structural_disagreement",
-                    "word_assignment_ambiguity",
-                    "weak_critical_assignment",
-                )
-            ):
-                continue
             if set(row_metadata.get("review_reasons") or {}).intersection(
                 {
                     "ambiguous_table_schema",
@@ -855,10 +839,6 @@ class YandexVisionProvider:
                     "unsupported_table_schema",
                     "schema_unknown",
                 }
-            ):
-                continue
-            if set(row_metadata.get("ambiguous_fields") or {}).intersection(
-                set(EXACT_CELL_FIELDS)
             ):
                 continue
             refs = row.metadata.get("physical_grid_cells") or {}
@@ -875,6 +855,12 @@ class YandexVisionProvider:
                     continue
                 cell = grid.cell(grid_row, grid_column)
                 if cell is None:
+                    continue
+                local_safety = target_cell_structural_safety(row, field, grid)
+                row_metadata.setdefault("target_cell_structural_safety", {})[
+                    field
+                ] = local_safety
+                if not local_safety["safe"]:
                     continue
                 crop = prepare_exact_cell_crop(raster, cell, scale=2)
                 if not crop_has_glyph(crop):
@@ -941,6 +927,78 @@ class YandexVisionProvider:
                         f"[{self.key}] exact-cell проверка {field} не выполнена: "
                         f"{str(exc)[:240]}"
                     )
+
+    @staticmethod
+    def _position_mapping_present(metadata: dict) -> bool:
+        mapping = metadata.get("column_mapping") or {}
+        return any(
+            "position" in (
+                {str(keys)}
+                if isinstance(keys, str)
+                else {str(key) for key in (keys or [])}
+            )
+            for keys in mapping.values()
+        )
+
+    def _mark_identity_cell_loss(
+        self,
+        raster: RasterGridPage | None,
+        rows: list,
+    ) -> int:
+        """Mark independently witnessed missing position OCR without guessing it."""
+        if (
+            raster is None
+            or not raster.detection.high_confidence
+            or raster.detection.grid is None
+            or validate_physical_grid(raster.detection.grid)
+        ):
+            return 0
+        grid = raster.detection.grid
+        marked = 0
+        for row in rows:
+            metadata = row.metadata if isinstance(row.metadata, dict) else {}
+            schema = metadata.get("schema_assessment")
+            if (
+                not isinstance(schema, dict)
+                or str(schema.get("status") or "").lower() != "supported"
+                or not metadata.get("structured_table")
+                or not metadata.get("provider_has_explicit_rows")
+                or not self._position_mapping_present(metadata)
+                or str(row.values.get("position", "") or "").strip()
+                or not is_critical_values(row.values)
+            ):
+                continue
+            local_safety = target_cell_structural_safety(row, "position", grid)
+            identity_safety_reasons = [
+                reason
+                for reason in local_safety["reasons"]
+                if reason != "unlocalized_structural_ambiguity"
+            ]
+            if identity_safety_reasons:
+                continue
+            ref = (metadata.get("physical_grid_cells") or {}).get("position")
+            if not isinstance(ref, dict):
+                continue
+            cell = grid.cell(local_safety["row_index"], local_safety["column_index"])
+            if cell is None or not crop_has_isolated_glyph(
+                prepare_exact_cell_crop(raster, cell, scale=2)
+            ):
+                continue
+            metadata.update({
+                "identity_cell_missing": True,
+                "identity_field": "position",
+                "identity_cell_bbox": cell.as_bbox(),
+                "identity_cell_row": cell.row_index,
+                "identity_cell_column": cell.column_index,
+                "identity_raster_glyph": True,
+                "identity_candidate_source": None,
+            })
+            reasons = list(metadata.get("review_reasons") or [])
+            if "identity_cell_missing" not in reasons:
+                reasons.append("identity_cell_missing")
+            metadata["review_reasons"] = reasons
+            marked += 1
+        return marked
 
     def _recognition_url(self, operation_id: str, recognition_base: str) -> str:
         return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
@@ -1097,6 +1155,7 @@ class YandexVisionProvider:
             "exact_cell_checked": 0,
             "exact_cell_requests": 0,
             "exact_cell_candidates": 0,
+            "identity_cell_missing": 0,
             "unresolved_critical": 0,
         }
         by_page: dict[int, PageOcrResult] = {
@@ -1234,6 +1293,11 @@ class YandexVisionProvider:
                         reconstruction_diagnostics["physical_row_loss_rows"] = list(
                             witness["suspected_loss_rows"]
                         )
+                identity_missing = self._mark_identity_cell_loss(raster, rows)
+                stats["identity_cell_missing"] += identity_missing
+                reconstruction_diagnostics["identity_cell_missing_count"] = (
+                    identity_missing
+                )
                 self._exact_cell_verify_page(
                     number,
                     raster,
