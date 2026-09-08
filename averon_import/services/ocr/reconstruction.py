@@ -35,11 +35,19 @@ from averon_import.services.ocr.physical_grid import (
     validate_physical_grid,
     word_assignment_evidence,
 )
-from averon_import.services.ocr.schema_recognizer import (
-    AMBIGUOUS as AMBIGUOUS_SCHEMA,
-    DEFAULT_SCHEMA_RECOGNIZER,
+from averon_import.services.ocr.physical_evidence import PhysicalEvidenceSnapshot
+from averon_import.services.ocr.semantics import (
+    AMBIGUOUS_FAMILY,
+    BoundedFamilyContext,
+    ContextRegionEvidence,
+    DEFAULT_SCHEMA_GATE,
+    DEFAULT_TABLE_FAMILY_CLASSIFIER,
+    SchemaGateEvidence,
+    TableFamilyAssessment,
+    map_semantic_header,
 )
-from averon_import.services.ocr.semantics import HeaderSourceCell, map_semantic_header
+from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult, HeaderSourceCell
+from averon_import.services.ocr.semantics.context_evidence import bounded_context_from_words
 
 BASE_COLUMN_KEYS: tuple[str, ...] = tuple(column["key"] for column in BASE_COLUMNS)
 
@@ -490,10 +498,8 @@ def _legacy_table_header_mapping(
     return None, set()
 
 
-def _table_header_mapping(
-    table: DetectedTable,
-) -> tuple[dict[int, tuple[str, ...]] | None, set[int]]:
-    """Map physical columns with evidence; retain the old mapper as shadow only."""
+def _table_header_mapping_result(table: DetectedTable) -> HeaderMappingResult:
+    """Return the complete mapper result without converting it to a gate decision."""
     previous_reasons = list(table.review_reasons)
     legacy_mapping, legacy_rows = _legacy_table_header_mapping(table)
     legacy_reasons = [
@@ -537,13 +543,134 @@ def _table_header_mapping(
             ),
         }
     )
-    table.header_mapping_diagnostics = diagnostics
+    result.diagnostics.update(diagnostics)
+    table.header_mapping_diagnostics = result.as_dict()
     if not result.trusted:
         for reason in ("semantic_mapping_ambiguous", *result.reasons):
             if reason not in table.review_reasons:
                 table.review_reasons.append(reason)
+    return result
+
+
+def _table_header_mapping(
+    table: DetectedTable,
+) -> tuple[dict[int, tuple[str, ...]] | None, set[int]]:
+    """Compatibility wrapper returning only trusted mapping assignments."""
+    result = _table_header_mapping_result(table)
+    if not result.trusted:
         return None, set()
     return dict(result.mapping), set(result.header_rows)
+
+
+def _detected_table_bounds(table: DetectedTable) -> tuple[float, float, float, float]:
+    vertices = _vertices_of(table.bbox)
+    if not vertices:
+        vertices = [
+            point
+            for row in table.rows
+            for cell in row.cells
+            for point in _vertices_of(cell.bbox)
+        ]
+    if not vertices:
+        return 0.0, 0.0, 0.0, 0.0
+    return (
+        min(x for x, _ in vertices),
+        min(y for _, y in vertices),
+        max(x for x, _ in vertices),
+        max(y for _, y in vertices),
+    )
+
+
+def _family_context_for_table(
+    table: DetectedTable,
+    mapping_result: HeaderMappingResult,
+    words: list[dict] | None,
+    page_height: float,
+    compatibility_text: str = "",
+) -> BoundedFamilyContext:
+    bounds = _detected_table_bounds(table)
+    context = bounded_context_from_words(
+        bounds,
+        words or [],
+        page_height=page_height,
+        compatibility_text=compatibility_text,
+    )
+    header_cells = [
+        cell for cell in mapping_result.header_cells
+        if cell.physical_row in set(mapping_result.header_rows)
+        and cell.raw_text.strip()
+    ]
+    header_points = [
+        point for cell in header_cells for point in _vertices_of(cell.bbox)
+    ]
+    if header_points:
+        header_bounds = (
+            min(point[0] for point in header_points),
+            min(point[1] for point in header_points),
+            max(point[0] for point in header_points),
+            max(point[1] for point in header_points),
+        )
+        context = BoundedFamilyContext(
+            regions=tuple(context.regions) + (
+                ContextRegionEvidence(
+                    kind="header",
+                    bounds=header_bounds,
+                    text=" ".join(cell.raw_text for cell in header_cells)[:1500],
+                    source="selected_table_header",
+                    provenance=({"scope": "selected_table", "header_rows": list(mapping_result.header_rows)},),
+                ),
+            ),
+            provenance=context.provenance,
+        )
+    return context
+
+
+def _physical_snapshot_for_table(
+    table: DetectedTable,
+    mapping_result: HeaderMappingResult,
+    words: list[dict] | None,
+    *,
+    grid: PhysicalGrid | None = None,
+    assigned_word_refs: dict[str, tuple[int, ...]] | None = None,
+) -> PhysicalEvidenceSnapshot:
+    rows = []
+    for row in table.rows:
+        cell_records = []
+        for cell in row.cells:
+            cell_records.append({
+                "source_cell_index": cell.source_cell_index,
+                "row_index": cell.row_index,
+                "column_index": cell.column_index,
+                "raw_text": cell.text,
+                "bbox": dict(cell.bbox),
+            })
+        row_vertices = [
+            point for cell in row.cells for point in _vertices_of(cell.bbox)
+        ]
+        rows.append({
+            "source_row_index": row.row_index,
+            "bbox": {
+                "vertices": [
+                    {"x": point[0], "y": point[1]} for point in row_vertices
+                ]
+            } if row_vertices else {},
+            "cells": cell_records,
+        })
+    return PhysicalEvidenceSnapshot(
+        grid=grid.as_dict() if grid is not None else None,
+        selected_table_bounds={
+            "x": bounds[0], "y": bounds[1],
+            "width": max(0.0, bounds[2] - bounds[0]),
+            "height": max(0.0, bounds[3] - bounds[1]),
+        } if (bounds := _detected_table_bounds(table)) else {},
+        physical_rows=tuple(rows),
+        spatial_words=tuple(
+            {"text": str(word.get("text") or ""), "vertices": list(word.get("vertices") or [])}
+            for word in (words or [])
+        ),
+        assigned_word_refs=dict(assigned_word_refs or {}),
+        header_mapping=mapping_result.as_dict(),
+    )
 
 
 def _bbox_height(bbox: dict) -> float:
@@ -1059,6 +1186,9 @@ def rows_from_tables(
     secondary_crop: dict | None = None,
     diagnostics: dict | None = None,
     context_text: str = "",
+    precomputed_mapping_result: HeaderMappingResult | None = None,
+    precomputed_structural_evidence: dict | None = None,
+    physical_evidence: PhysicalEvidenceSnapshot | None = None,
 ) -> list[OcrRow] | None:
     """PRIMARY path: preserve physical rows, segment them, then map fields."""
     candidates = [
@@ -1078,14 +1208,18 @@ def rows_from_tables(
                 source_table_index=candidate.source_table_index,
                 drop_reason="table_not_selected",
             )
-    mapping, header_rows = _table_header_mapping(table)
+    mapping_result = precomputed_mapping_result or _table_header_mapping_result(table)
+    mapping = dict(mapping_result.mapping) if mapping_result.mapping else None
+    header_rows = set(mapping_result.header_rows)
     table.header_rows = header_rows
     if diagnostics is not None:
-        diagnostics["header_mapping"] = dict(table.header_mapping_diagnostics)
-    if mapping is None:
+        diagnostics["header_mapping"] = mapping_result.as_dict()
+    if mapping_result is None:
+        # Defensive branch for malformed caller integrations.  A missing
+        # mapping is still an explicit no-semantic-output decision.
         if diagnostics is not None:
             diagnostics["schema"] = {
-                "status": AMBIGUOUS_SCHEMA,
+                "status": "ambiguous",
                 "coverage_score": 0.0,
                 "uniqueness_score": 0.0,
                 "header_consistency": 0.0,
@@ -1100,21 +1234,38 @@ def rows_from_tables(
             drop_reason="semantic_mapping_unavailable",
         )
         return None
-    schema = DEFAULT_SCHEMA_RECOGNIZER.assess(
-        column_count=table.column_count,
-        mapping=mapping,
-        header_rows=header_rows,
-        header_text=" ".join(
-            _cell_text(cell)
-            for row in table.rows
-            if row.row_index in header_rows
-            for cell in row.cells
-        ),
-        context_text=context_text,
+    family_context = _family_context_for_table(
+        table,
+        mapping_result,
+        words,
+        denominator_y,
+        # ``context_text`` is retained in the public signature for callers
+        # from the pre-Stage-7.1 API, but is intentionally ignored here.  A
+        # caller cannot prove that an arbitrary string is table-bounded; page
+        # fullText must never become family or schema evidence.
     )
+    family = DEFAULT_TABLE_FAMILY_CLASSIFIER.assess(family_context)
+    schema = DEFAULT_SCHEMA_GATE.assess(
+        column_count=table.column_count,
+        mapping=mapping_result,
+        family=family,
+        structural=SchemaGateEvidence(
+            header_body_conflict="header_body_conflict" in mapping_result.reasons,
+        ),
+    )
+    if physical_evidence is None:
+        physical_evidence = _physical_snapshot_for_table(
+            table, mapping_result, words
+        )
+    physical_evidence.family_assessment = family.as_dict()
+    if precomputed_structural_evidence is not None:
+        physical_evidence.structural_evidence = dict(precomputed_structural_evidence)
     if diagnostics is not None:
+        diagnostics["family"] = family.as_dict()
         diagnostics["schema"] = schema.as_dict()
-    if schema.status == AMBIGUOUS_SCHEMA:
+        diagnostics["schema_status"] = schema.status
+        diagnostics["physical_evidence"] = physical_evidence.as_dict()
+    if schema.status == "ambiguous" and mapping_result.trusted:
         reason = "ambiguous_table_schema"
         if reason not in table.review_reasons:
             table.review_reasons.append(reason)
@@ -1138,6 +1289,18 @@ def rows_from_tables(
             kind="table_dropped",
             source_table_index=table.source_table_index,
             drop_reason=reason,
+        )
+        return None
+    elif schema.status == "ambiguous":
+        # An ambiguous mapper cannot produce semantic rows.  Keep the
+        # physical snapshot/diagnostics above, but never invent a mapping.
+        if diagnostics is not None:
+            diagnostics["unsupported_table_schema"] = True
+        _record_diagnostic(
+            diagnostics,
+            kind="table_dropped",
+            source_table_index=table.source_table_index,
+            drop_reason="semantic_mapping_unavailable",
         )
         return None
     table.column_mapping = mapping
@@ -1599,11 +1762,6 @@ def _reconstruct_legacy_page_rows(
             secondary_payload=secondary_payload,
             secondary_crop=secondary_crop,
             diagnostics=diagnostics,
-            context_text=str(
-                (text_annotation.get("fullText") or "")
-                if isinstance(text_annotation, dict)
-                else ""
-            ),
         )
         if rows is not None:
             return rows
@@ -2141,10 +2299,11 @@ def rows_from_physical_grid(
     )
     preflight_mapping: dict[int, tuple[str, ...]] | None = None
     preflight_header_rows: set[int] = set()
+    preflight_mapping_result: HeaderMappingResult | None = None
     if preflight_table is not None:
-        preflight_mapping, preflight_header_rows = _table_header_mapping(
-            preflight_table
-        )
+        preflight_mapping_result = _table_header_mapping_result(preflight_table)
+        preflight_mapping = dict(preflight_mapping_result.mapping) or None
+        preflight_header_rows = set(preflight_mapping_result.header_rows)
 
     grid_left, grid_top, grid_right, grid_bottom = grid.bounds
     x_gaps = [
@@ -2209,6 +2368,42 @@ def rows_from_physical_grid(
                 return row_index
         return max(0, grid.row_count - 1) if center_y <= grid_bottom else None
 
+    physical_body_rows_preflight = {
+        row_index for row_index in range(grid.row_count)
+        if row_index not in preflight_header_rows
+    }
+    physical_word_covered_rows_preflight = {
+        row_index
+        for word in spatial_words
+        for row_index in [grid_row_for_word(word)]
+        if row_index is not None and row_index in physical_body_rows_preflight
+    }
+    preflight_evidence = _primary_structural_evidence(
+        payload, grid, width, height, mapping=preflight_mapping or {}
+    )
+    preflight_snapshot = (
+        _physical_snapshot_for_table(
+            preflight_table,
+            preflight_mapping_result,
+            collect_words(payload.get("textAnnotation") or {}),
+            grid=grid,
+            assigned_word_refs={
+                f"{row}:{column}": tuple(word.source_index for word in values)
+                for (row, column), values in initial_assigned.items()
+            },
+        )
+        if preflight_table is not None and preflight_mapping_result is not None
+        else None
+    )
+    if diagnostics is not None:
+        diagnostics["physical_body_row_indexes"] = sorted(physical_body_rows_preflight)
+        diagnostics["physical_header_row_indexes"] = sorted(preflight_header_rows)
+        diagnostics["physical_word_covered_row_indexes"] = sorted(physical_word_covered_rows_preflight)
+        diagnostics["physical_evidence"] = (
+            preflight_snapshot.as_dict() if preflight_snapshot is not None else {}
+        )
+        diagnostics["structural_evidence"] = dict(preflight_evidence)
+
     weak_critical: dict[tuple[int, int], list[dict[str, object]]] = {}
     filtered_assigned: dict[tuple[int, int], list[SpatialWord]] = {}
     for cell_key, cell_words in initial_assigned.items():
@@ -2243,11 +2438,9 @@ def rows_from_physical_grid(
         provider_key,
         words=collect_words(payload.get("textAnnotation") or {}),
         diagnostics=local_diagnostics,
-        context_text=str(
-            ((payload.get("textAnnotation") or {}).get("fullText") or "")
-            if isinstance(payload.get("textAnnotation"), dict)
-            else ""
-        ),
+        precomputed_mapping_result=preflight_mapping_result,
+        precomputed_structural_evidence=preflight_evidence,
+        physical_evidence=preflight_snapshot,
     )
     if rows is None:
         if local_diagnostics.get("unsupported_table_schema"):
@@ -2529,6 +2722,8 @@ def reconstruct_page_rows(
             "schema_status",
             "unsupported_table_schema",
             "header_mapping",
+            "family",
+            "physical_evidence",
         ):
             if key in legacy_diagnostics:
                 diagnostics[key] = legacy_diagnostics[key]
@@ -2537,7 +2732,9 @@ def reconstruct_page_rows(
     )
     legacy_table_supported = bool(
         isinstance(legacy_diagnostics.get("schema"), dict)
-        and legacy_diagnostics["schema"].get("status") == "supported"
+        and legacy_diagnostics["schema"].get("status") in {"supported", "ambiguous"}
+        and isinstance(legacy_diagnostics.get("header_mapping"), dict)
+        and legacy_diagnostics["header_mapping"].get("mapping_status") == "trusted"
         and not legacy_schema_unsupported
     )
     if mode == "table" or (mode == "shadow" and physical_grid is None):

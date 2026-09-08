@@ -308,9 +308,12 @@ def test_partially_ocrd_final_item_row_is_not_dropped_as_service_tail(tmp_path, 
     for event in diagnostics.get("events", [])
     )
     status = page_status_from_diagnostics(1, diagnostics, row_count=len(rows))
-    assert status.output_status == "USABLE"
+    # Stage 7.1 intentionally no longer promotes a five-concept table from
+    # page-wide fullText.  The physical row remains present, but absent
+    # bounded family evidence makes the page review-only.
+    assert status.output_status == "REVIEW_REQUIRED"
     assembled = SpecificationRowAssembler().build_page(1, rows)
-    with pytest.raises(ValueError, match="Не проверено"):
+    with pytest.raises(ValueError, match="Экспорт заблокирован"):
         ExcelExportService().export(
             assembled,
             ["name", "type_mark", "unit", "quantity"],

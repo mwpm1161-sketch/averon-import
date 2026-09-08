@@ -1,64 +1,73 @@
-"""Safety assessment for tables mapped to Averon's specification schema.
+"""Compatibility facade for the Stage 7.1 family/schema split.
 
-The recognizer deliberately knows nothing about a particular OCR provider or
-document.  It accepts a semantic mapping produced from a bounded header
-region and decides whether that mapping is safe to use as a specification.
+Production reconstruction uses :mod:`semantics.family_classifier` and
+:mod:`semantics.schema_gate` directly.  This facade remains for older callers
+and tests that supplied explicit bounded ``header_text``/``context_text``.
+It does not inspect page-wide text and it does not own family keywords.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from averon_import.services.ocr.semantics.context_evidence import (
+    BoundedFamilyContext,
+    ContextRegionEvidence,
+)
+from averon_import.services.ocr.semantics.family_classifier import (
+    DEFAULT_TABLE_FAMILY_CLASSIFIER,
+)
+from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult
+from averon_import.services.ocr.semantics.schema_gate import (
+    AMBIGUOUS,
+    CORE_FIELDS,
+    DEFAULT_SCHEMA_GATE,
+    OPTIONAL_FIELDS,
+    SUPPORTED,
+    UNSUPPORTED,
+    SchemaAssessment,
+)
 
 
-SUPPORTED = "supported"
-AMBIGUOUS = "ambiguous"
-UNSUPPORTED = "unsupported"
-
-CORE_FIELDS = frozenset({"name", "unit", "quantity"})
-OPTIONAL_FIELDS = frozenset({
-    "position",
-    "type_mark",
-    "code",
-    "manufacturer",
-    "mass",
-    "note",
-})
-
-
-@dataclass(frozen=True, slots=True)
-class SchemaAssessment:
-    """Result kept in diagnostics and used at the reconstruction boundary."""
-
-    status: str
-    coverage_score: float
-    uniqueness_score: float
-    header_consistency: float
-    mapped_fields: tuple[str, ...]
-    reasons: tuple[str, ...] = ()
-
-    @property
-    def trusted(self) -> bool:
-        return self.status == SUPPORTED
-
-    def as_dict(self) -> dict:
-        return {
-            "status": self.status,
-            "coverage_score": round(self.coverage_score, 4),
-            "uniqueness_score": round(self.uniqueness_score, 4),
-            "header_consistency": round(self.header_consistency, 4),
-            "mapped_fields": list(self.mapped_fields),
-            "reasons": list(self.reasons),
-        }
+def _compatibility_mapping_result(
+    column_count: int,
+    mapping: dict[int, tuple[str, ...]],
+    header_rows: set[int],
+) -> HeaderMappingResult:
+    normalized = {
+        int(column): tuple(str(field) for field in fields)
+        for column, fields in mapping.items()
+    }
+    fields = {field for values in normalized.values() for field in values}
+    inverse: dict[str, list[int]] = {}
+    for column, values in normalized.items():
+        for field in values:
+            inverse.setdefault(field, []).append(column)
+    illegal = any(
+        len(values) != 1 and set(values) != {"mass", "note"}
+        for values in normalized.values()
+    ) or any(len(set(columns)) > 1 for columns in inverse.values())
+    missing = tuple(sorted(CORE_FIELDS - fields))
+    status = "ambiguous" if illegal else "trusted" if normalized and not missing else "unavailable"
+    reasons: list[str] = []
+    if illegal:
+        reasons.append("multiple_semantic_fields_in_one_column")
+    if missing:
+        reasons.append("missing_core_fields:" + ",".join(missing))
+    return HeaderMappingResult(
+        status=status,
+        header_rows=tuple(sorted(header_rows)),
+        mapping=normalized,
+        candidates_by_column={},
+        best_score=1.0 if normalized else 0.0,
+        second_best_score=0.0,
+        assignment_margin=1.0 if normalized else 0.0,
+        unmapped_columns=tuple(column for column in range(max(0, column_count)) if column not in normalized),
+        missing_core_fields=missing,
+        reasons=tuple(reasons),
+    )
 
 
 class SupportedSpecificationSchemaRecognizer:
-    """Recognize the supported classic specification family.
-
-    The column count is intentionally not part of the schema identity.  A
-    table must instead provide all three critical semantic concepts, at least
-    one additional specification concept, and enough semantic coverage that
-    a large unrelated journal cannot be projected into BASE_COLUMNS.
-    """
+    """Backward-compatible entry point delegating to the separated layers."""
 
     def assess(
         self,
@@ -69,125 +78,43 @@ class SupportedSpecificationSchemaRecognizer:
         header_text: str = "",
         context_text: str = "",
     ) -> SchemaAssessment:
-        reasons: list[str] = []
-        if column_count <= 0:
-            return SchemaAssessment(
-                UNSUPPORTED, 0.0, 0.0, 0.0, (), ("invalid_column_count",)
+        result = _compatibility_mapping_result(column_count, mapping, header_rows)
+        regions = []
+        if header_text.strip():
+            regions.append(
+                ContextRegionEvidence(
+                    kind="header",
+                    bounds=(0.0, 0.0, 1.0, 1.0),
+                    text=header_text.strip()[:1000],
+                    source="explicit_bounded_context",
+                )
             )
-        if not header_rows:
-            reasons.append("header_region_missing")
-
-        normalized: dict[int, tuple[str, ...]] = {
-            int(column): tuple(str(key) for key in keys)
-            for column, keys in mapping.items()
-        }
-        mapped_fields = {
-            key
-            for keys in normalized.values()
-            for key in keys
-            if key in CORE_FIELDS or key in OPTIONAL_FIELDS
-        }
-        # A combined ``mass + note`` column is a known supported variant of
-        # the specification family: body values are separated conservatively
-        # by the table mapper.  Combining critical concepts (for example
-        # unit + quantity) remains ambiguous and is never trusted.
-        multi_field_columns = [
-            column
-            for column, keys in normalized.items()
-            if len(keys) != 1 and set(keys) != {"mass", "note"}
-        ]
-        inverse: dict[str, list[int]] = {}
-        for column, keys in normalized.items():
-            for key in keys:
-                inverse.setdefault(key, []).append(column)
-        duplicate_fields = {
-            key for key, columns in inverse.items() if len(set(columns)) > 1
-        }
-        if multi_field_columns:
-            reasons.append("multiple_semantic_fields_in_one_column")
-        if duplicate_fields:
-            reasons.append("semantic_field_has_multiple_columns")
-
-        coverage = min(
-            1.0,
-            len(normalized) / max(1, int(column_count)),
-        )
-        uniqueness = 1.0
-        if multi_field_columns or duplicate_fields:
-            uniqueness = 0.0
-        header_consistency = 1.0 if header_rows else 0.0
-        if not CORE_FIELDS.issubset(mapped_fields):
-            missing = sorted(CORE_FIELDS - mapped_fields)
-            reasons.append("missing_core_fields:" + ",".join(missing))
-        if len(mapped_fields & OPTIONAL_FIELDS) < 1:
-            reasons.append("insufficient_optional_specification_evidence")
-        # A 30-column journal with five familiar words is not a classic
-        # specification.  The threshold is deliberately expressed as semantic
-        # coverage, not as a magic accepted column count.
-        if coverage < 0.45:
-            reasons.append("semantic_coverage_too_low")
-
-        family_text = f"{header_text} {context_text}".lower().replace("ё", "е")
-        negative_families = (
-            "кабельн", "трасс", "начало", "конец", "ведомость элементов",
-            "усили", "сечени", "марка металла", "смет", "расцен",
-            "стоимост", "протокол испытан",
-        )
-        # A bare word such as "оборудование" describes a list subject, not
-        # the document family.  Only explicit specification-family wording is
-        # a positive title/context signal; rich one-to-one headers remain a
-        # separate bounded acceptance path below.
-        positive_families = (
-            "спецификац",
-            "ведомость материалов",
-            "перечень материалов",
-            "техническая спецификац",
-        )
-        negative_hits = tuple(
-            value for value in negative_families if value in family_text
-        )
-        positive_hits = tuple(
-            value for value in positive_families if value in family_text
-        )
-        if negative_hits:
-            reasons.append("negative_document_family:" + ",".join(negative_hits))
-        elif positive_hits:
-            reasons.append("positive_document_family:" + ",".join(positive_hits))
-        else:
-            # A name/unit/quantity trio (or a small four-column list) is not
-            # enough to establish a classic material/equipment specification.
-            # Rich classic headers are accepted without a title because OCR
-            # often misses the document heading entirely.
-            rich_header = len(mapped_fields) >= 5 and bool(
-                mapped_fields.intersection({"type_mark", "code", "manufacturer", "mass", "note"})
+        if context_text.strip():
+            regions.append(
+                ContextRegionEvidence(
+                    kind="compatibility_context",
+                    bounds=(0.0, 0.0, 1.0, 1.0),
+                    text=context_text.strip()[:500],
+                    source="explicit_bounded_context",
+                )
             )
-            if not rich_header:
-                reasons.append("family_evidence_missing")
-
-        blocking_reasons = [
-            reason for reason in reasons
-            if not reason.startswith("positive_document_family:")
-        ]
-        if blocking_reasons:
-            status = UNSUPPORTED if negative_hits or "semantic_coverage_too_low" in blocking_reasons else (AMBIGUOUS if any(
-                reason in {
-                    "multiple_semantic_fields_in_one_column",
-                    "semantic_field_has_multiple_columns",
-                    "header_region_missing",
-                    "family_evidence_missing",
-                }
-                for reason in blocking_reasons
-            ) else UNSUPPORTED)
-        else:
-            status = SUPPORTED
-        return SchemaAssessment(
-            status=status,
-            coverage_score=coverage,
-            uniqueness_score=uniqueness,
-            header_consistency=header_consistency,
-            mapped_fields=tuple(sorted(mapped_fields)),
-            reasons=tuple(dict.fromkeys(reasons)),
+        family = DEFAULT_TABLE_FAMILY_CLASSIFIER.assess(BoundedFamilyContext(tuple(regions)))
+        return DEFAULT_SCHEMA_GATE.assess(
+            column_count=column_count,
+            mapping=result,
+            family=family,
         )
 
 
 DEFAULT_SCHEMA_RECOGNIZER = SupportedSpecificationSchemaRecognizer()
+
+__all__ = [
+    "AMBIGUOUS",
+    "CORE_FIELDS",
+    "DEFAULT_SCHEMA_RECOGNIZER",
+    "OPTIONAL_FIELDS",
+    "SUPPORTED",
+    "UNSUPPORTED",
+    "SchemaAssessment",
+    "SupportedSpecificationSchemaRecognizer",
+]

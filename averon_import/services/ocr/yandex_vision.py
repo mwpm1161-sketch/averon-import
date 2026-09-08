@@ -1273,6 +1273,20 @@ class YandexVisionProvider:
                 if (
                     raster is not None
                     and physical_grid is not None
+                ):
+                    raw_witness = physical_row_raster_witness(
+                        raster,
+                        physical_grid,
+                        reconstruction_diagnostics.get("physical_body_row_indexes"),
+                        reconstruction_diagnostics.get("physical_word_covered_row_indexes"),
+                    )
+                    reconstruction_diagnostics["physical_raster_witness"] = raw_witness
+                    physical_evidence = reconstruction_diagnostics.get("physical_evidence")
+                    if isinstance(physical_evidence, dict):
+                        physical_evidence["raster_witness"] = dict(raw_witness)
+                if (
+                    raster is not None
+                    and physical_grid is not None
                     and reconstruction_diagnostics.get("selected_mode") == "geometry_first"
                 ):
                     covered_rows = {
