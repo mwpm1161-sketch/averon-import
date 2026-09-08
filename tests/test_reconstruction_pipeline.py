@@ -516,7 +516,7 @@ def test_span_cell_is_projected_once_and_source_ref_is_retained():
     assert rows[0].metadata["source_cell_refs"]
 
 
-def test_ambiguous_unit_anchor_keeps_table_path_and_marks_local_review():
+def test_ambiguous_unit_anchor_fails_closed_without_legacy_promotion():
     headers = [
         "Позиция", "Наименование", "Тип", "Код", "Изготовитель",
         "Единица измерения", "Количество", "Единица измерения", "Примечание",
@@ -530,13 +530,12 @@ def test_ambiguous_unit_anchor_keeps_table_path_and_marks_local_review():
             "cells": [cell(text, row, column) for row, row_values in enumerate((headers, values)) for column, text in enumerate(row_values)],
         }]},
     }
-    rows = reconstruct_page_rows(payload, "yandex_vision")
+    diagnostics: dict = {}
+    rows = reconstruct_page_rows(payload, "yandex_vision", diagnostics=diagnostics)
 
-    assert len(rows) == 1
-    assert rows[0].metadata["structured_table"] is True
-    assert rows[0].values["unit"] == "шт."
-    assert rows[0].values.get("mass", "") == ""
-    assert "ambiguous_columns" in rows[0].metadata["review_reasons"]
+    assert rows == []
+    assert diagnostics["unsupported_table_schema"] is True
+    assert diagnostics["header_mapping"]["mapping_status"] == "ambiguous"
 
 
 def test_dropped_footer_row_has_traceable_diagnostic_reason():

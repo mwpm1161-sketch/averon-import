@@ -493,6 +493,8 @@ def test_geometry_mode_uses_grid_words_and_skips_incomplete_numbering_row():
     assert all("structural_disagreement" in row.metadata["review_reasons"] for row in rows)
     assert diagnostics["structural_evidence"]["column_count_conflict"] is True
     assert diagnostics["schema"]["status"] == SUPPORTED
+    assert diagnostics["header_mapping"]["mapping_status"] == "trusted"
+    assert diagnostics["header_mapping"]["selected_mapping"]["6"] == ["quantity"]
     assert page_status_from_diagnostics(18, diagnostics, row_count=len(rows)).schema_status == SUPPORTED.upper()
 
 
@@ -962,6 +964,8 @@ def test_real_multiline_mass_header_maps_supported_schema():
     rows = reconstruct_page_rows(payload, "yandex_vision", diagnostics=diagnostics)
 
     assert diagnostics["schema"]["status"] == SUPPORTED
+    assert diagnostics["header_mapping"]["mapping_status"] == "trusted"
+    assert diagnostics["header_mapping"]["selected_mapping"]["6"] == ["quantity"]
     assert len(rows) == 1
     assert rows[0].values["name"] == "Насос-1"
     assert rows[0].values["quantity"] == "1"
@@ -1117,12 +1121,10 @@ def test_combined_critical_header_is_ambiguous_and_not_trusted():
         "yandex_vision",
         diagnostics=diagnostics,
     )
-    assert rows
+    assert rows == []
     assert diagnostics["schema"]["status"] == AMBIGUOUS
-    assert "ambiguous_table_schema" in rows[0].metadata["review_reasons"]
-    assert "critical_value_missing" not in rows[0].metadata["review_reasons"]
-    assembled = SpecificationRowAssembler().build_page(1, rows)
-    assert "ambiguous_table_schema" in critical_blockers_for_row(assembled[0])
+    assert diagnostics["unsupported_table_schema"] is True
+    assert diagnostics["header_mapping"]["mapping_status"] == "ambiguous"
 
 
 def test_grid_detector_rejects_missing_outer_rule_and_reports_integrity():

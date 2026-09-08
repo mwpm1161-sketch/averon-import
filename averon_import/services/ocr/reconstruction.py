@@ -39,6 +39,7 @@ from averon_import.services.ocr.schema_recognizer import (
     AMBIGUOUS as AMBIGUOUS_SCHEMA,
     DEFAULT_SCHEMA_RECOGNIZER,
 )
+from averon_import.services.ocr.semantics import HeaderSourceCell, map_semantic_header
 
 BASE_COLUMN_KEYS: tuple[str, ...] = tuple(column["key"] for column in BASE_COLUMNS)
 
@@ -91,6 +92,7 @@ class DetectedTable:
     header_rows: set[int] = field(default_factory=set)
     column_mapping: dict[int, tuple[str, ...]] = field(default_factory=dict)
     review_reasons: list[str] = field(default_factory=list)
+    header_mapping_diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,7 +430,7 @@ def _build_detected_table(table: dict, source: str, source_table_index: int) -> 
     )
 
 
-def _table_header_mapping(
+def _legacy_table_header_mapping(
     table: DetectedTable,
 ) -> tuple[dict[int, tuple[str, ...]] | None, set[int]]:
     if not table.rows or table.column_count <= 0:
@@ -486,6 +488,62 @@ def _table_header_mapping(
 
     table.review_reasons.append("ambiguous_columns")
     return None, set()
+
+
+def _table_header_mapping(
+    table: DetectedTable,
+) -> tuple[dict[int, tuple[str, ...]] | None, set[int]]:
+    """Map physical columns with evidence; retain the old mapper as shadow only."""
+    previous_reasons = list(table.review_reasons)
+    legacy_mapping, legacy_rows = _legacy_table_header_mapping(table)
+    legacy_reasons = [
+        reason for reason in table.review_reasons if reason not in previous_reasons
+    ]
+    table.review_reasons[:] = previous_reasons
+
+    source_cells = [
+        HeaderSourceCell(
+            physical_row=cell.row_index,
+            physical_column=cell.column_index,
+            row_span=cell.row_span,
+            column_span=cell.column_span,
+            bbox=dict(cell.bbox),
+            raw_text=cell.text,
+            provenance=(
+                {
+                    "source": cell.source,
+                    "source_table_index": table.source_table_index,
+                    "source_cell_index": cell.source_cell_index,
+                },
+            ),
+        )
+        for row in table.rows
+        for cell in row.cells
+    ]
+    result = map_semantic_header(source_cells, table.column_count)
+    diagnostics = result.as_dict()
+    diagnostics.update(
+        {
+            "old_mapping": {
+                str(column): list(fields)
+                for column, fields in sorted((legacy_mapping or {}).items())
+            },
+            "old_header_rows": sorted(legacy_rows),
+            "old_mapping_reasons": legacy_reasons,
+            "mapping_agreement": bool(
+                result.trusted
+                and legacy_mapping == result.mapping
+                and legacy_rows == set(result.header_rows)
+            ),
+        }
+    )
+    table.header_mapping_diagnostics = diagnostics
+    if not result.trusted:
+        for reason in ("semantic_mapping_ambiguous", *result.reasons):
+            if reason not in table.review_reasons:
+                table.review_reasons.append(reason)
+        return None, set()
+    return dict(result.mapping), set(result.header_rows)
 
 
 def _bbox_height(bbox: dict) -> float:
@@ -1022,6 +1080,8 @@ def rows_from_tables(
             )
     mapping, header_rows = _table_header_mapping(table)
     table.header_rows = header_rows
+    if diagnostics is not None:
+        diagnostics["header_mapping"] = dict(table.header_mapping_diagnostics)
     if mapping is None:
         if diagnostics is not None:
             diagnostics["schema"] = {
@@ -2178,6 +2238,9 @@ def rows_from_physical_grid(
         }
         diagnostics["structural_evidence"] = evidence
         diagnostics["geometry_events"] = local_diagnostics.get("events", [])
+        diagnostics["header_mapping"] = dict(
+            local_diagnostics.get("header_mapping") or {}
+        )
         # The schema was assessed on the selected physical-grid table.  Make
         # that assessment authoritative for the page contract; callers must
         # not fall back to the incomplete legacy diagnostics after a
@@ -2221,7 +2284,12 @@ def reconstruct_page_rows(
         diagnostics["legacy_events"] = legacy_events
         # Preserve the public diagnostics shape used by existing callers.
         diagnostics["events"] = list(legacy_events)
-        for key in ("schema", "schema_status", "unsupported_table_schema"):
+        for key in (
+            "schema",
+            "schema_status",
+            "unsupported_table_schema",
+            "header_mapping",
+        ):
             if key in legacy_diagnostics:
                 diagnostics[key] = legacy_diagnostics[key]
     legacy_schema_unsupported = bool(
