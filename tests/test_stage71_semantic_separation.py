@@ -156,6 +156,17 @@ def test_explicit_and_profile_negative_evidence_is_confirmed():
     assert classifier.assess(_context("марка металла")).family == OTHER_TABLE
 
 
+def test_profile_negative_evidence_keeps_supporting_region_provenance():
+    context = BoundedFamilyContext((
+        ContextRegionEvidence("near_table_above", (0, 0, 1, 1), "Раздел оборудования"),
+        ContextRegionEvidence("table_caption", (0, 1, 1, 2), "Цена и стоимость"),
+    ))
+    assessment = TableFamilyClassifier().assess(context)
+    evidence = next(item for item in assessment.negative_evidence if item.code == "cost_document")
+    assert evidence.text == "Цена и стоимость"
+    assert evidence.region_kind == "table_caption"
+
+
 def test_far_context_above_tall_table_is_outside_hard_cap():
     words = [
         {"text": "Спецификация", "vertices": [

@@ -15,8 +15,13 @@ from averon_import.services.ocr.page_contract import page_status_from_diagnostic
 from averon_import.services.ocr.raster_grid import RasterGridPage, crop_has_isolated_glyph
 from averon_import.services.ocr.reconstruction import (
     _primary_structural_evidence,
+    _schema_gate_structural_evidence,
     target_cell_structural_safety,
 )
+from averon_import.services.ocr.semantics.context_evidence import BoundedFamilyContext
+from averon_import.services.ocr.semantics.family_classifier import TableFamilyClassifier
+from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult
+from averon_import.services.ocr.semantics.schema_gate import DEFAULT_SCHEMA_GATE
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider, _HttpResponse
 from averon_import.services.review_policy import (
     CRITICAL_FIELDS,
@@ -110,6 +115,51 @@ def test_extra_outer_leading_provider_column_is_informational():
     assert evidence["missing_grid_internal_boundaries"] == []
     assert evidence["material_disagreement"] is False
     assert evidence["informational_column_disagreement"] is True
+
+
+def _trusted_schema_mapping() -> HeaderMappingResult:
+    return HeaderMappingResult(
+        status="trusted",
+        header_rows=(0,),
+        mapping=MAPPING,
+        candidates_by_column={},
+        best_score=1.0,
+        second_best_score=0.0,
+        assignment_margin=1.0,
+        unmapped_columns=(),
+        missing_core_fields=(),
+        reasons=(),
+    )
+
+
+def test_primary_material_internal_disagreement_reaches_schema_gate():
+    edges = list(_grid().x_boundaries)
+    edges.pop(6)
+    evidence = _evidence(edges)
+    gate_evidence = _schema_gate_structural_evidence(evidence)
+    assessment = DEFAULT_SCHEMA_GATE.assess(
+        column_count=9,
+        mapping=_trusted_schema_mapping(),
+        family=TableFamilyClassifier().assess(BoundedFamilyContext()),
+        structural=gate_evidence,
+    )
+    assert evidence["material_column_disagreement"] is True
+    assert gate_evidence.material_column_conflict is True
+    assert assessment.status == "ambiguous"
+
+
+def test_primary_nvk_style_extra_outer_column_stays_schema_eligible():
+    evidence = _evidence([0.01, *_grid().x_boundaries], column_count=10)
+    gate_evidence = _schema_gate_structural_evidence(evidence)
+    assessment = DEFAULT_SCHEMA_GATE.assess(
+        column_count=9,
+        mapping=_trusted_schema_mapping(),
+        family=TableFamilyClassifier().assess(BoundedFamilyContext()),
+        structural=gate_evidence,
+    )
+    assert evidence["material_column_disagreement"] is False
+    assert gate_evidence.material_column_conflict is False
+    assert assessment.status == "supported"
 
 
 def test_provider_bbox_jitter_is_clustered_and_informational():

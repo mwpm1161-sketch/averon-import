@@ -1189,7 +1189,24 @@ def _schema_gate_structural_evidence(
     """
     evidence = structural if isinstance(structural, dict) else {}
     critical = tuple(evidence.get("critical_boundary_conflicts") or ())
+    material_reasons = set(evidence.get("material_disagreement_reasons") or ())
+    has_internal_material = bool(
+        evidence.get("missing_grid_internal_boundaries")
+        or evidence.get("extra_provider_internal_boundaries")
+        or "missing_grid_internal_boundary" in material_reasons
+        or "extra_provider_internal_boundary" in material_reasons
+    )
+    trailing_optional_only = bool(
+        evidence.get("trailing_optional_collapse")
+        and material_reasons <= {"extra_provider_internal_boundary"}
+        and not evidence.get("missing_grid_internal_boundaries")
+        and not evidence.get("critical_boundary_conflicts")
+    )
     material = bool(
+        evidence.get("material_column_disagreement")
+        and has_internal_material
+        and not trailing_optional_only
+    ) or bool(
         evidence.get("material_column_conflict")
         or evidence.get("relevant_material_column_conflict")
     )

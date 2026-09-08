@@ -152,12 +152,26 @@ class TableFamilyClassifier:
             bool(profile_hits[key]) for key in ("metal_section", "metal_strength", "metal_profile")
         ) >= 2:
             profile_codes.add("metal_schedule")
+        profile_support_tokens = {
+            "cost_document": ("смет", "цен", "стоимост", "сумм", "расцен"),
+            "route_register": ("трасс", "маршрут", "начало", "конец", "кабел"),
+            "metal_schedule": ("марка металла", "сечени", "усили", "профил", "элемент"),
+        }
         for code in sorted(profile_codes):
-            matching = next((region for region in usable_regions if code in {
-                "cost_document", "route_register", "metal_schedule"
-            }), None)
-            if matching is None and usable_regions:
-                matching = usable_regions[0]
+            support_tokens = profile_support_tokens[code]
+            matching = next(
+                (
+                    region
+                    for region in usable_regions
+                    if any(
+                        token in " ".join(
+                            str(region.text).lower().replace("ё", "е").split()
+                        )
+                        for token in support_tokens
+                    )
+                ),
+                None,
+            )
             if matching is not None:
                 negative.append(FamilyEvidence(
                     code, "negative", matching.kind, matching.text, "strong", matching.provenance
