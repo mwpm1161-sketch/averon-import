@@ -8,6 +8,8 @@ semantic layer and never become part of ``PhysicalTableIR`` itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import math
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -84,6 +86,21 @@ def _bbox_dict(value: BBox) -> dict[str, float]:
     }
 
 
+def _validate_bbox(value: BBox, label: str) -> None:
+    if not all(math.isfinite(number) for number in value):
+        raise ValueError(f"{label} must contain finite coordinates")
+    left, top, right, bottom = value
+    if left < 0 or top < 0 or right < left or bottom < top:
+        raise ValueError(f"{label} must have a non-negative, ordered extent")
+
+
+def _validate_boundaries(values: tuple[float, ...], label: str) -> None:
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError(f"{label} must contain finite values")
+    if any(left >= right for left, right in zip(values, values[1:])):
+        raise ValueError(f"{label} must be strictly increasing")
+
+
 def _strings(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -146,6 +163,19 @@ class PhysicalTableRef:
         if self.document_id and ("/" in self.document_id or "\\" in self.document_id):
             raise ValueError("document_id must not contain a filesystem path")
 
+    @property
+    def key(self) -> str:
+        """Canonical identity for this table.
+
+        The JSON tuple is length-safe for arbitrary document/detector text and
+        includes every equality field.  ``document_id=None`` is an explicit
+        runtime-local scope: callers must not use it to correlate tables from
+        separate document lifecycles without supplying a document id.
+        """
+
+        identity = [self.document_id, self.page_number, self.table_index, self.detector_source]
+        return "table:" + json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "page_number": self.page_number,
@@ -169,10 +199,7 @@ class PhysicalRowRef:
 
     @property
     def key(self) -> str:
-        return (
-            f"{self.table.document_id or 'document'}:p{self.table.page_number}:"
-            f"t{self.table.table_index}:r{self.row_index}"
-        )
+        return f"{self.table.key}|row:{self.row_index}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +221,7 @@ class PhysicalCellRef:
 
     @property
     def key(self) -> str:
-        return f"{self.row.key}:c{self.column_index}:s{self.source_cell_index}"
+        return f"{self.row.key}|cell:{self.column_index}:{self.source_cell_index}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,7 +241,7 @@ class PhysicalWordRef:
 
     @property
     def key(self) -> str:
-        return f"{self.table.document_id or 'document'}:p{self.table.page_number}:w{self.source_word_index}"
+        return f"{self.table.key}|word:{self.source_word_index}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,9 +433,13 @@ class PhysicalTableIR:
         object.__setattr__(self, "bounds", _bbox(self.bounds))
         object.__setattr__(self, "x_boundaries", tuple(float(value) for value in self.x_boundaries))
         object.__setattr__(self, "y_boundaries", tuple(float(value) for value in self.y_boundaries))
-        object.__setattr__(self, "rows", tuple(self.rows))
-        object.__setattr__(self, "cells", tuple(self.cells) or tuple(cell for row in self.rows for cell in row.cells))
-        object.__setattr__(self, "words", tuple(self.words))
+        rows = tuple(self.rows)
+        explicit_cells = tuple(self.cells)
+        words = tuple(self.words)
+        fragments = tuple(self.row_fragments)
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "cells", explicit_cells or tuple(cell for row in rows for cell in row.cells))
+        object.__setattr__(self, "words", words)
         normalized_assignments = {
             str(key): tuple(_word_ref(ref) for ref in value)
             for key, value in self.assigned_word_refs.items()
@@ -418,7 +449,89 @@ class PhysicalTableIR:
         object.__setattr__(self, "structural_evidence", _freeze(self.structural_evidence))
         object.__setattr__(self, "raster_witness", _freeze(self.raster_witness))
         object.__setattr__(self, "provenance", _freeze(self.provenance))
-        object.__setattr__(self, "row_fragments", tuple(self.row_fragments))
+        object.__setattr__(self, "row_fragments", fragments)
+
+        _validate_bbox(self.bounds, "table bounds")
+        _validate_boundaries(self.x_boundaries, "x boundaries")
+        _validate_boundaries(self.y_boundaries, "y boundaries")
+
+        row_by_key: dict[str, PhysicalRowIR] = {}
+        row_indexes: set[int] = set()
+        for row in rows:
+            if not isinstance(row, PhysicalRowIR):
+                raise TypeError("rows must contain PhysicalRowIR values")
+            if row.ref.table != self.ref:
+                raise ValueError("row reference belongs to a different physical table")
+            if row.ref.key in row_by_key or row.ref.row_index in row_indexes:
+                raise ValueError("duplicate physical row identity")
+            _validate_bbox(row.bbox, f"row {row.ref.row_index} bounds")
+            row_by_key[row.ref.key] = row
+            row_indexes.add(row.ref.row_index)
+
+        row_cells: dict[str, PhysicalCellIR] = {}
+        row_columns: set[tuple[str, int]] = set()
+        for row in rows:
+            for cell in row.cells:
+                if not isinstance(cell, PhysicalCellIR):
+                    raise TypeError("row cells must contain PhysicalCellIR values")
+                if cell.ref.row != row.ref or cell.ref.row.table != self.ref:
+                    raise ValueError("cell reference belongs to an unrelated row/table")
+                if cell.ref.key in row_cells or (row.ref.key, cell.ref.column_index) in row_columns:
+                    raise ValueError("duplicate or conflicting physical cell identity")
+                _validate_bbox(cell.bbox, f"cell {cell.ref.key} bounds")
+                row_cells[cell.ref.key] = cell
+                row_columns.add((row.ref.key, cell.ref.column_index))
+
+        explicit_cell_keys = [cell.ref.key for cell in explicit_cells]
+        if len(set(explicit_cell_keys)) != len(explicit_cell_keys):
+            raise ValueError("duplicate physical cell identity in flat cells")
+        if explicit_cells and set(explicit_cell_keys) != set(row_cells):
+            raise ValueError("flat cells disagree with row-owned cells")
+        for cell in self.cells:
+            if cell.ref.key not in row_cells:
+                raise ValueError("flat cell is not owned by a physical row")
+
+        word_by_key: dict[str, PhysicalWordIR] = {}
+        word_indexes: set[int] = set()
+        for word in words:
+            if not isinstance(word, PhysicalWordIR):
+                raise TypeError("words must contain PhysicalWordIR values")
+            if word.ref.table != self.ref:
+                raise ValueError("word reference belongs to a different physical table")
+            if word.ref.key in word_by_key or word.ref.source_word_index in word_indexes:
+                raise ValueError("duplicate physical word identity")
+            _validate_bbox(word.bbox, f"word {word.ref.key} bounds")
+            word_by_key[word.ref.key] = word
+            word_indexes.add(word.ref.source_word_index)
+
+        for cell in row_cells.values():
+            for word_ref in cell.word_refs:
+                if word_ref.table != self.ref or word_ref.key not in word_by_key:
+                    raise ValueError("cell word reference is not a known word in this table")
+
+        for assignment in self.assigned_word_refs.values():
+            for word_ref in assignment:
+                if word_ref.table != self.ref or word_ref.key not in word_by_key:
+                    raise ValueError("assigned word reference is not a known word in this table")
+
+        fragment_keys: set[tuple[str, int]] = set()
+        fragment_cells: set[str] = set()
+        for fragment in fragments:
+            if not isinstance(fragment, PhysicalRowFragmentIR):
+                raise TypeError("row_fragments must contain PhysicalRowFragmentIR values")
+            if fragment.parent_row_ref.table != self.ref:
+                raise ValueError("row fragment parent belongs to a different table")
+            fragment_identity = (fragment.parent_row_ref.key, fragment.fragment_index)
+            if fragment_identity in fragment_keys:
+                raise ValueError("duplicate row fragment identity")
+            _validate_bbox(fragment.bbox, f"fragment {fragment_identity} bounds")
+            fragment_keys.add(fragment_identity)
+            for cell in fragment.cells:
+                if cell.ref.row != fragment.parent_row_ref or cell.ref.row.table != self.ref:
+                    raise ValueError("row fragment cell claims an unrelated row")
+                if cell.ref.key in fragment_cells:
+                    raise ValueError("duplicate row fragment cell identity")
+                fragment_cells.add(cell.ref.key)
 
     @property
     def row_count(self) -> int:

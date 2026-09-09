@@ -11,6 +11,7 @@ from averon_import.services.ocr.semantics.row_evidence import (
     RoleCandidate,
     RowRelationAssessment,
     RowRelationState,
+    RowQualifier,
     RowRole,
     RowRoleAssessment,
     RowRoleState,
@@ -290,7 +291,14 @@ def test_semantic_table_roundtrip_preserves_fragments_provenance_and_candidate_o
     )
     ir = SemanticTableIR.from_parts(
         context,
-        row_roles=(RowRoleAssessment(refs[0], selected_role=RowRole.ITEM_ROOT, state=RowRoleState.CONFIRMED),),
+        row_roles=(
+            RowRoleAssessment(
+                refs[0],
+                candidates=(RoleCandidate(RowRole.ITEM_ROOT),),
+                selected_role=RowRole.ITEM_ROOT,
+                state=RowRoleState.CONFIRMED,
+            ),
+        ),
         logical_items=(logical_item,),
         dispositions=(_item(refs[0]),),
         diagnostics={"mode": "shadow"},
@@ -300,3 +308,261 @@ def test_semantic_table_roundtrip_preserves_fragments_provenance_and_candidate_o
     assert payload["logical_items"][0]["fields"]["quantity"]["canonical_text"] is None
     assert payload["conservation"]["semantic_conservation_pass"] is False
     assert payload["logical_items"][0]["provenance"]["source"] == "shadow"
+
+
+def test_ref_keys_include_all_table_identity_fields():
+    first = PhysicalTableRef(7, 0, "fixture", "raster")
+    second_table = PhysicalTableRef(7, 1, "fixture", "raster")
+    second_detector = PhysicalTableRef(7, 0, "fixture", "yandex")
+    first_word = PhysicalWordRef(first, 3)
+    second_word = PhysicalWordRef(second_table, 3)
+    third_word = PhysicalWordRef(second_detector, 3)
+    assert first.key != second_table.key
+    assert first.key != second_detector.key
+    assert PhysicalRowRef(first, 0).key != PhysicalRowRef(second_table, 0).key
+    assert first_word.key != second_word.key
+    assert first_word.key != third_word.key
+    assert PhysicalCellRef(PhysicalRowRef(first, 0), 1).key != PhysicalCellRef(
+        PhysicalRowRef(second_detector, 0), 1
+    ).key
+
+
+def test_physical_table_ir_rejects_malformed_internal_references():
+    table, refs = _table()
+    foreign_table = PhysicalTableRef(7, 0, "fixture", "other-detector")
+    foreign_row = PhysicalRowIR(PhysicalRowRef(foreign_table, 0), (0, 0, 10, 10))
+    with pytest.raises(ValueError, match="row reference"):
+        PhysicalTableIR(table.ref, table.bounds, rows=(foreign_row,))
+
+    with pytest.raises(ValueError, match="duplicate physical row"):
+        PhysicalTableIR(table.ref, table.bounds, rows=(table.rows[0], table.rows[0]))
+
+    unrelated_cell = PhysicalCellIR(
+        PhysicalCellRef(PhysicalRowRef(foreign_table, 0), 0),
+        (0, 0, 10, 10),
+        raw_text="foreign",
+    )
+    malformed_row = PhysicalRowIR(refs[0], table.rows[0].bbox, cells=(unrelated_cell,))
+    with pytest.raises(ValueError, match="cell reference"):
+        PhysicalTableIR(table.ref, table.bounds, rows=(malformed_row,))
+
+    with pytest.raises(ValueError, match="assigned word"):
+        PhysicalTableIR(
+            table.ref,
+            table.bounds,
+            assigned_word_refs={"cell": (PhysicalWordRef(table.ref, 999),)},
+        )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        PhysicalTableIR(table.ref, table.bounds, x_boundaries=(0, 10, 10))
+    with pytest.raises(ValueError, match="non-negative"):
+        PhysicalTableIR(table.ref, (-1, 0, 10, 10))
+
+    foreign_fragment = PhysicalRowFragmentIR(
+        PhysicalRowRef(foreign_table, 0),
+        0,
+        (0, 0, 10, 10),
+    )
+    with pytest.raises(ValueError, match="fragment parent"):
+        PhysicalTableIR(table.ref, table.bounds, row_fragments=(foreign_fragment,))
+
+
+def _continuation(
+    source: PhysicalRowRef,
+    target: PhysicalRowRef,
+    logical_id: str = "item-1",
+) -> tuple[ResolvedPhysicalDisposition, RowRelationAssessment]:
+    relation = RowRelationAssessment(
+        source_row_ref=source,
+        target_row_ref=target,
+        state=RowRelationState.CONFIRMED,
+        evidence=("explicit parent relation",),
+    )
+    return (
+        ResolvedPhysicalDisposition(
+            source,
+            role=RowRole.CONTINUATION,
+            validation_state=DispositionValidation.VALIDATED,
+            role_state=RowRoleState.CONFIRMED,
+            logical_item_id=logical_id,
+            relation=relation,
+            evidence=("explicit continuation",),
+        ),
+        relation,
+    )
+
+
+def test_conservation_validates_continuation_chain_to_one_root():
+    table, refs = _table()
+    middle, middle_relation = _continuation(refs[1], refs[0])
+    tail, tail_relation = _continuation(refs[2], refs[1])
+    report = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), middle, tail),
+        logical_items=(LogicalSpecificationItem("item-1", refs),),
+        relations=(middle_relation, tail_relation),
+    )
+    assert report.semantic_conservation_pass is True
+
+
+def test_conservation_rejects_cycle_and_chain_without_root():
+    table, refs = _table()
+    first, first_relation = _continuation(refs[0], refs[1])
+    second, second_relation = _continuation(refs[1], refs[0])
+    cycle_report = evaluate_semantic_conservation(
+        table.rows,
+        (first, second, _item(refs[2], role=RowRole.NOTE)),
+        logical_items=(LogicalSpecificationItem("item-1", (refs[0], refs[1])),),
+        relations=(first_relation, second_relation),
+    )
+    assert cycle_report.semantic_conservation_pass is False
+    assert "RELATION_CYCLE" in cycle_report.reasons
+
+    tail, tail_relation = _continuation(refs[1], refs[2])
+    no_root = ResolvedPhysicalDisposition(
+        refs[2],
+        role=RowRole.CONTINUATION,
+        validation_state=DispositionValidation.VALIDATED,
+        role_state=RowRoleState.CONFIRMED,
+        logical_item_id="item-1",
+        evidence=("no root",),
+    )
+    no_root_report = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), tail, no_root),
+        logical_items=(LogicalSpecificationItem("item-1", refs),),
+        relations=(tail_relation,),
+    )
+    assert no_root_report.semantic_conservation_pass is False
+    assert "ORPHAN" in no_root_report.reasons
+
+
+def test_conservation_rejects_bad_target_relation_and_disagreement():
+    table, refs = _table()
+    continuation, attached = _continuation(refs[1], refs[2])
+    target_note = _item(refs[2], role=RowRole.NOTE)
+    report = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), continuation, target_note),
+        logical_items=(LogicalSpecificationItem("item-1", (refs[0], refs[1])),),
+        relations=(attached,),
+    )
+    assert report.semantic_conservation_pass is False
+    assert "ROOT_CONFLICT" in report.reasons
+
+    wrong_authoritative = RowRelationAssessment(
+        source_row_ref=refs[1],
+        target_row_ref=refs[0],
+        state=RowRelationState.CONFIRMED,
+    )
+    mismatch = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), continuation, target_note),
+        logical_items=(LogicalSpecificationItem("item-1", (refs[0], refs[1])),),
+        relations=(wrong_authoritative,),
+    )
+    assert mismatch.semantic_conservation_pass is False
+    assert "RELATION_CONFLICT" in mismatch.reasons
+
+
+def test_conservation_reports_foreign_disposition_relation_and_item_refs():
+    table, refs = _table()
+    foreign = PhysicalRowRef(PhysicalTableRef(7, 0, "fixture", "foreign"), 99)
+    disposition_report = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), _item(refs[1]), _item(refs[2], role=RowRole.NOTE), _item(foreign)),
+        logical_items=(LogicalSpecificationItem("item-1", (refs[0], refs[1], refs[2])),),
+    )
+    assert disposition_report.semantic_conservation_pass is False
+    assert foreign in disposition_report.invalid_physical_rows
+    assert "FOREIGN_PHYSICAL_REF" in disposition_report.reasons
+
+    foreign_relation = RowRelationAssessment(refs[1], foreign, state=RowRelationState.CONFIRMED)
+    relation_report = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), _item(refs[1]), _item(refs[2], role=RowRole.NOTE)),
+        logical_items=(LogicalSpecificationItem("item-1", (refs[0], refs[1], refs[2])),),
+        relations=(foreign_relation,),
+    )
+    assert relation_report.semantic_conservation_pass is False
+    assert foreign in relation_report.invalid_physical_rows
+
+    item_report = evaluate_semantic_conservation(
+        table.rows,
+        (_item(refs[0]), _item(refs[1]), _item(refs[2], role=RowRole.NOTE)),
+        logical_items=(LogicalSpecificationItem("item-1", (refs[0], foreign)),),
+    )
+    assert item_report.semantic_conservation_pass is False
+    assert foreign in item_report.invalid_physical_rows
+
+
+def test_logical_field_canonical_provenance_contract():
+    table, refs = _table()
+    with pytest.raises(ValueError, match="source fragment"):
+        LogicalFieldValue("quantity", canonical_text="1", origin=FieldOrigin.OCR)
+
+    fragment = SourceFieldFragment("quantity", "1", refs[0], table.rows[0].cells[0].ref)
+    accepted = LogicalFieldValue("quantity", canonical_text="1", source_fragments=(fragment,))
+    assert accepted.canonical_text == "1"
+
+    with pytest.raises(ValueError, match="field"):
+        LogicalSpecificationItem("item-1", (refs[0],), fields={"name": accepted})
+    with pytest.raises(ValueError, match="source fragment field"):
+        LogicalFieldValue(
+            "quantity",
+            canonical_text="1",
+            source_fragments=(SourceFieldFragment("name", "1", refs[0]),),
+        )
+    with pytest.raises(ValueError, match="belong to the logical item"):
+        LogicalSpecificationItem(
+            "item-1",
+            (refs[0],),
+            fields={
+                "quantity": LogicalFieldValue(
+                    "quantity",
+                    canonical_text="1",
+                    source_fragments=(SourceFieldFragment("quantity", "1", refs[1]),),
+                )
+            },
+        )
+
+    assert LogicalFieldValue("quantity", canonical_text="1", origin=FieldOrigin.HUMAN).origin == FieldOrigin.HUMAN
+    assert LogicalFieldValue(
+        "quantity", canonical_text="1", origin=FieldOrigin.TRUSTED_RULE
+    ).origin == FieldOrigin.TRUSTED_RULE
+
+
+def test_row_qualifier_contract_does_not_hide_ambiguous_same_role_candidates():
+    assert {
+        RowQualifier.COLUMN_HEADER,
+        RowQualifier.REPEATED_HEADER,
+        RowQualifier.NUMBERING_BAND,
+        RowQualifier.TITLE_BLOCK,
+        RowQualifier.SECTION,
+        RowQualifier.SYSTEM,
+    }.issubset(set(RowQualifier))
+    _, refs = _table()
+    ambiguous = RowRoleAssessment(
+        refs[0],
+        candidates=(
+            RoleCandidate(RowRole.HEADER, qualifier=RowQualifier.COLUMN_HEADER),
+            RoleCandidate(RowRole.HEADER, qualifier=RowQualifier.REPEATED_HEADER),
+        ),
+        selected_role=RowRole.HEADER,
+        state=RowRoleState.AMBIGUOUS,
+    )
+    assert ambiguous.selected is None
+    selected = RowRoleAssessment(
+        refs[0],
+        candidates=ambiguous.candidates,
+        selected_role=RowRole.HEADER,
+        selected_qualifier=RowQualifier.REPEATED_HEADER,
+        state=RowRoleState.CONFIRMED,
+    )
+    assert selected.selected.qualifier == RowQualifier.REPEATED_HEADER.value
+    with pytest.raises(ValueError, match="exactly one candidate"):
+        RowRoleAssessment(
+            refs[0],
+            selected_role=RowRole.HEADER,
+            state=RowRoleState.CONFIRMED,
+        )

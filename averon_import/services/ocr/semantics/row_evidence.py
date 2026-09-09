@@ -28,6 +28,9 @@ class RowRole(str, Enum):
 
 class RowQualifier(str, Enum):
     COLUMN_HEADER = "COLUMN_HEADER"
+    REPEATED_HEADER = "REPEATED_HEADER"
+    NUMBERING_BAND = "NUMBERING_BAND"
+    TITLE_BLOCK = "TITLE_BLOCK"
     SECTION = "SECTION"
     SYSTEM = "SYSTEM"
     TITLE = "TITLE"
@@ -64,7 +67,13 @@ def _tuple_strings(value: Any) -> tuple[str, ...]:
         return ()
     if isinstance(value, str):
         return (value,)
-    return tuple(str(item) for item in value)
+    return tuple(item.value if isinstance(item, Enum) else str(item) for item in value)
+
+
+def _qualifier_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.value if isinstance(value, Enum) else str(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +93,10 @@ class RoleCandidate:
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", _enum_value(self.role, RowRole))
         qualifiers = _tuple_strings(self.qualifiers)
-        if self.qualifier and self.qualifier not in qualifiers:
-            qualifiers = (str(self.qualifier),) + qualifiers
-        object.__setattr__(self, "qualifier", str(self.qualifier) if self.qualifier else None)
+        qualifier = _qualifier_value(self.qualifier)
+        if qualifier and qualifier not in qualifiers:
+            qualifiers = (qualifier,) + qualifiers
+        object.__setattr__(self, "qualifier", qualifier)
         object.__setattr__(self, "qualifiers", qualifiers)
         object.__setattr__(self, "evidence", _tuple_strings(self.evidence))
         object.__setattr__(self, "contradictions", _tuple_strings(self.contradictions))
@@ -126,23 +136,45 @@ class RowRoleAssessment:
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "candidates", tuple(self.candidates))
+        candidates = tuple(self.candidates)
+        if any(not isinstance(candidate, RoleCandidate) for candidate in candidates):
+            raise TypeError("candidates must contain RoleCandidate values")
+        object.__setattr__(self, "candidates", candidates)
         if self.selected_role is not None:
             object.__setattr__(self, "selected_role", _enum_value(self.selected_role, RowRole))
+        object.__setattr__(self, "selected_qualifier", _qualifier_value(self.selected_qualifier))
         object.__setattr__(self, "state", _enum_value(self.state, RowRoleState))
         object.__setattr__(self, "evidence", _tuple_strings(self.evidence))
         object.__setattr__(self, "contradictions", _tuple_strings(self.contradictions))
         object.__setattr__(self, "reasons", _tuple_strings(self.reasons))
         object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+        if self.state == RowRoleState.CONFIRMED:
+            if self.selected_role is None:
+                raise ValueError("confirmed row role must select a role")
+            matching = [candidate for candidate in candidates if candidate.role == self.selected_role]
+            if self.selected_qualifier is not None:
+                matching = [
+                    candidate
+                    for candidate in matching
+                    if self.selected_qualifier in candidate.qualifiers
+                    or candidate.qualifier == self.selected_qualifier
+                ]
+            if len(matching) != 1:
+                raise ValueError("confirmed row role must resolve exactly one candidate")
 
     @property
     def selected(self) -> RoleCandidate | None:
         if self.selected_role is None:
             return None
-        return next(
-            (candidate for candidate in self.candidates if candidate.role == self.selected_role),
-            None,
-        )
+        matching = [candidate for candidate in self.candidates if candidate.role == self.selected_role]
+        if self.selected_qualifier is not None:
+            matching = [
+                candidate
+                for candidate in matching
+                if self.selected_qualifier in candidate.qualifiers
+                or candidate.qualifier == self.selected_qualifier
+            ]
+        return matching[0] if len(matching) == 1 else None
 
     def as_dict(self) -> dict[str, Any]:
         return {

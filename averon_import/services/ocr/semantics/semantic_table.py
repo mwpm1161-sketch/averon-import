@@ -159,6 +159,8 @@ class SourceFieldFragment:
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.physical_row_ref, PhysicalRowRef):
+            raise TypeError("source fragment requires a PhysicalRowRef")
         object.__setattr__(self, "bbox", _bbox(self.bbox))
         object.__setattr__(self, "origin", _enum(self.origin, FieldOrigin))
         object.__setattr__(self, "word_refs", tuple(self.word_refs))
@@ -196,6 +198,10 @@ class LogicalFieldValue:
         object.__setattr__(self, "origin", _enum(self.origin, FieldOrigin))
         object.__setattr__(self, "review_reasons", _strings(self.review_reasons))
         object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+        if self.origin == FieldOrigin.OCR and self.canonical_text is not None and not self.source_fragments:
+            raise ValueError("OCR canonical value requires a supporting source fragment")
+        if any(fragment.field != self.field for fragment in self.source_fragments):
+            raise ValueError("source fragment field must match logical field")
 
     @property
     def candidate_only(self) -> bool:
@@ -224,9 +230,23 @@ class LogicalSpecificationItem:
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "physical_row_refs", tuple(self.physical_row_refs))
+        physical_row_refs = tuple(self.physical_row_refs)
+        if len(set(ref.key for ref in physical_row_refs)) != len(physical_row_refs):
+            raise ValueError("logical item physical row refs must be unique")
+        object.__setattr__(self, "physical_row_refs", physical_row_refs)
         object.__setattr__(self, "context_refs", tuple(self.context_refs))
-        object.__setattr__(self, "fields", freeze_mapping(self.fields))
+        normalized_fields: dict[str, LogicalFieldValue] = {}
+        for field_name, field_value in self.fields.items():
+            if not isinstance(field_value, LogicalFieldValue):
+                raise TypeError("logical item fields must contain LogicalFieldValue values")
+            if not isinstance(field_name, str) or field_name != field_value.field:
+                raise ValueError("logical item field key must match LogicalFieldValue.field")
+            if field_value.origin == FieldOrigin.OCR:
+                if any(fragment.physical_row_ref.key not in {ref.key for ref in physical_row_refs}
+                       for fragment in field_value.source_fragments):
+                    raise ValueError("OCR source fragment row must belong to the logical item")
+            normalized_fields[str(field_name)] = field_value
+        object.__setattr__(self, "fields", freeze_mapping(normalized_fields))
         object.__setattr__(self, "bbox", _bbox(self.bbox))
         object.__setattr__(self, "review_reasons", _strings(self.review_reasons))
         object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
@@ -379,104 +399,219 @@ def evaluate_semantic_conservation(
     logical_items: Iterable[LogicalSpecificationItem] = (),
     relations: Iterable[RowRelationAssessment] = (),
 ) -> SemanticConservationReport:
-    """Evaluate explicit physical-row accounting without inventing semantics."""
+    """Evaluate explicit physical-row accounting and relation-graph safety."""
 
     refs = _physical_refs(physical_rows)
     dispositions_tuple = tuple(dispositions)
     items = tuple(logical_items)
     relation_tuple = tuple(relations)
-    by_key: dict[str, list[ResolvedPhysicalDisposition]] = defaultdict(list)
-    ref_by_key = {_row_key(ref): ref for ref in refs}
-    for disposition in dispositions_tuple:
-        by_key[_row_key(disposition.physical_row_ref)].append(disposition)
-
+    ref_by_key: dict[str, PhysicalRowRef] = {}
+    invalid_refs: dict[str, PhysicalRowRef] = {}
     invalid: dict[str, set[str]] = defaultdict(set)
+
+    def mark(ref: PhysicalRowRef | None, reason: str) -> None:
+        if ref is None:
+            return
+        key = _row_key(ref)
+        invalid_refs.setdefault(key, ref)
+        invalid[key].add(reason)
+
+    for ref in refs:
+        key = _row_key(ref)
+        if key in ref_by_key:
+            mark(ref, "ROOT_CONFLICT")
+            mark(ref_by_key[key], "ROOT_CONFLICT")
+        else:
+            ref_by_key[key] = ref
+
+    by_key: dict[str, list[ResolvedPhysicalDisposition]] = defaultdict(list)
+    for disposition in dispositions_tuple:
+        key = _row_key(disposition.physical_row_ref)
+        by_key[key].append(disposition)
+        if key not in ref_by_key or disposition.physical_row_ref != ref_by_key[key]:
+            mark(disposition.physical_row_ref, "FOREIGN_PHYSICAL_REF")
+
     counts = Counter()
     for ref in refs:
         key = _row_key(ref)
         candidates = by_key.get(key, [])
         if not candidates:
-            invalid[key].add("UNACCOUNTED")
+            mark(ref, "UNACCOUNTED")
             continue
         if len(candidates) != 1:
-            invalid[key].add("MULTIPLE_DISPOSITIONS")
+            mark(ref, "MULTIPLE_DISPOSITIONS")
             continue
         disposition = candidates[0]
         counts[disposition.role] += 1
         if disposition.role == RowRole.UNKNOWN:
-            invalid[key].add("UNKNOWN")
+            mark(ref, "UNKNOWN")
         if disposition.validation_state != DispositionValidation.VALIDATED:
-            invalid[key].add("UNRESOLVED")
+            mark(ref, "UNRESOLVED")
         if disposition.role_state != RowRoleState.CONFIRMED:
-            invalid[key].add("UNRESOLVED")
+            mark(ref, "UNRESOLVED")
         if not disposition.evidence:
-            invalid[key].add("UNRESOLVED")
+            mark(ref, "UNRESOLVED")
         if disposition.role in {RowRole.ITEM_ROOT, RowRole.CONTINUATION} and not disposition.logical_item_id:
-            invalid[key].add("ORPHAN")
-        if disposition.role == RowRole.CONTINUATION:
-            if disposition.relation is None:
-                invalid[key].add("ORPHAN")
-            elif (
-                disposition.relation.relation_type != RowRelationType.CONTINUATION_OF
-                or disposition.relation.state != RowRelationState.CONFIRMED
-                or disposition.relation.target_row_ref is None
-            ):
-                invalid[key].add("RELATION_CONFLICT")
+            mark(ref, "ORPHAN")
 
-    confirmed_relations = [
-        relation
-        for relation in relation_tuple
-        if relation.state == RowRelationState.CONFIRMED
-    ]
-    relation_targets: dict[str, set[str]] = defaultdict(set)
-    for relation in confirmed_relations:
+    authoritative_by_source: dict[str, list[RowRelationAssessment]] = defaultdict(list)
+    for relation in relation_tuple:
         source_key = _row_key(relation.source_row_ref)
         target_key = _row_key(relation.target_row_ref) if relation.target_row_ref else None
-        if relation.relation_type != RowRelationType.CONTINUATION_OF or target_key is None:
-            invalid[source_key].add("RELATION_CONFLICT")
+        source_internal = source_key in ref_by_key and relation.source_row_ref == ref_by_key[source_key]
+        target_internal = target_key is not None and target_key in ref_by_key and relation.target_row_ref == ref_by_key[target_key]
+        if not source_internal:
+            mark(relation.source_row_ref, "FOREIGN_PHYSICAL_REF")
+        if relation.target_row_ref is not None and not target_internal:
+            mark(relation.target_row_ref, "FOREIGN_PHYSICAL_REF")
+        if not source_internal:
             continue
-        relation_targets[source_key].add(target_key)
-        if len(relation_targets[source_key]) > 1:
-            invalid[source_key].add("RELATION_CONFLICT")
-        if source_key not in by_key or target_key not in ref_by_key:
-            invalid[source_key].add("ORPHAN")
+        authoritative_by_source[source_key].append(relation)
+        if relation.state == RowRelationState.CONFIRMED and (
+            relation.relation_type != RowRelationType.CONTINUATION_OF
+            or not target_internal
+            or relation.target_row_ref is None
+        ):
+            mark(relation.source_row_ref, "RELATION_CONFLICT")
+
+    def relation_signature(relation: RowRelationAssessment) -> tuple[Any, ...]:
+        return (
+            relation.source_row_ref.key,
+            relation.target_row_ref.key if relation.target_row_ref else None,
+            relation.relation_type,
+            relation.state,
+        )
+
+    # The relation embedded in a disposition is evidence that must agree with
+    # the authoritative relation collection; it is not a second graph.
+    for key, row_dispositions in by_key.items():
+        if len(row_dispositions) != 1 or key not in ref_by_key:
+            continue
+        disposition = row_dispositions[0]
+        attached = disposition.relation
+        if attached is not None:
+            attached_source_key = _row_key(attached.source_row_ref)
+            if attached_source_key != key:
+                mark(attached.source_row_ref, "FOREIGN_PHYSICAL_REF")
+            if attached.target_row_ref is not None and _row_key(attached.target_row_ref) not in ref_by_key:
+                mark(attached.target_row_ref, "FOREIGN_PHYSICAL_REF")
+        if disposition.role == RowRole.CONTINUATION:
+            if attached is None:
+                mark(disposition.physical_row_ref, "ORPHAN")
+                continue
+            if (
+                attached.relation_type != RowRelationType.CONTINUATION_OF
+                or attached.state != RowRelationState.CONFIRMED
+                or attached.target_row_ref is None
+            ):
+                mark(disposition.physical_row_ref, "RELATION_CONFLICT")
+            authoritative = authoritative_by_source.get(key, [])
+            if len(authoritative) != 1:
+                mark(disposition.physical_row_ref, "RELATION_CONFLICT")
+            elif relation_signature(attached) != relation_signature(authoritative[0]):
+                mark(disposition.physical_row_ref, "RELATION_CONFLICT")
+        elif attached is not None:
+            mark(disposition.physical_row_ref, "RELATION_CONFLICT")
+
+    parent_by_source: dict[str, PhysicalRowRef] = {}
+    for source_key, source_relations in authoritative_by_source.items():
+        confirmed = [relation for relation in source_relations if relation.state == RowRelationState.CONFIRMED]
+        if not confirmed:
+            continue
+        source_ref = ref_by_key[source_key]
+        source_dispositions = by_key.get(source_key, [])
+        if len(confirmed) != 1 or len(source_dispositions) != 1:
+            mark(source_ref, "RELATION_CONFLICT")
+            continue
+        relation = confirmed[0]
+        if source_dispositions[0].role != RowRole.CONTINUATION or relation.target_row_ref is None:
+            mark(source_ref, "RELATION_CONFLICT")
+            continue
+        parent_by_source[source_key] = relation.target_row_ref
+
+    def resolve_root(start_key: str, logical_item_id: str | None) -> str | None:
+        current = start_key
+        visited: list[str] = []
+        while True:
+            if current in visited:
+                for cycle_key in visited[visited.index(current):]:
+                    mark(ref_by_key.get(cycle_key), "RELATION_CYCLE")
+                return None
+            visited.append(current)
+            current_dispositions = by_key.get(current, [])
+            if len(current_dispositions) != 1 or current not in ref_by_key:
+                mark(ref_by_key.get(current), "ORPHAN")
+                mark(ref_by_key.get(start_key), "ORPHAN")
+                return None
+            current_disposition = current_dispositions[0]
+            if current_disposition.role == RowRole.ITEM_ROOT:
+                if current_disposition.logical_item_id != logical_item_id:
+                    mark(current_disposition.physical_row_ref, "ROOT_CONFLICT")
+                    mark(ref_by_key.get(start_key), "ROOT_CONFLICT")
+                    return None
+                return current
+            if current_disposition.role != RowRole.CONTINUATION:
+                mark(current_disposition.physical_row_ref, "ROOT_CONFLICT")
+                mark(ref_by_key.get(start_key), "ROOT_CONFLICT")
+                return None
+            if current_disposition.logical_item_id != logical_item_id:
+                mark(current_disposition.physical_row_ref, "ROOT_CONFLICT")
+                mark(ref_by_key.get(start_key), "ROOT_CONFLICT")
+                return None
+            parent = parent_by_source.get(current)
+            if parent is None:
+                mark(current_disposition.physical_row_ref, "ORPHAN")
+                mark(ref_by_key.get(start_key), "ORPHAN")
+                return None
+            current = parent.key
+
+    for key, row_dispositions in by_key.items():
+        if len(row_dispositions) != 1 or key not in ref_by_key:
+            continue
+        disposition = row_dispositions[0]
+        if disposition.role == RowRole.CONTINUATION:
+            resolve_root(key, disposition.logical_item_id)
 
     item_rows: dict[str, list[str]] = defaultdict(list)
     for item in items:
-        if not item.physical_row_refs:
-            continue
+        seen_in_item: set[str] = set()
         for ref in item.physical_row_refs:
             key = _row_key(ref)
+            if key in seen_in_item:
+                mark(ref, "ROOT_CONFLICT")
+            seen_in_item.add(key)
             item_rows[item.logical_id].append(key)
-            if key not in ref_by_key:
-                invalid[key].add("ORPHAN")
+            if key not in ref_by_key or ref != ref_by_key[key]:
+                mark(ref, "FOREIGN_PHYSICAL_REF")
+
     seen_item_rows: dict[str, str] = {}
     for item_id, row_keys in item_rows.items():
         for key in row_keys:
             previous = seen_item_rows.get(key)
             if previous is not None and previous != item_id:
-                invalid[key].add("RELATION_CONFLICT")
+                mark(ref_by_key.get(key), "ROOT_CONFLICT")
             seen_item_rows[key] = item_id
+
     for key, row_dispositions in by_key.items():
-        if not row_dispositions:
+        if len(row_dispositions) != 1 or key not in ref_by_key:
             continue
         disposition = row_dispositions[0]
         if disposition.role in {RowRole.ITEM_ROOT, RowRole.CONTINUATION}:
-            if disposition.logical_item_id not in item_rows:
-                invalid[key].add("ORPHAN")
-            elif key not in item_rows[disposition.logical_item_id]:
-                invalid[key].add("RELATION_CONFLICT")
+            item_id = disposition.logical_item_id
+            if not item_id or key not in item_rows.get(item_id, ()):
+                mark(disposition.physical_row_ref, "ORPHAN")
 
-    for source_key, targets in relation_targets.items():
-        disposition = by_key.get(source_key, [None])[0]
-        if disposition is None or disposition.role != RowRole.CONTINUATION:
-            invalid[source_key].add("RELATION_CONFLICT")
-        elif len(targets) != 1:
-            invalid[source_key].add("RELATION_CONFLICT")
+    for item_id, row_keys in item_rows.items():
+        for key in row_keys:
+            row_dispositions = by_key.get(key, [])
+            if len(row_dispositions) == 1 and row_dispositions[0].role not in {
+                RowRole.ITEM_ROOT,
+                RowRole.CONTINUATION,
+            }:
+                mark(row_dispositions[0].physical_row_ref, "ROOT_CONFLICT")
 
     valid_count = sum(1 for key in ref_by_key if not invalid.get(key))
-
-    invalid_rows = tuple(ref_by_key[key] for key in sorted(invalid) if key in ref_by_key)
+    invalid_rows = tuple(invalid_refs[key] for key in sorted(invalid_refs))
     unresolved_rows = invalid_rows
     total = len(refs)
     rate = valid_count / total if total else 1.0
