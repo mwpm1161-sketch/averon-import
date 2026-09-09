@@ -232,6 +232,61 @@ def test_hyphenated_manufacturer_fragment_is_strong_continuation_evidence():
     assert _disposition(semantic, 2).role == RowRole.CONTINUATION
 
 
+def test_f1_distinct_sparse_identity_rows_are_not_confirmed_continuation():
+    body = {
+        1: {1: "Клапан шаровой", 4: "ООО Альфа"},
+        2: {1: "Затвор дисковый", 4: "ООО Бета"},
+    }
+    _table_ir, _context, _graph, relations, _semantic = _run(body)
+    relation = _relation(relations, 2)
+    assert relation.state == RowRelationState.AMBIGUOUS
+    assert "identity_subset_only" in relation.reasons
+    assert relation.target_row_ref is None
+
+
+def test_f2_lowercase_alone_does_not_confirm_identity_only_relation():
+    body = {
+        1: {1: "клапан шаровой", 4: "ООО Альфа"},
+        2: {1: "затвор дисковый", 4: "ООО Бета"},
+    }
+    _table_ir, _context, _graph, relations, _semantic = _run(body)
+    assert _relation(relations, 2).state == RowRelationState.AMBIGUOUS
+
+
+def test_f4_open_name_and_lowercase_same_field_remain_ambiguous():
+    body = {
+        1: {1: "Насос (", 5: "шт", 6: "1"},
+        2: {1: "модель"},
+    }
+    _table_ir, _context, _graph, relations, _semantic = _run(body)
+    relation = _relation(relations, 2)
+    assert relation.state == RowRelationState.AMBIGUOUS
+    assert relation.target_row_ref is None
+
+
+def test_f5_name_and_type_subset_without_textual_continuity_is_ambiguous():
+    body = {
+        1: {1: "Клапан", 2: "Тип-А"},
+        2: {1: "Затвор", 2: "Тип-Б"},
+    }
+    _table_ir, _context, _graph, relations, _semantic = _run(body)
+    assert _relation(relations, 2).state == RowRelationState.AMBIGUOUS
+
+
+def test_f6_ambiguous_edge_stops_a_continuation_chain():
+    body = {
+        1: {1: "Насос", 4: "Завод-", 5: "шт", 6: "1"},
+        2: {1: "центробежный", 4: "А"},
+        3: {1: "другая модель", 4: "Б"},
+    }
+    _table_ir, _context, _graph, relations, semantic = _run(body)
+    assert _relation(relations, 2).state == RowRelationState.CONFIRMED
+    assert _relation(relations, 3).state == RowRelationState.AMBIGUOUS
+    assert len(semantic.logical_items) == 1
+    assert [ref.row_index for ref in semantic.logical_items[0].physical_row_refs] == [1, 2]
+    assert _disposition(semantic, 3).logical_item_id is None
+
+
 def test_new_critical_or_position_identity_evidence_blocks_continuation():
     cases = (
         ({2: {6: "2"}}, False),
@@ -351,7 +406,7 @@ def test_page_start_and_repeated_header_do_not_continue_previous_table():
 def test_continuation_chain_resolves_to_one_root_without_cycles():
     body = {
         1: {1: "Насос", 4: "Завод-", 5: "шт", 6: "1"},
-        2: {1: "центробежный", 4: "А"},
+        2: {1: "центробежный", 4: "А-"},
         3: {1: "исполнение", 4: "Б"},
     }
     _table_ir, _context, _graph, relations, semantic = _run(body)
@@ -434,3 +489,5 @@ def test_metrics_expose_relation_and_conservation_quality():
     assert metrics["semantic_conservation_pass"] is True
     assert metrics["auto_resolved_row_rate"] == 1.0
     assert metrics["item_auto_resolution_rate"] == 1.0
+    assert metrics["confirmed_continuation_with_textual_support"] == 1
+    assert metrics["ambiguous_identity_only_relation_count"] == 0

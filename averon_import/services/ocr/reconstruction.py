@@ -2806,6 +2806,24 @@ def rows_from_physical_grid(
                             relation.state.value in {"AMBIGUOUS", "UNRESOLVED"}
                             for relation in relation_assessments
                         ),
+                        "confirmed_continuation_with_textual_support": sum(
+                            relation.state.value == "CONFIRMED"
+                            and bool(
+                                set(relation.evidence).intersection(
+                                    {
+                                        "hyphenated_field_continuity",
+                                        "open_quote_or_bracket_continuity",
+                                        "lowercase_text_continuity",
+                                    }
+                                )
+                            )
+                            for relation in relation_assessments
+                        ),
+                        "ambiguous_identity_only_relation_count": sum(
+                            relation.state.value in {"AMBIGUOUS", "UNRESOLVED"}
+                            and "identity_subset_only" in relation.reasons
+                            for relation in relation_assessments
+                        ),
                     },
                 }
                 shadow["semantic_table"] = semantic_table.as_dict()

@@ -432,6 +432,24 @@ class GlobalRowSemanticsResolver:
                 relation.state in {RowRelationState.AMBIGUOUS, RowRelationState.UNRESOLVED}
                 for relation in relation_tuple
             ),
+            "confirmed_continuation_with_textual_support": sum(
+                relation.state == RowRelationState.CONFIRMED
+                and bool(
+                    set(relation.evidence).intersection(
+                        {
+                            "hyphenated_field_continuity",
+                            "open_quote_or_bracket_continuity",
+                            "lowercase_text_continuity",
+                        }
+                    )
+                )
+                for relation in relation_tuple
+            ),
+            "ambiguous_identity_only_relation_count": sum(
+                relation.state in {RowRelationState.AMBIGUOUS, RowRelationState.UNRESOLVED}
+                and "identity_subset_only" in relation.reasons
+                for relation in relation_tuple
+            ),
             "semantic_conservation_rate": conservation.semantic_conservation_rate,
             "semantic_conservation_pass": conservation.semantic_conservation_pass,
             "auto_resolved_row_rate": (

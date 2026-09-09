@@ -92,11 +92,26 @@ def _lowercase_continuity(texts: Iterable[str]) -> bool:
     return False
 
 
-def _ends_with_open_shape(texts: Iterable[str]) -> bool:
-    joined = " ".join(text.strip() for text in texts if text.strip())
-    if not joined:
-        return False
-    return joined.endswith(("-", "(", "«", '"', "["))
+def _field_has_lowercase(
+    fields: Mapping[str, tuple[tuple[PhysicalCellIR, str], ...]],
+    field: str,
+) -> bool:
+    return _lowercase_continuity(_texts(fields, field))
+
+
+def _field_has_hyphen(
+    fields: Mapping[str, tuple[tuple[PhysicalCellIR, str], ...]],
+    field: str,
+) -> bool:
+    return any(text.rstrip().endswith("-") for text in _texts(fields, field))
+
+
+def _field_has_quote_or_bracket_open(
+    fields: Mapping[str, tuple[tuple[PhysicalCellIR, str], ...]],
+    field: str,
+) -> bool:
+    joined = " ".join(text.strip() for text in _texts(fields, field) if text.strip())
+    return bool(joined) and joined.endswith(("(", "«", '"', "["))
 
 
 def _relation(
@@ -189,9 +204,6 @@ class RowRelationAnalyzer:
 
             source_fields = _row_fields(source, mapping)
             previous_fields = _row_fields(previous, mapping)
-            source_names = _texts(source_fields, "name")
-            previous_names = _texts(previous_fields, "name")
-            previous_manufacturers = _texts(previous_fields, "manufacturer")
             source_present = _present_fields(source_fields)
             previous_present = _present_fields(previous_fields)
             source_role = _role_for(source.ref.key, role_assessments)
@@ -279,14 +291,46 @@ class RowRelationAnalyzer:
 
             source_subset = bool(source_present) and source_present.issubset(previous_present)
             same_identity_fragments = len(source_identity) >= 2 and source_subset
-            manufacturer_hyphen = any(text.rstrip().endswith("-") for text in previous_manufacturers)
+            aligned_identity_fields = source_identity.intersection(previous_present)
+            lower_fields = {
+                field
+                for field in source_identity
+                if _field_has_lowercase(source_fields, field)
+            }
+            hyphen_fields = {
+                field
+                for field in aligned_identity_fields
+                if _field_has_hyphen(previous_fields, field)
+            }
+            quote_open_fields = {
+                field
+                for field in aligned_identity_fields
+                if _field_has_quote_or_bracket_open(previous_fields, field)
+            }
             textual_support = []
-            if _lowercase_continuity(source_names):
+            if lower_fields:
                 textual_support.append("lowercase_text_continuity")
-            if _ends_with_open_shape(previous_names) or manufacturer_hyphen:
+            if quote_open_fields or hyphen_fields:
                 textual_support.append("open_previous_text_fragment")
+            if hyphen_fields:
+                evidence.append("hyphenated_field_continuity")
+            if quote_open_fields:
+                evidence.append("open_quote_or_bracket_continuity")
             if textual_support:
                 evidence.extend(textual_support)
+
+            # A lowercase marker or an opening shape in one field is not
+            # enough to destroy a possible adjacent item.  An aligned hyphen
+            # is a strong generic continuation signal.  Otherwise a
+            # lowercase source field must be paired with an opening shape in
+            # a different aligned identity field.
+            cross_field_textual_support = bool(
+                lower_fields
+                and (quote_open_fields or hyphen_fields)
+                and bool(lower_fields.difference(quote_open_fields | hyphen_fields))
+            )
+            strong_textual_continuity = bool(hyphen_fields)
+            multiple_textual_signals = cross_field_textual_support
 
             if material_structure:
                 relations.append(
@@ -302,10 +346,8 @@ class RowRelationAnalyzer:
                 )
                 continue
 
-            if same_identity_fragments or (
-                manufacturer_hyphen
-                and "manufacturer" in common_fields
-                and source_subset
+            if source_subset and common_fields and (
+                strong_textual_continuity or multiple_textual_signals
             ):
                 relations.append(
                     _relation(
@@ -317,12 +359,16 @@ class RowRelationAnalyzer:
                             *evidence,
                             "source_fields_subset_of_parent",
                             "identity_fragment_complements_parent",
+                            *textual_support,
                         ),
                     )
                 )
                 continue
 
             if source_subset and common_fields and not source_critical and not has_position:
+                relation_reasons = ["continuation_evidence_not_sufficient"]
+                if same_identity_fragments:
+                    relation_reasons.append("identity_subset_only")
                 relations.append(
                     _relation(
                         source,
@@ -330,7 +376,7 @@ class RowRelationAnalyzer:
                         state=RowRelationState.AMBIGUOUS,
                         tier=EvidenceTier.SUPPORTING,
                         evidence=(*evidence, "source_fields_subset_of_parent"),
-                        reasons=("continuation_evidence_not_sufficient",),
+                        reasons=tuple(relation_reasons),
                     )
                 )
                 continue
