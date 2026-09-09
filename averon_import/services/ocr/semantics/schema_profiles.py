@@ -219,13 +219,24 @@ class SchemaProfileMatcher:
     ) -> ProfileMatchResult:
         family_name = str(_family_value(family, "family", ""))
         negative = _family_value(family, "negative_evidence", ()) or ()
-        if family_name == "OTHER_TABLE" or negative:
+        # A confirmed OTHER_TABLE is a hard negative.  An AMBIGUOUS family
+        # with both positive and negative bounded evidence is reviewable, not
+        # a reason to discard a potentially legitimate specification.
+        if family_name == "OTHER_TABLE":
             return ProfileMatchResult(
                 NON_SPEC,
                 candidates=(),
                 contradictions=("confirmed_other_table",),
                 strength="strong",
                 reasons=("explicit_other_table",),
+            )
+        if family_name == "AMBIGUOUS" and negative:
+            return ProfileMatchResult(
+                AMBIGUOUS,
+                candidates=(),
+                contradictions=("conflicting_family_evidence",),
+                strength="conflicting",
+                reasons=("conflicting_family_evidence",),
             )
 
         concepts = set(observed.mapped_concepts)

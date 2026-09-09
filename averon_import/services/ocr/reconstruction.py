@@ -1357,6 +1357,25 @@ def rows_from_tables(
         )
         diagnostics["physical_evidence"] = physical_evidence.as_dict()
     if schema.status == "ambiguous" and mapping_result.trusted:
+        # A mapper-trusted observation is not by itself a specification.  A
+        # review-only semantic projection is safe only when a concrete
+        # profile matched and the gate rejected it for an independent safety
+        # reason (for example a structural conflict).  Unmatched/ambiguous
+        # profile evidence must fail closed instead of becoming legacy output.
+        if profile_match.status != MATCHED:
+            reason = "unsupported_table_schema"
+            if reason not in table.review_reasons:
+                table.review_reasons.append(reason)
+            if diagnostics is not None:
+                diagnostics["unsupported_table_schema"] = True
+                diagnostics["schema_status"] = schema.status
+            _record_diagnostic(
+                diagnostics,
+                kind="table_dropped",
+                source_table_index=table.source_table_index,
+                drop_reason="profile_not_matched",
+            )
+            return None
         reason = "ambiguous_table_schema"
         if reason not in table.review_reasons:
             table.review_reasons.append(reason)
@@ -2991,6 +3010,8 @@ def reconstruct_page_rows(
         and legacy_diagnostics["schema"].get("status") in {"supported", "ambiguous"}
         and isinstance(legacy_diagnostics.get("header_mapping"), dict)
         and legacy_diagnostics["header_mapping"].get("mapping_status") == "trusted"
+        and isinstance(legacy_diagnostics.get("profile_match"), dict)
+        and legacy_diagnostics["profile_match"].get("status") == "MATCHED"
         and not legacy_schema_unsupported
     )
     if mode == "table" or (mode == "shadow" and physical_grid is None):

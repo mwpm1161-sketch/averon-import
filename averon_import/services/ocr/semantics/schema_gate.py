@@ -313,9 +313,6 @@ class SchemaGate:
                 )
             decision = ("canonical_header_without_family_context",)
             variant = "canonical_header"
-        elif _family_value(family, "family", "") == AMBIGUOUS_FAMILY:
-            decision = ("profile_matched_without_family_context",)
-            variant = profile.profile_id
         else:
             decision = ("profile_matched",)
             variant = profile.profile_id

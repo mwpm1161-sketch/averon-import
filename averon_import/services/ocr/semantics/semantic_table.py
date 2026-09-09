@@ -78,6 +78,10 @@ class TableAnalysisContext:
             object.__setattr__(self, "family_assessment", freeze_mapping(self.family_assessment))
         if self.schema_assessment is not None:
             object.__setattr__(self, "schema_assessment", freeze_mapping(self.schema_assessment))
+        if self.observed_schema is not None:
+            object.__setattr__(self, "observed_schema", freeze_mapping(self.observed_schema))
+        if self.profile_match is not None:
+            object.__setattr__(self, "profile_match", freeze_mapping(self.profile_match))
         if self.structural_evidence is not None:
             object.__setattr__(self, "structural_evidence", freeze_mapping(self.structural_evidence))
         object.__setattr__(self, "provenance", freeze_mapping(self.provenance))

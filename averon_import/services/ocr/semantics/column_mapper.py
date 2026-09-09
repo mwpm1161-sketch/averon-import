@@ -38,7 +38,6 @@ MAX_HEADER_REGION_ROWS = 3
 MIN_ASSIGNABLE_SCORE = 0.62
 MIN_TRUSTED_FIELD_SCORE = 0.68
 MIN_ASSIGNMENT_MARGIN = 0.12
-MIN_HEADER_FIELDS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,8 +508,6 @@ class HeaderSemanticMapper:
             for reason in cell.body_evidence
         )
         reasons: list[str] = []
-        if len(mapped_fields) < MIN_HEADER_FIELDS or "name" not in mapped_fields:
-            reasons.append("insufficient_header_evidence")
         weak_fields = sorted(
             field
             for column, fields in mapping.items()
@@ -625,11 +622,10 @@ class HeaderSemanticMapper:
                 )
                 if has_body and not numbering:
                     break
-        viable = [
-            result
-            for result in results
-            if result.mapping and "name" in {field for values in result.mapping.values() for field in values}
-        ]
+        # Mapping viability means that at least one physical column received
+        # a locally supported semantic assignment.  Schema applicability and
+        # required concepts belong to SchemaProfileMatcher/SchemaGate.
+        viable = [result for result in results if result.mapping]
         if not viable:
             reasons = ("semantic_mapping_unavailable",)
             return HeaderMappingResult(
@@ -652,7 +648,12 @@ class HeaderSemanticMapper:
         viable.sort(
             key=lambda result: (
                 result.status == TRUSTED,
+                # Richness ranks competing header regions, but is not a
+                # completeness requirement for mapper trust.
+                len(result.mapping),
+                len({field for values in result.mapping.values() for field in values}),
                 result.best_score,
+                result.assignment_margin,
                 len(result.candidate_regions[0].numbering_rows),
                 len(result.header_rows),
             ),
