@@ -51,6 +51,9 @@ from averon_import.services.ocr.semantics import (
     map_semantic_header,
     physical_table_ir_from_snapshot,
 )
+from averon_import.services.ocr.semantics.semantic_projection import (
+    StructuredReconstructionResult,
+)
 from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult, HeaderSourceCell
 from averon_import.services.ocr.semantics.context_evidence import bounded_context_from_words
 
@@ -2332,6 +2335,7 @@ def rows_from_physical_grid(
     *,
     diagnostics: dict | None = None,
     functional_shadow: bool = False,
+    structured_result: StructuredReconstructionResult | None = None,
 ) -> list[OcrRow] | None:
     """Build physical rows from a detector grid and OCR words only."""
     if diagnostics is not None:
@@ -2757,6 +2761,10 @@ def rows_from_physical_grid(
                     preflight_snapshot,
                     page_size=(width, height),
                 )
+                if structured_result is not None:
+                    structured_result.physical_table = physical_ir
+                    structured_result.physical_ir_constructed = True
+                    structured_result.semantic_candidate = True
                 # Exercise the compatibility adapter as part of the shadow
                 # path while keeping the historical diagnostics shape intact.
                 compatibility_snapshot = PhysicalEvidenceSnapshot.from_physical_table_ir(
@@ -2774,17 +2782,24 @@ def rows_from_physical_grid(
                     physical_ir,
                     context,
                 )
+                if structured_result is not None:
+                    structured_result.functional_analysis_completed = True
                 relation_assessments = RowRelationAnalyzer().analyze(
                     physical_ir,
                     context,
                     functional_graph,
                 )
+                if structured_result is not None:
+                    structured_result.relation_analysis_completed = True
                 semantic_table = GlobalRowSemanticsResolver().resolve(
                     physical_ir,
                     context,
                     functional_graph,
                     relation_assessments,
                 )
+                if structured_result is not None:
+                    structured_result.semantic_table = semantic_table
+                    structured_result.semantic_resolution_completed = True
                 shadow = functional_graph.as_dict()
                 shadow["physical_ir_compatibility"] = {
                     "snapshot_rows": len(compatibility_snapshot.physical_rows),
@@ -2837,7 +2852,7 @@ def rows_from_physical_grid(
                     semantic_table.as_dict().get("diagnostics", {}).get("metrics", {})
                 )
                 diagnostics["functional_semantics_shadow"] = shadow
-            except (TypeError, ValueError, KeyError) as error:
+            except Exception as error:
                 # Shadow diagnostics must never alter the existing OCR result
                 # if an offline payload cannot satisfy the new IR contract.
                 diagnostics["functional_semantics_shadow"] = {
@@ -2845,6 +2860,11 @@ def rows_from_physical_grid(
                     "error_type": type(error).__name__,
                     "error": str(error)[:240],
                 }
+                if structured_result is not None:
+                    structured_result.semantic_candidate = True
+                    structured_result.semantic_resolution_error = (
+                        f"{type(error).__name__}: {str(error)[:240]}"
+                    )
     return rows
 
 
@@ -2857,6 +2877,7 @@ def reconstruct_page_rows(
     physical_grid: PhysicalGrid | None = None,
     reconstruction_mode: str = "table",
     diagnostics: dict | None = None,
+    _structured_result: StructuredReconstructionResult | None = None,
 ) -> list[OcrRow]:
     """Reconstruct a page with safe geometry-first shadow/fallback modes.
 
@@ -2995,6 +3016,7 @@ def reconstruct_page_rows(
         physical_grid,
         diagnostics=geometry_diagnostics,
         functional_shadow=(mode == "geometry"),
+        structured_result=_structured_result,
     )
     if not geometry_rows:
         if diagnostics is not None:
@@ -3027,3 +3049,34 @@ def reconstruct_page_rows(
             "geometry_first" if mode == "geometry" else "table_shadow"
         )
     return geometry_rows if mode == "geometry" else legacy_rows
+
+
+def reconstruct_page_rows_result(
+    payload: dict,
+    provider_key: str,
+    *,
+    secondary_payload: dict | None = None,
+    secondary_crop: dict | None = None,
+    physical_grid: PhysicalGrid | None = None,
+    reconstruction_mode: str = "table",
+    diagnostics: dict | None = None,
+) -> StructuredReconstructionResult:
+    """Return the internal reconstruction boundary without changing legacy API."""
+
+    result = StructuredReconstructionResult(
+        diagnostics=diagnostics if diagnostics is not None else {},
+        page_size=_page_dimensions(payload),
+    )
+    rows = reconstruct_page_rows(
+        payload,
+        provider_key,
+        secondary_payload=secondary_payload,
+        secondary_crop=secondary_crop,
+        physical_grid=physical_grid,
+        reconstruction_mode=reconstruction_mode,
+        diagnostics=result.diagnostics,
+        _structured_result=result,
+    )
+    result.rows = list(rows)
+    result.selected_mode = str(result.diagnostics.get("selected_mode") or "")
+    return result

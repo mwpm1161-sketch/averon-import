@@ -116,6 +116,19 @@ def page_status_from_diagnostics(
         status.add_blocker("physical_row_loss_suspected")
     if int(data.get("identity_cell_missing_count") or 0) > 0:
         status.add_blocker("identity_cell_missing")
+    if int(data.get("semantic_critical_value_missing_count") or 0) > 0:
+        status.add_blocker("critical_value_missing")
+    if int(data.get("semantic_numeric_suspect_count") or 0) > 0:
+        status.add_blocker("numeric_suspect")
+    if int(data.get("semantic_secondary_conflict_count") or 0) > 0:
+        status.add_blocker("secondary_conflict")
+    if data.get("semantic_resolution_error"):
+        status.add_blocker("physical_row_semantics_unresolved")
+        status.add_blocker("semantic_resolution_error")
+    if int(data.get("unresolved_physical_row_count") or 0) > 0:
+        status.add_blocker("physical_row_semantics_unresolved")
+    if int(data.get("semantic_relation_conflict_count") or 0) > 0:
+        status.add_blocker("physical_row_semantics_unresolved")
     if data.get("assembly_error"):
         status.add_blocker("assembly_error")
     if (
@@ -131,4 +144,21 @@ def page_status_from_diagnostics(
         status.output_status = OUTPUT_NO_SPEC
     status.diagnostics["row_count"] = int(row_count)
     status.diagnostics["geometry_trusted"] = bool(high_grid and not geometry_failed)
+    for key in (
+        "semantic_authoritative",
+        "semantic_authoritative_activation",
+        "semantic_resolution_error",
+        "semantic_verified_item_count",
+        "semantic_review_item_count",
+        "unresolved_physical_row_count",
+        "semantic_auto_accept_rate",
+        "logical_item_count",
+        "confirmed_continuation_count",
+        "semantic_relation_conflict_count",
+        "semantic_critical_value_missing_count",
+        "semantic_numeric_suspect_count",
+        "semantic_secondary_conflict_count",
+    ):
+        if key in data:
+            status.diagnostics[key] = data[key]
     return status

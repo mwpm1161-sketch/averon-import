@@ -118,12 +118,21 @@ class ExcelExportService:
 
         exported_count = 0
         for row in rows:
+            semantic_review = bool(
+                row.get("semantic_review")
+                or
+                row.get("semantic_state") == "REVIEW"
+                or row.get("semantic_authoritative")
+                and isinstance(row.get("ocr_metadata"), dict)
+                and row["ocr_metadata"].get("semantic_review")
+            )
             if only_exportable and (
                 row.get("row_type") in {"section", "system", "skip"}
                 or (
                     row.get("row_type") == "note"
                     and not row.get("structured_table")
                 )
+                or semantic_review
             ):
                 continue
             if row.get("selected") is False:

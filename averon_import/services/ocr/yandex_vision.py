@@ -40,8 +40,13 @@ from averon_import.services.ocr.page_contract import page_status_from_diagnostic
 from averon_import.services.ocr.reconstruction import (
     collect_words,
     page_geometry,
-    reconstruct_page_rows,
+    reconstruct_page_rows_result,
     target_cell_structural_safety,
+)
+from averon_import.services.ocr.semantics.semantic_projection import (
+    StructuredReconstructionResult,
+    project_semantic_table,
+    semantic_table_authoritative_enabled,
 )
 from averon_import.services.ocr.critical_verification import (
     attach_exact_cell_candidate,
@@ -922,11 +927,122 @@ class YandexVisionProvider:
                         f"[{self.key}] exact-cell проверка {field} не выполнена: "
                         f"{str(exc)[:240]}"
                     )
+
                 except (OSError, ValueError) as exc:
                     warnings.append(
                         f"[{self.key}] exact-cell проверка {field} не выполнена: "
                         f"{str(exc)[:240]}"
                     )
+
+    def _apply_semantic_projection(
+        self,
+        result: StructuredReconstructionResult,
+        diagnostics: dict,
+    ) -> list:
+        """Activate the semantic pilot only after every hard precondition."""
+
+        grid = diagnostics.get("geometry_grid") or {}
+        mapping = diagnostics.get("header_mapping") or {}
+        schema = diagnostics.get("schema") or {}
+        enabled = semantic_table_authoritative_enabled()
+        eligible = bool(
+            enabled
+            and self._reconstruction_mode == "geometry"
+            and result.selected_mode == "geometry_first"
+            and bool(grid.get("high_confidence"))
+            and mapping.get("mapping_status") == "trusted"
+            and str(schema.get("status") or "").lower() == "supported"
+            and result.physical_ir_constructed
+            and result.functional_analysis_completed
+            and result.relation_analysis_completed
+            and result.semantic_resolution_completed
+            and result.semantic_table is not None
+        )
+        diagnostics["semantic_authoritative_activation"] = {
+            "enabled": enabled,
+            "eligible": eligible,
+            "selected_mode": result.selected_mode,
+            "physical_ir_constructed": result.physical_ir_constructed,
+            "functional_analysis_completed": result.functional_analysis_completed,
+            "relation_analysis_completed": result.relation_analysis_completed,
+            "semantic_resolution_completed": result.semantic_resolution_completed,
+        }
+        if result.semantic_resolution_error and enabled and result.semantic_candidate:
+            # The semantic path was selected, so accepted legacy rows are not
+            # a valid recovery. Physical diagnostics remain in the result.
+            diagnostics["semantic_authoritative"] = True
+            diagnostics["semantic_resolution_error"] = result.semantic_resolution_error
+            diagnostics["semantic_review"] = True
+            diagnostics["unresolved_physical_row_count"] = max(
+                1, int(diagnostics.get("unresolved_physical_row_count") or 0)
+            )
+            return []
+        if not eligible:
+            diagnostics["semantic_authoritative"] = False
+            if result.semantic_table is not None:
+                diagnostics["semantic_pilot_available"] = True
+            return list(result.rows)
+
+        try:
+            rows = project_semantic_table(result, provider_key=self.key)
+        except Exception as exc:
+            result.semantic_resolution_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+            diagnostics["semantic_authoritative"] = True
+            diagnostics["semantic_resolution_error"] = result.semantic_resolution_error
+            diagnostics["semantic_review"] = True
+            diagnostics["unresolved_physical_row_count"] = max(
+                1, int(diagnostics.get("unresolved_physical_row_count") or 0)
+            )
+            return []
+        semantic = result.semantic_table
+        metrics = dict(
+            (semantic.diagnostics.get("metrics") if semantic else {}) or {}
+        )
+        conservation = semantic.conservation if semantic else None
+        unresolved_count = len(conservation.unresolved_rows) if conservation else 0
+        logical_count = len(semantic.logical_items) if semantic else 0
+        item_rows = [
+            row for row in rows
+            if isinstance(row.metadata, dict)
+            and row.metadata.get("semantic_role") == "ITEM_ROOT"
+        ]
+        review_item_count = sum(
+            row.metadata.get("semantic_state") == "REVIEW"
+            for row in item_rows
+        )
+        verified_item_count = max(0, len(item_rows) - review_item_count)
+        diagnostics.update({
+            "semantic_authoritative": True,
+            "semantic_resolution_completed": True,
+            "semantic_verified_item_count": verified_item_count,
+            "semantic_review_item_count": review_item_count,
+            "unresolved_physical_row_count": unresolved_count,
+            "semantic_auto_accept_rate": (
+                verified_item_count / logical_count if logical_count else 1.0
+            ),
+            "logical_item_count": logical_count,
+            "confirmed_continuation_count": int(
+                metrics.get("confirmed_continuation_count")
+                or metrics.get("confirmed_continuation_rows")
+                or 0
+            ),
+            "semantic_relation_conflict_count": int(
+                metrics.get("relation_conflict_count") or 0
+            ),
+            "semantic_critical_value_missing_count": sum(
+                1
+                for row in item_rows
+                for field in ("unit", "quantity", "mass")
+                if not str(row.values.get(field, "") or "").strip()
+            ),
+        })
+        if logical_count == 0 and diagnostics.get("physical_body_row_indexes"):
+            diagnostics["unresolved_physical_row_count"] = max(
+                unresolved_count,
+                len(diagnostics.get("physical_body_row_indexes") or []),
+            )
+        result.semantic_authoritative = True
+        return rows
 
     @staticmethod
     def _position_mapping_present(metadata: dict) -> bool:
@@ -1157,6 +1273,9 @@ class YandexVisionProvider:
             "exact_cell_candidates": 0,
             "identity_cell_missing": 0,
             "unresolved_critical": 0,
+            "semantic_authoritative_pages": 0,
+            "semantic_logical_items": 0,
+            "semantic_review_rows": 0,
         }
         by_page: dict[int, PageOcrResult] = {
             number: PageOcrResult(page=number, provides_confidence=False)
@@ -1208,12 +1327,15 @@ class YandexVisionProvider:
                 if grid_detection is not None and grid_detection.high_confidence:
                     stats["geometry_high_confidence_pages"] += 1
                 reconstruction_diagnostics: dict = {}
-                rows = reconstruct_page_rows(
+                reconstruction_result = reconstruct_page_rows_result(
                     payload,
                     self.key,
                     physical_grid=physical_grid,
                     reconstruction_mode=self._reconstruction_mode,
                     diagnostics=reconstruction_diagnostics,
+                )
+                rows = self._apply_semantic_projection(
+                    reconstruction_result, reconstruction_diagnostics
                 )
                 if grid_detection is not None and physical_grid is None:
                     reconstruction_diagnostics["geometry_source"] = (
@@ -1250,7 +1372,7 @@ class YandexVisionProvider:
                 )
                 if secondary is not None:
                     secondary_payload, secondary_crop = secondary
-                    rows = reconstruct_page_rows(
+                    reconstruction_result = reconstruct_page_rows_result(
                         payload,
                         self.key,
                         secondary_payload=secondary_payload,
@@ -1258,6 +1380,9 @@ class YandexVisionProvider:
                         physical_grid=physical_grid,
                         reconstruction_mode=self._reconstruction_mode,
                         diagnostics=reconstruction_diagnostics,
+                    )
+                    rows = self._apply_semantic_projection(
+                        reconstruction_result, reconstruction_diagnostics
                     )
                     secondary_result = attach_secondary_candidates(
                         rows,
@@ -1289,12 +1414,18 @@ class YandexVisionProvider:
                     and physical_grid is not None
                     and reconstruction_diagnostics.get("selected_mode") == "geometry_first"
                 ):
-                    covered_rows = {
-                        int(row.metadata.get("source_row_index"))
-                        for row in rows
-                        if isinstance(row.metadata, dict)
-                        and str(row.metadata.get("source_row_index", "")).lstrip("-").isdigit()
-                    }
+                    covered_rows: set[int] = set()
+                    for row in rows:
+                        metadata = row.metadata if isinstance(row.metadata, dict) else {}
+                        source_index = metadata.get("source_row_index")
+                        if str(source_index).lstrip("-").isdigit():
+                            covered_rows.add(int(source_index))
+                        for ref in metadata.get("physical_row_refs") or []:
+                            if not isinstance(ref, dict):
+                                continue
+                            value = ref.get("row_index")
+                            if str(value).lstrip("-").isdigit():
+                                covered_rows.add(int(value))
                     witness = physical_row_raster_witness(
                         raster,
                         physical_grid,
@@ -1325,11 +1456,65 @@ class YandexVisionProvider:
                         page_index, total_pages, message
                     ),
                 )
+                if reconstruction_diagnostics.get("semantic_authoritative"):
+                    semantic_rows = [
+                        row for row in rows
+                        if isinstance(row.metadata, dict)
+                        and row.metadata.get("semantic_role") == "ITEM_ROOT"
+                    ]
+                    reconstruction_diagnostics["semantic_review_item_count"] = sum(
+                        bool(
+                            row.metadata.get("semantic_review")
+                            or row.metadata.get("semantic_state") == "REVIEW"
+                            or row.metadata.get("review_reasons")
+                        )
+                        for row in semantic_rows
+                    )
+                    reconstruction_diagnostics["semantic_numeric_suspect_count"] = sum(
+                        "numeric_suspect"
+                        in set(row.metadata.get("review_reasons") or [])
+                        for row in semantic_rows
+                    )
+                    reconstruction_diagnostics["semantic_secondary_conflict_count"] = sum(
+                        "secondary_conflict"
+                        in set(row.metadata.get("review_reasons") or [])
+                        for row in semantic_rows
+                    )
+                    reconstruction_diagnostics["semantic_critical_value_missing_count"] = sum(
+                        1
+                        for row in semantic_rows
+                        for field in ("unit", "quantity", "mass")
+                        if not str(row.values.get(field, "") or "").strip()
+                    )
                 target.page_status = page_status_from_diagnostics(
                     number,
                     reconstruction_diagnostics,
                     row_count=len(rows),
                 ).as_dict()
+                semantic_diagnostics = (
+                    target.page_status.get("diagnostics")
+                    if isinstance(target.page_status, dict)
+                    else {}
+                )
+                if reconstruction_diagnostics.get("semantic_authoritative"):
+                    stats["semantic_authoritative_pages"] += 1
+                    stats["semantic_logical_items"] += int(
+                        reconstruction_diagnostics.get("logical_item_count") or 0
+                    )
+                    stats["semantic_review_rows"] += int(
+                        reconstruction_diagnostics.get("semantic_review_item_count") or 0
+                    )
+                    if isinstance(semantic_diagnostics, dict):
+                        target.stats.update({
+                            key: value
+                            for key, value in reconstruction_diagnostics.items()
+                            if key.startswith("semantic_")
+                            or key in {
+                                "logical_item_count",
+                                "unresolved_physical_row_count",
+                                "confirmed_continuation_count",
+                            }
+                        })
                 selected_mode = reconstruction_diagnostics.get("selected_mode")
                 if selected_mode == "geometry_first":
                     stats["geometry_selected_pages"] += 1

@@ -66,6 +66,11 @@ from averon_import.services.ocr.semantics.functional_analyzer import (
 )
 from averon_import.services.ocr.semantics.row_relation_analyzer import RowRelationAnalyzer
 from averon_import.services.ocr.semantics.row_semantics_resolver import GlobalRowSemanticsResolver
+from averon_import.services.ocr.semantics.semantic_projection import (
+    StructuredReconstructionResult,
+    project_semantic_table,
+    semantic_table_authoritative_enabled,
+)
 
 __all__ = [
     "HeaderCellEvidence",
@@ -118,4 +123,7 @@ __all__ = [
     "physical_table_ir_from_snapshot",
     "RowRelationAnalyzer",
     "GlobalRowSemanticsResolver",
+    "StructuredReconstructionResult",
+    "project_semantic_table",
+    "semantic_table_authoritative_enabled",
 ]

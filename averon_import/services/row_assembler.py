@@ -187,6 +187,101 @@ class SpecificationRowAssembler:
         refresh_review_state(result)
         return result
 
+    def build_semantic_row(self, page: int, raw: OcrRow | dict) -> dict:
+        """Present an already-resolved semantic row without legacy inference.
+
+        The semantic resolver owns row meaning, continuation composition and
+        canonical values.  The assembler only adds the stable presentation
+        shape and applies the shared review policy; in particular it never
+        calls ``classify_row`` or ``repair_continuation_rows`` on this path.
+        """
+
+        self.begin_page(page)
+        payload = raw.as_dict() if isinstance(raw, OcrRow) else dict(raw)
+        values = dict(payload.get("values") or {})
+        metadata = dict(payload.get("metadata") or {})
+        semantic_role = str(metadata.get("semantic_role") or "ITEM_ROOT")
+        role_to_type = {
+            "ITEM_ROOT": "item",
+            "COMPONENT": "component",
+            "NOTE": "note",
+            "SERVICE": "note",
+            "SECTION": "section",
+            "SYSTEM": "system",
+            "HEADER": "skip",
+        }
+        row_type = str(
+            metadata.get("semantic_row_type")
+            or role_to_type.get(semantic_role, "semantic_review")
+        )
+        if metadata.get("semantic_resolved") is False:
+            row_type = "semantic_review"
+        semantic_review = bool(
+            metadata.get("semantic_review")
+            or metadata.get("semantic_resolved") is False
+            or metadata.get("semantic_state") == "REVIEW"
+        )
+        review_reasons = list(metadata.get("review_reasons") or [])
+        if semantic_review and "physical_row_semantics_unresolved" in review_reasons:
+            pass
+        elif semantic_review and metadata.get("semantic_resolved") is False:
+            review_reasons.append("physical_row_semantics_unresolved")
+        confidence_values = [
+            float(value)
+            for key, value in (payload.get("confidences") or {}).items()
+            if values.get(key, "").strip()
+        ]
+        confidence = round(sum(confidence_values) / len(confidence_values), 1) if confidence_values else 0.0
+        section = self.current_section
+        system = self.current_system
+        if row_type == "section":
+            section = str(values.get("name") or values.get("position") or "").rstrip(":*")
+            self.current_section = section
+            self.current_system = ""
+            system = ""
+        elif row_type == "system":
+            system = str(values.get("name") or values.get("position") or "")
+            self.current_system = system
+        result = {
+            "id": uuid.uuid4().hex,
+            **values,
+            "section": section,
+            "system": system,
+            "row_type": row_type,
+            "page": page,
+            "confidence": confidence,
+            "status": "review" if semantic_review else "recognized",
+            "bbox": dict(payload.get("bbox") or {}),
+            "confidences": dict(payload.get("confidences") or {}),
+            "ocr_sources": dict(payload.get("ocr_sources") or {}),
+            "source_row": payload.get("source_row", 0),
+            "edited": False,
+            "ocr_metadata": metadata,
+            "structured_table": bool(metadata.get("structured_table")),
+            "provider_has_explicit_rows": bool(metadata.get("provider_has_explicit_rows")),
+            "source_table_index": metadata.get("source_table_index"),
+            "source_row_index": metadata.get("source_row_index"),
+            "source_subrow_index": metadata.get("source_subrow_index"),
+            "source_cell_refs": list(metadata.get("source_cell_refs") or []),
+            "physical_row_refs": list(metadata.get("physical_row_refs") or []),
+            "split_evidence": list(metadata.get("split_evidence") or []),
+            "structural_ambiguity": bool(metadata.get("structural_ambiguity")),
+            "secondary_conflict_fields": list(
+                metadata.get("secondary_conflict_fields") or []
+            ),
+            "review_reasons": list(dict.fromkeys(review_reasons)),
+            "semantic_authoritative": bool(metadata.get("semantic_authoritative")),
+            "semantic_review": semantic_review,
+            "semantic_state": metadata.get("semantic_state", "VERIFIED"),
+            "logical_item_id": metadata.get("logical_item_id"),
+        }
+        result["review_reason"] = ", ".join(result["review_reasons"])
+        result["value_candidates"] = dict(metadata.get("value_candidates") or {})
+        refresh_review_state(result)
+        if semantic_review and result.get("status") == "recognized":
+            result["status"] = "review"
+        return result
+
     @staticmethod
     def repair_continuation_rows(raw_rows: list[dict]) -> list[dict]:
         """Conservatively merge OCR fragments split into a following table row.

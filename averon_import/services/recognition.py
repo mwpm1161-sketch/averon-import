@@ -88,9 +88,25 @@ class RecognitionService:
             assembler_state = deepcopy(getattr(assembler, "__dict__", {}))
             try:
                 assembler.begin_page(page_number)
-                raw_rows = assembler.prepare(page_result.rows)
                 page_tables[str(page_number)] = page_result.geometry or {}
                 page_statuses[str(page_number)] = dict(page_result.page_status or {})
+                status_diagnostics = (
+                    page_statuses[str(page_number)].get("diagnostics")
+                    if isinstance(page_statuses[str(page_number)], dict)
+                    else {}
+                )
+                semantic_authoritative = bool(
+                    ocr_result.provider == "yandex_vision"
+                    and isinstance(status_diagnostics, dict)
+                    and status_diagnostics.get("semantic_authoritative")
+                ) or (
+                    ocr_result.provider == "yandex_vision"
+                    and any(
+                        isinstance(row.metadata, dict)
+                        and row.metadata.get("semantic_authoritative")
+                        for row in page_result.rows
+                    )
+                )
                 if page_result.errors and not page_statuses[str(page_number)]:
                     page_statuses[str(page_number)] = {
                         "page": page_number,
@@ -100,8 +116,15 @@ class RecognitionService:
                         "blockers": ["ocr_page_error"],
                         "diagnostics": {"errors": list(page_result.errors)},
                     }
-                for raw in raw_rows:
-                    page_rows.append(assembler.build_row(page_number, raw))
+                if semantic_authoritative:
+                    for raw in page_result.rows:
+                        page_rows.append(
+                            assembler.build_semantic_row(page_number, raw)
+                        )
+                else:
+                    raw_rows = assembler.prepare(page_result.rows)
+                    for raw in raw_rows:
+                        page_rows.append(assembler.build_row(page_number, raw))
                 all_rows.extend(page_rows)
             except Exception as exc:
                 # A failed page is atomic: neither partially built rows nor

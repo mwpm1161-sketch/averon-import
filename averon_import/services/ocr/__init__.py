@@ -8,7 +8,14 @@ from averon_import.services.ocr.base import (
     PageOcrResult,
     ProgressCallback,
 )
-from averon_import.services.ocr.reconstruction import reconstruct_page_rows
+from averon_import.services.ocr.reconstruction import (
+    reconstruct_page_rows,
+    reconstruct_page_rows_result,
+)
+from averon_import.services.ocr.semantics.semantic_projection import (
+    StructuredReconstructionResult,
+    project_semantic_table,
+)
 from averon_import.services.ocr.physical_grid import (
     AmbiguousWord,
     PhysicalGrid,
@@ -64,6 +71,9 @@ __all__ = [
     "TesseractOcrAdapter",
     "YandexVisionProvider",
     "reconstruct_page_rows",
+    "reconstruct_page_rows_result",
+    "StructuredReconstructionResult",
+    "project_semantic_table",
     "validate_physical_grid",
     "register_provider",
     "create_ocr_provider",
