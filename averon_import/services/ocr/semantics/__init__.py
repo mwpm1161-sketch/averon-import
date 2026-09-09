@@ -64,6 +64,8 @@ from averon_import.services.ocr.semantics.functional_analyzer import (
     TableFunctionalAnalyzer,
     physical_table_ir_from_snapshot,
 )
+from averon_import.services.ocr.semantics.row_relation_analyzer import RowRelationAnalyzer
+from averon_import.services.ocr.semantics.row_semantics_resolver import GlobalRowSemanticsResolver
 
 __all__ = [
     "HeaderCellEvidence",
@@ -114,4 +116,6 @@ __all__ = [
     "FunctionalEvidenceGraph",
     "TableFunctionalAnalyzer",
     "physical_table_ir_from_snapshot",
+    "RowRelationAnalyzer",
+    "GlobalRowSemanticsResolver",
 ]

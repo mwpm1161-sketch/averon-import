@@ -46,6 +46,8 @@ from averon_import.services.ocr.semantics import (
     TableFamilyAssessment,
     TableAnalysisContext,
     TableFunctionalAnalyzer,
+    RowRelationAnalyzer,
+    GlobalRowSemanticsResolver,
     map_semantic_header,
     physical_table_ir_from_snapshot,
 )
@@ -2772,12 +2774,44 @@ def rows_from_physical_grid(
                     physical_ir,
                     context,
                 )
+                relation_assessments = RowRelationAnalyzer().analyze(
+                    physical_ir,
+                    context,
+                    functional_graph,
+                )
+                semantic_table = GlobalRowSemanticsResolver().resolve(
+                    physical_ir,
+                    context,
+                    functional_graph,
+                    relation_assessments,
+                )
                 shadow = functional_graph.as_dict()
                 shadow["physical_ir_compatibility"] = {
                     "snapshot_rows": len(compatibility_snapshot.physical_rows),
                     "snapshot_words": len(compatibility_snapshot.spatial_words),
                     "row_ref_count": physical_ir.row_count,
                 }
+                # Preserve the Stage B graph shape while exposing the two new
+                # shadow layers in explicit namespaces for offline auditing.
+                shadow["functional_graph"] = functional_graph.as_dict()
+                shadow["relation_graph"] = {
+                    "relations": [relation.as_dict() for relation in relation_assessments],
+                    "diagnostics": {
+                        "candidate_count": len(relation_assessments),
+                        "confirmed_count": sum(
+                            relation.state.value == "CONFIRMED"
+                            for relation in relation_assessments
+                        ),
+                        "ambiguous_count": sum(
+                            relation.state.value in {"AMBIGUOUS", "UNRESOLVED"}
+                            for relation in relation_assessments
+                        ),
+                    },
+                }
+                shadow["semantic_table"] = semantic_table.as_dict()
+                shadow["metrics"] = dict(
+                    semantic_table.as_dict().get("diagnostics", {}).get("metrics", {})
+                )
                 diagnostics["functional_semantics_shadow"] = shadow
             except (TypeError, ValueError, KeyError) as error:
                 # Shadow diagnostics must never alter the existing OCR result
