@@ -1017,34 +1017,9 @@ class YandexVisionProvider:
         conservation = semantic.conservation if semantic else None
         unresolved_count = len(conservation.unresolved_rows) if conservation else 0
         logical_count = len(semantic.logical_items) if semantic else 0
-        item_rows = [
-            row for row in rows
-            if isinstance(row.metadata, dict)
-            and row.metadata.get("semantic_role") == "ITEM_ROOT"
-            and row.metadata.get("logical_item_id")
-        ]
-        evidence_rows = [
-            row for row in rows
-            if isinstance(row.metadata, dict)
-            and row.metadata.get("semantic_review")
-            and not row.metadata.get("logical_item_id")
-        ]
-        review_item_count = sum(
-            row.metadata.get("semantic_state") == "REVIEW"
-            for row in item_rows
-        )
-        verified_item_count = max(0, len(item_rows) - review_item_count)
         diagnostics.update({
             "semantic_authoritative": True,
             "semantic_resolution_completed": True,
-            "semantic_verified_item_count": verified_item_count,
-            "semantic_review_item_count": review_item_count,
-            "semantic_review_evidence_row_count": len(evidence_rows),
-            "semantic_non_output_review_row_count": sum(
-                str(row.metadata.get("semantic_review_impact") or "").upper()
-                == "NON_OUTPUT"
-                for row in evidence_rows
-            ),
             "semantic_output_critical_unresolved_count": int(
                 metrics.get("semantic_output_critical_unresolved_count") or 0
             ),
@@ -1055,9 +1030,6 @@ class YandexVisionProvider:
                 metrics.get("semantic_safety_special_count") or 0
             ),
             "unresolved_physical_row_count": unresolved_count,
-            "semantic_auto_accept_rate": (
-                verified_item_count / logical_count if logical_count else 1.0
-            ),
             "logical_item_count": logical_count,
             "confirmed_continuation_count": int(
                 metrics.get("confirmed_continuation_count")
@@ -1066,10 +1038,6 @@ class YandexVisionProvider:
             ),
             "semantic_relation_conflict_count": int(
                 metrics.get("relation_conflict_count") or 0
-            ),
-            "semantic_critical_value_missing_count": sum(
-                len(semantic_missing_critical_fields(row))
-                for row in item_rows
             ),
         })
         if logical_count == 0 and diagnostics.get("physical_body_row_indexes"):
@@ -1151,6 +1119,121 @@ class YandexVisionProvider:
             metadata["review_reasons"] = reasons
             marked += 1
         return marked
+
+    @staticmethod
+    def _final_semantic_item_needs_review(row) -> bool:
+        """Return the final review state for one semantic logical item.
+
+        This is deliberately evaluated after all row-local post-processing.
+        Informational structural evidence and legacy presentation-only reasons
+        must not turn an otherwise grounded logical item into a review item.
+        """
+
+        metadata = row.metadata if isinstance(row.metadata, dict) else {}
+        raw_reasons = {
+            str(reason)
+            for reason in metadata.get("review_reasons") or ()
+            if str(reason).strip()
+        }
+        reasons = set(raw_reasons)
+        ignored_reasons = {"no_confidence", "context_missing"}
+        structural_reasons = {
+            "structural_ambiguity",
+            "structural_disagreement",
+            "structural_boundary_conflict",
+            "word_assignment_ambiguity",
+        }
+        if str(metadata.get("semantic_structural_impact") or "").upper() == "INFORMATIONAL":
+            reasons.difference_update(structural_reasons)
+        substantive_reasons = reasons - ignored_reasons
+
+        missing = semantic_missing_critical_fields(row)
+        candidates = metadata.get("value_candidates") or {}
+        required_fields = metadata.get("semantic_required_critical_fields")
+        if not isinstance(required_fields, (list, tuple, set)):
+            required_fields = CRITICAL_FIELDS
+        candidate_only_required = any(
+            field in candidates
+            and isinstance(candidates.get(field), dict)
+            and not str(row.values.get(field, "") or "").strip()
+            for field in required_fields
+        )
+
+        # A semantic REVIEW state with no substantive reason is retained as a
+        # real review obligation.  If it is accompanied only by ignored or
+        # informational evidence, it is normalized back to VERIFIED.
+        semantic_review_state = bool(
+            metadata.get("semantic_review")
+            or str(metadata.get("semantic_state") or "").upper() == "REVIEW"
+        )
+        if substantive_reasons or missing or candidate_only_required:
+            return True
+        return semantic_review_state and not raw_reasons
+
+    def _finalize_semantic_item_state_and_telemetry(
+        self,
+        rows: list,
+        reconstruction_diagnostics: dict,
+    ) -> None:
+        """Own final semantic item state and all post-verification counters."""
+
+        item_rows = [
+            row for row in rows
+            if isinstance(row.metadata, dict)
+            and row.metadata.get("semantic_role") == "ITEM_ROOT"
+            and row.metadata.get("logical_item_id")
+        ]
+        evidence_rows = [
+            row for row in rows
+            if isinstance(row.metadata, dict)
+            and row.metadata.get("semantic_review")
+            and not row.metadata.get("logical_item_id")
+        ]
+
+        for row in item_rows:
+            needs_review = self._final_semantic_item_needs_review(row)
+            row.metadata["semantic_review"] = needs_review
+            row.metadata["semantic_state"] = "REVIEW" if needs_review else "VERIFIED"
+
+        review_items = [
+            row
+            for row in item_rows
+            if str(row.metadata.get("semantic_state") or "").upper() == "REVIEW"
+        ]
+        verified_items = [
+            row
+            for row in item_rows
+            if str(row.metadata.get("semantic_state") or "").upper() == "VERIFIED"
+        ]
+        logical_count = len(item_rows)
+        review_reasons = [
+            set(row.metadata.get("review_reasons") or ())
+            for row in item_rows
+        ]
+        reconstruction_diagnostics.update({
+            "logical_item_count": logical_count,
+            "semantic_verified_item_count": len(verified_items),
+            "semantic_review_item_count": len(review_items),
+            "semantic_review_evidence_row_count": len(evidence_rows),
+            "semantic_non_output_review_row_count": sum(
+                str(row.metadata.get("semantic_review_impact") or "").upper()
+                == "NON_OUTPUT"
+                for row in evidence_rows
+            ),
+            "semantic_auto_accept_rate": (
+                len(verified_items) / logical_count if logical_count else 1.0
+            ),
+            "semantic_critical_value_missing_count": sum(
+                len(semantic_missing_critical_fields(row))
+                for row in item_rows
+            ),
+            "semantic_numeric_suspect_count": sum(
+                "numeric_suspect" in reasons for reasons in review_reasons
+            ),
+            "semantic_secondary_conflict_count": sum(
+                "secondary_conflict" in reasons for reasons in review_reasons
+            ),
+        })
 
     def _recognition_url(self, operation_id: str, recognition_base: str) -> str:
         return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
@@ -1493,47 +1576,9 @@ class YandexVisionProvider:
                     ),
                 )
                 if reconstruction_diagnostics.get("semantic_authoritative"):
-                    semantic_rows = [
-                        row for row in rows
-                        if isinstance(row.metadata, dict)
-                        and row.metadata.get("semantic_role") == "ITEM_ROOT"
-                        and row.metadata.get("logical_item_id")
-                    ]
-                    evidence_rows = [
-                        row for row in rows
-                        if isinstance(row.metadata, dict)
-                        and row.metadata.get("semantic_review")
-                        and not row.metadata.get("logical_item_id")
-                    ]
-                    reconstruction_diagnostics["semantic_review_item_count"] = sum(
-                        bool(
-                            row.metadata.get("semantic_review")
-                            or row.metadata.get("semantic_state") == "REVIEW"
-                            or row.metadata.get("review_reasons")
-                        )
-                        for row in semantic_rows
-                    )
-                    reconstruction_diagnostics["semantic_review_evidence_row_count"] = len(
-                        evidence_rows
-                    )
-                    reconstruction_diagnostics["semantic_non_output_review_row_count"] = sum(
-                        str(row.metadata.get("semantic_review_impact") or "").upper()
-                        == "NON_OUTPUT"
-                        for row in evidence_rows
-                    )
-                    reconstruction_diagnostics["semantic_numeric_suspect_count"] = sum(
-                        "numeric_suspect"
-                        in set(row.metadata.get("review_reasons") or [])
-                        for row in semantic_rows
-                    )
-                    reconstruction_diagnostics["semantic_secondary_conflict_count"] = sum(
-                        "secondary_conflict"
-                        in set(row.metadata.get("review_reasons") or [])
-                        for row in semantic_rows
-                    )
-                    reconstruction_diagnostics["semantic_critical_value_missing_count"] = sum(
-                        len(semantic_missing_critical_fields(row))
-                        for row in semantic_rows
+                    self._finalize_semantic_item_state_and_telemetry(
+                        rows,
+                        reconstruction_diagnostics,
                     )
                 target.page_status = page_status_from_diagnostics(
                     number,
