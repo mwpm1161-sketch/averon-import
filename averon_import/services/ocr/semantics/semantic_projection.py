@@ -135,10 +135,23 @@ def _field_candidate_values(field_value: Any) -> list[dict[str, Any]]:
 def _source_safety_reasons(metadata: Mapping[str, Any]) -> list[str]:
     """Keep row-local safety evidence, excluding legacy presentation guesses."""
 
+    informational_structural = (
+        str(metadata.get("semantic_structural_impact") or "").upper()
+        == "INFORMATIONAL"
+    )
     reasons = [
         str(reason)
         for reason in metadata.get("review_reasons") or ()
         if str(reason) in SEMANTIC_SOURCE_SAFETY_REASONS
+        and not (
+            informational_structural
+            and str(reason) in {
+                "structural_ambiguity",
+                "structural_disagreement",
+                "structural_boundary_conflict",
+                "word_assignment_ambiguity",
+            }
+        )
     ]
     flag_reasons = {
         "numeric_suspect": bool(
@@ -155,12 +168,14 @@ def _source_safety_reasons(metadata: Mapping[str, Any]) -> list[str]:
             metadata.get("ambiguous_fields")
             or metadata.get("ambiguous_physical_cells")
         ),
-        "structural_ambiguity": bool(metadata.get("structural_ambiguity")),
-        "structural_disagreement": bool(metadata.get("structural_disagreement")),
+        "structural_ambiguity": bool(metadata.get("structural_ambiguity"))
+        and not informational_structural,
+        "structural_disagreement": bool(metadata.get("structural_disagreement"))
+        and not informational_structural,
         "word_assignment_ambiguity": bool(
             metadata.get("word_assignment_ambiguity")
             or metadata.get("ambiguous_physical_cells")
-        ),
+        ) and not informational_structural,
         "secondary_conflict": bool(metadata.get("secondary_conflict_fields")),
         "physical_row_unresolved": bool(metadata.get("physical_row_unresolved")),
         "identity_cell_missing": bool(metadata.get("identity_cell_missing")),
@@ -173,6 +188,7 @@ def _source_safety_reasons(metadata: Mapping[str, Any]) -> list[str]:
             reasons.append(reason)
     if (
         metadata.get("structural_boundary_conflict")
+        and not informational_structural
         and "structural_boundary_conflict" not in reasons
     ):
         reasons.append("structural_boundary_conflict")
@@ -245,6 +261,8 @@ def _base_metadata_for_row(
         "secondary_conflict_fields", "physical_row_unresolved",
         "identity_cell_missing", "physical_row_loss_suspected",
         "structural_boundary_conflict", "semantic_field_evidence",
+        "semantic_structural_impact", "semantic_structural_impact_reasons",
+        "semantic_review_impact",
     }
     result = {
         key: value.copy() if isinstance(value, dict) else list(value) if isinstance(value, list) else value
@@ -360,6 +378,9 @@ def _item_row(
         "review_reasons": review_reasons,
         "semantic_provenance": dict(item.provenance),
         "provides_confidence": False,
+        "semantic_review_impact": (
+            "OUTPUT_CRITICAL" if review_reasons else "NONE"
+        ),
     })
     return OcrRow(
         source_row=root_index or 0,
@@ -469,6 +490,10 @@ def _review_row(
         "semantic_required_critical_fields": [],
         "review_reasons": list(dict.fromkeys(reasons)),
         "semantic_provenance": dict(getattr(disposition, "provenance", {}) or {}),
+        "semantic_review_impact": (
+            getattr(getattr(disposition, "review_impact", None), "value", None)
+            or "OUTPUT_CRITICAL"
+        ),
         "provides_confidence": False,
     }
     # No raw OCR text is copied into canonical values on an unresolved row.
@@ -536,6 +561,7 @@ def _resolved_context_row(
         "value_candidates": {},
         "semantic_required_critical_fields": [],
         "review_reasons": [],
+        "semantic_review_impact": "NONE",
         "provides_confidence": False,
     }
     return OcrRow(

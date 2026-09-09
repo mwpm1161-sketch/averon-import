@@ -17,6 +17,7 @@ from averon_import.services.ocr.semantics.row_evidence import (
     RowRole,
     RowRoleAssessment,
     RowRoleState,
+    SemanticReviewImpact,
 )
 from averon_import.services.ocr.semantics.semantic_table import (
     DispositionValidation,
@@ -153,6 +154,79 @@ def _hard_non_item_role(assessment: RowRoleAssessment | None) -> bool:
         assessment
         and assessment.selected_role in _HARD_NON_ITEM_ROLES
     )
+
+
+def _semantic_review_impact(
+    row: Any,
+    assessment: RowRoleAssessment | None,
+    relation_candidates: Iterable[RowRelationAssessment],
+    mapping: Mapping[int, tuple[str, ...]],
+) -> SemanticReviewImpact:
+    """Classify unresolved physical rows at the semantic safety boundary.
+
+    This is deliberately owned by the resolver.  Page status, presentation,
+    and export consume the typed result but do not infer row impact from text
+    heuristics of their own.
+    """
+
+    if assessment is None:
+        return SemanticReviewImpact.OUTPUT_CRITICAL
+    if (
+        assessment.selected_qualifier == "NUMBERING_BAND"
+        and (
+            "numbering_band_ocr_anomaly" in assessment.contradictions
+            or "numbering_band_ocr_anomaly" in assessment.reasons
+            or any(
+                candidate.qualifier == "NUMBERING_BAND"
+                and "numbering_band_ocr_anomaly" in candidate.reasons
+                for candidate in assessment.candidates
+            )
+        )
+    ):
+        return SemanticReviewImpact.SAFETY_SPECIAL
+
+    plausible_continuation = any(
+        _relation_is_plausible(relation) for relation in relation_candidates
+    )
+    candidate_roles = {
+        candidate.role
+        for candidate in assessment.candidates
+        if candidate.evidence_strength != EvidenceTier.HARD_CONTRADICTION.value
+    }
+    item_candidate = RowRole.ITEM_ROOT in candidate_roles
+    occupied_fields = _mapped_present_fields(row, mapping)
+    has_identity_or_critical = bool(
+        occupied_fields.intersection(
+            {
+                "position", "name", "type_mark", "code", "manufacturer",
+                "unit", "quantity", "mass",
+            }
+        )
+    )
+
+    # An unresolved item/continuation interpretation is output-critical even
+    # when only a sparse identity fragment survived OCR.  This prevents a
+    # physical row from being downgraded to harmless context.
+    if plausible_continuation or item_candidate:
+        return SemanticReviewImpact.OUTPUT_CRITICAL
+
+    if candidate_roles and candidate_roles.issubset(
+        {
+            RowRole.HEADER,
+            RowRole.SERVICE,
+            RowRole.CONTEXT,
+            RowRole.COMPONENT,
+            RowRole.NOTE,
+        }
+    ):
+        return SemanticReviewImpact.NON_OUTPUT
+
+    if has_identity_or_critical:
+        return SemanticReviewImpact.OUTPUT_CRITICAL
+
+    # UNKNOWN is not harmless by default: without a bounded non-item proof,
+    # the physical row may still alter specification output.
+    return SemanticReviewImpact.OUTPUT_CRITICAL
 
 
 def _has_independent_anchor(row: Any, mapping: Mapping[int, tuple[str, ...]]) -> bool:
@@ -489,6 +563,7 @@ class GlobalRowSemanticsResolver:
                         validation_state=DispositionValidation.VALIDATED,
                         role_state=RowRoleState.CONFIRMED,
                         logical_item_id=f"item:{key}",
+                        review_impact=SemanticReviewImpact.NONE,
                         reasons=("confirmed_independent_item_root",),
                     )
                 )
@@ -506,6 +581,16 @@ class GlobalRowSemanticsResolver:
                 state = RowRoleState.UNRESOLVED
                 reasons.append("relation_cycle")
             disposition_role = selected_role or RowRole.UNKNOWN
+            review_impact = (
+                SemanticReviewImpact.NONE
+                if state == RowRoleState.CONFIRMED
+                else _semantic_review_impact(
+                    row,
+                    assessment,
+                    relation_candidates,
+                    mapping,
+                )
+            )
             validation = (
                 DispositionValidation.VALIDATED
                 if selected_role is not None
@@ -521,6 +606,7 @@ class GlobalRowSemanticsResolver:
                     validation_state=validation,
                     role_state=state,
                     logical_item_id=None,
+                    review_impact=review_impact,
                     reasons=tuple(reasons) or ("semantic_role_unresolved",),
                 )
             )
@@ -672,6 +758,21 @@ class GlobalRowSemanticsResolver:
                 for assessment in functional_graph.row_role_assessments
             ),
             "relation_conflict_count": relation_conflicts + len(cycle_keys),
+            "semantic_output_critical_unresolved_count": sum(
+                disposition.review_impact == SemanticReviewImpact.OUTPUT_CRITICAL
+                for disposition in dispositions
+                if disposition.role_state != RowRoleState.CONFIRMED
+            ),
+            "semantic_non_output_unresolved_count": sum(
+                disposition.review_impact == SemanticReviewImpact.NON_OUTPUT
+                for disposition in dispositions
+                if disposition.role_state != RowRoleState.CONFIRMED
+            ),
+            "semantic_safety_special_count": sum(
+                disposition.review_impact == SemanticReviewImpact.SAFETY_SPECIAL
+                for disposition in dispositions
+                if disposition.role_state != RowRoleState.CONFIRMED
+            ),
         }
         diagnostics = {
             "resolver": "GlobalRowSemanticsResolver",
@@ -689,6 +790,11 @@ class GlobalRowSemanticsResolver:
             "cycle_row_keys": sorted(cycle_keys),
             "critical_values_projected_from_source_only": True,
             "continuation_numeric_composition": False,
+            "semantic_review_impacts": {
+                disposition.physical_row_ref.key: disposition.review_impact.value
+                for disposition in dispositions
+                if disposition.role_state != RowRoleState.CONFIRMED
+            },
         }
         return SemanticTableIR(
             analysis_context=context,

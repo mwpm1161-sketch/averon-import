@@ -31,6 +31,7 @@ from .row_evidence import (
     RowRole,
     RowRoleAssessment,
     RowRoleState,
+    SemanticReviewImpact,
 )
 
 
@@ -296,6 +297,7 @@ class ResolvedPhysicalDisposition:
     evidence: tuple[str, ...] = ()
     contradictions: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
+    review_impact: SemanticReviewImpact = SemanticReviewImpact.NONE
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -305,6 +307,11 @@ class ResolvedPhysicalDisposition:
         object.__setattr__(self, "evidence", _strings(self.evidence))
         object.__setattr__(self, "contradictions", _strings(self.contradictions))
         object.__setattr__(self, "reasons", _strings(self.reasons))
+        object.__setattr__(
+            self,
+            "review_impact",
+            _enum(self.review_impact, SemanticReviewImpact),
+        )
         object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
 
     @property
@@ -325,6 +332,7 @@ class ResolvedPhysicalDisposition:
             "evidence": list(self.evidence),
             "contradictions": list(self.contradictions),
             "reasons": list(self.reasons),
+            "review_impact": self.review_impact.value,
             "provenance": _thaw(self.provenance),
         }
 

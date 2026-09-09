@@ -125,7 +125,20 @@ def page_status_from_diagnostics(
     if data.get("semantic_resolution_error"):
         status.add_blocker("physical_row_semantics_unresolved")
         status.add_blocker("semantic_resolution_error")
-    if int(data.get("unresolved_physical_row_count") or 0) > 0:
+    semantic_impact_keys = {
+        "semantic_output_critical_unresolved_count",
+        "semantic_non_output_unresolved_count",
+        "semantic_safety_special_count",
+    }
+    if any(key in data for key in semantic_impact_keys):
+        if (
+            int(data.get("semantic_output_critical_unresolved_count") or 0) > 0
+            or int(data.get("semantic_safety_special_count") or 0) > 0
+        ):
+            status.add_blocker("physical_row_semantics_unresolved")
+    elif int(data.get("unresolved_physical_row_count") or 0) > 0:
+        # Legacy/failed semantic paths without typed impact diagnostics fail
+        # closed exactly as before.
         status.add_blocker("physical_row_semantics_unresolved")
     if int(data.get("semantic_relation_conflict_count") or 0) > 0:
         status.add_blocker("physical_row_semantics_unresolved")
@@ -150,6 +163,11 @@ def page_status_from_diagnostics(
         "semantic_resolution_error",
         "semantic_verified_item_count",
         "semantic_review_item_count",
+        "semantic_review_evidence_row_count",
+        "semantic_non_output_review_row_count",
+        "semantic_output_critical_unresolved_count",
+        "semantic_non_output_unresolved_count",
+        "semantic_safety_special_count",
         "unresolved_physical_row_count",
         "semantic_auto_accept_rate",
         "logical_item_count",

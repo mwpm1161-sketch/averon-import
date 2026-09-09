@@ -55,9 +55,16 @@ class EvidenceTier(str, Enum):
 
 _INTEGER_RE = re.compile(r"^\d+$")
 _NUMBER_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
-_SYSTEM_RE = re.compile(r"^[A-ZА-ЯЁ]\s*\d{1,3}$", re.IGNORECASE)
+_SYSTEM_RE = re.compile(
+    r"^[A-ZА-ЯЁ]\s*\d{1,3}(?:[.,]\d+)?$",
+    re.IGNORECASE,
+)
 _NOTE_RE = re.compile(
     r"^(?:примеч|см\.?\s|согласно\b|по месту\b|в соответствии\b|для\s+справ|\*|•|—\s*прим)",
+    re.IGNORECASE,
+)
+_SECTION_HEADING_RE = re.compile(
+    r"^\s*(?:[IVXLCDM]+\s*[.)]|\d+(?:\.\d+)+\s*[.)]?)\s+\S",
     re.IGNORECASE,
 )
 
@@ -421,6 +428,55 @@ def _context_component_note_evidence(
     return tuple(candidates)
 
 
+def _section_heading_evidence(
+    row: PhysicalRowIR,
+    mapping: Mapping[int, tuple[str, ...]],
+) -> tuple[RoleCandidate, ...]:
+    """Recognize generic heading topology without engineering vocabulary.
+
+    A heading candidate is intentionally structural: it requires sparse text
+    in the name/position area and a generic heading shape.  Product anchors
+    in mapped product/critical columns win, so model text such as ``IV.
+    ABC-400`` with unit/quantity remains an item.
+    """
+
+    occupied = _row_occupied(row)
+    if not occupied or len(occupied) > 2:
+        return ()
+    field_text = _field_texts(row, mapping)
+    mapped_fields = set(field_text)
+    if mapped_fields - {"name", "position"}:
+        return ()
+    if any(field_text.get(field) for field in ("unit", "quantity", "mass")):
+        return ()
+    if any(
+        any(_has_letters(value) for value in field_text.get(field, ()))
+        for field in ("type_mark", "code", "manufacturer")
+    ):
+        return ()
+    combined = " ".join(_text(cell.raw_text) for cell in occupied).strip()
+    if not combined:
+        return ()
+    heading_shape = bool(_SECTION_HEADING_RE.match(combined))
+    sparse_colon = len(occupied) <= 2 and combined.rstrip().endswith(":")
+    if not heading_shape and not sparse_colon:
+        return ()
+    return (
+        _candidate(
+            RowRole.CONTEXT,
+            qualifier="SECTION",
+            tier=EvidenceTier.STRONG,
+            evidence=(
+                "generic_section_heading_syntax"
+                if heading_shape
+                else "generic_section_terminal_colon",
+                "sparse_heading_topology",
+                "no_independent_product_anchor",
+            ),
+        ),
+    )
+
+
 def _assessment(
     row: PhysicalRowIR,
     candidates: Iterable[RoleCandidate],
@@ -451,6 +507,21 @@ def _assessment(
         best = ()
     identities = {(candidate.role, candidate.qualifier) for candidate in best}
     selected = best[0] if len(identities) == 1 else None
+    structural_section = next(
+        (
+            candidate
+            for candidate in best
+            if candidate.role == RowRole.CONTEXT
+            and candidate.qualifier == "SECTION"
+            and "generic_section_heading_syntax" in candidate.evidence
+        ),
+        None,
+    )
+    if structural_section is not None:
+        # A generic, independently evidenced heading wins a tie against the
+        # weak identity/position item hypothesis. Product anchors in critical
+        # columns prevent the section candidate from being emitted earlier.
+        selected = structural_section
     # Weak evidence is deliberately not a role decision.  In particular, a
     # lone position/number must remain unresolved rather than becoming an
     # item or a numbering row by proximity alone.
@@ -557,6 +628,7 @@ class TableFunctionalAnalyzer:
                     if numbering_diagnostics.get("numbering_band_ocr_anomaly"):
                         anomalies.append({"row_ref": row.ref.as_dict(), **numbering_diagnostics})
                 candidates.extend(_item_evidence(row, mapping))
+                candidates.extend(_section_heading_evidence(row, mapping))
                 candidates.extend(_context_component_note_evidence(row, mapping))
             assessments.append(_assessment(row, candidates))
 

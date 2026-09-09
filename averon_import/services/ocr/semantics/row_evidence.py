@@ -45,6 +45,15 @@ class RowRoleState(str, Enum):
     UNRESOLVED = "UNRESOLVED"
 
 
+class SemanticReviewImpact(str, Enum):
+    """Safety impact of an unresolved physical semantic row."""
+
+    OUTPUT_CRITICAL = "OUTPUT_CRITICAL"
+    NON_OUTPUT = "NON_OUTPUT"
+    SAFETY_SPECIAL = "SAFETY_SPECIAL"
+    NONE = "NONE"
+
+
 class RowRelationType(str, Enum):
     CONTINUATION_OF = "CONTINUATION_OF"
 
@@ -243,5 +252,6 @@ __all__ = [
     "RowRoleAssessment",
     "RowRoleCandidate",
     "RowRoleState",
+    "SemanticReviewImpact",
     "RowQualifier",
 ]

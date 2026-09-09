@@ -40,6 +40,7 @@ from averon_import.services.ocr.semantics.row_evidence import (
     RowRoleAssessment,
     RowRoleCandidate,
     RowRoleState,
+    SemanticReviewImpact,
     RowQualifier,
 )
 from averon_import.services.ocr.semantics.semantic_table import (
@@ -100,6 +101,7 @@ __all__ = [
     "RowQualifier",
     "RowRoleAssessment",
     "RowRoleState",
+    "SemanticReviewImpact",
     "RowRelationAssessment",
     "RowRelationState",
     "RowRelationType",

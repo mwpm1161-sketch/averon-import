@@ -34,6 +34,23 @@ SEMANTIC_SOURCE_SAFETY_REASONS = frozenset(CRITICAL_REASONS - {
     "critical_value_missing",
 })
 
+STRUCTURAL_REVIEW_REASONS = frozenset({
+    "structural_ambiguity",
+    "structural_disagreement",
+    "structural_boundary_conflict",
+    "word_assignment_ambiguity",
+})
+
+
+def _semantic_structural_impact(row: object) -> str:
+    metadata = _row_metadata(row)
+    if isinstance(row, dict):
+        value = row.get("semantic_structural_impact")
+    else:
+        value = None
+    value = value or metadata.get("semantic_structural_impact")
+    return str(value or "").strip().upper()
+
 
 def _values(row: dict) -> dict:
     return row if isinstance(row, dict) else {}
@@ -134,6 +151,8 @@ def is_critical_row(row: dict) -> bool:
         "word_assignment_ambiguity",
         "identity_cell_missing",
     }
+    if _semantic_structural_impact(row) == "INFORMATIONAL":
+        structural_reasons.difference_update(STRUCTURAL_REVIEW_REASONS)
     row_reasons = set(_as_list(row.get("review_reasons")))
     if (
         row.get("structured_table")
@@ -224,6 +243,11 @@ def critical_blockers_for_row(row: dict) -> list[str]:
         "physical_row_loss_suspected",
         "identity_cell_missing",
     ):
+        if (
+            reason in STRUCTURAL_REVIEW_REASONS
+            and _semantic_structural_impact(row) == "INFORMATIONAL"
+        ):
+            continue
         if reason in reasons:
             blockers.append(reason)
     return blockers

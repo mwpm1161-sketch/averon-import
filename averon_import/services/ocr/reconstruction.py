@@ -2112,8 +2112,6 @@ def _primary_structural_evidence(
     material_reasons: list[str] = []
     if missing_grid_internal_boundaries:
         material_reasons.append("missing_grid_internal_boundary")
-    if extra_provider_internal_boundaries:
-        material_reasons.append("extra_provider_internal_boundary")
     if critical_boundary_conflicts:
         material_reasons.append("critical_boundary_conflict")
     material_column_disagreement = bool(material_reasons)
@@ -2228,7 +2226,7 @@ def target_cell_structural_safety(
             for value in evidence.get("extra_provider_internal_boundaries") or []
             if cell.bounds[0] + tolerance < float(value) < cell.bounds[2] - tolerance
         ]
-        if touching or splitting:
+        if touching or (splitting and evidence.get("material_disagreement")):
             reasons.append("material_column_conflict_at_target")
         material_rows = evidence.get("material_row_boundary_conflicts") or []
         if any(
@@ -2247,8 +2245,11 @@ def target_cell_structural_safety(
         )
         if evidence.get("material_disagreement") and not detailed_material:
             reasons.append("unlocalized_material_disagreement")
-    if metadata.get("structural_ambiguity") and not metadata.get(
-        "ambiguous_physical_cells"
+    if (
+        metadata.get("structural_ambiguity")
+        and str(metadata.get("semantic_structural_impact") or "").upper()
+        != "INFORMATIONAL"
+        and not metadata.get("ambiguous_physical_cells")
     ):
         reasons.append("unlocalized_structural_ambiguity")
     return {
@@ -2684,6 +2685,26 @@ def rows_from_physical_grid(
         ]
         metadata["structural_disagreement"] = disagreement
         metadata["informational_structural_disagreement"] = informational_disagreement
+        local_structural_material = bool(
+            disagreement
+            or evidence.get("material_disagreement")
+            or row_weak_fields
+            or metadata.get("ambiguous_physical_cells")
+        )
+        metadata["semantic_structural_impact"] = (
+            "MATERIAL" if local_structural_material else (
+                "INFORMATIONAL"
+                if metadata.get("structural_ambiguity") or informational_disagreement
+                else "NONE"
+            )
+        )
+        metadata["semantic_structural_impact_reasons"] = (
+            ["material_structural_evidence"]
+            if local_structural_material
+            else ["provider_or_raster_alignment_only"]
+            if metadata["semantic_structural_impact"] == "INFORMATIONAL"
+            else []
+        )
         if disagreement or row_ambiguity:
             reasons = list(metadata.get("review_reasons") or [])
             if disagreement and "structural_disagreement" not in reasons:

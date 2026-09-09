@@ -1021,6 +1021,13 @@ class YandexVisionProvider:
             row for row in rows
             if isinstance(row.metadata, dict)
             and row.metadata.get("semantic_role") == "ITEM_ROOT"
+            and row.metadata.get("logical_item_id")
+        ]
+        evidence_rows = [
+            row for row in rows
+            if isinstance(row.metadata, dict)
+            and row.metadata.get("semantic_review")
+            and not row.metadata.get("logical_item_id")
         ]
         review_item_count = sum(
             row.metadata.get("semantic_state") == "REVIEW"
@@ -1032,6 +1039,21 @@ class YandexVisionProvider:
             "semantic_resolution_completed": True,
             "semantic_verified_item_count": verified_item_count,
             "semantic_review_item_count": review_item_count,
+            "semantic_review_evidence_row_count": len(evidence_rows),
+            "semantic_non_output_review_row_count": sum(
+                str(row.metadata.get("semantic_review_impact") or "").upper()
+                == "NON_OUTPUT"
+                for row in evidence_rows
+            ),
+            "semantic_output_critical_unresolved_count": int(
+                metrics.get("semantic_output_critical_unresolved_count") or 0
+            ),
+            "semantic_non_output_unresolved_count": int(
+                metrics.get("semantic_non_output_unresolved_count") or 0
+            ),
+            "semantic_safety_special_count": int(
+                metrics.get("semantic_safety_special_count") or 0
+            ),
             "unresolved_physical_row_count": unresolved_count,
             "semantic_auto_accept_rate": (
                 verified_item_count / logical_count if logical_count else 1.0
@@ -1475,6 +1497,13 @@ class YandexVisionProvider:
                         row for row in rows
                         if isinstance(row.metadata, dict)
                         and row.metadata.get("semantic_role") == "ITEM_ROOT"
+                        and row.metadata.get("logical_item_id")
+                    ]
+                    evidence_rows = [
+                        row for row in rows
+                        if isinstance(row.metadata, dict)
+                        and row.metadata.get("semantic_review")
+                        and not row.metadata.get("logical_item_id")
                     ]
                     reconstruction_diagnostics["semantic_review_item_count"] = sum(
                         bool(
@@ -1483,6 +1512,14 @@ class YandexVisionProvider:
                             or row.metadata.get("review_reasons")
                         )
                         for row in semantic_rows
+                    )
+                    reconstruction_diagnostics["semantic_review_evidence_row_count"] = len(
+                        evidence_rows
+                    )
+                    reconstruction_diagnostics["semantic_non_output_review_row_count"] = sum(
+                        str(row.metadata.get("semantic_review_impact") or "").upper()
+                        == "NON_OUTPUT"
+                        for row in evidence_rows
                     )
                     reconstruction_diagnostics["semantic_numeric_suspect_count"] = sum(
                         "numeric_suspect"

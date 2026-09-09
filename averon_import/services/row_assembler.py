@@ -214,6 +214,11 @@ class SpecificationRowAssembler:
             metadata.get("semantic_row_type")
             or role_to_type.get(semantic_role, "semantic_review")
         )
+        if semantic_role == "CONTEXT":
+            row_type = {
+                "SECTION": "section",
+                "SYSTEM": "system",
+            }.get(str(metadata.get("semantic_qualifier") or ""), "note")
         if metadata.get("semantic_resolved") is False:
             row_type = "semantic_review"
         semantic_review = bool(
@@ -273,6 +278,7 @@ class SpecificationRowAssembler:
             "semantic_authoritative": bool(metadata.get("semantic_authoritative")),
             "semantic_review": semantic_review,
             "semantic_state": metadata.get("semantic_state", "VERIFIED"),
+            "semantic_review_impact": metadata.get("semantic_review_impact", "NONE"),
             "logical_item_id": metadata.get("logical_item_id"),
             "semantic_review_preview": metadata.get("semantic_review_preview", ""),
         }
