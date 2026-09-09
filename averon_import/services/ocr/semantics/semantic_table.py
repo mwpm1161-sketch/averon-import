@@ -1,0 +1,578 @@
+"""Provider-neutral semantic table IR and conservation accounting.
+
+The classes in this module are deliberately descriptive.  They do not infer
+row roles, merge rows, repair values, or replace the existing assembler.  A
+future analyzer may populate them in shadow mode and the conservation report
+will fail closed when physical evidence has no explicit safe disposition.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Iterable, Mapping
+
+from ..table_ir import (
+    BBox,
+    PhysicalCellRef,
+    PhysicalRowIR,
+    PhysicalRowRef,
+    PhysicalTableIR,
+    PhysicalWordRef,
+    _bbox,
+    _thaw,
+    freeze_mapping,
+)
+from .row_evidence import (
+    RowRelationAssessment,
+    RowRelationState,
+    RowRelationType,
+    RowRole,
+    RowRoleAssessment,
+    RowRoleState,
+)
+
+
+def _strings(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
+
+
+def _enum(value: Enum | str, enum_type: type[Enum]) -> Enum:
+    if isinstance(value, enum_type):
+        return value
+    return enum_type(str(value))
+
+
+def _snapshot(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "as_dict"):
+        return value.as_dict()
+    if isinstance(value, Mapping):
+        return _thaw(freeze_mapping(value))
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class TableAnalysisContext:
+    """Immutable boundary between physical evidence and semantic assessments."""
+
+    physical_table: PhysicalTableIR
+    header_mapping: Mapping[str, Any] = field(default_factory=dict)
+    family_assessment: Mapping[str, Any] | None = None
+    schema_assessment: Mapping[str, Any] | None = None
+    structural_evidence: Mapping[str, Any] | None = None
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "header_mapping", freeze_mapping(self.header_mapping))
+        if self.family_assessment is not None:
+            object.__setattr__(self, "family_assessment", freeze_mapping(self.family_assessment))
+        if self.schema_assessment is not None:
+            object.__setattr__(self, "schema_assessment", freeze_mapping(self.schema_assessment))
+        if self.structural_evidence is not None:
+            object.__setattr__(self, "structural_evidence", freeze_mapping(self.structural_evidence))
+        object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+
+    @classmethod
+    def from_assessments(
+        cls,
+        physical_table: PhysicalTableIR,
+        *,
+        header_mapping: Any = None,
+        family_assessment: Any = None,
+        schema_assessment: Any = None,
+        structural_evidence: Any = None,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> TableAnalysisContext:
+        return cls(
+            physical_table=physical_table,
+            header_mapping=_snapshot(header_mapping) or {},
+            family_assessment=_snapshot(family_assessment),
+            schema_assessment=_snapshot(schema_assessment),
+            structural_evidence=_snapshot(structural_evidence),
+            provenance=provenance or {},
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "physical_table": self.physical_table.as_dict(),
+            "header_mapping": _thaw(self.header_mapping),
+            "family_assessment": _thaw(self.family_assessment) if self.family_assessment is not None else None,
+            "schema_assessment": _thaw(self.schema_assessment) if self.schema_assessment is not None else None,
+            "structural_evidence": _thaw(self.structural_evidence) if self.structural_evidence is not None else None,
+            "provenance": _thaw(self.provenance),
+        }
+
+class FieldOrigin(str, Enum):
+    OCR = "OCR"
+    HUMAN = "HUMAN"
+    TRUSTED_RULE = "TRUSTED_RULE"
+
+
+SemanticOrigin = FieldOrigin
+
+
+@dataclass(frozen=True, slots=True)
+class ValueCandidate:
+    value: str
+    origin: FieldOrigin = FieldOrigin.OCR
+    auto_trusted: bool = False
+    review_reason: str | None = None
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin", _enum(self.origin, FieldOrigin))
+        object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+        if self.auto_trusted and self.origin == FieldOrigin.OCR:
+            raise ValueError("OCR candidates must remain candidate-only")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "value": self.value,
+            "origin": self.origin.value,
+            "auto_trusted": self.auto_trusted,
+            "review_reason": self.review_reason,
+            "provenance": _thaw(self.provenance),
+        }
+
+
+FieldValueCandidate = ValueCandidate
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFieldFragment:
+    field: str
+    text: str
+    physical_row_ref: PhysicalRowRef
+    physical_cell_ref: PhysicalCellRef | None = None
+    word_refs: tuple[PhysicalWordRef, ...] = ()
+    bbox: BBox = (0.0, 0.0, 0.0, 0.0)
+    origin: FieldOrigin = FieldOrigin.OCR
+    raw_text: str | None = None
+    provider_refs: tuple[str, ...] = ()
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bbox", _bbox(self.bbox))
+        object.__setattr__(self, "origin", _enum(self.origin, FieldOrigin))
+        object.__setattr__(self, "word_refs", tuple(self.word_refs))
+        object.__setattr__(self, "provider_refs", _strings(self.provider_refs))
+        object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "field": self.field,
+            "text": self.text,
+            "raw_text": self.raw_text,
+            "origin": self.origin.value,
+            "physical_row_ref": self.physical_row_ref.as_dict(),
+            "physical_cell_ref": self.physical_cell_ref.as_dict() if self.physical_cell_ref else None,
+            "word_refs": [ref.as_dict() for ref in self.word_refs],
+            "bbox": list(self.bbox),
+            "provider_refs": list(self.provider_refs),
+            "provenance": _thaw(self.provenance),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalFieldValue:
+    field: str
+    canonical_text: str | None = None
+    source_fragments: tuple[SourceFieldFragment, ...] = ()
+    candidates: tuple[ValueCandidate, ...] = ()
+    origin: FieldOrigin = FieldOrigin.OCR
+    review_reasons: tuple[str, ...] = ()
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_fragments", tuple(self.source_fragments))
+        object.__setattr__(self, "candidates", tuple(self.candidates))
+        object.__setattr__(self, "origin", _enum(self.origin, FieldOrigin))
+        object.__setattr__(self, "review_reasons", _strings(self.review_reasons))
+        object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+
+    @property
+    def candidate_only(self) -> bool:
+        return self.canonical_text is None and bool(self.candidates)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "field": self.field,
+            "canonical_text": self.canonical_text,
+            "source_fragments": [fragment.as_dict() for fragment in self.source_fragments],
+            "candidates": [candidate.as_dict() for candidate in self.candidates],
+            "origin": self.origin.value,
+            "review_reasons": list(self.review_reasons),
+            "provenance": _thaw(self.provenance),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalSpecificationItem:
+    logical_id: str
+    physical_row_refs: tuple[PhysicalRowRef, ...] = ()
+    fields: Mapping[str, LogicalFieldValue] = field(default_factory=dict)
+    bbox: BBox = (0.0, 0.0, 0.0, 0.0)
+    review_reasons: tuple[str, ...] = ()
+    context_refs: tuple[PhysicalRowRef, ...] = ()
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "physical_row_refs", tuple(self.physical_row_refs))
+        object.__setattr__(self, "context_refs", tuple(self.context_refs))
+        object.__setattr__(self, "fields", freeze_mapping(self.fields))
+        object.__setattr__(self, "bbox", _bbox(self.bbox))
+        object.__setattr__(self, "review_reasons", _strings(self.review_reasons))
+        object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "logical_id": self.logical_id,
+            "physical_row_refs": [ref.as_dict() for ref in self.physical_row_refs],
+            "fields": {name: value.as_dict() for name, value in self.fields.items()},
+            "bbox": list(self.bbox),
+            "review_reasons": list(self.review_reasons),
+            "context_refs": [ref.as_dict() for ref in self.context_refs],
+            "provenance": _thaw(self.provenance),
+        }
+
+    @property
+    def field_values(self) -> Mapping[str, LogicalFieldValue]:
+        return self.fields
+
+
+class DispositionValidation(str, Enum):
+    VALIDATED = "VALIDATED"
+    UNVALIDATED = "UNVALIDATED"
+
+
+class InvalidDispositionState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    UNRESOLVED = "UNRESOLVED"
+    ORPHAN = "ORPHAN"
+    ROLE_CONFLICT = "ROLE_CONFLICT"
+    RELATION_CONFLICT = "RELATION_CONFLICT"
+    MULTIPLE_DISPOSITIONS = "MULTIPLE_DISPOSITIONS"
+    UNACCOUNTED = "UNACCOUNTED"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPhysicalDisposition:
+    physical_row_ref: PhysicalRowRef
+    role: RowRole = RowRole.UNKNOWN
+    qualifier: str | None = None
+    validation_state: DispositionValidation = DispositionValidation.UNVALIDATED
+    role_state: RowRoleState = RowRoleState.UNRESOLVED
+    logical_item_id: str | None = None
+    relation: RowRelationAssessment | None = None
+    evidence_score: float = 0.0
+    evidence_strength: str = "none"
+    evidence: tuple[str, ...] = ()
+    contradictions: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role", _enum(self.role, RowRole))
+        object.__setattr__(self, "validation_state", _enum(self.validation_state, DispositionValidation))
+        object.__setattr__(self, "role_state", _enum(self.role_state, RowRoleState))
+        object.__setattr__(self, "evidence", _strings(self.evidence))
+        object.__setattr__(self, "contradictions", _strings(self.contradictions))
+        object.__setattr__(self, "reasons", _strings(self.reasons))
+        object.__setattr__(self, "provenance", freeze_mapping(self.provenance))
+
+    @property
+    def validated(self) -> bool:
+        return self.validation_state == DispositionValidation.VALIDATED
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "physical_row_ref": self.physical_row_ref.as_dict(),
+            "role": self.role.value,
+            "qualifier": self.qualifier,
+            "validation_state": self.validation_state.value,
+            "role_state": self.role_state.value,
+            "logical_item_id": self.logical_item_id,
+            "relation": self.relation.as_dict() if self.relation else None,
+            "evidence_score": self.evidence_score,
+            "evidence_strength": self.evidence_strength,
+            "evidence": list(self.evidence),
+            "contradictions": list(self.contradictions),
+            "reasons": list(self.reasons),
+            "provenance": _thaw(self.provenance),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticConservationReport:
+    total_physical_rows: int
+    resolved_physical_rows: int
+    unaccounted_physical_rows: int
+    invalid_physical_rows: tuple[PhysicalRowRef, ...] = ()
+    unresolved_rows: tuple[PhysicalRowRef, ...] = ()
+    reasons: tuple[str, ...] = ()
+    invalid_reasons_by_row: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    continuation_count: int = 0
+    logical_item_count: int = 0
+    component_count: int = 0
+    note_count: int = 0
+    service_count: int = 0
+    context_count: int = 0
+    semantic_conservation_rate: float = 0.0
+    semantic_conservation_pass: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "invalid_physical_rows", tuple(self.invalid_physical_rows))
+        object.__setattr__(self, "unresolved_rows", tuple(self.unresolved_rows))
+        object.__setattr__(self, "reasons", _strings(self.reasons))
+        object.__setattr__(
+            self,
+            "invalid_reasons_by_row",
+            freeze_mapping({key: tuple(value) for key, value in self.invalid_reasons_by_row.items()}),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total_physical_rows": self.total_physical_rows,
+            "resolved_physical_rows": self.resolved_physical_rows,
+            "unaccounted_physical_rows": self.unaccounted_physical_rows,
+            "invalid_physical_rows": [ref.as_dict() for ref in self.invalid_physical_rows],
+            "unresolved_rows": [ref.as_dict() for ref in self.unresolved_rows],
+            "reasons": list(self.reasons),
+            "invalid_reasons_by_row": _thaw(self.invalid_reasons_by_row),
+            "continuation_count": self.continuation_count,
+            "logical_item_count": self.logical_item_count,
+            "component_count": self.component_count,
+            "note_count": self.note_count,
+            "service_count": self.service_count,
+            "context_count": self.context_count,
+            "semantic_conservation_rate": self.semantic_conservation_rate,
+            "semantic_conservation_pass": self.semantic_conservation_pass,
+        }
+
+
+def _row_key(ref: PhysicalRowRef) -> str:
+    return ref.key
+
+
+def _physical_refs(rows: Iterable[PhysicalRowIR | PhysicalRowRef]) -> tuple[PhysicalRowRef, ...]:
+    refs = []
+    for row in rows:
+        if isinstance(row, PhysicalRowIR):
+            if row.nonempty:
+                refs.append(row.ref)
+        else:
+            refs.append(row)
+    return tuple(refs)
+
+
+def evaluate_semantic_conservation(
+    physical_rows: Iterable[PhysicalRowIR | PhysicalRowRef],
+    dispositions: Iterable[ResolvedPhysicalDisposition],
+    *,
+    logical_items: Iterable[LogicalSpecificationItem] = (),
+    relations: Iterable[RowRelationAssessment] = (),
+) -> SemanticConservationReport:
+    """Evaluate explicit physical-row accounting without inventing semantics."""
+
+    refs = _physical_refs(physical_rows)
+    dispositions_tuple = tuple(dispositions)
+    items = tuple(logical_items)
+    relation_tuple = tuple(relations)
+    by_key: dict[str, list[ResolvedPhysicalDisposition]] = defaultdict(list)
+    ref_by_key = {_row_key(ref): ref for ref in refs}
+    for disposition in dispositions_tuple:
+        by_key[_row_key(disposition.physical_row_ref)].append(disposition)
+
+    invalid: dict[str, set[str]] = defaultdict(set)
+    counts = Counter()
+    for ref in refs:
+        key = _row_key(ref)
+        candidates = by_key.get(key, [])
+        if not candidates:
+            invalid[key].add("UNACCOUNTED")
+            continue
+        if len(candidates) != 1:
+            invalid[key].add("MULTIPLE_DISPOSITIONS")
+            continue
+        disposition = candidates[0]
+        counts[disposition.role] += 1
+        if disposition.role == RowRole.UNKNOWN:
+            invalid[key].add("UNKNOWN")
+        if disposition.validation_state != DispositionValidation.VALIDATED:
+            invalid[key].add("UNRESOLVED")
+        if disposition.role_state != RowRoleState.CONFIRMED:
+            invalid[key].add("UNRESOLVED")
+        if not disposition.evidence:
+            invalid[key].add("UNRESOLVED")
+        if disposition.role in {RowRole.ITEM_ROOT, RowRole.CONTINUATION} and not disposition.logical_item_id:
+            invalid[key].add("ORPHAN")
+        if disposition.role == RowRole.CONTINUATION:
+            if disposition.relation is None:
+                invalid[key].add("ORPHAN")
+            elif (
+                disposition.relation.relation_type != RowRelationType.CONTINUATION_OF
+                or disposition.relation.state != RowRelationState.CONFIRMED
+                or disposition.relation.target_row_ref is None
+            ):
+                invalid[key].add("RELATION_CONFLICT")
+
+    confirmed_relations = [
+        relation
+        for relation in relation_tuple
+        if relation.state == RowRelationState.CONFIRMED
+    ]
+    relation_targets: dict[str, set[str]] = defaultdict(set)
+    for relation in confirmed_relations:
+        source_key = _row_key(relation.source_row_ref)
+        target_key = _row_key(relation.target_row_ref) if relation.target_row_ref else None
+        if relation.relation_type != RowRelationType.CONTINUATION_OF or target_key is None:
+            invalid[source_key].add("RELATION_CONFLICT")
+            continue
+        relation_targets[source_key].add(target_key)
+        if len(relation_targets[source_key]) > 1:
+            invalid[source_key].add("RELATION_CONFLICT")
+        if source_key not in by_key or target_key not in ref_by_key:
+            invalid[source_key].add("ORPHAN")
+
+    item_rows: dict[str, list[str]] = defaultdict(list)
+    for item in items:
+        if not item.physical_row_refs:
+            continue
+        for ref in item.physical_row_refs:
+            key = _row_key(ref)
+            item_rows[item.logical_id].append(key)
+            if key not in ref_by_key:
+                invalid[key].add("ORPHAN")
+    seen_item_rows: dict[str, str] = {}
+    for item_id, row_keys in item_rows.items():
+        for key in row_keys:
+            previous = seen_item_rows.get(key)
+            if previous is not None and previous != item_id:
+                invalid[key].add("RELATION_CONFLICT")
+            seen_item_rows[key] = item_id
+    for key, row_dispositions in by_key.items():
+        if not row_dispositions:
+            continue
+        disposition = row_dispositions[0]
+        if disposition.role in {RowRole.ITEM_ROOT, RowRole.CONTINUATION}:
+            if disposition.logical_item_id not in item_rows:
+                invalid[key].add("ORPHAN")
+            elif key not in item_rows[disposition.logical_item_id]:
+                invalid[key].add("RELATION_CONFLICT")
+
+    for source_key, targets in relation_targets.items():
+        disposition = by_key.get(source_key, [None])[0]
+        if disposition is None or disposition.role != RowRole.CONTINUATION:
+            invalid[source_key].add("RELATION_CONFLICT")
+        elif len(targets) != 1:
+            invalid[source_key].add("RELATION_CONFLICT")
+
+    valid_count = sum(1 for key in ref_by_key if not invalid.get(key))
+
+    invalid_rows = tuple(ref_by_key[key] for key in sorted(invalid) if key in ref_by_key)
+    unresolved_rows = invalid_rows
+    total = len(refs)
+    rate = valid_count / total if total else 1.0
+    reasons = tuple(sorted({reason for values in invalid.values() for reason in values}))
+    return SemanticConservationReport(
+        total_physical_rows=total,
+        resolved_physical_rows=max(0, valid_count),
+        unaccounted_physical_rows=sum(1 for key in ref_by_key if not by_key.get(key)),
+        invalid_physical_rows=invalid_rows,
+        unresolved_rows=unresolved_rows,
+        reasons=reasons,
+        invalid_reasons_by_row={key: tuple(sorted(values)) for key, values in invalid.items()},
+        continuation_count=counts[RowRole.CONTINUATION],
+        logical_item_count=len(items),
+        component_count=counts[RowRole.COMPONENT],
+        note_count=counts[RowRole.NOTE],
+        service_count=counts[RowRole.SERVICE],
+        context_count=counts[RowRole.CONTEXT],
+        semantic_conservation_rate=rate,
+        semantic_conservation_pass=not invalid_rows and valid_count == total,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticTableIR:
+    analysis_context: TableAnalysisContext
+    row_roles: tuple[RowRoleAssessment, ...] = ()
+    relations: tuple[RowRelationAssessment, ...] = ()
+    dispositions: tuple[ResolvedPhysicalDisposition, ...] = ()
+    logical_items: tuple[LogicalSpecificationItem, ...] = ()
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    conservation: SemanticConservationReport | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "row_roles", tuple(self.row_roles))
+        object.__setattr__(self, "relations", tuple(self.relations))
+        object.__setattr__(self, "dispositions", tuple(self.dispositions))
+        object.__setattr__(self, "logical_items", tuple(self.logical_items))
+        object.__setattr__(self, "diagnostics", freeze_mapping(self.diagnostics))
+        if self.conservation is None:
+            object.__setattr__(
+                self,
+                "conservation",
+                evaluate_semantic_conservation(
+                    self.analysis_context.physical_table.rows,
+                    self.dispositions,
+                    logical_items=self.logical_items,
+                    relations=self.relations,
+                ),
+            )
+
+    @classmethod
+    def from_parts(
+        cls,
+        analysis_context: TableAnalysisContext,
+        *,
+        row_roles: Iterable[RowRoleAssessment] = (),
+        relations: Iterable[RowRelationAssessment] = (),
+        dispositions: Iterable[ResolvedPhysicalDisposition] = (),
+        logical_items: Iterable[LogicalSpecificationItem] = (),
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> SemanticTableIR:
+        return cls(
+            analysis_context=analysis_context,
+            row_roles=tuple(row_roles),
+            relations=tuple(relations),
+            dispositions=tuple(dispositions),
+            logical_items=tuple(logical_items),
+            diagnostics=diagnostics or {},
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "analysis_context": self.analysis_context.as_dict(),
+            "row_roles": [assessment.as_dict() for assessment in self.row_roles],
+            "relations": [relation.as_dict() for relation in self.relations],
+            "dispositions": [disposition.as_dict() for disposition in self.dispositions],
+            "logical_items": [item.as_dict() for item in self.logical_items],
+            "diagnostics": _thaw(self.diagnostics),
+            "conservation": self.conservation.as_dict() if self.conservation else None,
+        }
+
+
+__all__ = [
+    "DispositionValidation",
+    "FieldOrigin",
+    "FieldValueCandidate",
+    "InvalidDispositionState",
+    "LogicalFieldValue",
+    "LogicalSpecificationItem",
+    "SemanticConservationReport",
+    "SemanticOrigin",
+    "SemanticTableIR",
+    "ResolvedPhysicalDisposition",
+    "SourceFieldFragment",
+    "TableAnalysisContext",
+    "ValueCandidate",
+    "evaluate_semantic_conservation",
+]

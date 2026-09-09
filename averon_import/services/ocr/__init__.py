@@ -21,6 +21,17 @@ from averon_import.services.ocr.raster_grid import RasterRuledTableGridDetector
 from averon_import.services.ocr.tesseract_adapter import TesseractOcrAdapter
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.ocr.page_contract import PageExtractionStatus
+from averon_import.services.ocr.table_ir import (
+    PhysicalCellIR,
+    PhysicalCellRef,
+    PhysicalRowFragmentIR,
+    PhysicalRowIR,
+    PhysicalRowRef,
+    PhysicalTableIR,
+    PhysicalTableRef,
+    PhysicalWordIR,
+    PhysicalWordRef,
+)
 
 _PROVIDER_FACTORIES: dict[str, type] = {"tesseract": TesseractOcrAdapter}
 
@@ -57,4 +68,13 @@ __all__ = [
     "register_provider",
     "create_ocr_provider",
     "PageExtractionStatus",
+    "PhysicalCellIR",
+    "PhysicalCellRef",
+    "PhysicalRowFragmentIR",
+    "PhysicalRowIR",
+    "PhysicalRowRef",
+    "PhysicalTableIR",
+    "PhysicalTableRef",
+    "PhysicalWordIR",
+    "PhysicalWordRef",
 ]
