@@ -198,6 +198,54 @@ def _numbering_evidence(
             ),
         ), diagnostics
 
+    ordinal_values = [value for _cell, value in numeric_cells]
+    offset_counts = Counter(
+        value - cell.ref.column_index
+        for cell, value in numeric_cells
+    )
+    offset_support_count = max(offset_counts.values(), default=0)
+    strongest_offsets = tuple(
+        offset
+        for offset, support in offset_counts.items()
+        if support == offset_support_count
+    )
+    offset_conflict = (
+        offset_support_count < 2
+        or len(strongest_offsets) != 1
+    )
+    ordinal_offset = (
+        strongest_offsets[0]
+        if not offset_conflict
+        else None
+    )
+    expected = []
+    matches = []
+    mismatches = []
+    if ordinal_offset is not None:
+        for cell, observed in numeric_cells:
+            expected_value = cell.ref.column_index + ordinal_offset
+            expected.append({"column_index": cell.ref.column_index, "value": expected_value})
+            entry = {
+                "column_index": cell.ref.column_index,
+                "observed": observed,
+                "expected": expected_value,
+            }
+            if observed == expected_value:
+                matches.append(entry)
+            else:
+                mismatches.append(entry)
+    diagnostics.update(
+        {
+            "ordinal_offset": ordinal_offset,
+            "offset_support_count": offset_support_count,
+            "offset_conflict": offset_conflict,
+            "ordinal_values": ordinal_values,
+            "expected_ordinals": expected,
+            "ordinal_matches": matches,
+            "ordinal_mismatches": mismatches,
+        }
+    )
+
     non_numeric = [value for value in values if not _INTEGER_RE.fullmatch(value)]
     if non_numeric:
         diagnostics["non_numeric_tokens"] = non_numeric[:20]
@@ -212,37 +260,19 @@ def _numbering_evidence(
             ),
         ), diagnostics
 
-    ordinal_values = [value for _cell, value in numeric_cells]
-    expected = []
-    matches = []
-    mismatches = []
-    start = ordinal_values[0]
-    for offset, (cell, observed) in enumerate(numeric_cells):
-        expected_value = start + offset
-        expected.append({"column_index": cell.ref.column_index, "value": expected_value})
-        entry = {
-            "column_index": cell.ref.column_index,
-            "observed": observed,
-            "expected": expected_value,
-        }
-        if observed == expected_value:
-            matches.append(entry)
-        else:
-            mismatches.append(entry)
-
     duplicates = sorted(value for value, count in Counter(ordinal_values).items() if count > 1)
     non_monotonic = any(left >= right for left, right in zip(ordinal_values, ordinal_values[1:]))
     outliers = [
-        {"column_index": cell.ref.column_index, "observed": value}
-        for cell, value in numeric_cells
-        if value >= 10 and sum(item < 10 for item in ordinal_values) >= 2
+        {
+            "column_index": mismatch["column_index"],
+            "observed": mismatch["observed"],
+            "expected": mismatch["expected"],
+        }
+        for mismatch in mismatches
+        if mismatch["observed"] >= 10 and mismatch["expected"] < 10
     ]
     diagnostics.update(
         {
-            "ordinal_values": ordinal_values,
-            "expected_ordinals": expected,
-            "ordinal_matches": matches,
-            "ordinal_mismatches": mismatches,
             "ordinal_duplicates": duplicates,
             "ordinal_non_monotonic": non_monotonic,
             "ocr_outliers": outliers,
@@ -256,11 +286,20 @@ def _numbering_evidence(
     if non_monotonic:
         contradictions.append("non_monotonic_ordinal")
         reasons.append("numbering_band_ambiguous")
-    if outliers:
+    if offset_conflict:
+        contradictions.append("offset_conflict")
+        reasons.append("ordinal_offset_unresolved")
+    if mismatches:
         contradictions.append("numbering_band_ocr_anomaly")
         reasons.append("numbering_band_ocr_anomaly")
+    if outliers:
         diagnostics["numbering_band_ocr_anomaly"] = True
-    strong_shape = len(numeric_cells) >= 3 and not duplicates and not non_monotonic
+    strong_shape = (
+        len(numeric_cells) >= 3
+        and not duplicates
+        and not non_monotonic
+        and not offset_conflict
+    )
     tier = EvidenceTier.STRONG if strong_shape else EvidenceTier.SUPPORTING
     return (
         _candidate(
@@ -397,8 +436,19 @@ def _assessment(
                 reasons=("role_unresolved",),
             ),
         )
-    best_rank = max(candidate.evidence_score for candidate in candidate_tuple)
-    best = tuple(candidate for candidate in candidate_tuple if candidate.evidence_score == best_rank)
+    positive_candidates = tuple(
+        candidate
+        for candidate in candidate_tuple
+        if candidate.evidence_strength != EvidenceTier.HARD_CONTRADICTION.value
+    )
+    if positive_candidates:
+        best_rank = max(candidate.evidence_score for candidate in positive_candidates)
+        best = tuple(candidate for candidate in positive_candidates if candidate.evidence_score == best_rank)
+    else:
+        # HARD_CONTRADICTION is retained in the graph for auditability, but it
+        # is never allowed to select a role or act as role support.
+        best_rank = 0
+        best = ()
     identities = {(candidate.role, candidate.qualifier) for candidate in best}
     selected = best[0] if len(identities) == 1 else None
     # Weak evidence is deliberately not a role decision.  In particular, a
@@ -408,11 +458,15 @@ def _assessment(
         selected = None
     state = RowRoleState.UNRESOLVED
     if selected is not None and selected.evidence_strength == EvidenceTier.STRONG.value:
-        state = RowRoleState.CONFIRMED
+        state = (
+            RowRoleState.AMBIGUOUS
+            if selected.contradictions
+            else RowRoleState.CONFIRMED
+        )
     elif selected is not None and selected.evidence_strength == EvidenceTier.SUPPORTING.value:
         state = RowRoleState.AMBIGUOUS
     second_rank = max(
-        (candidate.evidence_score for candidate in candidate_tuple if candidate.evidence_score < best_rank),
+        (candidate.evidence_score for candidate in positive_candidates if candidate.evidence_score < best_rank),
         default=0,
     )
     decision_margin = float(best_rank - second_rank) if selected is not None else 0.0
