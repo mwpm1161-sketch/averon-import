@@ -2795,16 +2795,19 @@ def rows_from_physical_grid(
                 # shadow layers in explicit namespaces for offline auditing.
                 shadow["functional_graph"] = functional_graph.as_dict()
                 shadow["relation_graph"] = {
-                    "relations": [relation.as_dict() for relation in relation_assessments],
+                    # The resolver may strengthen a bounded chain edge using
+                    # adjacent lookahead.  Publish that effective shadow
+                    # graph, while production rows remain unchanged.
+                    "relations": [relation.as_dict() for relation in semantic_table.relations],
                     "diagnostics": {
-                        "candidate_count": len(relation_assessments),
+                        "candidate_count": len(semantic_table.relations),
                         "confirmed_count": sum(
                             relation.state.value == "CONFIRMED"
-                            for relation in relation_assessments
+                            for relation in semantic_table.relations
                         ),
                         "ambiguous_count": sum(
                             relation.state.value in {"AMBIGUOUS", "UNRESOLVED"}
-                            for relation in relation_assessments
+                            for relation in semantic_table.relations
                         ),
                         "confirmed_continuation_with_textual_support": sum(
                             relation.state.value == "CONFIRMED"
@@ -2814,15 +2817,18 @@ def rows_from_physical_grid(
                                         "hyphenated_field_continuity",
                                         "open_quote_or_bracket_continuity",
                                         "lowercase_text_continuity",
+                                        "grammar_marker_continuity",
+                                        "open_grammar_tail_continuity",
+                                        "lookahead_chain_consistency",
                                     }
                                 )
                             )
-                            for relation in relation_assessments
+                            for relation in semantic_table.relations
                         ),
                         "ambiguous_identity_only_relation_count": sum(
                             relation.state.value in {"AMBIGUOUS", "UNRESOLVED"}
                             and "identity_subset_only" in relation.reasons
-                            for relation in relation_assessments
+                            for relation in semantic_table.relations
                         ),
                     },
                 }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from averon_import.services.ocr.semantics.functional_analyzer import TableFunctionalAnalyzer
 from averon_import.services.ocr.semantics.row_evidence import (
     RowRelationAssessment,
@@ -491,3 +493,152 @@ def test_metrics_expose_relation_and_conservation_quality():
     assert metrics["item_auto_resolution_rate"] == 1.0
     assert metrics["confirmed_continuation_with_textual_support"] == 1
     assert metrics["ambiguous_identity_only_relation_count"] == 0
+
+
+def test_a1_lowercase_name_only_after_root_remains_unresolved():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {1: {1: "Насос", 5: "шт", 6: "1"}, 2: {1: "клапан шаровой"}}
+    )
+    assert _relation(relations, 2).state == RowRelationState.AMBIGUOUS
+    assert _disposition(semantic, 2).logical_item_id is None
+
+
+def test_a2_sparse_name_and_manufacturer_remain_unresolved():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {1: {1: "Клапан шаровой", 4: "ООО Альфа"}, 2: {1: "Затвор", 4: "ООО Бета"}}
+    )
+    assert _relation(relations, 2).state == RowRelationState.AMBIGUOUS
+    assert _disposition(semantic, 2).logical_item_id is None
+
+
+def test_a3_grammar_marker_without_proven_root_is_ambiguous():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {1: {8: "Раздел водоснабжения"}, 2: {1: "с приводом"}}
+    )
+    assert _relation(relations, 2).state in {
+        RowRelationState.AMBIGUOUS,
+        RowRelationState.UNRESOLVED,
+    }
+    assert _disposition(semantic, 2).logical_item_id is None
+
+
+def test_a4_anchored_grammar_marker_confirms_modifier_continuation():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {1: {1: "Насос", 5: "шт", 6: "1"}, 2: {1: "с электроприводом"}}
+    )
+    assert _relation(relations, 2).state == RowRelationState.CONFIRMED
+    assert _disposition(semantic, 2).role == RowRole.CONTINUATION
+
+
+def test_a5_and_a6_critical_modifier_values_are_rejected():
+    for column, value in ((6, "2"), (5, "шт")):
+        _table_ir, _context, _graph, relations, semantic = _run(
+            {1: {1: "Насос", 5: "шт", 6: "1"}, 2: {1: "с приводом", column: value}}
+        )
+        assert _relation(relations, 2).state == RowRelationState.REJECTED
+        assert _disposition(semantic, 2).role != RowRole.CONTINUATION
+
+
+def test_a7_one_row_lookahead_confirms_a_coherent_adjacent_chain():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {
+            1: {1: "Насос", 5: "шт", 6: "1"},
+            2: {1: "корпуса из"},
+            3: {1: "оцинкованной стали"},
+        }
+    )
+    assert _relation(semantic.relations, 2).state == RowRelationState.CONFIRMED
+    assert _relation(semantic.relations, 3).state == RowRelationState.CONFIRMED
+    assert all(
+        _disposition(semantic, index).role == RowRole.CONTINUATION
+        for index in (2, 3)
+    )
+    assert [ref.row_index for ref in semantic.logical_items[0].physical_row_refs] == [1, 2, 3]
+    assert "lookahead_chain_consistency" in _relation(semantic.relations, 2).evidence
+
+
+def test_a8_independent_second_row_does_not_strengthen_first_edge():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {
+            1: {1: "Насос", 5: "шт", 6: "1"},
+            2: {1: "корпуса из"},
+            3: {1: "самостоятельный насос", 6: "2"},
+        }
+    )
+    assert _relation(relations, 2).state == RowRelationState.AMBIGUOUS
+    assert _relation(relations, 3).state == RowRelationState.REJECTED
+    assert _disposition(semantic, 2).logical_item_id is None
+
+
+def test_a9_three_continuation_edges_preserve_every_physical_reference():
+    _table_ir, _context, _graph, relations, semantic = _run(
+        {
+            1: {1: "Насос", 4: "Завод-", 5: "шт", 6: "1"},
+            2: {4: "А-"},
+            3: {4: "Б-"},
+            4: {4: "В"},
+        }
+    )
+    assert [
+        _relation(semantic.relations, index).state for index in (2, 3, 4)
+    ] == [RowRelationState.CONFIRMED] * 3
+    assert [ref.row_index for ref in semantic.logical_items[0].physical_row_refs] == [1, 2, 3, 4]
+
+
+def test_a10_cycle_is_not_projected_as_a_logical_item():
+    table, context, graph, _relations, _semantic = _run(
+        {1: {1: "фрагмент"}, 2: {1: "другая часть"}}
+    )
+    cycle = (
+        RowRelationAssessment(
+            table.row(1).ref,
+            table.row(2).ref,
+            state=RowRelationState.CONFIRMED,
+            evidence_strength="STRONG",
+        ),
+        RowRelationAssessment(
+            table.row(2).ref,
+            table.row(1).ref,
+            state=RowRelationState.CONFIRMED,
+            evidence_strength="STRONG",
+        ),
+    )
+    semantic = GlobalRowSemanticsResolver().resolve(table, context, graph, cycle)
+    assert semantic.logical_items == ()
+    assert semantic.diagnostics["metrics"]["relation_conflict_count"] > 0
+
+
+def test_a11_raster_only_row_is_witness_not_semantic_unknown():
+    table, context = _table({1: {1: "Насос", 5: "шт", 6: "1"}})
+    empty_ref = PhysicalRowRef(table.ref, 2)
+    empty_row = PhysicalRowIR(
+        empty_ref,
+        (0.0, 40.0, len(_FIELDS) * 100.0, 60.0),
+        raster_nonempty=False,
+        raster_metrics={"unmatched_glyphs": 1},
+    )
+    rows = (*table.rows, empty_row)
+    table = replace(
+        table,
+        rows=rows,
+        cells=tuple(cell for row in rows for cell in row.cells),
+        raster_witness={"nonempty_rows": [0, 1], "unmatched_glyphs": [2]},
+    )
+    context = replace(context, physical_table=table)
+    graph = TableFunctionalAnalyzer().analyze(table, context)
+    relations = RowRelationAnalyzer().analyze(table, context, graph)
+    semantic = GlobalRowSemanticsResolver().resolve(table, context, graph, relations)
+    assert all(disposition.physical_row_ref != empty_ref for disposition in semantic.dispositions)
+    assert list(semantic.diagnostics["raster_witness_only_rows"]) == [empty_ref.as_dict()]
+    assert semantic.diagnostics["metrics"]["authoritative_semantic_row_count"] == 2
+
+
+def test_a12_unmatched_raster_glyph_remains_visible_in_witness_diagnostics():
+    table, context = _table({1: {1: "Насос", 5: "шт", 6: "1"}})
+    witness = {"nonempty_rows": [0, 1], "unmatched_glyphs": [{"row_index": 2, "text": "1"}]}
+    table = replace(table, raster_witness=witness)
+    context = replace(context, physical_table=table)
+    graph = TableFunctionalAnalyzer().analyze(table, context)
+    relations = RowRelationAnalyzer().analyze(table, context, graph)
+    semantic = GlobalRowSemanticsResolver().resolve(table, context, graph, relations)
+    assert list(semantic.diagnostics["raster_witness"]["unmatched_glyphs"]) == witness["unmatched_glyphs"]

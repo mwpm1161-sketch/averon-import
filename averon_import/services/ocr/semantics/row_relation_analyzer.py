@@ -32,6 +32,9 @@ from averon_import.services.ocr.table_ir import (
 
 _IDENTITY_FIELDS = frozenset({"name", "type_mark", "code", "manufacturer"})
 _CRITICAL_FIELDS = frozenset({"unit", "quantity", "mass"})
+_CONTINUATION_MARKERS = frozenset(
+    {"с", "со", "из", "в", "во", "для", "по", "к", "ко", "на", "при", "без", "и", "или", "а"}
+)
 
 
 def _candidate_text(value: Any) -> str:
@@ -112,6 +115,38 @@ def _field_has_quote_or_bracket_open(
 ) -> bool:
     joined = " ".join(text.strip() for text in _texts(fields, field) if text.strip())
     return bool(joined) and joined.endswith(("(", "«", '"', "["))
+
+
+def _starts_with_continuation_marker(text: str) -> bool:
+    """Return generic Russian grammar evidence, never domain evidence."""
+
+    normalized = text.strip().lstrip("([{\"«—–- ").casefold()
+    if not normalized:
+        return False
+    words = normalized.split()
+    if len(words) >= 2 and words[0] == "а" and words[1] == "также":
+        return True
+    return words[0].rstrip(".,;:") in _CONTINUATION_MARKERS
+
+
+def _field_has_grammar_marker(
+    fields: Mapping[str, tuple[tuple[PhysicalCellIR, str], ...]],
+    field: str,
+) -> bool:
+    return any(_starts_with_continuation_marker(text) for text in _texts(fields, field))
+
+
+def _field_has_open_grammar_tail(
+    fields: Mapping[str, tuple[tuple[PhysicalCellIR, str], ...]],
+    field: str,
+) -> bool:
+    """Recognize an unfinished generic phrase at the previous row's tail."""
+
+    for text in _texts(fields, field):
+        words = text.strip().rstrip(".,;:").casefold().split()
+        if words and words[-1] in _CONTINUATION_MARKERS - {"а", "и", "или"}:
+            return True
+    return False
 
 
 def _relation(
@@ -242,7 +277,10 @@ class RowRelationAnalyzer:
                 RowRole.CONTEXT,
                 RowRole.COMPONENT,
                 RowRole.NOTE,
-            } and source_role.state == RowRoleState.CONFIRMED:
+            } and source_role.state in {
+                RowRoleState.CONFIRMED,
+                RowRoleState.AMBIGUOUS,
+            }:
                 relations.append(
                     _relation(
                         source,
@@ -270,12 +308,16 @@ class RowRelationAnalyzer:
                 )
                 continue
 
-            parent_is_item = bool(
+            previous_identity_only = bool(
+                previous_present.intersection(_IDENTITY_FIELDS)
+                and not previous_present.intersection(_CRITICAL_FIELDS)
+                and "position" not in previous_present
+            )
+            parent_is_candidate = bool(
                 previous_role
                 and previous_role.selected_role == RowRole.ITEM_ROOT
-                and previous_role.state == RowRoleState.CONFIRMED
-            )
-            if not parent_is_item:
+            ) or previous_identity_only
+            if not parent_is_candidate:
                 relations.append(
                     _relation(
                         source,
@@ -307,6 +349,29 @@ class RowRelationAnalyzer:
                 for field in aligned_identity_fields
                 if _field_has_quote_or_bracket_open(previous_fields, field)
             }
+            grammar_marker_fields = {
+                field
+                for field in aligned_identity_fields
+                if _field_has_grammar_marker(source_fields, field)
+            }
+            open_grammar_tail_fields = {
+                field
+                for field in aligned_identity_fields
+                if _field_has_open_grammar_tail(previous_fields, field)
+            }
+            parent_strong_anchor = bool(
+                previous_role
+                and previous_role.selected_role == RowRole.ITEM_ROOT
+                and previous_role.state == RowRoleState.CONFIRMED
+                and (
+                    previous_present.intersection(_CRITICAL_FIELDS)
+                    or "position" in previous_present
+                    or (
+                        len(previous_present.intersection(_IDENTITY_FIELDS)) >= 2
+                        and previous_present.intersection(_CRITICAL_FIELDS)
+                    )
+                )
+            )
             textual_support = []
             if lower_fields:
                 textual_support.append("lowercase_text_continuity")
@@ -316,6 +381,10 @@ class RowRelationAnalyzer:
                 evidence.append("hyphenated_field_continuity")
             if quote_open_fields:
                 evidence.append("open_quote_or_bracket_continuity")
+            if grammar_marker_fields:
+                evidence.append("grammar_marker_continuity")
+            if open_grammar_tail_fields:
+                evidence.append("open_grammar_tail_continuity")
             if textual_support:
                 evidence.extend(textual_support)
 
@@ -329,7 +398,23 @@ class RowRelationAnalyzer:
                 and (quote_open_fields or hyphen_fields)
                 and bool(lower_fields.difference(quote_open_fields | hyphen_fields))
             )
-            strong_textual_continuity = bool(hyphen_fields)
+            anchored_grammar_continuity = bool(
+                grammar_marker_fields
+                and parent_strong_anchor
+                and source_subset
+                and not source_critical
+                and not has_position
+            )
+            open_grammar_continuity = bool(
+                open_grammar_tail_fields
+                and lower_fields.intersection(open_grammar_tail_fields)
+                and source_subset
+                and not source_critical
+                and not has_position
+            )
+            strong_textual_continuity = bool(
+                hyphen_fields or anchored_grammar_continuity or open_grammar_continuity
+            )
             multiple_textual_signals = cross_field_textual_support
 
             if material_structure:
@@ -349,11 +434,25 @@ class RowRelationAnalyzer:
             if source_subset and common_fields and (
                 strong_textual_continuity or multiple_textual_signals
             ):
+                # Pairwise evidence may be strong before global ancestry is
+                # known.  Only an independently confirmed parent is allowed
+                # to become a locally confirmed edge; the resolver may use a
+                # strong adjacent edge as bounded lookahead evidence.
+                edge_state = (
+                    RowRelationState.CONFIRMED
+                    if parent_strong_anchor or (hyphen_fields and parent_is_candidate and previous_role and previous_role.state == RowRoleState.CONFIRMED)
+                    else RowRelationState.AMBIGUOUS
+                )
+                edge_reasons = (
+                    ()
+                    if edge_state == RowRelationState.CONFIRMED
+                    else ("continuation_parent_requires_global_confirmation",)
+                )
                 relations.append(
                     _relation(
                         source,
                         previous,
-                        state=RowRelationState.CONFIRMED,
+                        state=edge_state,
                         tier=EvidenceTier.STRONG,
                         evidence=(
                             *evidence,
@@ -361,6 +460,7 @@ class RowRelationAnalyzer:
                             "identity_fragment_complements_parent",
                             *textual_support,
                         ),
+                        reasons=edge_reasons,
                     )
                 )
                 continue

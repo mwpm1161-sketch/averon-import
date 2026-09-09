@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any, Iterable, Mapping
 
 from averon_import.services.ocr.semantics.functional_analyzer import (
@@ -120,6 +121,74 @@ def _relation_is_plausible(relation: RowRelationAssessment) -> bool:
     }
 
 
+_STRONG_CONTINUATION_EVIDENCE = frozenset(
+    {
+        "hyphenated_field_continuity",
+        "open_quote_or_bracket_continuity",
+        "grammar_marker_continuity",
+        "open_grammar_tail_continuity",
+    }
+)
+_HARD_NON_ITEM_ROLES = frozenset(
+    {RowRole.HEADER, RowRole.SERVICE, RowRole.CONTEXT, RowRole.COMPONENT, RowRole.NOTE}
+)
+
+
+def _candidate_target(relation: RowRelationAssessment) -> Any | None:
+    if relation.target_row_ref is not None:
+        return relation.target_row_ref
+    if len(relation.candidate_target_refs) == 1:
+        return relation.candidate_target_refs[0]
+    return None
+
+
+def _has_strong_continuation_evidence(relation: RowRelationAssessment) -> bool:
+    return relation.evidence_strength == EvidenceTier.STRONG.value and bool(
+        set(relation.evidence).intersection(_STRONG_CONTINUATION_EVIDENCE)
+    )
+
+
+def _hard_non_item_role(assessment: RowRoleAssessment | None) -> bool:
+    return bool(
+        assessment
+        and assessment.selected_role in _HARD_NON_ITEM_ROLES
+    )
+
+
+def _has_independent_anchor(row: Any, mapping: Mapping[int, tuple[str, ...]]) -> bool:
+    fields = _mapped_present_fields(row, mapping)
+    return bool(fields.intersection(_CRITICAL_FIELDS) or "position" in fields)
+
+
+def _material_structure(context: TableAnalysisContext, table: PhysicalTableIR) -> bool:
+    raw = context.structural_evidence or table.structural_evidence or {}
+    return bool(
+        raw.get("critical_boundary_conflicts")
+        or raw.get("material_column_disagreement")
+        or raw.get("material_column_conflict")
+        or raw.get("relevant_material_column_conflict")
+    )
+
+
+def _promote_with_lookahead(
+    relation: RowRelationAssessment,
+    target: Any,
+) -> RowRelationAssessment:
+    return replace(
+        relation,
+        target_row_ref=target,
+        state=RowRelationState.CONFIRMED,
+        evidence_score=max(relation.evidence_score, EvidenceTier.STRONG.rank),
+        evidence_strength=EvidenceTier.STRONG.value,
+        evidence=(*relation.evidence, "lookahead_chain_consistency"),
+        reasons=(*relation.reasons, "lookahead_chain_strengthened"),
+        provenance={
+            **dict(relation.provenance),
+            "global_confirmation": "adjacent_one_row_lookahead",
+        },
+    )
+
+
 class GlobalRowSemanticsResolver:
     """Resolve row roles and continuation chains into shadow SemanticTableIR."""
 
@@ -144,7 +213,13 @@ class GlobalRowSemanticsResolver:
 
             relations = RowRelationAnalyzer().analyze(physical_table, context, functional_graph)
         relation_tuple = tuple(relations)
-        rows = tuple(sorted(physical_table.rows, key=lambda row: row.ref.row_index))
+        all_rows = tuple(sorted(physical_table.rows, key=lambda row: row.ref.row_index))
+        # A row with no OCR/word evidence can still be retained by the
+        # physical/raster layer, but it is not an authoritative semantic row.
+        # Keep it in the analysis context and witness diagnostics; do not turn
+        # it into a synthetic UNKNOWN disposition or conservation failure.
+        rows = tuple(row for row in all_rows if row.nonempty)
+        raster_witness_only_rows = tuple(row for row in all_rows if not row.nonempty)
         row_by_key = {row.ref.key: row for row in rows}
         mapping = _mapping_from_context(context)
         role_by_key = {
@@ -220,6 +295,132 @@ class GlobalRowSemanticsResolver:
                 and row.ref.key not in plausible_relations
             ):
                 confirmed_roots.add(row.ref.key)
+
+        # Bounded chain confirmation.  A weak P -> S edge may be strengthened
+        # by one independently strong S -> T edge, but only when T is the
+        # adjacent, independently confirmed root and both continuation rows
+        # are free of their own physical anchors/role blockers.  This is the
+        # resolver's ancestry decision; the analyzer remains pairwise.
+        def _safe_chain_edge(source_key: str, relation: RowRelationAssessment) -> bool:
+            target = _candidate_target(relation)
+            if target is None or source_key not in row_by_key or target.key not in row_by_key:
+                return False
+            source = row_by_key[source_key]
+            if source.ref.row_index != target.row_index + 1:
+                return False
+            if source_key in invalid_relation_keys or len(relation_by_source.get(source_key, ())) != 1:
+                return False
+            if relation.state not in {RowRelationState.AMBIGUOUS, RowRelationState.UNRESOLVED}:
+                return False
+            if not _relation_is_plausible(relation):
+                return False
+            if _has_independent_anchor(source, mapping):
+                return False
+            if _hard_non_item_role(role_by_key.get(source_key)):
+                return False
+            if _material_structure(context, physical_table):
+                return False
+            if set(relation.contradictions).intersection(
+                {"material_structural_ambiguity", "critical_boundary_conflict"}
+            ):
+                return False
+            return True
+
+        def _would_cycle(source_key: str, target_key: str, parents: Mapping[str, str]) -> bool:
+            current = target_key
+            visited: set[str] = set()
+            while current in parents:
+                if current == source_key or current in visited:
+                    return True
+                visited.add(current)
+                current = parents[current]
+            return current == source_key
+
+        # First use S -> T as lookahead evidence to promote P -> S where T
+        # is the only proven root.  Only adjacent topology is considered.
+        for child_key, child_candidates in tuple(relation_by_source.items()):
+            if len(child_candidates) != 1:
+                continue
+            child_relation = child_candidates[0]
+            middle_ref = _candidate_target(child_relation)
+            if (
+                middle_ref is None
+                or not _has_strong_continuation_evidence(child_relation)
+                or child_key not in row_by_key
+                or middle_ref.key not in row_by_key
+            ):
+                continue
+            middle_key = middle_ref.key
+            middle_candidates = relation_by_source.get(middle_key, ())
+            if len(middle_candidates) != 1:
+                continue
+            middle_relation = middle_candidates[0]
+            root_ref = _candidate_target(middle_relation)
+            if (
+                root_ref is None
+                or root_ref.key not in confirmed_roots
+                or not _safe_chain_edge(middle_key, middle_relation)
+            ):
+                continue
+            if not _safe_chain_edge(child_key, child_relation):
+                continue
+            if _has_independent_anchor(row_by_key[child_key], mapping):
+                continue
+            if _hard_non_item_role(role_by_key.get(middle_key)) or _hard_non_item_role(role_by_key.get(child_key)):
+                continue
+            if _would_cycle(middle_key, root_ref.key, {
+                key: relation.target_row_ref.key
+                for key, relation in confirmed_relation_by_source.items()
+                if relation.target_row_ref is not None
+            }):
+                continue
+            promoted = _promote_with_lookahead(middle_relation, root_ref)
+            relation_by_source[middle_key] = [promoted]
+            confirmed_relation_by_source[middle_key] = promoted
+
+        # Promote a strong continuation edge once its adjacent parent is now
+        # on a chain rooted at a confirmed item.  This second small pass lets
+        # the tail follow the newly strengthened middle edge without skipping
+        # over that physical row.
+        for _ in range(max(1, len(rows))):
+            changed = False
+            parent_by_source = {
+                source_key: relation.target_row_ref.key
+                for source_key, relation in confirmed_relation_by_source.items()
+                if relation.target_row_ref is not None
+            }
+            for source_key, candidates in tuple(relation_by_source.items()):
+                if source_key in confirmed_relation_by_source or len(candidates) != 1:
+                    continue
+                relation = candidates[0]
+                if not _safe_chain_edge(source_key, relation) or not _has_strong_continuation_evidence(relation):
+                    continue
+                target = _candidate_target(relation)
+                if target is None or target.key not in row_by_key:
+                    continue
+                target_root = target.key
+                visited: set[str] = set()
+                while target_root in parent_by_source and target_root not in visited:
+                    visited.add(target_root)
+                    target_root = parent_by_source[target_root]
+                if target_root not in confirmed_roots or _would_cycle(source_key, target.key, parent_by_source):
+                    continue
+                promoted = _promote_with_lookahead(relation, target)
+                relation_by_source[source_key] = [promoted]
+                confirmed_relation_by_source[source_key] = promoted
+                changed = True
+            if not changed:
+                break
+
+        # Expose the effective (possibly globally strengthened) relation
+        # assessments to diagnostics and conservation while preserving the
+        # analyzer's original ordering.
+        relation_tuple = tuple(
+            relation_by_source[relation.source_row_ref.key][0]
+            if len(relation_by_source.get(relation.source_row_ref.key, ())) == 1
+            else relation
+            for relation in relation_tuple
+        )
 
         parent_by_source = {
             source_key: relation.target_row_ref.key
@@ -383,6 +584,7 @@ class GlobalRowSemanticsResolver:
             assessment.physical_row_ref.key
             for assessment in functional_graph.row_role_assessments
             if assessment.selected_role == RowRole.ITEM_ROOT
+            and assessment.physical_row_ref.key in row_by_key
         }
         resolved_item_rows = {
             disposition.physical_row_ref.key
@@ -392,6 +594,9 @@ class GlobalRowSemanticsResolver:
         }
         metrics = {
             "physical_nonempty_rows": sum(row.nonempty for row in rows),
+            "authoritative_semantic_row_count": len(rows),
+            "raster_witness_only_row_count": len(raster_witness_only_rows),
+            "semantic_authoritative_row_coverage": conservation.semantic_conservation_rate,
             "resolved_physical_rows": conservation.resolved_physical_rows,
             "unresolved_physical_rows": len(conservation.unresolved_rows),
             "confirmed_header_rows": sum(
@@ -472,6 +677,11 @@ class GlobalRowSemanticsResolver:
             "resolver": "GlobalRowSemanticsResolver",
             "shadow_only": True,
             "metrics": metrics,
+            "authoritative_semantic_rows": [row.ref.as_dict() for row in rows],
+            "raster_witness_only_rows": [row.ref.as_dict() for row in raster_witness_only_rows],
+            # Keep the original physical witness, including unmatched glyph
+            # diagnostics, alongside the semantic population decision.
+            "raster_witness": dict(physical_table.raster_witness),
             "unresolved_physical_row_refs": [
                 ref.as_dict() for ref in conservation.unresolved_rows
             ],
