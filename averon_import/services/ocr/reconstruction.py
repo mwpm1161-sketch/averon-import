@@ -44,7 +44,10 @@ from averon_import.services.ocr.semantics import (
     DEFAULT_TABLE_FAMILY_CLASSIFIER,
     SchemaGateEvidence,
     TableFamilyAssessment,
+    TableAnalysisContext,
+    TableFunctionalAnalyzer,
     map_semantic_header,
+    physical_table_ir_from_snapshot,
 )
 from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult, HeaderSourceCell
 from averon_import.services.ocr.semantics.context_evidence import bounded_context_from_words
@@ -2326,6 +2329,7 @@ def rows_from_physical_grid(
     grid: PhysicalGrid,
     *,
     diagnostics: dict | None = None,
+    functional_shadow: bool = False,
 ) -> list[OcrRow] | None:
     """Build physical rows from a detector grid and OCR words only."""
     if diagnostics is not None:
@@ -2738,6 +2742,51 @@ def rows_from_physical_grid(
         if isinstance(local_diagnostics.get("schema"), dict):
             diagnostics["schema"] = dict(local_diagnostics["schema"])
             diagnostics["schema_status"] = local_diagnostics["schema"].get("status")
+        if (
+            functional_shadow
+            and preflight_snapshot is not None
+            and preflight_mapping_result is not None
+            and preflight_mapping_result.trusted
+            and isinstance(local_diagnostics.get("schema"), dict)
+            and local_diagnostics["schema"].get("status") == "supported"
+        ):
+            try:
+                physical_ir = physical_table_ir_from_snapshot(
+                    preflight_snapshot,
+                    page_size=(width, height),
+                )
+                # Exercise the compatibility adapter as part of the shadow
+                # path while keeping the historical diagnostics shape intact.
+                compatibility_snapshot = PhysicalEvidenceSnapshot.from_physical_table_ir(
+                    physical_ir,
+                    header_mapping=preflight_mapping_result.as_dict(),
+                    structural_evidence=evidence,
+                )
+                context = TableAnalysisContext.from_assessments(
+                    physical_ir,
+                    header_mapping=preflight_mapping_result,
+                    schema_assessment=local_diagnostics.get("schema"),
+                    structural_evidence=evidence,
+                )
+                functional_graph = TableFunctionalAnalyzer().analyze(
+                    physical_ir,
+                    context,
+                )
+                shadow = functional_graph.as_dict()
+                shadow["physical_ir_compatibility"] = {
+                    "snapshot_rows": len(compatibility_snapshot.physical_rows),
+                    "snapshot_words": len(compatibility_snapshot.spatial_words),
+                    "row_ref_count": physical_ir.row_count,
+                }
+                diagnostics["functional_semantics_shadow"] = shadow
+            except (TypeError, ValueError, KeyError) as error:
+                # Shadow diagnostics must never alter the existing OCR result
+                # if an offline payload cannot satisfy the new IR contract.
+                diagnostics["functional_semantics_shadow"] = {
+                    "status": "construction_error",
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:240],
+                }
     return rows
 
 
@@ -2887,6 +2936,7 @@ def reconstruct_page_rows(
         provider_key,
         physical_grid,
         diagnostics=geometry_diagnostics,
+        functional_shadow=(mode == "geometry"),
     )
     if not geometry_rows:
         if diagnostics is not None:

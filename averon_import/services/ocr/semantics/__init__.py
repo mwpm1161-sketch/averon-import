@@ -58,6 +58,12 @@ from averon_import.services.ocr.semantics.semantic_table import (
     ValueCandidate,
     evaluate_semantic_conservation,
 )
+from averon_import.services.ocr.semantics.functional_analyzer import (
+    EvidenceTier,
+    FunctionalEvidenceGraph,
+    TableFunctionalAnalyzer,
+    physical_table_ir_from_snapshot,
+)
 
 __all__ = [
     "HeaderCellEvidence",
@@ -104,4 +110,8 @@ __all__ = [
     "SemanticTableIR",
     "TableAnalysisContext",
     "evaluate_semantic_conservation",
+    "EvidenceTier",
+    "FunctionalEvidenceGraph",
+    "TableFunctionalAnalyzer",
+    "physical_table_ir_from_snapshot",
 ]
