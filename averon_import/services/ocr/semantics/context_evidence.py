@@ -59,7 +59,14 @@ class BoundedFamilyContext:
 
 
 def _word_bounds(word: dict[str, Any]) -> Bounds | None:
-    vertices = word.get("vertices") or []
+    # ``collect_words`` keeps provider-neutral words with the provider's
+    # ``boundingBox.vertices`` shape.  Accept the direct ``vertices`` shape
+    # as well so this helper remains usable by raster/vector adapters.
+    vertices = word.get("vertices") or (
+        (word.get("boundingBox") or {}).get("vertices")
+        if isinstance(word.get("boundingBox"), dict)
+        else []
+    ) or []
     points = []
     for vertex in vertices:
         try:

@@ -968,6 +968,7 @@ class YandexVisionProvider:
             and bool(grid.get("high_confidence"))
             and mapping.get("mapping_status") == "trusted"
             and str(schema.get("status") or "").lower() == "supported"
+            and not bool(diagnostics.get("schema_profile_shadow_only"))
             and result.physical_ir_constructed
             and result.functional_analysis_completed
             and result.relation_analysis_completed
@@ -1395,6 +1396,11 @@ class YandexVisionProvider:
             "semantic_authoritative_pages": 0,
             "semantic_logical_items": 0,
             "semantic_review_rows": 0,
+            "observed_schema_count": 0,
+            "profile_matched_count": 0,
+            "profile_ambiguous_count": 0,
+            "unknown_spec_schema_count": 0,
+            "profile_id_distribution": {},
         }
         by_page: dict[int, PageOcrResult] = {
             number: PageOcrResult(page=number, provides_confidence=False)
@@ -1456,6 +1462,23 @@ class YandexVisionProvider:
                 rows = self._apply_semantic_projection(
                     reconstruction_result, reconstruction_diagnostics
                 )
+                observed_schema = reconstruction_diagnostics.get("observed_schema")
+                if isinstance(observed_schema, dict):
+                    stats["observed_schema_count"] += 1
+                profile_match = reconstruction_diagnostics.get("profile_match")
+                if isinstance(profile_match, dict):
+                    match_status = str(profile_match.get("status") or "")
+                    if match_status == "MATCHED":
+                        stats["profile_matched_count"] += 1
+                        selected_profile = profile_match.get("selected_profile") or {}
+                        profile_id = str(selected_profile.get("profile_id") or "")
+                        if profile_id:
+                            distribution = stats.setdefault("profile_id_distribution", {})
+                            distribution[profile_id] = int(distribution.get(profile_id) or 0) + 1
+                    elif match_status == "AMBIGUOUS":
+                        stats["profile_ambiguous_count"] += 1
+                    elif match_status == "UNKNOWN_SPEC_SCHEMA":
+                        stats["unknown_spec_schema_count"] += 1
                 if grid_detection is not None and physical_grid is None:
                     reconstruction_diagnostics["geometry_source"] = (
                         grid_detection.source

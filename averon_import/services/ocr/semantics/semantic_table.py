@@ -67,6 +67,8 @@ class TableAnalysisContext:
     header_mapping: Mapping[str, Any] = field(default_factory=dict)
     family_assessment: Mapping[str, Any] | None = None
     schema_assessment: Mapping[str, Any] | None = None
+    observed_schema: Mapping[str, Any] | None = None
+    profile_match: Mapping[str, Any] | None = None
     structural_evidence: Mapping[str, Any] | None = None
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
@@ -88,6 +90,8 @@ class TableAnalysisContext:
         header_mapping: Any = None,
         family_assessment: Any = None,
         schema_assessment: Any = None,
+        observed_schema: Any = None,
+        profile_match: Any = None,
         structural_evidence: Any = None,
         provenance: Mapping[str, Any] | None = None,
     ) -> TableAnalysisContext:
@@ -96,6 +100,8 @@ class TableAnalysisContext:
             header_mapping=_snapshot(header_mapping) or {},
             family_assessment=_snapshot(family_assessment),
             schema_assessment=_snapshot(schema_assessment),
+            observed_schema=_snapshot(observed_schema),
+            profile_match=_snapshot(profile_match),
             structural_evidence=_snapshot(structural_evidence),
             provenance=provenance or {},
         )
@@ -106,6 +112,8 @@ class TableAnalysisContext:
             "header_mapping": _thaw(self.header_mapping),
             "family_assessment": _thaw(self.family_assessment) if self.family_assessment is not None else None,
             "schema_assessment": _thaw(self.schema_assessment) if self.schema_assessment is not None else None,
+            "observed_schema": _thaw(self.observed_schema) if self.observed_schema is not None else None,
+            "profile_match": _thaw(self.profile_match) if self.profile_match is not None else None,
             "structural_evidence": _thaw(self.structural_evidence) if self.structural_evidence is not None else None,
             "provenance": _thaw(self.provenance),
         }

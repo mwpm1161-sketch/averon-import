@@ -20,6 +20,8 @@ TRUSTED = "trusted"
 AMBIGUOUS = "ambiguous"
 UNAVAILABLE = "unavailable"
 
+# These are mapper vocabulary names, not a schema-completeness contract.  A
+# profile interprets applicability after this layer has described the header.
 CANONICAL_FIELDS = (
     "position",
     "name",
@@ -31,13 +33,10 @@ CANONICAL_FIELDS = (
     "mass",
     "note",
 )
-CORE_FIELDS = frozenset({"name", "unit", "quantity"})
-
 MAX_HEADER_SCAN_ROWS = 5
 MAX_HEADER_REGION_ROWS = 3
 MIN_ASSIGNABLE_SCORE = 0.62
 MIN_TRUSTED_FIELD_SCORE = 0.68
-MIN_TRUSTED_CORE_SCORE = 0.72
 MIN_ASSIGNMENT_MARGIN = 0.12
 MIN_HEADER_FIELDS = 4
 
@@ -503,7 +502,6 @@ class HeaderSemanticMapper:
             candidates_by_column, column_count
         )
         mapped_fields = {field for fields in mapping.values() for field in fields}
-        missing_core = tuple(sorted(CORE_FIELDS - mapped_fields))
         body_evidence = tuple(
             f"r{cell.physical_row}c{cell.physical_column}:{reason}"
             for cell in evidence_cells
@@ -513,17 +511,29 @@ class HeaderSemanticMapper:
         reasons: list[str] = []
         if len(mapped_fields) < MIN_HEADER_FIELDS or "name" not in mapped_fields:
             reasons.append("insufficient_header_evidence")
-        if missing_core:
-            reasons.append("missing_core_fields:" + ",".join(missing_core))
         weak_fields = sorted(
             field
             for column, fields in mapping.items()
             for field in fields
             if selected_scores.get(column, 0.0)
-            < (MIN_TRUSTED_CORE_SCORE if field in CORE_FIELDS else MIN_TRUSTED_FIELD_SCORE)
+            < MIN_TRUSTED_FIELD_SCORE
         )
         if weak_fields:
             reasons.append("weak_semantic_evidence:" + ",".join(dict.fromkeys(weak_fields)))
+        ambiguous_columns = []
+        for column, candidates in candidates_by_column.items():
+            strong = [candidate for candidate in candidates if candidate.score >= MIN_TRUSTED_FIELD_SCORE]
+            selected = set(mapping.get(column, ()))
+            # A mass+note composite is an intentional supported projection;
+            # competing critical meanings in one physical column are not.
+            strong_fields = {candidate.field for candidate in strong}
+            if (
+                {"unit", "quantity"}.issubset(strong_fields)
+                and selected != {"unit", "quantity"}
+            ):
+                ambiguous_columns.append(str(column))
+        if ambiguous_columns:
+            reasons.append("semantic_column_ambiguity:" + ",".join(ambiguous_columns))
         margin = max(0.0, best - second)
         if mapping and margin < MIN_ASSIGNMENT_MARGIN:
             reasons.append("assignment_margin_too_low")
@@ -553,7 +563,10 @@ class HeaderSemanticMapper:
             unmapped_columns=tuple(
                 column for column in range(column_count) if column not in mapping
             ),
-            missing_core_fields=missing_core,
+            # Kept in the DTO for compatibility with older consumers.  It is
+            # intentionally empty: header mapping does not own profile
+            # applicability or schema completeness.
+            missing_core_fields=(),
             reasons=tuple(reasons),
             header_cells=evidence_cells,
             candidate_regions=(region,),
@@ -571,7 +584,7 @@ class HeaderSemanticMapper:
                 second_best_score=0.0,
                 assignment_margin=0.0,
                 unmapped_columns=tuple(range(max(0, column_count))),
-                missing_core_fields=tuple(sorted(CORE_FIELDS)),
+                missing_core_fields=(),
                 reasons=("header_region_missing",),
             )
         rows_by_index: dict[int, tuple[HeaderSourceCell, ...]] = {}
@@ -628,7 +641,7 @@ class HeaderSemanticMapper:
                 second_best_score=0.0,
                 assignment_margin=0.0,
                 unmapped_columns=tuple(range(column_count)),
-                missing_core_fields=tuple(sorted(CORE_FIELDS)),
+                missing_core_fields=(),
                 reasons=reasons,
                 candidate_regions=tuple(
                     region

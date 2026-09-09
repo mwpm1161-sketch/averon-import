@@ -20,7 +20,9 @@ class PhysicalEvidenceSnapshot:
     spatial_words: tuple[dict[str, Any], ...] = ()
     assigned_word_refs: dict[str, tuple[int, ...]] = field(default_factory=dict)
     header_mapping: dict[str, Any] = field(default_factory=dict)
+    observed_schema: dict[str, Any] | None = None
     family_assessment: dict[str, Any] | None = None
+    profile_match: dict[str, Any] | None = None
     structural_evidence: dict[str, Any] | None = None
     raster_witness: dict[str, Any] | None = None
     physical_table_ir: PhysicalTableIR | None = field(default=None, repr=False, compare=False)
@@ -31,7 +33,9 @@ class PhysicalEvidenceSnapshot:
         physical_table: PhysicalTableIR,
         *,
         header_mapping: dict[str, Any] | None = None,
+        observed_schema: dict[str, Any] | None = None,
         family_assessment: dict[str, Any] | None = None,
+        profile_match: dict[str, Any] | None = None,
         structural_evidence: dict[str, Any] | None = None,
         raster_witness: dict[str, Any] | None = None,
     ) -> "PhysicalEvidenceSnapshot":
@@ -90,7 +94,9 @@ class PhysicalEvidenceSnapshot:
             spatial_words=tuple(words),
             assigned_word_refs=assigned,
             header_mapping=dict(header_mapping or {}),
+            observed_schema=dict(observed_schema) if observed_schema else None,
             family_assessment=dict(family_assessment) if family_assessment else None,
+            profile_match=dict(profile_match) if profile_match else None,
             structural_evidence=thaw_value(structural_evidence or physical_table.structural_evidence),
             raster_witness=thaw_value(raster_witness or physical_table.raster_witness),
             physical_table_ir=physical_table,
@@ -114,7 +120,9 @@ class PhysicalEvidenceSnapshot:
                 str(key): list(values) for key, values in self.assigned_word_refs.items()
             },
             "header_mapping": dict(self.header_mapping),
+            "observed_schema": dict(self.observed_schema) if self.observed_schema else None,
             "family_assessment": dict(self.family_assessment) if self.family_assessment else None,
+            "profile_match": dict(self.profile_match) if self.profile_match else None,
             "structural_evidence": dict(self.structural_evidence) if self.structural_evidence else None,
             "raster_witness": dict(self.raster_witness) if self.raster_witness else None,
         }

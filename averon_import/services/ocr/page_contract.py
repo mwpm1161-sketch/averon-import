@@ -18,6 +18,7 @@ SCHEMA_SUPPORTED = "SUPPORTED"
 SCHEMA_AMBIGUOUS = "AMBIGUOUS"
 SCHEMA_UNSUPPORTED = "UNSUPPORTED"
 SCHEMA_UNKNOWN = "UNKNOWN"
+SCHEMA_UNKNOWN_SPEC = "UNKNOWN_SPEC_SCHEMA"
 
 OUTPUT_USABLE = "USABLE"
 OUTPUT_REVIEW_REQUIRED = "REVIEW_REQUIRED"
@@ -67,6 +68,7 @@ def page_status_from_diagnostics(
         "ambiguous": SCHEMA_AMBIGUOUS,
         "unsupported": SCHEMA_UNSUPPORTED,
         "unknown": SCHEMA_UNKNOWN,
+        "unknown_spec_schema": SCHEMA_UNKNOWN_SPEC,
     }
     schema_value = schema_map.get(schema_status, SCHEMA_UNKNOWN)
     selected_mode = str(data.get("selected_mode") or "")
@@ -99,10 +101,16 @@ def page_status_from_diagnostics(
     )
     if schema_value == SCHEMA_AMBIGUOUS:
         status.add_blocker("structural_schema_ambiguous")
-    elif schema_value in {SCHEMA_UNSUPPORTED, SCHEMA_UNKNOWN}:
+    elif schema_value in {SCHEMA_UNSUPPORTED, SCHEMA_UNKNOWN, SCHEMA_UNKNOWN_SPEC}:
         status.add_blocker(
-            "unsupported_table_schema" if schema_value == SCHEMA_UNSUPPORTED else "schema_unknown"
+            "unsupported_table_schema"
+            if schema_value == SCHEMA_UNSUPPORTED
+            else "unknown_specification_profile"
+            if schema_value == SCHEMA_UNKNOWN_SPEC
+            else "schema_unknown"
         )
+    if data.get("schema_profile_shadow_only"):
+        status.add_blocker("schema_profile_shadow_only")
     if layout != LAYOUT_TRUSTED and selected_mode not in {"table_fallback", "table_shadow"}:
         status.add_blocker("structural_layout_ambiguous" if layout == LAYOUT_AMBIGUOUS else "schema_unknown")
     if data.get("material_disagreement") or (

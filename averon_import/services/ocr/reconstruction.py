@@ -56,6 +56,13 @@ from averon_import.services.ocr.semantics.semantic_projection import (
 )
 from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult, HeaderSourceCell
 from averon_import.services.ocr.semantics.context_evidence import bounded_context_from_words
+from averon_import.services.ocr.semantics.observed_schema import ObservedSchema
+from averon_import.services.ocr.semantics.schema_profiles import (
+    DEFAULT_SCHEMA_PROFILE_MATCHER,
+    MATCHED,
+    NON_SPEC,
+    UNKNOWN_SPEC_SCHEMA,
+)
 
 BASE_COLUMN_KEYS: tuple[str, ...] = tuple(column["key"] for column in BASE_COLUMNS)
 
@@ -1309,11 +1316,23 @@ def rows_from_tables(
         # fullText must never become family or schema evidence.
     )
     family = DEFAULT_TABLE_FAMILY_CLASSIFIER.assess(family_context)
+    observed_schema = ObservedSchema.from_mapping_result(
+        mapping_result,
+        table.column_count,
+        provenance=({"source": "header_mapping"},),
+    )
+    profile_match = DEFAULT_SCHEMA_PROFILE_MATCHER.match(
+        observed_schema,
+        family=family,
+        structural=precomputed_structural_evidence or {},
+    )
     if physical_evidence is None:
         physical_evidence = _physical_snapshot_for_table(
             table, mapping_result, words
         )
+    physical_evidence.observed_schema = observed_schema.as_dict()
     physical_evidence.family_assessment = family.as_dict()
+    physical_evidence.profile_match = profile_match.as_dict()
     if precomputed_structural_evidence is not None:
         physical_evidence.structural_evidence = dict(precomputed_structural_evidence)
     schema = DEFAULT_SCHEMA_GATE.assess(
@@ -1324,11 +1343,18 @@ def rows_from_tables(
             precomputed_structural_evidence,
             header_body_conflict="header_body_conflict" in mapping_result.reasons,
         ),
+        observed_schema=observed_schema,
+        profile_match=profile_match,
     )
     if diagnostics is not None:
         diagnostics["family"] = family.as_dict()
+        diagnostics["observed_schema"] = observed_schema.as_dict()
+        diagnostics["profile_match"] = profile_match.as_dict()
         diagnostics["schema"] = schema.as_dict()
         diagnostics["schema_status"] = schema.status
+        diagnostics["schema_profile_shadow_only"] = bool(
+            schema.status == "supported" and not schema.production_authoritative
+        )
         diagnostics["physical_evidence"] = physical_evidence.as_dict()
     if schema.status == "ambiguous" and mapping_result.trusted:
         reason = "ambiguous_table_schema"
@@ -1342,6 +1368,21 @@ def rows_from_tables(
             source_table_index=table.source_table_index,
             reason=reason,
         )
+    elif schema.status == UNKNOWN_SPEC_SCHEMA:
+        reason = "unknown_specification_profile"
+        if reason not in table.review_reasons:
+            table.review_reasons.append(reason)
+        if diagnostics is not None:
+            diagnostics["unknown_spec_schema"] = True
+            diagnostics["unsupported_table_schema"] = True
+            diagnostics["schema_status"] = schema.status
+        _record_diagnostic(
+            diagnostics,
+            kind="table_schema_unknown",
+            source_table_index=table.source_table_index,
+            reason=reason,
+        )
+        return None
     elif not schema.trusted:
         reason = "unsupported_table_schema"
         if reason not in table.review_reasons:
@@ -1484,6 +1525,9 @@ def rows_from_tables(
                         str(column): list(keys) for column, keys in mapping.items()
                     },
                     "schema_assessment": schema.as_dict(),
+                    "schema_profile_shadow_only": bool(
+                        schema.status == "supported" and not schema.production_authoritative
+                    ),
                     "raw_values": raw_values,
                     "normalization": normalization,
                     "cell_bboxes": cell_bboxes,
@@ -2797,6 +2841,8 @@ def rows_from_physical_grid(
                     physical_ir,
                     header_mapping=preflight_mapping_result,
                     schema_assessment=local_diagnostics.get("schema"),
+                    observed_schema=local_diagnostics.get("observed_schema"),
+                    profile_match=local_diagnostics.get("profile_match"),
                     structural_evidence=evidence,
                 )
                 functional_graph = TableFunctionalAnalyzer().analyze(
@@ -2929,6 +2975,10 @@ def reconstruct_page_rows(
             "unsupported_table_schema",
             "header_mapping",
             "family",
+            "observed_schema",
+            "profile_match",
+            "schema_profile_shadow_only",
+            "unknown_spec_schema",
             "physical_evidence",
         ):
             if key in legacy_diagnostics:

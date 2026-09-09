@@ -18,12 +18,13 @@ from averon_import.services.ocr.semantics.family_classifier import (
 from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult
 from averon_import.services.ocr.semantics.schema_gate import (
     AMBIGUOUS,
-    CORE_FIELDS,
     DEFAULT_SCHEMA_GATE,
-    OPTIONAL_FIELDS,
+    SchemaAssessment,
     SUPPORTED,
     UNSUPPORTED,
-    SchemaAssessment,
+)
+from averon_import.services.ocr.semantics.schema_profiles import (
+    EQUIPMENT_MATERIAL_SPECIFICATION,
 )
 
 
@@ -45,8 +46,10 @@ def _compatibility_mapping_result(
         len(values) != 1 and set(values) != {"mass", "note"}
         for values in normalized.values()
     ) or any(len(set(columns)) > 1 for columns in inverse.values())
-    missing = tuple(sorted(CORE_FIELDS - fields))
-    status = "ambiguous" if illegal else "trusted" if normalized and not missing else "unavailable"
+    # This compatibility facade represents the historical equipment profile
+    # explicitly.  The production mapper/gate no longer owns this contract.
+    missing = tuple(sorted(EQUIPMENT_MATERIAL_SPECIFICATION.required_concepts - fields))
+    status = "ambiguous" if illegal else "trusted" if normalized else "unavailable"
     reasons: list[str] = []
     if illegal:
         reasons.append("multiple_semantic_fields_in_one_column")
@@ -110,9 +113,7 @@ DEFAULT_SCHEMA_RECOGNIZER = SupportedSpecificationSchemaRecognizer()
 
 __all__ = [
     "AMBIGUOUS",
-    "CORE_FIELDS",
     "DEFAULT_SCHEMA_RECOGNIZER",
-    "OPTIONAL_FIELDS",
     "SUPPORTED",
     "UNSUPPORTED",
     "SchemaAssessment",

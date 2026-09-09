@@ -1,9 +1,9 @@
-"""Safety gate separating family evidence from semantic schema evidence."""
+"""Fail-closed schema gate driven by observed evidence and profiles."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from averon_import.services.ocr.semantics.family_classifier import (
     AMBIGUOUS as AMBIGUOUS_FAMILY,
@@ -11,16 +11,23 @@ from averon_import.services.ocr.semantics.family_classifier import (
     TableFamilyAssessment,
 )
 from averon_import.services.ocr.semantics.header_evidence import HeaderMappingResult
+from averon_import.services.ocr.semantics.observed_schema import ObservedSchema
+from averon_import.services.ocr.semantics.schema_profiles import (
+    AMBIGUOUS as AMBIGUOUS_PROFILE,
+    DEFAULT_SCHEMA_PROFILE_MATCHER,
+    MATCHED,
+    NON_SPEC,
+    UNKNOWN_SPEC_SCHEMA,
+    ProfileMatchResult,
+    SchemaProfileMatcher,
+    SpecificationSchemaProfile,
+)
 
 
 SUPPORTED = "supported"
 AMBIGUOUS = "ambiguous"
 UNSUPPORTED = "unsupported"
-
-CORE_FIELDS = frozenset({"name", "unit", "quantity"})
-OPTIONAL_FIELDS = frozenset({
-    "position", "type_mark", "code", "manufacturer", "mass", "note",
-})
+UNKNOWN = "unknown_spec_schema"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +64,10 @@ class SchemaAssessment:
     mapping_status: str = "unavailable"
     supported_variant: str | None = None
     decision_reasons: tuple[str, ...] = ()
+    observed_schema: dict[str, Any] | None = None
+    profile_match: dict[str, Any] | None = None
+    critical_field_policy: dict[str, str] | None = None
+    production_authoritative: bool = False
 
     @property
     def trusted(self) -> bool:
@@ -73,23 +84,33 @@ class SchemaAssessment:
             "mapping_status": self.mapping_status,
             "supported_variant": self.supported_variant,
             "decision_reasons": list(self.decision_reasons),
+            "observed_schema": dict(self.observed_schema) if self.observed_schema else None,
+            "profile_match": dict(self.profile_match) if self.profile_match else None,
+            "critical_field_policy": dict(self.critical_field_policy or {}),
+            "production_authoritative": self.production_authoritative,
         }
         if self.family_assessment is not None:
             result["family"] = dict(self.family_assessment)
         return result
 
 
-def _fields(mapping: HeaderMappingResult) -> set[str]:
-    return {
-        field
-        for values in mapping.mapping.values()
-        for field in values
-        if field in CORE_FIELDS or field in OPTIONAL_FIELDS
-    }
+def _family_value(family: Any, key: str, default: Any = None) -> Any:
+    if family is None:
+        return default
+    if isinstance(family, Mapping):
+        return family.get(key, default)
+    return getattr(family, key, default)
+
+
+def _mapping_fields(mapping: HeaderMappingResult) -> set[str]:
+    return {str(field) for values in mapping.mapping.values() for field in values}
 
 
 class SchemaGate:
-    """Decide whether an already-mapped table is safe specification schema."""
+    """Decide applicability using the selected profile, never global core fields."""
+
+    def __init__(self, profile_matcher: SchemaProfileMatcher | None = None) -> None:
+        self.profile_matcher = profile_matcher or DEFAULT_SCHEMA_PROFILE_MATCHER
 
     def assess(
         self,
@@ -98,9 +119,17 @@ class SchemaGate:
         mapping: HeaderMappingResult,
         family: TableFamilyAssessment,
         structural: SchemaGateEvidence | None = None,
+        observed_schema: ObservedSchema | None = None,
+        profile_match: ProfileMatchResult | None = None,
     ) -> SchemaAssessment:
         evidence = structural or SchemaGateEvidence()
-        mapped_fields = _fields(mapping)
+        observed = observed_schema or ObservedSchema.from_mapping_result(mapping, column_count)
+        match = profile_match or self.profile_matcher.match(
+            observed,
+            family=family,
+            structural=evidence.as_dict(),
+        )
+        mapped_fields = set(observed.mapped_concepts) or _mapping_fields(mapping)
         reasons: list[str] = list(mapping.reasons)
         decision: list[str] = []
         structural_blockers: list[str] = []
@@ -110,6 +139,7 @@ class SchemaGate:
             structural_blockers.append("material_column_conflict")
         if evidence.unsafe_physical_column_anchoring:
             structural_blockers.append("unsafe_physical_column_anchoring")
+
         illegal = bool(evidence.illegal_critical_combination)
         multi_field_columns = [
             column for column, values in mapping.mapping.items()
@@ -118,7 +148,7 @@ class SchemaGate:
         inverse: dict[str, list[int]] = {}
         for column, values in mapping.mapping.items():
             for field in values:
-                inverse.setdefault(field, []).append(column)
+                inverse.setdefault(str(field), []).append(column)
         duplicate_fields = {
             field for field, columns in inverse.items() if len(set(columns)) > 1
         }
@@ -131,34 +161,24 @@ class SchemaGate:
         coverage = min(1.0, len(mapping.mapping) / max(1, int(column_count)))
         uniqueness = 0.0 if illegal else 1.0
         header_consistency = 1.0 if mapping.header_rows else 0.0
-        missing_core = sorted(CORE_FIELDS - mapped_fields)
-        if missing_core:
-            reasons.append("missing_core_fields:" + ",".join(missing_core))
-        if len(mapped_fields & OPTIONAL_FIELDS) < 1:
-            reasons.append("insufficient_optional_specification_evidence")
+        if not mapped_fields:
+            reasons.append("no_observed_semantic_concepts")
         if coverage < 0.45:
             reasons.append("semantic_coverage_too_low")
         if evidence.header_body_conflict or "header_body_conflict" in mapping.reasons:
             reasons.append("header_body_conflict")
         reasons.extend(evidence.structural_reasons)
         reasons.extend(structural_blockers)
-        if family.negative_evidence:
-            reasons.append(
-                "negative_document_family:" + ",".join(
-                    sorted({item.code for item in family.negative_evidence})
-                )
-            )
-        elif family.family == AMBIGUOUS_FAMILY:
-            reasons.append("family_evidence_missing")
-        elif family.positive_evidence:
-            reasons.append(
-                "positive_document_family:" + ",".join(
-                    sorted({item.code for item in family.positive_evidence})
-                )
-            )
+        negative_evidence = _family_value(family, "negative_evidence", ()) or ()
+        if negative_evidence:
+            codes = {
+                str(item.code if hasattr(item, "code") else item.get("code"))
+                for item in negative_evidence
+            }
+            reasons.append("negative_document_family:" + ",".join(sorted(codes)))
         reasons = list(dict.fromkeys(reasons))
 
-        family_data = family.as_dict()
+        family_data = family.as_dict() if hasattr(family, "as_dict") else dict(family or {})
         base = dict(
             coverage_score=coverage,
             uniqueness_score=uniqueness,
@@ -166,59 +186,165 @@ class SchemaGate:
             mapped_fields=tuple(sorted(mapped_fields)),
             family_assessment=family_data,
             mapping_status=mapping.status,
+            observed_schema=observed.as_dict(),
+            profile_match=match.as_dict(),
         )
+
         if column_count <= 0:
-            return SchemaAssessment(UNSUPPORTED, 0.0, 0.0, 0.0, (), ("invalid_column_count",), **{
-                key: value for key, value in base.items() if key not in {"coverage_score", "uniqueness_score", "header_consistency", "mapped_fields"}
-            })
-        if family.family == OTHER_TABLE:
-            reasons.append("confirmed_other_table")
-            return SchemaAssessment(UNSUPPORTED, **base, reasons=tuple(dict.fromkeys(reasons)), decision_reasons=("confirmed_other_table",))
-        if mapping.status != "trusted":
-            decision.append("mapping_not_trusted")
-            # A supported-family signal does not turn an unavailable/ambiguous
-            # mapper into an unsupported table.  The physical evidence remains
-            # reviewable, but no semantic rows are accepted.
-            status = AMBIGUOUS
-        elif missing_core or illegal or evidence.header_body_conflict or not evidence.safe_relevant_structure or structural_blockers:
-            status = AMBIGUOUS
-            decision.append("critical_schema_evidence_incomplete")
-        elif family.family == "SUPPORTED_SPECIFICATION":
-            if "semantic_coverage_too_low" in reasons:
-                status = UNSUPPORTED
-                decision.append("semantic_coverage_too_low")
-            else:
-                status = SUPPORTED
-                decision.append("positive_family_evidence")
-        elif family.family == AMBIGUOUS_FAMILY:
-            canonical_ready = (
-                family.reasons == ("family_context_missing",)
-                and not family.negative_evidence
-                and len(mapped_fields) >= 6
-                and not duplicate_fields
-                and not multi_field_columns
-                and mapping.status == "trusted"
-                and not missing_core
-                and "semantic_coverage_too_low" not in reasons
+            return SchemaAssessment(
+                UNSUPPORTED,
+                0.0,
+                0.0,
+                0.0,
+                (),
+                ("invalid_column_count",),
+                **{key: value for key, value in base.items() if key not in {"coverage_score", "uniqueness_score", "header_consistency", "mapped_fields"}},
             )
-            if canonical_ready:
-                status = SUPPORTED
-                decision.append("canonical_header_without_family_context")
-            else:
-                status = UNSUPPORTED if "semantic_coverage_too_low" in reasons else AMBIGUOUS
-                decision.append("family_context_missing")
+        if _family_value(family, "family", "") == OTHER_TABLE or match.status == NON_SPEC:
+            reasons.append("confirmed_other_table")
+            return SchemaAssessment(
+                UNSUPPORTED,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons)),
+                decision_reasons=("confirmed_other_table",),
+            )
+        schema_conflict = bool(
+            illegal
+            or evidence.header_body_conflict
+            or "header_body_conflict" in mapping.reasons
+            or not evidence.safe_relevant_structure
+            or structural_blockers
+        )
+        if match.status == UNKNOWN_SPEC_SCHEMA and mapping.trusted:
+            reasons.append("unknown_specification_profile")
+            if schema_conflict:
+                return SchemaAssessment(
+                    AMBIGUOUS,
+                    **base,
+                    reasons=tuple(dict.fromkeys(reasons)),
+                    decision_reasons=("critical_schema_evidence_incomplete",),
+                )
+            return SchemaAssessment(
+                UNKNOWN,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons)),
+                decision_reasons=("unknown_specification_profile",),
+            )
+        if mapping.status != "trusted":
+            return SchemaAssessment(
+                AMBIGUOUS,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons)),
+                decision_reasons=("mapping_not_trusted",),
+            )
+        if match.status == AMBIGUOUS_PROFILE:
+            return SchemaAssessment(
+                AMBIGUOUS,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons + list(match.reasons))),
+                decision_reasons=("profile_match_ambiguous",),
+            )
+        profile: SpecificationSchemaProfile | None = match.selected_profile
+        if match.status != MATCHED or profile is None:
+            status = UNSUPPORTED if "semantic_coverage_too_low" in reasons else AMBIGUOUS
+            return SchemaAssessment(
+                status,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons + list(match.reasons))),
+                decision_reasons=("profile_not_matched",),
+            )
+
+        missing_profile = sorted(profile.required_concepts - mapped_fields)
+        forbidden_profile = [
+            "+".join(item)
+            for item in profile.forbidden_combinations
+            if set(item).issubset(mapped_fields)
+        ]
+        if missing_profile:
+            reasons.append("missing_profile_concepts:" + ",".join(missing_profile))
+        if forbidden_profile:
+            reasons.append("forbidden_profile_combination:" + ",".join(forbidden_profile))
+        if coverage < 0.45:
+            return SchemaAssessment(
+                UNSUPPORTED,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons)),
+                decision_reasons=("semantic_coverage_too_low",),
+            )
+        if missing_profile or forbidden_profile or illegal or evidence.header_body_conflict or not evidence.safe_relevant_structure or structural_blockers:
+            return SchemaAssessment(
+                AMBIGUOUS,
+                **base,
+                reasons=tuple(dict.fromkeys(reasons)),
+                decision_reasons=("critical_schema_evidence_incomplete",),
+                supported_variant=profile.profile_id,
+                critical_field_policy={
+                    str(key): str(value.value if hasattr(value, "value") else value)
+                    for key, value in profile.critical_field_policy.items()
+                },
+                production_authoritative=profile.production_authoritative,
+            )
+
+        if _family_value(family, "family", "") == AMBIGUOUS_FAMILY:
+            # Missing family context is not enough to promote a short generic
+            # equipment list.  The deliberately narrow canonical-header path
+            # belongs here, after a unique profile match, and requires a rich
+            # observed header rather than a duplicated mapper threshold.
+            canonical_ready = (
+                len(mapped_fields) >= 6
+                and profile.required_concepts.issubset(mapped_fields)
+                and "semantic_coverage_too_low" not in reasons
+                and not schema_conflict
+                and not negative_evidence
+            )
+            if not canonical_ready:
+                reasons.append("family_evidence_missing")
+                return SchemaAssessment(
+                    AMBIGUOUS,
+                    **base,
+                    reasons=tuple(dict.fromkeys(reasons)),
+                    decision_reasons=("family_context_missing",),
+                    supported_variant=profile.profile_id,
+                    critical_field_policy={
+                        str(key): str(value.value if hasattr(value, "value") else value)
+                        for key, value in profile.critical_field_policy.items()
+                    },
+                    production_authoritative=profile.production_authoritative,
+                )
+            decision = ("canonical_header_without_family_context",)
+            variant = "canonical_header"
+        elif _family_value(family, "family", "") == AMBIGUOUS_FAMILY:
+            decision = ("profile_matched_without_family_context",)
+            variant = profile.profile_id
         else:
-            status = AMBIGUOUS
-            decision.append("family_not_confirmed")
+            decision = ("profile_matched",)
+            variant = profile.profile_id
         return SchemaAssessment(
-            status=status,
-            reasons=tuple(dict.fromkeys(reasons)),
-            decision_reasons=tuple(dict.fromkeys(decision)),
-            supported_variant=("canonical_header" if "canonical_header_without_family_context" in decision else "family_confirmed" if status == SUPPORTED else None),
+            SUPPORTED,
             **base,
+            reasons=tuple(dict.fromkeys(reasons)),
+            decision_reasons=decision,
+            supported_variant=variant,
+            critical_field_policy={
+                str(key): str(value.value if hasattr(value, "value") else value)
+                for key, value in profile.critical_field_policy.items()
+            },
+            production_authoritative=profile.production_authoritative,
         )
 
     evaluate = assess
 
 
 DEFAULT_SCHEMA_GATE = SchemaGate()
+
+
+__all__ = [
+    "AMBIGUOUS",
+    "DEFAULT_SCHEMA_GATE",
+    "SchemaAssessment",
+    "SchemaGate",
+    "SchemaGateEvidence",
+    "SUPPORTED",
+    "UNKNOWN",
+    "UNSUPPORTED",
+]
