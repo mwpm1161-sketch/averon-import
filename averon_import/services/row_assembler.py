@@ -274,6 +274,7 @@ class SpecificationRowAssembler:
             "semantic_review": semantic_review,
             "semantic_state": metadata.get("semantic_state", "VERIFIED"),
             "logical_item_id": metadata.get("logical_item_id"),
+            "semantic_review_preview": metadata.get("semantic_review_preview", ""),
         }
         result["review_reason"] = ", ".join(result["review_reasons"])
         result["value_candidates"] = dict(metadata.get("value_candidates") or {})

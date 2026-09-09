@@ -65,7 +65,13 @@ from averon_import.services.ocr.raster_grid import (
     physical_row_raster_witness,
     prepare_exact_cell_crop,
 )
-from averon_import.services.review_policy import CRITICAL_FIELDS, critical_field_count, is_critical_values
+from averon_import.services.review_policy import (
+    CRITICAL_FIELDS,
+    critical_field_count,
+    is_critical_values,
+    mark_semantic_field_required,
+    semantic_missing_critical_fields,
+)
 from averon_import.services.secrets import YANDEX_API_KEY, resolve_secret
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -722,15 +728,20 @@ class YandexVisionProvider:
         stats: dict[str, int],
         progress: Callable[[str], None] | None = None,
     ) -> tuple[dict, dict] | None:
-        missing = any(
-            is_critical_values(row.values)
-            and any(
-                not str(row.values.get(field, "") or "").strip()
-                and isinstance((row.metadata.get("cell_bboxes") or {}).get(field), dict)
-                for field in CRITICAL_FIELDS
+        def _needs_secondary(row) -> bool:
+            metadata = row.metadata if isinstance(row.metadata, dict) else {}
+            fields = (
+                semantic_missing_critical_fields(row)
+                if metadata.get("semantic_authoritative")
+                else CRITICAL_FIELDS
             )
-            for row in primary_rows
-        )
+            return is_critical_values(row.values) and any(
+                not str(row.values.get(field, "") or "").strip()
+                and isinstance((metadata.get("cell_bboxes") or {}).get(field), dict)
+                for field in fields
+            )
+
+        missing = any(_needs_secondary(row) for row in primary_rows)
         if not missing:
             return None
         try:
@@ -870,6 +881,11 @@ class YandexVisionProvider:
                 crop = prepare_exact_cell_crop(raster, cell, scale=2)
                 if not crop_has_glyph(crop):
                     continue
+                mark_semantic_field_required(row, field)
+                row_metadata.setdefault("semantic_field_evidence", {})[field] = {
+                    "raster_glyph": True,
+                    "bbox": cell.as_bbox(),
+                }
                 stats["exact_cell_checked"] += 1
                 try:
                     content = encode_png(crop)
@@ -1030,10 +1046,8 @@ class YandexVisionProvider:
                 metrics.get("relation_conflict_count") or 0
             ),
             "semantic_critical_value_missing_count": sum(
-                1
+                len(semantic_missing_critical_fields(row))
                 for row in item_rows
-                for field in ("unit", "quantity", "mass")
-                if not str(row.values.get(field, "") or "").strip()
             ),
         })
         if logical_count == 0 and diagnostics.get("physical_body_row_indexes"):
@@ -1481,10 +1495,8 @@ class YandexVisionProvider:
                         for row in semantic_rows
                     )
                     reconstruction_diagnostics["semantic_critical_value_missing_count"] = sum(
-                        1
+                        len(semantic_missing_critical_fields(row))
                         for row in semantic_rows
-                        for field in ("unit", "quantity", "mass")
-                        if not str(row.values.get(field, "") or "").strip()
                     )
                 target.page_status = page_status_from_diagnostics(
                     number,

@@ -30,6 +30,10 @@ from averon_import.services.ocr.semantics.semantic_table import (
     LogicalSpecificationItem,
     SemanticTableIR,
 )
+from averon_import.services.review_policy import (
+    CRITICAL_FIELDS,
+    SEMANTIC_SOURCE_SAFETY_REASONS,
+)
 
 
 @dataclass(slots=True)
@@ -128,6 +132,97 @@ def _field_candidate_values(field_value: Any) -> list[dict[str, Any]]:
     return [candidate.as_dict() for candidate in field_value.candidates]
 
 
+def _source_safety_reasons(metadata: Mapping[str, Any]) -> list[str]:
+    """Keep row-local safety evidence, excluding legacy presentation guesses."""
+
+    reasons = [
+        str(reason)
+        for reason in metadata.get("review_reasons") or ()
+        if str(reason) in SEMANTIC_SOURCE_SAFETY_REASONS
+    ]
+    flag_reasons = {
+        "numeric_suspect": bool(
+            any(
+                isinstance(details, Mapping) and details.get("numeric_suspect")
+                for details in (
+                    (metadata.get("normalization") or {}).values()
+                    if isinstance(metadata.get("normalization"), Mapping)
+                    else ()
+                )
+            )
+        ),
+        "ambiguous_columns": bool(
+            metadata.get("ambiguous_fields")
+            or metadata.get("ambiguous_physical_cells")
+        ),
+        "structural_ambiguity": bool(metadata.get("structural_ambiguity")),
+        "structural_disagreement": bool(metadata.get("structural_disagreement")),
+        "word_assignment_ambiguity": bool(
+            metadata.get("word_assignment_ambiguity")
+            or metadata.get("ambiguous_physical_cells")
+        ),
+        "secondary_conflict": bool(metadata.get("secondary_conflict_fields")),
+        "physical_row_unresolved": bool(metadata.get("physical_row_unresolved")),
+        "identity_cell_missing": bool(metadata.get("identity_cell_missing")),
+        "physical_row_loss_suspected": bool(
+            metadata.get("physical_row_loss_suspected")
+        ),
+    }
+    for reason, present in flag_reasons.items():
+        if present and reason not in reasons:
+            reasons.append(reason)
+    if (
+        metadata.get("structural_boundary_conflict")
+        and "structural_boundary_conflict" not in reasons
+    ):
+        reasons.append("structural_boundary_conflict")
+    return list(dict.fromkeys(reasons))
+
+
+def _mass_has_positive_evidence(
+    field_value: Any | None,
+    metadata: Mapping[str, Any],
+) -> bool:
+    if field_value is not None and (
+        field_value.source_fragments
+        or field_value.candidates
+        or field_value.review_reasons
+        or field_value.canonical_text
+    ):
+        return True
+    candidates = metadata.get("value_candidates") or {}
+    if isinstance(candidates, Mapping) and candidates.get("mass"):
+        return True
+    field_evidence = metadata.get("semantic_field_evidence") or {}
+    if isinstance(field_evidence, Mapping) and field_evidence.get("mass"):
+        return True
+    for key in ("ambiguous_fields", "weak_critical_fields"):
+        if "mass" in set(metadata.get(key) or ()):
+            return True
+    if "mass" in set(metadata.get("secondary_conflict_fields") or ()):
+        return True
+    return False
+
+
+def _required_fields(
+    item: LogicalSpecificationItem,
+    mapping: Mapping[int, tuple[str, ...]],
+    metadata: Mapping[str, Any],
+) -> list[str]:
+    mapped_fields = {
+        field
+        for fields in mapping.values()
+        for field in fields
+        if field in CRITICAL_FIELDS
+    }
+    required = [
+        field for field in ("quantity", "unit") if field in mapped_fields
+    ]
+    if _mass_has_positive_evidence(item.fields.get("mass"), metadata):
+        required.append("mass")
+    return [field for field in CRITICAL_FIELDS if field in required]
+
+
 def _base_metadata_for_row(
     base_rows: Mapping[int, OcrRow],
     row_index: int,
@@ -147,12 +242,17 @@ def _base_metadata_for_row(
         "structural_disagreement", "word_assignment_ambiguity",
         "ambiguous_fields", "weak_critical_assignment",
         "weak_critical_fields", "ambiguous_physical_cells",
+        "secondary_conflict_fields", "physical_row_unresolved",
+        "identity_cell_missing", "physical_row_loss_suspected",
+        "structural_boundary_conflict", "semantic_field_evidence",
     }
-    return {
+    result = {
         key: value.copy() if isinstance(value, dict) else list(value) if isinstance(value, list) else value
         for key, value in row.metadata.items()
         if key in keep
     }
+    result["review_reasons"] = _source_safety_reasons(row.metadata)
+    return result
 
 
 def _item_row(
@@ -172,7 +272,21 @@ def _item_row(
     cell_bboxes: dict[str, dict[str, float]] = {}
     physical_grid_cells = dict(metadata.get("physical_grid_cells") or {})
     candidates: dict[str, list[dict[str, Any]]] = {}
-    review_reasons = list(item.review_reasons)
+    source_safety_reasons: list[str] = []
+    for ref in item.physical_row_refs:
+        source_row = base_rows.get(_ref_row_index(ref) or 0)
+        if source_row is not None and isinstance(source_row.metadata, dict):
+            for reason in _source_safety_reasons(source_row.metadata):
+                if reason not in source_safety_reasons:
+                    source_safety_reasons.append(reason)
+    review_reasons = [
+        reason
+        for reason in item.review_reasons
+        if reason not in {"critical_value_missing", "no_confidence", "context_missing"}
+    ]
+    review_reasons.extend(
+        reason for reason in source_safety_reasons if reason not in review_reasons
+    )
     source_cell_refs: set[int] = set()
     physical_refs = [ref.as_dict() for ref in item.physical_row_refs]
     raw_cells: list[dict[str, Any]] = []
@@ -217,10 +331,8 @@ def _item_row(
             if normalization[field_name].get("numeric_suspect"):
                 review_reasons.append("numeric_suspect")
 
-    if any(
-        not str(values.get(field, "") or "").strip()
-        for field in ("unit", "quantity", "mass")
-    ):
+    required_fields = _required_fields(item, mapping, metadata)
+    if any(not str(values.get(field, "") or "").strip() for field in required_fields):
         review_reasons.append("critical_value_missing")
     review_reasons = list(dict.fromkeys(review_reasons))
     metadata.update({
@@ -243,6 +355,8 @@ def _item_row(
         "cell_bboxes": cell_bboxes,
         "physical_grid_cells": physical_grid_cells,
         "value_candidates": candidates,
+        "semantic_required_critical_fields": required_fields,
+        "source_safety_reasons": source_safety_reasons,
         "review_reasons": review_reasons,
         "semantic_provenance": dict(item.provenance),
         "provides_confidence": False,
@@ -288,9 +402,38 @@ def _review_row(
     disposition: Any | None,
     provider_key: str,
 ) -> OcrRow:
-    _values, _sources, bboxes, raw_cells = _raw_row_values(
-        row, mapping, page_size, set()
-    )
+    raw_cells = _physical_cell_records(row, mapping, page_size)
+    bboxes: dict[str, dict[str, float]] = {}
+    for record in raw_cells:
+        for field in record.get("fields") or ():
+            if record.get("bbox") and field not in bboxes:
+                bboxes[field] = dict(record["bbox"])
+    candidates: dict[str, dict[str, Any]] = {}
+    alternative_candidates: list[dict[str, Any]] = []
+    preview_parts: list[str] = []
+    for record in raw_cells:
+        raw_text = str(record.get("raw_text") or "").strip()
+        if not raw_text:
+            continue
+        for field in record.get("fields") or ():
+            candidate_value = normalize_cell(field, raw_text) or raw_text
+            candidate = {
+                "value_candidate": candidate_value,
+                "value": candidate_value,
+                "raw_value": raw_text,
+                "source": "physical_semantic_evidence",
+                "candidate_source": "physical_semantic_evidence",
+                "auto_trusted": False,
+                "review_reason": "physical_row_semantics_unresolved",
+                "bbox": dict(record.get("bbox") or {}),
+                "column_index": record.get("column_index"),
+                "row_index": record.get("row_index"),
+            }
+            if field not in candidates:
+                candidates[field] = candidate
+            else:
+                alternative_candidates.append({"field": field, **candidate})
+            preview_parts.append(f"{field}: {raw_text}")
     reasons = list(getattr(disposition, "reasons", ()) or ())
     if "physical_row_semantics_unresolved" not in reasons:
         reasons.append("physical_row_semantics_unresolved")
@@ -320,7 +463,10 @@ def _review_row(
         "cell_bboxes": bboxes,
         "raw_physical_cells": raw_cells,
         "raw_values": {},
-        "value_candidates": {},
+        "value_candidates": candidates,
+        "alternative_value_candidates": alternative_candidates,
+        "semantic_review_preview": " | ".join(preview_parts),
+        "semantic_required_critical_fields": [],
         "review_reasons": list(dict.fromkeys(reasons)),
         "semantic_provenance": dict(getattr(disposition, "provenance", {}) or {}),
         "provides_confidence": False,
@@ -388,6 +534,7 @@ def _resolved_context_row(
         "raw_physical_cells": raw_cells,
         "raw_values": dict(values),
         "value_candidates": {},
+        "semantic_required_critical_fields": [],
         "review_reasons": [],
         "provides_confidence": False,
     }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
+from averon_import.core.normalizers import normalize_cell
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.ocr.base import OcrResult, OcrRow, PageOcrResult
 from averon_import.services.ocr.page_contract import page_status_from_diagnostics
@@ -9,9 +11,18 @@ from averon_import.services.ocr.reconstruction import reconstruct_page_rows_resu
 from averon_import.services.ocr.semantics.semantic_projection import (
     project_semantic_table,
 )
+from averon_import.services.ocr.semantics.semantic_table import (
+    LogicalFieldValue,
+    ValueCandidate,
+)
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.row_assembler import SpecificationRowAssembler
 from averon_import.services.recognition import RecognitionService
+from averon_import.services.review_policy import (
+    critical_blockers_for_row,
+    missing_critical_fields,
+    refresh_review_state,
+)
 
 from tests.test_stage712c_row_relations import _geometry_payload, _grid
 
@@ -232,3 +243,210 @@ def test_rollout_switch_disables_activation_but_keeps_legacy_result(monkeypatch)
     assert result.semantic_authoritative is False
     assert rows == result.rows
     assert result.diagnostics["semantic_authoritative_activation"]["enabled"] is False
+
+
+def _with_semantic_item(result, item_index=0, **field_updates):
+    semantic = result.semantic_table
+    item = semantic.logical_items[item_index]
+    fields = dict(item.fields)
+    for field, value in field_updates.items():
+        if value is None:
+            fields.pop(field, None)
+        else:
+            fields[field] = value
+    result.semantic_table = replace(
+        semantic,
+        logical_items=(
+            replace(item, fields=fields),
+            *semantic.logical_items[item_index + 1:],
+        ),
+    )
+    return result
+
+
+def _assembled_semantic_row(result):
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    assert projected
+    return SpecificationRowAssembler().build_semantic_row(1, projected[0])
+
+
+def _unresolve_first_item(result):
+    semantic = result.semantic_table
+    item = semantic.logical_items[0]
+    target_key = item.physical_row_refs[0].key
+    target = next(
+        disposition
+        for disposition in semantic.dispositions
+        if disposition.physical_row_ref.key == target_key
+    )
+    unresolved = replace(
+        target,
+        validation_state="UNVALIDATED",
+        role_state="UNRESOLVED",
+        reasons=("physical_row_semantics_unresolved",),
+    )
+    result.semantic_table = replace(
+        semantic,
+        logical_items=semantic.logical_items[1:],
+        dispositions=tuple(
+            unresolved if disposition.physical_row_ref.key == target_key else disposition
+            for disposition in semantic.dispositions
+        ),
+    )
+    return result
+
+
+def test_d17_optional_blank_mass_does_not_review_semantic_item():
+    row = _assembled_semantic_row(_semantic_result())
+    assert row.get("mass", "") == ""
+    assert row["ocr_metadata"]["semantic_required_critical_fields"] == [
+        "quantity", "unit"
+    ]
+    assert "mass" not in row["critical_fields"]
+    assert "critical_value_missing" not in row["review_reasons"]
+    assert row["status"] == "recognized"
+
+
+def test_d18_missing_required_quantity_reviews_and_blocks():
+    result = _semantic_result()
+    item = result.semantic_table.logical_items[0]
+    _with_semantic_item(
+        result,
+        quantity=replace(item.fields["quantity"], canonical_text=None),
+    )
+    row = _assembled_semantic_row(result)
+    assert "quantity" in row["critical_fields"]
+    assert "critical_value_missing" in row["review_reasons"]
+    assert "critical_value_missing" in critical_blockers_for_row(row)
+
+
+def test_d19_missing_required_unit_reviews_and_blocks():
+    result = _semantic_result()
+    item = result.semantic_table.logical_items[0]
+    _with_semantic_item(
+        result,
+        unit=replace(item.fields["unit"], canonical_text=None),
+    )
+    row = _assembled_semantic_row(result)
+    assert "unit" in row["critical_fields"]
+    assert "critical_value_missing" in row["review_reasons"]
+    assert "critical_value_missing" in critical_blockers_for_row(row)
+
+
+def test_s4_mass_candidate_evidence_makes_missing_mass_reviewable():
+    result = _semantic_result()
+    semantic = result.semantic_table
+    item = semantic.logical_items[0]
+    fields = dict(item.fields)
+    fields["mass"] = LogicalFieldValue(
+        field="mass",
+        canonical_text=None,
+        candidates=(ValueCandidate(value="4"),),
+    )
+    result.semantic_table = replace(
+        semantic,
+        logical_items=(replace(item, fields=fields), *semantic.logical_items[1:]),
+    )
+    row = _assembled_semantic_row(result)
+    assert "mass" in row["ocr_metadata"]["semantic_required_critical_fields"]
+    assert "mass" in row["critical_fields"]
+    assert "critical_value_missing" in row["review_reasons"]
+
+
+def test_d20_source_structural_review_reason_survives_projection():
+    result = _semantic_result()
+    result.rows[0].metadata.update({
+        "review_reasons": ["word_assignment_ambiguity"],
+        "word_assignment_ambiguity": True,
+    })
+    row = _assembled_semantic_row(result)
+    assert "word_assignment_ambiguity" in row["review_reasons"]
+    assert "word_assignment_ambiguity" in critical_blockers_for_row(row)
+    assert row["status"] == "review"
+
+
+def test_d21_no_confidence_does_not_survive_as_semantic_blocker():
+    result = _semantic_result()
+    result.rows[0].metadata.update({
+        "review_reasons": ["no_confidence"],
+        "no_confidence": True,
+    })
+    row = _assembled_semantic_row(result)
+    assert "no_confidence" not in row["review_reasons"]
+    assert row["status"] == "recognized"
+
+
+def test_d22_unresolved_raw_values_are_candidates_and_preview_only():
+    result = _unresolve_first_item(_semantic_result())
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("semantic_review"))
+    assert review.values == {}
+    assert review.metadata["semantic_review_preview"]
+    assert review.metadata["value_candidates"]
+    assert all(
+        candidate["auto_trusted"] is False
+        for candidate in review.metadata["value_candidates"].values()
+    )
+    presented = SpecificationRowAssembler().build_semantic_row(1, review)
+    assert presented["row_type"] == "semantic_review"
+    assert presented.get("name", "") == ""
+    assert presented["semantic_review_preview"]
+
+
+def test_d23_p12_raw_17_is_review_evidence_not_canonical_quantity():
+    result = _semantic_result()
+    table = result.physical_table
+    first_row = table.rows[1]
+    quantity_cell = next(
+        cell for cell in first_row.cells if cell.ref.column_index == 6
+    )
+    updated_row = replace(
+        first_row,
+        cells=tuple(
+            replace(cell, raw_text="17") if cell is quantity_cell else cell
+            for cell in first_row.cells
+        ),
+    )
+    result.physical_table = replace(
+        table,
+        rows=tuple(
+            updated_row if row.ref.row_index == first_row.ref.row_index else row
+            for row in table.rows
+        ),
+    )
+    _unresolve_first_item(result)
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("semantic_review"))
+    assert review.values == {}
+    candidate = review.metadata["value_candidates"]["quantity"]
+    assert candidate["raw_value"] == "17"
+    assert candidate["value_candidate"] == normalize_cell("quantity", "17")
+    presented = SpecificationRowAssembler().build_semantic_row(1, review)
+    assert presented.get("quantity", "") == ""
+    assert presented["semantic_review_preview"]
+    assert presented["status"] == "review"
+
+
+def test_d24_blank_optional_mass_does_not_create_false_review():
+    row = _assembled_semantic_row(_semantic_result())
+    refresh_review_state(row)
+    assert row.get("mass", "") == ""
+    assert row["critical_fields"] == []
+    assert row["status"] == "recognized"
+
+
+def test_d25_legacy_review_policy_remains_unchanged():
+    legacy = {
+        "name": "Насос",
+        "row_type": "item",
+        "unit": "шт.",
+        "quantity": "1",
+        "mass": "",
+        "ocr_metadata": {"provider": "yandex_vision"},
+    }
+    assert missing_critical_fields(legacy) == ["mass"]
+    tesseract = {
+        **legacy,
+        "ocr_metadata": {"provider": "tesseract"},
+    }
+    assert missing_critical_fields(tesseract) == []

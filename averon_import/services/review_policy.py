@@ -26,9 +26,100 @@ CRITICAL_REASONS = {
     "identity_cell_missing",
 }
 
+# These reasons describe unresolved evidence, rather than a legacy row-role
+# guess.  Semantic projection may carry them from the physical row into the
+# logical item, while deliberately dropping ``no_confidence`` and
+# ``context_missing`` from the legacy assembler.
+SEMANTIC_SOURCE_SAFETY_REASONS = frozenset(CRITICAL_REASONS - {
+    "critical_value_missing",
+})
+
 
 def _values(row: dict) -> dict:
     return row if isinstance(row, dict) else {}
+
+
+def _row_metadata(row: object) -> dict:
+    if isinstance(row, dict):
+        metadata = row.get("ocr_metadata") or {}
+        return metadata if isinstance(metadata, dict) else {}
+    metadata = getattr(row, "metadata", {}) or {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _row_values(row: object) -> dict:
+    if isinstance(row, dict):
+        return row
+    values = getattr(row, "values", {}) or {}
+    return values if isinstance(values, dict) else {}
+
+
+def is_semantic_authoritative_row(row: object) -> bool:
+    metadata = _row_metadata(row)
+    values = _row_values(row)
+    return bool(
+        values.get("semantic_authoritative")
+        or metadata.get("semantic_authoritative")
+    )
+
+
+def required_critical_fields(row: object) -> tuple[str, ...]:
+    """Return the applicable critical fields for one row.
+
+    The legacy path intentionally retains the historical three-field rule.
+    Semantic-authoritative rows use the explicit projection contract; a
+    missing contract fails closed to the historical set rather than silently
+    allowing an unvalidated row through.
+    """
+
+    if not is_semantic_authoritative_row(row):
+        return CRITICAL_FIELDS
+    metadata = _row_metadata(row)
+    declared = metadata.get("semantic_required_critical_fields")
+    if isinstance(declared, (list, tuple, set)):
+        return tuple(
+            field for field in CRITICAL_FIELDS
+            if field in {str(item) for item in declared}
+        )
+    return CRITICAL_FIELDS
+
+
+def semantic_missing_critical_fields(row: object) -> list[str]:
+    """Apply the semantic applicability contract to an OCR or UI row."""
+
+    metadata = _row_metadata(row)
+    values = _row_values(row)
+    role = str(
+        values.get("row_type")
+        or metadata.get("semantic_row_type")
+        or ("item" if metadata.get("semantic_role") == "ITEM_ROOT" else "")
+    )
+    if not is_semantic_authoritative_row(row) or role not in {
+        "item", "component", "item_candidate"
+    }:
+        return []
+    return [
+        field for field in required_critical_fields(row)
+        if not str(values.get(field, "") or "").strip()
+    ]
+
+
+def mark_semantic_field_required(row: object, field: str) -> None:
+    """Record positive evidence that a semantic critical field is applicable."""
+
+    if field not in CRITICAL_FIELDS or not is_semantic_authoritative_row(row):
+        return
+    metadata = _row_metadata(row)
+    declared = metadata.get("semantic_required_critical_fields")
+    fields = [
+        item for item in (declared if isinstance(declared, (list, tuple, set)) else ())
+        if str(item) in CRITICAL_FIELDS
+    ]
+    if field not in fields:
+        fields.append(field)
+    metadata["semantic_required_critical_fields"] = [
+        item for item in CRITICAL_FIELDS if item in fields
+    ]
 
 
 def is_critical_row(row: dict) -> bool:
@@ -75,6 +166,8 @@ def is_critical_values(values: dict) -> bool:
 
 
 def missing_critical_fields(row: dict) -> list[str]:
+    if is_semantic_authoritative_row(row):
+        return semantic_missing_critical_fields(row)
     if not is_critical_row(row):
         return []
     return [

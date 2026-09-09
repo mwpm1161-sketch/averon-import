@@ -369,7 +369,12 @@ function isYandexCriticalRow(row) {
 
 function missingCriticalFields(row) {
   if (!isYandexCriticalRow(row)) return [];
-  return CRITICAL_FIELDS.filter((key) => !String(row[key] ?? "").trim());
+  const semantic = row?.semantic_authoritative || row?.ocr_metadata?.semantic_authoritative;
+  const declared = row?.ocr_metadata?.semantic_required_critical_fields;
+  const fields = semantic
+    ? (Array.isArray(declared) ? CRITICAL_FIELDS.filter((key) => declared.includes(key)) : CRITICAL_FIELDS)
+    : CRITICAL_FIELDS;
+  return fields.filter((key) => !String(row[key] ?? "").trim());
 }
 
 function numericSuspectFields(row) {
@@ -597,6 +602,11 @@ function cellHtml(row, key) {
   }
   if (key === "page") return `<td><span class="status-pill">${escapeHtml(String(row.page ?? ""))}</span></td>`;
   const value = String(row[key] ?? "");
+  if (key === "name" && row.row_type === "semantic_review") {
+    const preview = String(row.semantic_review_preview || row.ocr_metadata?.semantic_review_preview || "").trim();
+    const label = preview ? `Проверить: ${preview}` : "Проверить: строка не разрешена";
+    return `<td><div class="semantic-review-preview">${escapeHtml(label)}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
+  }
   if (!CRITICAL_FIELDS.includes(key) || !isYandexCriticalRow(row)) {
     return `<td><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
   }

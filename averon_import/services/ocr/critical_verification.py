@@ -11,7 +11,11 @@ import re
 
 from averon_import.core.normalizers import normalize_cell, numeric_cell_metadata
 from averon_import.services.ocr.base import OcrRow
-from averon_import.services.review_policy import CRITICAL_FIELDS, is_critical_values
+from averon_import.services.review_policy import (
+    CRITICAL_FIELDS,
+    is_critical_values,
+    mark_semantic_field_required,
+)
 
 _KNOWN_UNITS = {"шт.", "м", "м²", "м³", "кг", "компл.", "п.м.", "л", "к-т"}
 
@@ -177,6 +181,7 @@ def attach_secondary_candidates(
                 # review action or a duplicated value in the result.
                 continue
             conflict = bool(primary_value and primary_value != candidate["value_candidate"])
+            mark_semantic_field_required(row, field)
             candidate.update({
                 "candidate_source": "yandex_secondary",
                 "review_reason": (
@@ -221,6 +226,7 @@ def attach_exact_cell_candidate(
     value = _candidate_value(field, raw_value)
     if value is None:
         return False
+    mark_semantic_field_required(row, field)
     metadata = row.metadata
     candidates = dict(metadata.get("value_candidates") or {})
     existing = candidates.get(field)

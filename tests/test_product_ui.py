@@ -66,3 +66,11 @@ def test_critical_review_ui_is_present_and_export_safety_is_explicit():
     assert "Yandex повторно распознал" in app_js
     assert "candidate-accept" in app_js
     assert "critical-review" in css
+
+
+def test_semantic_review_preview_is_visible_without_canonical_values():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'row.row_type === "semantic_review"' in app_js
+    assert "semantic_review_preview" in app_js
+    assert "Проверить:" in app_js
