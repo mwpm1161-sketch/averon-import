@@ -3,12 +3,101 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
 
-from averon_import.services.sourcing.models import MatchResult, ProductIntent
+from averon_import.services.sourcing.models import (
+    MatchResult,
+    ProductIntent,
+    ProductUnderstandingProvenance,
+    ProductUnderstandingResult,
+    ProductUnderstandingSuggestion,
+    SuggestionResolution,
+)
+
+
+PRODUCT_UNDERSTANDING_REVISION = "1"
+
+# Existing matcher/catalog attribute names are the canonical compatibility
+# contract. Values use these stable units throughout sourcing.
+CANONICAL_ATTRIBUTE_UNITS = {
+    "power": "kW",
+    "voltage": "V",
+    "current": "A",
+    "diameter": "mm",
+    "pressure": "PN",
+    "cable_section": "mm2",
+    "dimensions": "mm",
+    "cores": "count",
+    "protection_class": "code",
+    "material": "text",
+    "mounting_type": "text",
+    "features": "text",
+}
+
+_ATTRIBUTE_ALIASES = {
+    "power": "power",
+    "power_kw": "power",
+    "power_w": "power",
+    "wattage": "power",
+    "rated_power": "power",
+    "nominal_power": "power",
+    "voltage": "voltage",
+    "voltage_v": "voltage",
+    "current": "current",
+    "current_a": "current",
+    "diameter": "diameter",
+    "diameter_mm": "diameter",
+    "dn": "diameter",
+    "pressure": "pressure",
+    "pressure_pn": "pressure",
+    "pn": "pressure",
+    "cores": "cores",
+    "core_count": "cores",
+    "cable_section": "cable_section",
+    "cable_section_mm2": "cable_section",
+    "section_mm2": "cable_section",
+    "protection_class": "protection_class",
+    "ip": "protection_class",
+    "dimensions": "dimensions",
+    "dimensions_mm": "dimensions",
+    "material": "material",
+    "mounting_type": "mounting_type",
+    "feature": "features",
+    "features": "features",
+}
+
+_COMMERCIAL_FIELDS = {
+    "price", "currency", "availability", "supplier", "url", "offer_id",
+    "stock", "delivery", "discount",
+}
+
+PRODUCT_UNDERSTANDING_SYSTEM_PROMPT = """Ты — консервативный семантический парсер одной инженерной товарной позиции.
+Верни только строгий JSON, совместимый с ProductIntent, без markdown и пояснений.
+
+Правила:
+- не переписывай source_row_id, source_text, quantity или unit;
+- сохраняй явно указанные manufacturer, model и article в точности;
+- не придумывай отсутствующие технические факты;
+- evidence может ссылаться только на дословный фрагмент входной строки;
+- неподтверждённые интерпретации помещай в preferred_attributes и uncertainties;
+- никогда не возвращай price, currency, availability, supplier, URL, offer_id,
+  stock, delivery или discount;
+- используй канонические ключи: power (кВт), voltage (В), current (А),
+  diameter (мм), pressure (PN), cores, cable_section (мм²),
+  protection_class, dimensions (мм), material, mounting_type, features;
+- не создавай варианты ключей вроде power_w, wattage или rated_power;
+- uncertainties и search_queries должны быть короткими списками строк.
+"""
+
+
+def _prompt_fingerprint() -> str:
+    return hashlib.sha256(
+        PRODUCT_UNDERSTANDING_SYSTEM_PROMPT.encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def _text(row: dict[str, Any], *keys: str) -> str:
@@ -37,30 +126,53 @@ def _number(value: str) -> float | int | None:
     return int(parsed) if parsed.is_integer() else parsed
 
 
+def _scaled_number(value: str, factor: float = 1.0) -> float | int | None:
+    parsed = _number(value)
+    if parsed is None:
+        return None
+    scaled = float(parsed) * factor
+    return int(scaled) if scaled.is_integer() else scaled
+
+
 def extract_generic_attributes(text: str) -> dict[str, Any]:
     """Extract conservative, provider-neutral hints without rewriting source text."""
 
     value = text.replace("×", "x").replace("х", "x")
     attributes: dict[str, Any] = {}
-    patterns = (
-        ("diameter", r"(?:dn|ду)\s*(\d+(?:[.,]\d+)?)\s*(?:мм)?"),
-        ("pressure", r"(?:pn|ру)\s*(\d+(?:[.,]\d+)?)"),
-        ("voltage", r"(\d+(?:[.,]\d+)?)\s*(?:в|v)\b"),
-        ("power", r"(\d+(?:[.,]\d+)?)\s*(?:квт|kw)\b"),
-        ("current", r"(\d+(?:[.,]\d+)?)\s*(?:а|a)\b"),
-        ("protection_class", r"\b(ip\s*\d+[a-zа-я]*)\b"),
+    numeric_patterns = (
+        ("diameter", r"(?:\b(?:dn|ду)\s*|[ø⌀]\s*)(\d+(?:[.,]\d+)?)\s*(?:мм|mm)?"),
+        ("pressure", r"\b(?:pn|ру)\s*(\d+(?:[.,]\d+)?)"),
+        ("voltage", r"(\d+(?:[.,]\d+)?)\s*(?:в|v)(?![a-zа-яё])"),
+        ("current", r"(\d+(?:[.,]\d+)?)\s*(?:а|a)(?![a-zа-яё])"),
     )
-    for name, pattern in patterns:
+    for name, pattern in numeric_patterns:
         match = re.search(pattern, value, flags=re.IGNORECASE)
         if match:
-            raw = match.group(1)
-            attributes[name] = _number(raw) if name not in {"protection_class"} else raw.upper().replace(" ", "")
-    cable = re.search(
-        r"(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*(?:мм2|мм²|mm2)?",
+            attributes[name] = _number(match.group(1))
+
+    power = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(к\s*вт|kw|вт|w)(?![a-zа-яё])",
         value,
         flags=re.IGNORECASE,
     )
-    if cable:
+    if power:
+        unit = re.sub(r"\s+", "", power.group(2).casefold())
+        attributes["power"] = _scaled_number(
+            power.group(1),
+            1.0 if unit in {"квт", "kw"} else 0.001,
+        )
+
+    protection = re.search(r"\b(ip\s*\d+[a-zа-я]*)\b", value, flags=re.IGNORECASE)
+    if protection:
+        attributes["protection_class"] = protection.group(1).upper().replace(" ", "")
+
+    cable = re.search(
+        r"(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*(мм2|мм²|mm2|mm²)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    cable_context = bool(re.search(r"\b(?:кабел\w*|провод\w*|жил\w*)\b", value, re.IGNORECASE))
+    if cable and (cable.group(3) or cable_context):
         attributes["cores"] = int(cable.group(1))
         attributes["cable_section"] = _number(cable.group(2))
     dimensions = re.search(
@@ -68,20 +180,106 @@ def extract_generic_attributes(text: str) -> dict[str, Any]:
         value,
         flags=re.IGNORECASE,
     )
-    if dimensions:
-        attributes["dimensions"] = "x".join(part for part in dimensions.groups() if part)
+    if dimensions and not cable_context:
+        attributes["dimensions"] = "x".join(
+            str(_number(part)) for part in dimensions.groups() if part
+        )
     return attributes
+
+
+def normalize_attribute_key(value: object) -> str | None:
+    key = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().casefold()).strip("_")
+    return _ATTRIBUTE_ALIASES.get(key)
+
+
+def _canonical_attribute_value(key: str, value: Any, source_key: str) -> Any:
+    if isinstance(value, dict) and "value" in value:
+        unit = str(value.get("unit") or "").strip()
+        value = f"{value['value']} {unit}".strip()
+    if key == "protection_class":
+        return str(value or "").strip().upper().replace(" ", "")
+    if key == "features":
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()][:12]
+        return str(value or "").strip()
+    if key in {"material", "mounting_type"}:
+        return str(value or "").strip()
+    if key == "dimensions":
+        text = str(value or "").replace("×", "x").replace("х", "x")
+        parts = re.findall(r"\d+(?:[.,]\d+)?", text)
+        return "x".join(str(_number(part)) for part in parts) if len(parts) in {2, 3} else str(value)
+    if key == "power":
+        text = str(value or "")
+        factor = 0.001 if source_key == "power_w" else 1.0
+        if re.search(r"(?:^|\s)(?:вт|w)(?:\s|$)", text, re.IGNORECASE) and not re.search(
+            r"(?:к\s*вт|kw)", text, re.IGNORECASE
+        ):
+            factor = 0.001
+        parsed = _scaled_number(text, factor)
+        return parsed if parsed is not None else value
+    if key in {"voltage", "current", "diameter", "pressure", "cable_section", "cores"}:
+        parsed = _number(str(value or ""))
+        return parsed if parsed is not None else value
+    return value
+
+
+def _normalize_attribute_mapping(mapping: Any) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
+    if mapping in (None, ""):
+        return {}, []
+    if not isinstance(mapping, dict):
+        raise ValueError("AI attributes must be an object")
+    normalized: dict[str, Any] = {}
+    rejected: list[tuple[str, Any]] = []
+    for raw_key, raw_value in mapping.items():
+        source_key = str(raw_key or "").strip().casefold()
+        if source_key in _COMMERCIAL_FIELDS:
+            raise ValueError("commercial fields are forbidden in ProductIntent")
+        key = normalize_attribute_key(source_key)
+        if key is None:
+            rejected.append((str(raw_key), deepcopy(raw_value)))
+            continue
+        value = _canonical_attribute_value(key, raw_value, source_key)
+        if key in normalized and normalized[key] != value:
+            raise ValueError("conflicting aliases for one canonical attribute")
+        normalized[key] = value
+    return normalized, rejected
+
+
+def _contains_commercial_field(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            str(key).strip().casefold() in _COMMERCIAL_FIELDS
+            or _contains_commercial_field(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_commercial_field(item) for item in value)
+    return False
+
+
+def _normalize_ai_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
+    if _contains_commercial_field(payload):
+        raise ValueError("commercial fields are forbidden in ProductIntent")
+    normalized = deepcopy(payload)
+    rejected: list[tuple[str, Any]] = []
+    for field in ("attributes", "required_attributes", "preferred_attributes"):
+        mapping, ignored = _normalize_attribute_mapping(normalized.get(field, {}))
+        normalized[field] = mapping
+        rejected.extend((f"{field}.{key}", value) for key, value in ignored)
+    return normalized, rejected
 
 
 def build_fallback_intent(row: dict[str, Any]) -> ProductIntent:
     name = str(row.get("name") or row.get("title") or "").strip()
-    model = str(row.get("type_mark") or "").strip()
-    article = str(row.get("code") or "").strip()
+    model = str(row.get("type_mark") or row.get("model") or "").strip()
+    article = str(row.get("code") or row.get("article") or "").strip()
     manufacturer = str(row.get("manufacturer") or "").strip()
     note = str(row.get("note") or "").strip()
-    source_text = _text(row, "name", "type_mark", "code", "manufacturer", "unit", "note")
-    if not source_text:
-        source_text = str(row.get("source_text") or "").strip()
+    explicit_source_text = str(row.get("source_text") or "").strip()
+    source_text = explicit_source_text or _text(
+        row, "name", "title", "type_mark", "model", "code", "article",
+        "manufacturer", "unit", "note"
+    )
     source_id = _source_id(row, source_text)
     attributes = extract_generic_attributes(source_text)
     required = dict(attributes)
@@ -177,6 +375,31 @@ def _phrase_grounded(value: str, source_text: str) -> bool:
     return bool(source_tokens & value_tokens)
 
 
+def _same_attribute(left: Any, right: Any) -> bool:
+    left_number = _number(str(left or ""))
+    right_number = _number(str(right or ""))
+    if left_number is not None and right_number is not None:
+        return float(left_number) == float(right_number)
+    return _compact(left) == _compact(right)
+
+
+def _attribute_grounded(
+    key: str,
+    value: Any,
+    fallback: ProductIntent,
+    evidence: dict[str, Any],
+) -> bool:
+    # Numeric/measurement grounding is mechanical: the deterministic parser
+    # must independently find the same canonical key/value in source text.
+    if key in fallback.attributes:
+        return _same_attribute(value, fallback.attributes[key])
+    if key in {"material", "mounting_type", "features"}:
+        if isinstance(value, list):
+            return bool(value) and all(_grounded(item, fallback.source_text, evidence, key) for item in value)
+        return _grounded(value, fallback.source_text, evidence, key)
+    return False
+
+
 def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) -> ProductIntent:
     """Merge an AI proposal while keeping OCR-owned facts authoritative."""
 
@@ -215,7 +438,7 @@ def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) 
             key = str(key)
             if key in fallback.attributes:
                 continue
-            if _grounded(proposed, fallback.source_text, candidate_evidence, key):
+            if _attribute_grounded(key, proposed, fallback, candidate_evidence):
                 attributes.setdefault(key, deepcopy(proposed))
                 origins.setdefault(key, "ai_grounded")
                 if mapping_name == "required_attributes":
@@ -260,6 +483,93 @@ def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) 
     )
 
 
+def _audit_suggestions(
+    baseline: ProductIntent,
+    proposal: ProductIntent,
+    resolved: ProductIntent,
+    rejected_attributes: list[tuple[str, Any]],
+) -> list[ProductUnderstandingSuggestion]:
+    suggestions: list[ProductUnderstandingSuggestion] = []
+    always_locked = {"source_row_id", "source_text", "quantity", "unit"}
+    explicitly_locked = {"manufacturer", "model", "article", "brand"}
+    for field in (
+        "source_row_id", "source_text", "quantity", "unit", "manufacturer",
+        "brand", "model", "article", "product_class", "normalized_name",
+    ):
+        if field not in proposal.model_fields_set:
+            continue
+        source_value = getattr(baseline, field)
+        proposed_value = getattr(proposal, field)
+        if proposed_value == source_value:
+            continue
+        resolved_value = getattr(resolved, field)
+        if field in always_locked or (field in explicitly_locked and source_value):
+            resolution = SuggestionResolution.SOURCE_LOCKED
+            grounded = False
+            reason = "explicit_source_value_is_authoritative"
+        elif resolved_value != proposed_value:
+            resolution = SuggestionResolution.REJECTED_UNGROUNDED
+            grounded = False
+            reason = "proposal_not_mechanically_grounded_in_source"
+        else:
+            grounded = _phrase_grounded(str(proposed_value), baseline.source_text)
+            resolution = (
+                SuggestionResolution.ACCEPTED_GROUNDED
+                if grounded
+                else SuggestionResolution.PREFERRED_AI_INFERENCE
+            )
+            reason = "source_span_confirmed" if grounded else "semantic_inference_not_used_as_required_constraint"
+        suggestions.append(ProductUnderstandingSuggestion(
+            field=field,
+            source_value=deepcopy(source_value),
+            proposed_value=deepcopy(proposed_value),
+            resolution=resolution,
+            reason=reason,
+            grounded=grounded,
+        ))
+
+    proposal_attributes: dict[str, Any] = {}
+    for mapping in (proposal.attributes, proposal.required_attributes, proposal.preferred_attributes):
+        proposal_attributes.update(mapping)
+    origins = resolved.evidence.get("attribute_origins", {})
+    for key, proposed_value in proposal_attributes.items():
+        source_value = baseline.attributes.get(key)
+        if key in baseline.attributes:
+            if _same_attribute(source_value, proposed_value):
+                continue
+            resolution = SuggestionResolution.SOURCE_LOCKED
+            grounded = False
+            reason = "deterministic_source_attribute_is_authoritative"
+        else:
+            origin = origins.get(key)
+            grounded = origin == "ai_grounded"
+            resolution = (
+                SuggestionResolution.ACCEPTED_GROUNDED
+                if grounded
+                else SuggestionResolution.PREFERRED_AI_INFERENCE
+            )
+            reason = "source_measurement_confirmed" if grounded else "not_a_required_matching_constraint"
+        suggestions.append(ProductUnderstandingSuggestion(
+            field=f"attributes.{key}",
+            source_value=deepcopy(source_value),
+            proposed_value=deepcopy(proposed_value),
+            resolution=resolution,
+            reason=reason,
+            grounded=grounded,
+        ))
+
+    for path, value in rejected_attributes:
+        suggestions.append(ProductUnderstandingSuggestion(
+            field=path,
+            source_value=None,
+            proposed_value=deepcopy(value),
+            resolution=SuggestionResolution.REJECTED_UNGROUNDED,
+            reason="unsupported_attribute_key",
+            grounded=False,
+        ))
+    return suggestions
+
+
 class SourcingAIService:
     """Typed sourcing-specific AI adapter; it never writes back to OCR rows."""
 
@@ -267,6 +577,34 @@ class SourcingAIService:
         self.ai_service = ai_service
         self.provider_key = provider_key
         self._last_status = "configured"
+
+    @property
+    def model_identity(self) -> str:
+        if self.ai_service is None:
+            return ""
+        try:
+            provider = self.ai_service.ensure_provider(self.provider_key)
+            return str(getattr(provider, "model", "") or "")
+        except (AttributeError, ValueError):
+            try:
+                return str(
+                    self.ai_service.public_config()
+                    .get("providers", {})
+                    .get(self.provider_key, {})
+                    .get("model", "")
+                    or ""
+                )
+            except Exception:
+                return ""
+
+    def cache_identity(self) -> dict[str, str]:
+        return {
+            "mode": "qwen" if self.available else "fallback",
+            "provider": self.provider_key,
+            "model": self.model_identity,
+            "parser_revision": PRODUCT_UNDERSTANDING_REVISION,
+            "prompt_fingerprint": _prompt_fingerprint(),
+        }
 
     @property
     def available(self) -> bool:
@@ -294,6 +632,7 @@ class SourcingAIService:
             "base_url": provider_info.get("base_url", ""),
             "available": configured,
             "status": self._last_status if configured else "not_configured",
+            "parser_revision": PRODUCT_UNDERSTANDING_REVISION,
         }
 
     def _record_error(self, exc: Exception) -> None:
@@ -309,28 +648,56 @@ class SourcingAIService:
             return f"{prefix}: Qwen вернул некорректный JSON; использован детерминированный fallback"
         return f"{prefix}: Qwen недоступен; использован детерминированный fallback"
 
-    def understand(self, row: dict[str, Any], fallback: ProductIntent) -> tuple[ProductIntent, list[str]]:
+    def _fallback_result(
+        self,
+        fallback: ProductIntent,
+        warnings: list[str],
+        *,
+        latency_ms: float | None = None,
+    ) -> ProductUnderstandingResult:
+        return ProductUnderstandingResult(
+            baseline_intent=fallback,
+            ai_proposal=None,
+            resolved_intent=fallback,
+            suggestions=[],
+            warnings=list(dict.fromkeys(warnings)),
+            mode="fallback",
+            provenance=ProductUnderstandingProvenance(
+                provider=self.provider_key,
+                model=self.model_identity,
+                parser_revision=PRODUCT_UNDERSTANDING_REVISION,
+                latency_ms=latency_ms,
+            ),
+        )
+
+    def understand_with_audit(
+        self,
+        row: dict[str, Any],
+        fallback: ProductIntent,
+    ) -> ProductUnderstandingResult:
         if not self.available:
-            return fallback, ["AI product understanding unavailable; deterministic fallback used"]
+            return self._fallback_result(
+                fallback,
+                ["Qwen не настроен; использован детерминированный fallback"],
+            )
+        started = time.perf_counter()
         try:
             provider = self.ai_service.ensure_provider(self.provider_key)
             prompt = {
                 "source_row_id": fallback.source_row_id,
+                "source_text": fallback.source_text,
                 "name": row.get("name", ""),
-                "type_mark": row.get("type_mark", ""),
-                "code": row.get("code", ""),
-                "manufacturer": row.get("manufacturer", ""),
-                "unit": row.get("unit", ""),
-                "quantity": row.get("quantity", ""),
+                "type_mark": fallback.model,
+                "code": fallback.article,
+                "manufacturer": fallback.manufacturer,
+                "unit": fallback.unit,
+                "quantity": fallback.quantity,
                 "note": row.get("note", ""),
             }
             raw = provider.complete([
                 {
                     "role": "system",
-                    "content": (
-                        "Return only strict JSON matching ProductIntent fields. "
-                        "Preserve evidence and uncertainties. Never invent commercial facts."
-                    ),
+                    "content": PRODUCT_UNDERSTANDING_SYSTEM_PROMPT,
                 },
                 {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
             ])
@@ -342,14 +709,47 @@ class SourcingAIService:
             payload.setdefault("source_text", fallback.source_text)
             payload.setdefault("quantity", fallback.quantity)
             payload.setdefault("unit", fallback.unit)
+            payload, rejected_attributes = _normalize_ai_payload(payload)
             candidate = ProductIntent.model_validate(payload)
             merged = merge_intent_with_source(candidate, fallback)
             self._last_status = "ready"
-            return merged, []
+            warnings = []
+            if rejected_attributes:
+                warnings.append("Qwen returned unsupported attribute keys; they were ignored")
+            return ProductUnderstandingResult(
+                baseline_intent=fallback,
+                ai_proposal=candidate,
+                resolved_intent=merged,
+                suggestions=_audit_suggestions(
+                    fallback, candidate, merged, rejected_attributes
+                ),
+                warnings=warnings,
+                mode="qwen",
+                provenance=ProductUnderstandingProvenance(
+                    provider=self.provider_key,
+                    model=str(getattr(provider, "model", "") or self.model_identity),
+                    parser_revision=PRODUCT_UNDERSTANDING_REVISION,
+                    latency_ms=round((time.perf_counter() - started) * 1000, 3),
+                ),
+            )
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
-            return fallback, [self._safe_warning("AI product understanding failed", exc)]
+            return self._fallback_result(
+                fallback,
+                [self._safe_warning("AI product understanding failed", exc)],
+                latency_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
         except Exception as exc:  # provider/network failures are a non-fatal sourcing warning
-            return fallback, [self._safe_warning("AI product understanding unavailable", exc)]
+            return self._fallback_result(
+                fallback,
+                [self._safe_warning("AI product understanding unavailable", exc)],
+                latency_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
+
+    def understand(self, row: dict[str, Any], fallback: ProductIntent) -> tuple[ProductIntent, list[str]]:
+        """Backward-compatible safe-intent API used by existing callers."""
+
+        result = self.understand_with_audit(row, fallback)
+        return result.resolved_intent, result.warnings
 
     def rank_matches(
         self,

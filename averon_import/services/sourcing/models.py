@@ -50,6 +50,48 @@ class ProductIntent(SourcingModel):
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+class SuggestionResolution(str, Enum):
+    SOURCE_LOCKED = "SOURCE_LOCKED"
+    ACCEPTED_GROUNDED = "ACCEPTED_GROUNDED"
+    PREFERRED_AI_INFERENCE = "PREFERRED_AI_INFERENCE"
+    REJECTED_UNGROUNDED = "REJECTED_UNGROUNDED"
+    UNCHANGED = "UNCHANGED"
+
+
+class ProductUnderstandingSuggestion(SourcingModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field: str
+    source_value: Any = None
+    proposed_value: Any = None
+    resolution: SuggestionResolution
+    reason: str = ""
+    grounded: bool = False
+
+
+class ProductUnderstandingProvenance(SourcingModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str
+    model: str = ""
+    parser_revision: str
+    latency_ms: float | None = Field(default=None, ge=0)
+
+
+class ProductUnderstandingResult(SourcingModel):
+    """Auditable envelope around the safe downstream ProductIntent."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    baseline_intent: ProductIntent
+    ai_proposal: ProductIntent | None = None
+    resolved_intent: ProductIntent
+    suggestions: list[ProductUnderstandingSuggestion] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    mode: Literal["qwen", "fallback"] = "fallback"
+    provenance: ProductUnderstandingProvenance
+
+
 class Offer(SourcingModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -111,6 +153,7 @@ class MatchResult(SourcingModel):
 
 class SourcingResult(SourcingModel):
     intent: ProductIntent
+    understanding: ProductUnderstandingResult | None = None
     recommended_offer: Offer | None = None
     offers: list[Offer] = Field(default_factory=list)
     match_results: list[MatchResult] = Field(default_factory=list)

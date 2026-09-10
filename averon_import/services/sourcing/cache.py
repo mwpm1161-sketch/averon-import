@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from averon_import.services.sourcing.models import ProductIntent, SourcingResult
+from averon_import.services.sourcing.models import (
+    ProductIntent,
+    ProductUnderstandingResult,
+    SourcingResult,
+)
 
 
 class SourcingCache:
@@ -26,8 +30,15 @@ class SourcingCache:
         payload = self._read().get(key)
         if not isinstance(payload, dict):
             return None
+        try:
+            return SourcingResult.model_validate(payload)
+        except Exception:
+            return None
 
     def get_intent(self, key: str) -> tuple[ProductIntent, list[str]] | None:
+        understanding = self.get_understanding(key)
+        if understanding is not None:
+            return understanding.resolved_intent, list(understanding.warnings)
         payload = self._read().get("__intents__", {}).get(key)
         if not isinstance(payload, dict):
             return None
@@ -38,8 +49,16 @@ class SourcingCache:
             )
         except Exception:
             return None
+
+    def get_understanding(self, key: str) -> ProductUnderstandingResult | None:
+        payload = self._read().get("__intents__", {}).get(key)
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("understanding")
+        if not isinstance(value, dict):
+            return None
         try:
-            return SourcingResult.model_validate(payload)
+            return ProductUnderstandingResult.model_validate(value)
         except Exception:
             return None
 
@@ -64,6 +83,24 @@ class SourcingCache:
         intents[key] = {
             "intent": intent.model_dump(mode="json"),
             "warnings": list(warnings),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(self.path)
+
+    def set_understanding(self, key: str, value: ProductUnderstandingResult) -> None:
+        if not self.path:
+            return
+        data = self._read()
+        intents = data.setdefault("__intents__", {})
+        if not isinstance(intents, dict):
+            intents = {}
+            data["__intents__"] = intents
+        intents[key] = {
+            "intent": value.resolved_intent.model_dump(mode="json"),
+            "warnings": list(value.warnings),
+            "understanding": value.model_dump(mode="json"),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")

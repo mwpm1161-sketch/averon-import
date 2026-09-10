@@ -762,6 +762,49 @@ function renderOfferCard(result, compact = false, intent = null) {
   </article>`;
 }
 
+const understandingAttributeLabels = {
+  power:"Мощность, кВт", voltage:"Напряжение, В", current:"Ток, А",
+  diameter:"Диаметр, мм", pressure:"Давление, PN", cores:"Число жил",
+  cable_section:"Сечение, мм²", protection_class:"Степень защиты",
+  dimensions:"Размеры, мм", material:"Материал", mounting_type:"Монтаж",
+  features:"Особенности",
+};
+
+const understandingFieldLabels = {
+  manufacturer:"Производитель", brand:"Бренд", model:"Модель", article:"Артикул",
+  product_class:"Категория", normalized_name:"Наименование",
+};
+
+function understandingValue(value) {
+  if (Array.isArray(value)) return value.join(", ");
+  if (value && typeof value === "object") return Object.values(value).join(" ");
+  return String(value ?? "");
+}
+
+function renderProductUnderstanding(understanding) {
+  if (!understanding) return "";
+  const baseline = understanding.baseline_intent || {};
+  const resolved = understanding.resolved_intent || {};
+  const status = understanding.mode === "qwen" ? "AI Studio · Qwen" : "Локальный разбор · Qwen недоступен";
+  const resolvedFacts = [
+    ["Категория", resolved.product_class],
+    ["Производитель", resolved.manufacturer || resolved.brand],
+    ["Модель", resolved.model],
+    ["Артикул", resolved.article],
+    ...Object.entries(resolved.attributes || {}).map(([key, value]) => [understandingAttributeLabels[key] || key, understandingValue(value)]),
+  ].filter(([, value]) => String(value ?? "").trim());
+  const proposals = (understanding.suggestions || []).filter((item) =>
+    ["PREFERRED_AI_INFERENCE", "REJECTED_UNGROUNDED", "SOURCE_LOCKED"].includes(item.resolution)
+    && String(item.proposed_value ?? "").trim()
+  );
+  return `<section class="understanding-panel">
+    <div class="understanding-heading"><div><small>Исходные данные</small><b>${escapeHtml(baseline.source_text || "Нет исходного текста")}</b></div><span class="technical-badge">${escapeHtml(status)}</span></div>
+    <div class="understanding-source-meta">${baseline.manufacturer ? `<span>${escapeHtml(baseline.manufacturer)}</span>` : ""}${baseline.model ? `<span>${escapeHtml(baseline.model)}</span>` : ""}${baseline.article ? `<span>${escapeHtml(baseline.article)}</span>` : ""}</div>
+    <div class="understanding-resolved"><small>Разбор позиции</small>${resolvedFacts.length ? resolvedFacts.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><b>${escapeHtml(String(value))}</b></div>`).join("") : `<p>Характеристики не определены.</p>`}</div>
+    ${proposals.length ? `<div class="understanding-suggestions"><small>Предположение AI</small>${proposals.slice(0, 5).map((item) => { const key = String(item.field || "").replace(/^attributes\./, ""); const label = understandingFieldLabels[key] || understandingAttributeLabels[key] || "Характеристика"; return `<span><b>${escapeHtml(label)}:</b> ${escapeHtml(understandingValue(item.proposed_value))}</span>`; }).join("")}</div>` : ""}
+  </section>`;
+}
+
 function renderSourcingResult(result, row = null) {
   const content = $("#sourcing-content");
   if (result.positions_total !== undefined) {
@@ -776,7 +819,7 @@ function renderSourcingResult(result, row = null) {
   const alternatives = (result.match_results || []).filter((item) => item !== best && item.decision !== "REJECT").slice(0, 5);
   const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
   $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
-  content.innerHTML = `<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges"><span class="technical-badge">${result.ai_mode === "qwen" ? "Qwen · AI Studio" : "Без AI · резервный режим"}</span>${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+  content.innerHTML = `${renderProductUnderstanding(result.understanding)}<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges"><span class="technical-badge">${result.ai_mode === "qwen" ? "Qwen · AI Studio" : "Без AI · резервный режим"}</span>${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
 }
 
 async function openSourcingForRow(row) {

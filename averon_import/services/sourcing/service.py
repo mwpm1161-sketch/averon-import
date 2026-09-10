@@ -11,6 +11,7 @@ from averon_import.services.sourcing.matching import OfferMatcher, recommended_o
 from averon_import.services.sourcing.models import (
     MatchDecision,
     ProductIntent,
+    ProductUnderstandingResult,
     ProjectSourcingResult,
     SourcingResult,
 )
@@ -52,16 +53,20 @@ class SourcingService:
         intent, _ = self.understand_row_with_warnings(row)
         return intent
 
-    def understand_row_with_warnings(self, row: dict[str, Any]) -> tuple[ProductIntent, list[str]]:
+    def understand_row_result(self, row: dict[str, Any]) -> ProductUnderstandingResult:
         source = dict(row)
         cache_key = self._intent_cache_key(source)
-        cached = self.cache.get_intent(cache_key)
+        cached = self.cache.get_understanding(cache_key)
         if cached is not None:
             return cached
         fallback = build_fallback_intent(source)
-        result = self.ai.understand(source, fallback)
-        self.cache.set_intent(cache_key, *result)
+        result = self.ai.understand_with_audit(source, fallback)
+        self.cache.set_understanding(cache_key, result)
         return result
+
+    def understand_row_with_warnings(self, row: dict[str, Any]) -> tuple[ProductIntent, list[str]]:
+        result = self.understand_row_result(row)
+        return result.resolved_intent, list(result.warnings)
 
     def search_row(
         self,
@@ -70,8 +75,14 @@ class SourcingService:
         provider_key: str | None = None,
         limit: int = 20,
     ) -> SourcingResult:
-        intent, warnings = self.understand_row_with_warnings(row)
-        return self.search_intent(intent, provider_key=provider_key, limit=limit, warnings=warnings)
+        understanding = self.understand_row_result(row)
+        return self.search_intent(
+            understanding.resolved_intent,
+            provider_key=provider_key,
+            limit=limit,
+            warnings=list(understanding.warnings),
+            understanding=understanding,
+        )
 
     def search_intent(
         self,
@@ -80,6 +91,7 @@ class SourcingService:
         provider_key: str | None = None,
         limit: int = 20,
         warnings: list[str] | None = None,
+        understanding: ProductUnderstandingResult | None = None,
     ) -> SourcingResult:
         provider = self.provider(provider_key)
         stats = provider.stats() if hasattr(provider, "stats") else {}
@@ -95,12 +107,13 @@ class SourcingService:
         match_results, ranking_warnings = self.ai.rank_matches(intent, match_results)
         result = SourcingResult(
             intent=intent,
+            understanding=understanding,
             recommended_offer=recommended_offer(match_results),
             offers=offers,
             match_results=match_results,
             warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
             timings={"retrieval_s": round(retrieval_time, 6)},
-            ai_mode=("qwen" if self.ai.available else "fallback"),
+            ai_mode=(understanding.mode if understanding is not None else ("qwen" if self.ai.available else "fallback")),
         )
         self.cache.set(cache_key, result)
         return result
@@ -192,13 +205,16 @@ class SourcingService:
         payload = {
             key: row.get(key, "")
             for key in (
-                "id", "source_row_id", "page", "source_row", "name", "title",
-                "type_mark", "code", "manufacturer", "unit", "quantity", "note",
+                "id", "source_row_id", "source_text", "page", "source_row", "name", "title",
+                "type_mark", "model", "code", "manufacturer", "unit", "quantity", "note",
             )
         }
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-        availability = "ai" if self.ai.available else "fallback"
-        return "intent:" + hashlib.sha256(f"{availability}:".encode() + encoded.encode("utf-8")).hexdigest()
+        identity = {
+            "source": payload,
+            "parser": self.ai.cache_identity(),
+        }
+        encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+        return "intent:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _trusted_quantity(row: dict[str, Any]) -> Decimal | None:

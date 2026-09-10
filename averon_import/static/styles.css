@@ -230,6 +230,17 @@ button { cursor: pointer; }
 .intent-summary b { display:block; color:#0f172a; }
 .intent-badges { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:8px; }
 .technical-badge { padding:5px 9px; border-radius:999px; background:#e0f2fe; color:#075985; font-size:12px; }
+.understanding-panel { margin-bottom:16px; padding:16px; border:1px solid #dbe4ee; border-radius:14px; background:#fff; }
+.understanding-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:14px; }
+.understanding-heading small,.understanding-resolved > small,.understanding-suggestions > small { display:block; margin-bottom:5px; color:#64748b; }
+.understanding-heading b { display:block; max-width:650px; color:#0f172a; line-height:1.45; }
+.understanding-source-meta { display:flex; flex-wrap:wrap; gap:7px 14px; margin-top:8px; color:#475569; font-size:13px; }
+.understanding-resolved { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 20px; margin-top:16px; padding-top:14px; border-top:1px solid #e2e8f0; }
+.understanding-resolved > small { grid-column:1 / -1; }
+.understanding-resolved div { display:flex; justify-content:space-between; gap:12px; font-size:13px; }
+.understanding-resolved span { color:#64748b; }.understanding-resolved b { text-align:right; color:#0f172a; }
+.understanding-suggestions { display:flex; flex-wrap:wrap; gap:7px 12px; margin-top:13px; padding:10px 12px; border-radius:10px; background:#fff7ed; color:#9a3412; font-size:12px; }
+.understanding-suggestions > small { flex-basis:100%; color:#9a3412; }
 .offer-card { padding:18px; border-radius:16px; border:1px solid #dbe4ee; background:#fff; box-shadow:0 10px 25px rgba(15,23,42,.06); margin:12px 0 20px; }
 .offer-card.recommended { border-color:#7dd3fc; background:linear-gradient(135deg,#f0f9ff,#fff); }
 .offer-card-heading { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
@@ -251,6 +262,7 @@ button { cursor: pointer; }
 .project-result-row:last-child { border-bottom:0; }
 .offer-total { display:flex; flex-wrap:wrap; gap:16px; margin:12px 0; color:#475569; font-size:13px; }
 @media (max-width:760px) {
-  .intent-summary, .sourcing-project-summary, .offer-grid { grid-template-columns:1fr; }
+  .intent-summary, .sourcing-project-summary, .offer-grid, .understanding-resolved { grid-template-columns:1fr; }
+  .understanding-heading { flex-direction:column; }
   .project-result-row { grid-template-columns:1fr; gap:4px; }
 }

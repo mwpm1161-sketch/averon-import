@@ -5,6 +5,8 @@ from averon_import.services.sourcing.models import (
     MatchResult,
     Offer,
     ProductIntent,
+    ProductUnderstandingResult,
+    ProductUnderstandingSuggestion,
     ProjectSourcingResult,
     SourcingResult,
 )
@@ -16,6 +18,8 @@ __all__ = [
     "MatchResult",
     "Offer",
     "ProductIntent",
+    "ProductUnderstandingResult",
+    "ProductUnderstandingSuggestion",
     "ProjectSourcingResult",
     "SourcingResult",
     "SourcingService",

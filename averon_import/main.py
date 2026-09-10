@@ -549,8 +549,12 @@ def sourcing_catalog_stats():
 
 @app.post("/api/sourcing/understand")
 def sourcing_understand(request: SourcingRowRequest):
-    intent, warnings = sourcing_service.understand_row_with_warnings(request.row)
-    return {"intent": _sourcing_payload(intent), "warnings": warnings}
+    understanding = sourcing_service.understand_row_result(request.row)
+    return {
+        "intent": _sourcing_payload(understanding.resolved_intent),
+        "understanding": _sourcing_payload(understanding),
+        "warnings": list(understanding.warnings),
+    }
 
 
 @app.post("/api/sourcing/search")

@@ -100,3 +100,19 @@ def test_semantic_review_preview_is_visible_without_canonical_values():
     assert 'row.row_type === "semantic_review"' in app_js
     assert "semantic_review_preview" in app_js
     assert "Проверить:" in app_js
+
+
+def test_sourcing_modal_shows_audited_product_understanding_without_raw_transport_data():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert "function renderProductUnderstanding(understanding)" in app_js
+    assert "Исходные данные" in app_js
+    assert "Разбор позиции" in app_js
+    assert "Предположение AI" in app_js
+    assert "AI Studio · Qwen" in app_js
+    assert "Локальный разбор · Qwen недоступен" in app_js
+    assert "result.understanding" in app_js
+    assert ".understanding-panel" in css
+    assert "understanding.provenance.base_url" not in app_js
+    assert "JSON.stringify(understanding)" not in app_js
