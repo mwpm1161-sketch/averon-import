@@ -6,6 +6,13 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from averon_import.services.app_settings import AppSettingsService
+from averon_import.services.secrets import (
+    YANDEX_AI_API_KEY,
+    YANDEX_API_KEY,
+    InsecureFileSecretStore,
+    MemorySecretStore,
+)
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.catalog_repository import CatalogRepository
 from averon_import.services.sourcing.matching import OfferMatcher
@@ -435,16 +442,67 @@ def test_q2_environment_model_overrides_app_settings(tmp_path, monkeypatch):
 
 def test_q3_secret_store_yandex_key_configures_sourcing_ai(tmp_path, monkeypatch):
     from averon_import.services.app_settings import AppSettingsService
-    from averon_import.services.secrets import MemorySecretStore
+    from averon_import.services.secrets import MemorySecretStore, YANDEX_AI_API_KEY
 
     for name in ("AVERON_YANDEX_AI_MODEL", "AVERON_YANDEX_AI_BASE_URL", "AVERON_YANDEX_AI_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     settings = AppSettingsService(tmp_path)
     settings.update({"yandex": {"llm_model": "gpt://folder/qwen/latest"}})
     store = MemorySecretStore()
-    store.set("yandex.api_key", "stored-key")
+    store.set(YANDEX_AI_API_KEY, "stored-key")
     transport = create_sourcing_ai_transport(settings, store)
     assert transport.providers["yandex"].configured is True
+
+
+def test_q_dedicated_ai_does_not_reuse_vision_credential(tmp_path, monkeypatch):
+    monkeypatch.delenv("AVERON_YANDEX_AI_API_KEY", raising=False)
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"folder_id": "folder-1", "llm_model": "gpt://folder-1/qwen/latest"}})
+    store = MemorySecretStore()
+    store.set(YANDEX_API_KEY, "vision-only")
+    transport = create_sourcing_ai_transport(settings, store)
+    provider = transport.providers["yandex"]
+    assert provider.configured is False
+    assert provider.settings.api_key == ""
+
+
+def test_q_dedicated_ai_secret_configures_sourcing_and_survives_restart(tmp_path, monkeypatch):
+    monkeypatch.delenv("AVERON_YANDEX_AI_API_KEY", raising=False)
+    settings_dir = tmp_path / "settings"
+    secrets_dir = tmp_path / "secrets"
+    settings = AppSettingsService(settings_dir)
+    settings.update({"yandex": {"folder_id": "folder-1", "llm_model": "gpt://folder-1/qwen/latest"}})
+    store = InsecureFileSecretStore(secrets_dir)
+    store.set(YANDEX_AI_API_KEY, "dedicated-ai")
+    first = create_sourcing_ai_transport(settings, store)
+    restarted_settings = AppSettingsService(settings_dir)
+    restarted_store = InsecureFileSecretStore(secrets_dir)
+    second = create_sourcing_ai_transport(restarted_settings, restarted_store)
+    assert first.providers["yandex"].configured is True
+    assert second.providers["yandex"].configured is True
+    assert second.providers["yandex"].settings.api_key == "dedicated-ai"
+
+
+def test_q_dedicated_ai_environment_overrides_stored_ai_key(tmp_path, monkeypatch):
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"folder_id": "folder-1", "llm_model": "gpt://folder-1/qwen/latest"}})
+    store = MemorySecretStore()
+    store.set(YANDEX_AI_API_KEY, "stored-ai")
+    monkeypatch.setenv("AVERON_YANDEX_AI_API_KEY", "environment-ai")
+    transport = create_sourcing_ai_transport(settings, store)
+    assert transport.providers["yandex"].settings.api_key == "environment-ai"
+
+
+def test_q_dedicated_ai_secret_never_appears_in_public_config_or_health(tmp_path):
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"folder_id": "folder-1", "llm_model": "gpt://folder-1/qwen/latest"}})
+    store = MemorySecretStore()
+    store.set(YANDEX_AI_API_KEY, "private-ai-secret")
+    transport = create_sourcing_ai_transport(settings, store)
+    ai = SourcingAIService(transport)
+    public = json.dumps({"config": ai.public_config(), "health": transport.health()}, ensure_ascii=False)
+    assert "private-ai-secret" not in public
+    assert "api_key" not in public
 
 
 def test_q4_sourcing_public_config_never_exposes_secret(tmp_path, monkeypatch):

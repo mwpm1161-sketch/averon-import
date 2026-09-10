@@ -52,6 +52,7 @@ from averon_import.services.review_decisions import (
 )
 from averon_import.services.review_policy import refresh_rows
 from averon_import.services.secrets import (
+    YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
     create_secret_store,
     resolve_secret,
@@ -216,7 +217,7 @@ class SourcingSettingsUpdate(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    """api_key is write-only: it goes to the SecretStore and is never returned."""
+    """API keys are write-only and are stored in separate SecretStore entries."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -226,22 +227,28 @@ class SettingsUpdate(BaseModel):
     pipeline: PipelineSettingsUpdate | None = None
     sourcing: SourcingSettingsUpdate | None = None
     api_key: str | None = None
+    ai_api_key: str | None = None
     delete_yandex_api_key: bool = False
+    delete_yandex_ai_api_key: bool = False
 
 
 def _settings_public() -> dict:
     payload = app_settings_service.public()
-    api_key_configured = None
-    for env_name in ("AVERON_YANDEX_VISION_API_KEY", "AVERON_YANDEX_AI_API_KEY"):
-        raw = os.environ.get(env_name)
-        if raw and raw.strip():
-            api_key_configured = resolve_secret(raw, secret_store, YANDEX_API_KEY)
-            break
-    if api_key_configured is None:
-        api_key_configured = resolve_secret(None, secret_store, YANDEX_API_KEY)
-    payload["yandex"]["api_key_configured"] = (
-        api_key_configured is not None
-    )
+    vision_key_configured = resolve_secret(
+        os.environ.get("AVERON_YANDEX_VISION_API_KEY"),
+        secret_store,
+        YANDEX_API_KEY,
+    ) is not None
+    ai_key_configured = resolve_secret(
+        os.environ.get("AVERON_YANDEX_AI_API_KEY"),
+        secret_store,
+        YANDEX_AI_API_KEY,
+    ) is not None
+    # Keep the legacy field as the Vision/OCR status.  It must not mean
+    # "either credential is present".
+    payload["yandex"]["api_key_configured"] = vision_key_configured
+    payload["yandex"]["vision_api_key_configured"] = vision_key_configured
+    payload["yandex"]["ai_api_key_configured"] = ai_key_configured
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
     return payload
@@ -256,9 +263,21 @@ def get_settings():
 def put_settings(request: SettingsUpdate):
     if request.api_key is not None and request.api_key.strip():
         secret_store.set(YANDEX_API_KEY, request.api_key.strip())
+    if request.ai_api_key is not None and request.ai_api_key.strip():
+        secret_store.set(YANDEX_AI_API_KEY, request.ai_api_key.strip())
     if request.delete_yandex_api_key:
         secret_store.delete(YANDEX_API_KEY)
-    patch = request.model_dump(exclude_none=True, exclude={"api_key", "delete_yandex_api_key"})
+    if request.delete_yandex_ai_api_key:
+        secret_store.delete(YANDEX_AI_API_KEY)
+    patch = request.model_dump(
+        exclude_none=True,
+        exclude={
+            "api_key",
+            "ai_api_key",
+            "delete_yandex_api_key",
+            "delete_yandex_ai_api_key",
+        },
+    )
     patch = {key: value for key, value in patch.items() if value is not None}
     try:
         app_settings_service.update(patch)
@@ -277,6 +296,12 @@ def put_settings(request: SettingsUpdate):
 @app.delete("/api/settings/yandex-api-key")
 def delete_yandex_api_key():
     secret_store.delete(YANDEX_API_KEY)
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/yandex-ai-api-key")
+def delete_yandex_ai_api_key():
+    secret_store.delete(YANDEX_AI_API_KEY)
     return {"deleted": True}
 
 

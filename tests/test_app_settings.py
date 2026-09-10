@@ -13,6 +13,7 @@ from averon_import.services.app_settings import (
     AppSettingsService,
 )
 from averon_import.services.secrets import (
+    YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
     InsecureFileSecretStore,
     MemorySecretStore,
@@ -143,6 +144,17 @@ def test_memory_store_has_set_delete():
     store.delete(YANDEX_API_KEY)
 
 
+def test_memory_store_keeps_vision_and_ai_credentials_independent():
+    store = MemorySecretStore()
+    store.set(YANDEX_API_KEY, "vision-key")
+    store.set(YANDEX_AI_API_KEY, "ai-key")
+    assert store.get(YANDEX_API_KEY) == "vision-key"
+    assert store.get(YANDEX_AI_API_KEY) == "ai-key"
+    store.delete(YANDEX_AI_API_KEY)
+    assert store.get(YANDEX_API_KEY) == "vision-key"
+    assert store.get(YANDEX_AI_API_KEY) is None
+
+
 def test_insecure_file_store_roundtrip_and_atomicity(tmp_path):
     store = InsecureFileSecretStore(tmp_path)
     store.set(YANDEX_API_KEY, SECRET_VALUE)
@@ -209,6 +221,21 @@ def test_get_settings_exposes_only_boolean_for_key(api):
     assert "api_key" not in payload["yandex"]
 
 
+def test_get_settings_distinguishes_vision_and_ai_key_status(api):
+    app_module, store, _ = api
+    store.set(YANDEX_API_KEY, "vision-secret")
+    payload = app_module.get_settings()
+    assert payload["yandex"]["api_key_configured"] is True
+    assert payload["yandex"]["vision_api_key_configured"] is True
+    assert payload["yandex"]["ai_api_key_configured"] is False
+    store.set(YANDEX_AI_API_KEY, "ai-secret")
+    payload = app_module.get_settings()
+    assert payload["yandex"]["vision_api_key_configured"] is True
+    assert payload["yandex"]["ai_api_key_configured"] is True
+    _assert_secret_absent(payload, "vision-secret")
+    _assert_secret_absent(payload, "ai-secret")
+
+
 def test_api_config_never_contains_secret(api):
     app_module, _, _ = api
     config_payload = app_module.config()
@@ -228,6 +255,39 @@ def test_put_saves_key_to_store_not_settings_json(api, tmp_path):
     raw_file = (service.path).read_text(encoding="utf-8") if service.path.exists() else ""
     assert SECRET_VALUE not in raw_file and "api_key" not in raw_file
     assert service.settings.processing_mode == "cloud"
+
+
+def test_put_saves_dedicated_ai_key_without_touching_vision_key(api, tmp_path):
+    app_module, store, service = api
+    response = app_module.put_settings(app_module.SettingsUpdate(
+        yandex=app_module.YandexSettingsUpdate(
+            folder_id="f-ai",
+            llm_model="gpt://f-ai/qwen3.6-35b-a3b/latest",
+        ),
+        ai_api_key="  dedicated-ai-key  ",
+    ))
+    assert store.get(YANDEX_API_KEY) is None
+    assert store.get(YANDEX_AI_API_KEY) == "dedicated-ai-key"
+    assert response["yandex"]["api_key_configured"] is False
+    assert response["yandex"]["ai_api_key_configured"] is True
+    raw_file = service.path.read_text(encoding="utf-8")
+    assert "dedicated-ai-key" not in raw_file
+
+
+def test_put_and_delete_vision_and_ai_keys_are_independent(api):
+    app_module, store, _ = api
+    app_module.put_settings(app_module.SettingsUpdate(
+        api_key="vision-key",
+        ai_api_key="ai-key",
+    ))
+    assert store.get(YANDEX_API_KEY) == "vision-key"
+    assert store.get(YANDEX_AI_API_KEY) == "ai-key"
+    app_module.put_settings(app_module.SettingsUpdate(delete_yandex_api_key=True))
+    assert store.get(YANDEX_API_KEY) is None
+    assert store.get(YANDEX_AI_API_KEY) == "ai-key"
+    app_module.put_settings(app_module.SettingsUpdate(delete_yandex_ai_api_key=True))
+    assert store.get(YANDEX_API_KEY) is None
+    assert store.get(YANDEX_AI_API_KEY) is None
 
 
 def test_put_partial_section_merge_keeps_other_fields(api, tmp_path):

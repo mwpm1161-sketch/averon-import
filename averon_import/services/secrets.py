@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Protocol
 
 YANDEX_API_KEY = "yandex.api_key"
+# Dedicated Yandex AI Studio credential.  It must never fall back to the
+# Vision/OCR credential above.
+YANDEX_AI_API_KEY = "yandex.ai_api_key"
 
 
 class SecretStoreError(RuntimeError):

@@ -229,13 +229,18 @@
           <p class="hint">Через запятую, например: ru,en</p>
         </div>
         <div>
-          <label class="field-label" for="settings-api-key">API key</label>
+          <label class="field-label" for="settings-api-key">Yandex Vision API key</label>
           <input class="input" id="settings-api-key" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
         </div>
         <div>
           <label class="field-label" for="settings-llm-model">AI Studio / Qwen model</label>
           <input class="input" id="settings-llm-model" autocomplete="off" placeholder="gpt://&lt;folder_id&gt;/qwen3.6-35b-a3b/latest">
           <p class="hint">OpenAI-compatible Yandex endpoint. Модель и base URL не являются секретами.</p>
+        </div>
+        <div>
+          <label class="field-label" for="settings-ai-api-key">API-ключ Qwen / AI Studio</label>
+          <input class="input" id="settings-ai-api-key" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
+          <p class="hint">Отдельный ключ AI Studio; значение не отображается и не сохраняется в settings.json.</p>
         </div>
       </div>
       <p class="mode-status" id="settings-connection"></p>

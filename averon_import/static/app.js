@@ -114,19 +114,24 @@ function initializeSettings(settings) {
   $("#settings-vision-model").value = settings?.yandex?.vision_model || "table";
   $("#settings-language-codes").value = (settings?.yandex?.language_codes || ["ru", "en"]).join(",");
   const ready = Boolean(state.ocrHealth?.available);
+  const visionKeyReady = Boolean(settings?.yandex?.vision_api_key_configured ?? settings?.yandex?.api_key_configured);
   $("#settings-connection").textContent = ready
-    ? "Yandex Vision подключён."
-    : "Yandex Vision не настроен. API key не отображается и не возвращается сервером.";
+    ? `Yandex Vision подключён · ключ ${visionKeyReady ? "настроен" : "не настроен"}.`
+    : `Yandex Vision не настроен · ключ ${visionKeyReady ? "настроен" : "не настроен"}.`;
   $("#settings-connection").className = ready ? "mode-status ok" : "mode-status warning";
   const folder = settings?.yandex?.folder_id || "";
   const proposal = folder ? `gpt://${folder}/qwen3.6-35b-a3b/latest` : "";
   $("#settings-llm-model").value = settings?.yandex?.llm_model || proposal;
+  const aiKeyReady = Boolean(settings?.yandex?.ai_api_key_configured);
+  $("#settings-ai-connection").textContent = `Qwen / AI Studio: ключ ${aiKeyReady ? "настроен" : "не настроен"}.`;
+  $("#settings-ai-connection").className = aiKeyReady ? "mode-status ok" : "mode-status warning";
   updateSourcingStatus();
 }
 
 function updateSourcingStatus() {
   const ai = state.sourcingHealth?.ai || state.config?.sourcing?.ai || {};
   const status = ai.status || "not_configured";
+  const keyReady = Boolean(state.settings?.yandex?.ai_api_key_configured);
   const element = $("#settings-ai-connection");
   if (!element) return;
   if (status === "ready") {
@@ -135,11 +140,14 @@ function updateSourcingStatus() {
   } else if (status === "access_denied") {
     element.textContent = "Ключ не имеет доступа к AI Studio. Используется резервный режим.";
     element.className = "mode-status warning";
+  } else if (!keyReady) {
+    element.textContent = "Qwen / AI Studio: ключ не настроен.";
+    element.className = "mode-status warning";
   } else if (ai.available) {
     element.textContent = "Qwen настроен; доступ проверится при подборе.";
     element.className = "mode-status warning";
   } else {
-    element.textContent = "Qwen не настроен. Подбор работает по каталогу.";
+    element.textContent = "Qwen / AI Studio: ключ настроен; модель или доступ не проверены.";
     element.className = "mode-status warning";
   }
 }
@@ -148,6 +156,7 @@ async function saveSettings() {
   const codes = $("#settings-language-codes").value.split(",").map((value) => value.trim()).filter(Boolean);
   if (!codes.length) { toast("Укажите хотя бы один язык OCR", "error"); return; }
   const apiKey = $("#settings-api-key").value.trim();
+  const aiApiKey = $("#settings-ai-api-key").value.trim();
   const payload = {
     processing_mode: "cloud",
     yandex: {
@@ -158,6 +167,7 @@ async function saveSettings() {
     },
   };
   if (apiKey) payload.api_key = apiKey;
+  if (aiApiKey) payload.ai_api_key = aiApiKey;
   try {
     state.settings = await api("/api/settings", {
       method: "PUT",
@@ -168,6 +178,7 @@ async function saveSettings() {
     state.ocrHealth = health.cloud_ocr;
     state.sourcingHealth = health.sourcing || null;
     $("#settings-api-key").value = "";
+    $("#settings-ai-api-key").value = "";
     initializeSettings(state.settings);
     updateCloudStatus();
     updateSourcingStatus();

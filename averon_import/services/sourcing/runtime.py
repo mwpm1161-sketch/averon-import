@@ -8,7 +8,7 @@ from typing import Any
 from averon_import.ai.config import AiSettings, ProviderSettings
 from averon_import.ai.provider import OpenAICompatibleProvider
 from averon_import.ai.service import AiCorrectionService
-from averon_import.services.secrets import YANDEX_API_KEY, resolve_secret
+from averon_import.services.secrets import YANDEX_AI_API_KEY, resolve_secret
 
 
 def _v1_base_url(value: str) -> str:
@@ -38,7 +38,7 @@ def create_sourcing_ai_transport(settings_service: Any, secret_store: Any) -> Ai
         api_key=resolve_secret(
             os.environ.get("AVERON_YANDEX_AI_API_KEY"),
             secret_store,
-            YANDEX_API_KEY,
+            YANDEX_AI_API_KEY,
         ) or "",
         # API-key credentials use Api-Key; IAM-style credentials can use
         # Bearer.  The provider retries only on 401/403.

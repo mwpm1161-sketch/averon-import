@@ -116,3 +116,16 @@ def test_sourcing_modal_shows_audited_product_understanding_without_raw_transpor
     assert ".understanding-panel" in css
     assert "understanding.provenance.base_url" not in app_js
     assert "JSON.stringify(understanding)" not in app_js
+
+
+def test_settings_ui_separates_vision_and_qwen_credentials():
+    html = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="settings-api-key"' in html
+    assert 'id="settings-ai-api-key"' in html
+    assert "Yandex Vision API key" in html
+    assert "API-ключ Qwen / AI Studio" in html
+    assert "vision_api_key_configured" in app_js
+    assert "ai_api_key_configured" in app_js
+    assert "payload.ai_api_key = aiApiKey" in app_js
