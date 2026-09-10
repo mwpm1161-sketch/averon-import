@@ -25,6 +25,15 @@ from averon_import.services.ocr.physical_grid import (
     validate_physical_grid,
 )
 from averon_import.services.ocr.raster_grid import RasterRuledTableGridDetector
+from averon_import.services.ocr.page_scene import (
+    LocalGridHypothesis,
+    PageSceneDetector,
+    PageSceneIR,
+    RasterRegionProposalSource,
+    TableRegionCandidate,
+    VectorTableRegionDetector,
+    build_page_scene,
+)
 from averon_import.services.ocr.tesseract_adapter import TesseractOcrAdapter
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.ocr.page_contract import PageExtractionStatus
@@ -68,6 +77,13 @@ __all__ = [
     "PhysicalGridDetection",
     "PhysicalGridDetector",
     "RasterRuledTableGridDetector",
+    "LocalGridHypothesis",
+    "PageSceneDetector",
+    "PageSceneIR",
+    "RasterRegionProposalSource",
+    "TableRegionCandidate",
+    "VectorTableRegionDetector",
+    "build_page_scene",
     "TesseractOcrAdapter",
     "YandexVisionProvider",
     "reconstruct_page_rows",

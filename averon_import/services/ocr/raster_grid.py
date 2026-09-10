@@ -655,6 +655,32 @@ class RasterRuledTableGridDetector:
         if grayscale.ndim != 2 or not grayscale.size:
             raise ValueError("Grid detector expects a non-empty grayscale image")
         height, width = grayscale.shape
+        horizontal, vertical, line_mask = self._line_masks(grayscale)
+        basic_metrics: dict[str, float | int | str] = {
+            "image_width_px": int(width),
+            "image_height_px": int(height),
+            "dpi": self.dpi,
+            "peak_array_bytes_estimate": int(
+                grayscale.nbytes
+                + (grayscale.nbytes * 4)
+            ),
+            "retained_array_bytes": int(grayscale.nbytes + line_mask.nbytes),
+        }
+        regions = self._candidate_regions(line_mask, width, height)
+        detections = [
+            self._detect_region(horizontal, vertical, region, width, height)
+            for region in regions
+        ]
+        return self._select_detection(
+            detections,
+            basic_metrics=basic_metrics,
+            started=started,
+            line_mask=line_mask,
+        )
+
+    def _line_masks(self, grayscale: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Extract reusable ruled-line masks for one already-rendered page."""
+        height, width = grayscale.shape
         _threshold, binary = cv2.threshold(
             grayscale,
             0,
@@ -690,25 +716,39 @@ class RasterRuledTableGridDetector:
             ),
         )
         line_mask = cv2.bitwise_or(horizontal, vertical)
+        return horizontal, vertical, line_mask
 
-        basic_metrics: dict[str, float | int | str] = {
-            "image_width_px": int(width),
-            "image_height_px": int(height),
-            "dpi": self.dpi,
-            "peak_array_bytes_estimate": int(
-                grayscale.nbytes
-                + binary.nbytes
-                + horizontal.nbytes
-                + vertical.nbytes
-                + line_mask.nbytes
-            ),
-            "retained_array_bytes": int(grayscale.nbytes + line_mask.nbytes),
-        }
+    def detect_region_detections(
+        self, grayscale: np.ndarray
+    ) -> tuple[PhysicalGridDetection, ...]:
+        """Expose every independent raster region without page-level selection.
+
+        The historical :meth:`detect_image` API still returns one dominant
+        detection.  This shadow API shares the same line extraction and
+        candidate-region logic, but preserves every local hypothesis for the
+        page-scene layer.
+        """
+        if grayscale.ndim != 2 or not grayscale.size:
+            raise ValueError("Grid detector expects a non-empty grayscale image")
+        horizontal, vertical, line_mask = self._line_masks(grayscale)
+        height, width = grayscale.shape
         regions = self._candidate_regions(line_mask, width, height)
-        detections = [
+        return tuple(
             self._detect_region(horizontal, vertical, region, width, height)
             for region in regions
-        ]
+        )
+
+    def _select_detection(
+        self,
+        detections: list[PhysicalGridDetection],
+        *,
+        basic_metrics: dict[str, float | int | str],
+        started: float,
+        line_mask: np.ndarray,
+    ) -> tuple[PhysicalGridDetection, np.ndarray]:
+        """Apply the legacy single-grid selection policy to all detections."""
+        height, width = line_mask.shape
+
         viable = [
             (index, detection)
             for index, detection in enumerate(detections)

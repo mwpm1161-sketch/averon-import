@@ -56,6 +56,7 @@ from averon_import.services.ocr.physical_grid import (
     PhysicalGridDetection,
     validate_physical_grid,
 )
+from averon_import.services.ocr.page_scene import PageSceneDetector
 from averon_import.services.ocr.raster_grid import (
     RasterGridPage,
     RasterRuledTableGridDetector,
@@ -183,6 +184,9 @@ class YandexVisionProvider:
         self._sleep = sleep_fn
         self._now = now_fn
         self._grid_detector = grid_detector or RasterRuledTableGridDetector()
+        self._page_scene_detector = PageSceneDetector(
+            raster_detector=self._grid_detector
+        )
         self._reconstruction_mode = (
             reconstruction_mode
             if reconstruction_mode in {"table", "shadow", "geometry"}
@@ -1401,6 +1405,11 @@ class YandexVisionProvider:
             "profile_ambiguous_count": 0,
             "unknown_spec_schema_count": 0,
             "profile_id_distribution": {},
+            "table_region_candidate_count": 0,
+            "table_region_trusted_count": 0,
+            "table_region_review_count": 0,
+            "table_region_rejected_count": 0,
+            "multi_table_pages": 0,
         }
         by_page: dict[int, PageOcrResult] = {
             number: PageOcrResult(page=number, provides_confidence=False)
@@ -1452,6 +1461,32 @@ class YandexVisionProvider:
                 if grid_detection is not None and grid_detection.high_confidence:
                     stats["geometry_high_confidence_pages"] += 1
                 reconstruction_diagnostics: dict = {}
+                try:
+                    page_scene = self._page_scene_detector.analyze_page(
+                        pdf_path,
+                        number,
+                        payload=payload,
+                        raster=raster,
+                    )
+                    reconstruction_diagnostics["page_scene"] = page_scene.as_dict()
+                    scene_metrics = page_scene.diagnostics
+                    for metric in (
+                        "table_region_candidate_count",
+                        "table_region_trusted_count",
+                        "table_region_review_count",
+                        "table_region_rejected_count",
+                    ):
+                        stats[metric] += int(scene_metrics.get(metric) or 0)
+                    if scene_metrics.get("multi_table_page"):
+                        stats["multi_table_pages"] += 1
+                except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+                    # The scene is shadow evidence.  A detector problem must
+                    # never change the existing equipment reconstruction path.
+                    reconstruction_diagnostics["page_scene"] = {
+                        "status": "construction_error",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:240],
+                    }
                 reconstruction_result = reconstruct_page_rows_result(
                     payload,
                     self.key,
