@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.models import (
+    Offer,
     ProductIntent,
     SuggestionResolution,
 )
@@ -53,6 +55,28 @@ class EmptyCatalogProvider:
 
     def stats(self):
         return {"item_count": 0, "catalog_version": "empty-1"}
+
+
+class CountingCatalogProvider:
+    key = "counting"
+    label = "Counting catalog"
+
+    def __init__(self):
+        self.calls = 0
+        self.offer = Offer(
+            offer_id="cached-offer",
+            provider=self.key,
+            title="Конвектор",
+            price=Decimal("10"),
+            currency="RUB",
+        )
+
+    def search(self, intent, *, limit=20):
+        self.calls += 1
+        return [self.offer]
+
+    def stats(self):
+        return {"item_count": 1, "catalog_version": "counting-1"}
 
 
 def ai_for(payload: dict | str | Exception, *, model: str = "gpt://folder/qwen/test"):
@@ -292,6 +316,95 @@ def test_p23_existing_search_consumes_only_resolved_product_intent(tmp_path):
     assert result.intent == result.understanding.resolved_intent
     assert result.intent.manufacturer == "NOBO"
     assert result.offers == []
+
+
+def test_search_cache_reuses_facts_but_attaches_current_understanding_and_mode(tmp_path):
+    cache_path = tmp_path / "search-cache.json"
+    provider = CountingCatalogProvider()
+    ai_a, provider_a = ai_for({"model": "NFK4N 10"}, model="model-a")
+    service_a = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=ai_a,
+        cache=SourcingCache(cache_path),
+    )
+    first = service_a.search_row(source_row())
+
+    ai_b, provider_b = ai_for({"model": "NFK4N 05"}, model="model-b")
+    service_b = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=ai_b,
+        cache=SourcingCache(cache_path),
+    )
+    second = service_b.search_row(source_row())
+
+    assert provider_a.calls == provider_b.calls == 1
+    assert provider.calls == 1
+    assert first.intent == second.intent
+    assert first.understanding.provenance.model == "model-a"
+    assert second.understanding.provenance.model == "model-b"
+    assert first.understanding.suggestions != second.understanding.suggestions
+    assert second.ai_mode == "qwen"
+    assert [item.offer.offer_id for item in first.match_results] == ["cached-offer"]
+    assert [item.offer.offer_id for item in second.match_results] == ["cached-offer"]
+
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    cached_payload = next(value for key, value in payload.items() if key.startswith("search:"))
+    assert cached_payload["understanding"] is None
+    assert cached_payload["ai_mode"] == "fallback"
+    assert cached_payload["warnings"] == []
+    assert "baseline_intent" not in cached_payload
+
+
+def test_search_cache_hit_ai_mode_follows_current_understanding(tmp_path):
+    cache_path = tmp_path / "search-cache.json"
+    provider = CountingCatalogProvider()
+    ai, _ = ai_for({"model": "NFK4N 10"}, model="model-a")
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=ai,
+        cache=SourcingCache(cache_path),
+    )
+    first = service.search_row(source_row())
+    fallback_understanding = SourcingAIService().understand_with_audit(
+        source_row(), build_fallback_intent(source_row())
+    )
+    second = service.search_intent(
+        first.intent,
+        understanding=fallback_understanding,
+    )
+
+    assert first.ai_mode == "qwen"
+    assert second.ai_mode == "fallback"
+    assert second.understanding == fallback_understanding
+    assert provider.calls == 1
+
+
+def test_search_intent_without_understanding_does_not_leak_previous_audit(tmp_path):
+    cache_path = tmp_path / "search-cache.json"
+    provider = CountingCatalogProvider()
+    ai, _ = ai_for({"model": "NFK4N 10"}, model="model-a")
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=ai,
+        cache=SourcingCache(cache_path),
+    )
+    first = service.search_row(source_row())
+
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    for key, value in payload.items():
+        if key.startswith("search:"):
+            value["understanding"] = first.understanding.model_dump(mode="json")
+            value["ai_mode"] = "qwen"
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    direct = service.search_intent(first.intent)
+    assert direct.understanding is None
+    assert direct.ai_mode == "fallback"
+    assert provider.calls == 1
 
 
 def test_p24_p58_reviewed_quantity_and_unit_survive_product_understanding():

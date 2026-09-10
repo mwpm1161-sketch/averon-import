@@ -99,7 +99,7 @@ class SourcingService:
         cache_key = f"search:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
         cached = self.cache.get(cache_key)
         if cached is not None:
-            return cached.model_copy(update={"warnings": list(dict.fromkeys([*(warnings or []), *cached.warnings, "Результат взят из актуального cache каталога"]))})
+            return self._compose_cached_result(cached, understanding, warnings)
         started = time.perf_counter()
         offers = provider.search(intent, limit=limit)
         retrieval_time = time.perf_counter() - started
@@ -113,10 +113,37 @@ class SourcingService:
             match_results=match_results,
             warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
             timings={"retrieval_s": round(retrieval_time, 6)},
-            ai_mode=(understanding.mode if understanding is not None else ("qwen" if self.ai.available else "fallback")),
+            ai_mode=self._current_ai_mode(understanding),
         )
-        self.cache.set(cache_key, result)
+        # Catalog offers and deterministic match facts are reusable. Audit
+        # provenance and parser warnings belong to the current response only.
+        self.cache.set(
+            cache_key,
+            result.model_copy(update={"understanding": None, "warnings": [], "ai_mode": "fallback"}),
+        )
         return result
+
+    @staticmethod
+    def _current_ai_mode(understanding: ProductUnderstandingResult | None) -> str:
+        return understanding.mode if understanding is not None else "fallback"
+
+    def _compose_cached_result(
+        self,
+        cached: SourcingResult,
+        understanding: ProductUnderstandingResult | None,
+        warnings: list[str] | None,
+    ) -> SourcingResult:
+        # Deliberately overwrite any legacy cached understanding/ai_mode too:
+        # old cache entries must not leak stale parser provenance.
+        merged_warnings = list(dict.fromkeys([
+            *(warnings or []),
+            "Результат взят из актуального cache каталога",
+        ]))
+        return cached.model_copy(update={
+            "understanding": understanding,
+            "ai_mode": self._current_ai_mode(understanding),
+            "warnings": merged_warnings,
+        })
 
     def search_project(
         self,
