@@ -45,6 +45,9 @@ class SourcingService:
             raise ValueError(f"Неизвестный sourcing provider: {selected}")
         return self.providers[selected]
 
+    def set_ai(self, ai: SourcingAIService) -> None:
+        self.ai = ai
+
     def understand_row(self, row: dict[str, Any]) -> ProductIntent:
         intent, _ = self.understand_row_with_warnings(row)
         return intent
@@ -97,6 +100,7 @@ class SourcingService:
             match_results=match_results,
             warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
             timings={"retrieval_s": round(retrieval_time, 6)},
+            ai_mode=("qwen" if self.ai.available else "fallback"),
         )
         self.cache.set(cache_key, result)
         return result
@@ -116,7 +120,7 @@ class SourcingService:
         results: list[SourcingResult] = []
         warnings: list[str] = []
         totals: dict[str, Decimal] = {}
-        matched = review = without = 0
+        matched = alternatives = review = without = 0
         for row in eligible:
             result = self.search_row(row, provider_key=provider_key, limit=limit)
             results.append(result)
@@ -127,7 +131,16 @@ class SourcingService:
             elif best is None:
                 review += 1
             else:
-                matched += 1
+                decision = next(
+                    (item.decision for item in result.match_results if item.offer.offer_id == best.offer_id),
+                    MatchDecision.REVIEW,
+                )
+                if decision == MatchDecision.ALTERNATIVE:
+                    alternatives += 1
+                elif decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                    matched += 1
+                else:
+                    review += 1
                 quantity = _trusted_quantity(row)
                 if quantity is None:
                     warnings.append(f"{result.intent.source_row_id}: quantity requires confirmation")
@@ -142,6 +155,7 @@ class SourcingService:
             positions_total=len(eligible),
             positions_processed=len(results),
             positions_matched=matched,
+            positions_alternatives=alternatives,
             positions_review=review,
             positions_without_offers=without,
             estimated_total=(totals[currencies[0]] if len(currencies) == 1 else None),
@@ -154,6 +168,7 @@ class SourcingService:
     def public_config(self) -> dict[str, Any]:
         active = self.provider()
         stats = active.stats() if hasattr(active, "stats") else {}
+        ai = self.ai.public_config()
         return {
             "provider": {"key": active.key, "label": active.label},
             "providers": [
@@ -166,8 +181,12 @@ class SourcingService:
                 for provider in self.providers.values()
             ],
             "catalog_item_count": stats.get("item_count", 0),
-            "ai_available": self.ai.available,
+            "ai_available": ai["available"],
+            "ai": ai,
         }
+
+    def health(self) -> dict[str, Any]:
+        return {"ai": self.ai.public_config()}
 
     def _intent_cache_key(self, row: dict[str, Any]) -> str:
         payload = {

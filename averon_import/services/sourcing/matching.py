@@ -51,11 +51,12 @@ class OfferMatcher:
 
 
 def recommended_offer(results: list[MatchResult]) -> Offer | None:
-    for result in results:
-        if result.decision in {
-            MatchDecision.MATCH,
-            MatchDecision.LIKELY_MATCH,
-            MatchDecision.ALTERNATIVE,
-        }:
-            return result.offer
+    for decision in (
+        MatchDecision.MATCH,
+        MatchDecision.LIKELY_MATCH,
+        MatchDecision.ALTERNATIVE,
+    ):
+        for result in results:
+            if result.decision == decision:
+                return result.offer
     return None

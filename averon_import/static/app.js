@@ -18,6 +18,7 @@ const state = {
   reviewFilter: "",
   settings: null,
   sourcing: {row: null, result: null},
+  sourcingHealth: null,
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -80,6 +81,7 @@ async function boot() {
     ]);
     state.config = config;
     state.settings = settings;
+    state.sourcingHealth = health.sourcing || null;
     const ocr = health.cloud_ocr;
     state.ocrHealth = ocr;
     updateCloudStatus();
@@ -116,6 +118,30 @@ function initializeSettings(settings) {
     ? "Yandex Vision подключён."
     : "Yandex Vision не настроен. API key не отображается и не возвращается сервером.";
   $("#settings-connection").className = ready ? "mode-status ok" : "mode-status warning";
+  const folder = settings?.yandex?.folder_id || "";
+  const proposal = folder ? `gpt://${folder}/qwen3.6-35b-a3b/latest` : "";
+  $("#settings-llm-model").value = settings?.yandex?.llm_model || proposal;
+  updateSourcingStatus();
+}
+
+function updateSourcingStatus() {
+  const ai = state.sourcingHealth?.ai || state.config?.sourcing?.ai || {};
+  const status = ai.status || "not_configured";
+  const element = $("#settings-ai-connection");
+  if (!element) return;
+  if (status === "ready") {
+    element.textContent = "Qwen подключён · AI Studio";
+    element.className = "mode-status ok";
+  } else if (status === "access_denied") {
+    element.textContent = "Ключ не имеет доступа к AI Studio. Используется резервный режим.";
+    element.className = "mode-status warning";
+  } else if (ai.available) {
+    element.textContent = "Qwen настроен; доступ проверится при подборе.";
+    element.className = "mode-status warning";
+  } else {
+    element.textContent = "Qwen не настроен. Подбор работает по каталогу.";
+    element.className = "mode-status warning";
+  }
 }
 
 async function saveSettings() {
@@ -128,6 +154,7 @@ async function saveSettings() {
       folder_id: $("#settings-folder-id").value.trim(),
       vision_model: $("#settings-vision-model").value,
       language_codes: codes,
+      llm_model: $("#settings-llm-model").value.trim(),
     },
   };
   if (apiKey) payload.api_key = apiKey;
@@ -139,9 +166,11 @@ async function saveSettings() {
     });
     const health = await api("/api/health");
     state.ocrHealth = health.cloud_ocr;
+    state.sourcingHealth = health.sourcing || null;
     $("#settings-api-key").value = "";
     initializeSettings(state.settings);
     updateCloudStatus();
+    updateSourcingStatus();
     $("#settings-modal").close();
     toast("Настройки Yandex Vision сохранены", "success");
   } catch (error) { toast(error.message, "error"); }
@@ -635,15 +664,18 @@ function renderOfferCard(result, compact = false, intent = null) {
 function renderSourcingResult(result, row = null) {
   const content = $("#sourcing-content");
   if (result.positions_total !== undefined) {
+    const qwenUsed = (result.results || []).some((item) => item.ai_mode === "qwen");
+    $("#sourcing-subtitle").textContent = qwenUsed ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
     const currency = result.currency || "";
-    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Совпали</small><b>${result.positions_matched}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>Расчётный итог</small><b>${result.estimated_total === null ? "Требует проверки" : formatMoney(result.estimated_total, currency)}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const offer = item.recommended_offer; const total = offer ? estimatedOfferTotal(offer, item.intent) : null; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${item.match_results?.[0]?.decision || "REVIEW"}</span><span>${escapeHtml(offer?.provider || "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>Расчётный итог</small><b>${result.estimated_total === null ? "Требует проверки" : formatMoney(result.estimated_total, currency)}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const offer = item.recommended_offer; const total = offer ? estimatedOfferTotal(offer, item.intent) : null; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${item.match_results?.find((match) => match.offer?.offer_id === offer?.offer_id)?.decision || "REVIEW"}</span><span>${escapeHtml(offer?.provider || "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
     return;
   }
   const intent = result.intent || {};
   const best = result.match_results?.find((item) => ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(item.decision));
   const alternatives = (result.match_results || []).filter((item) => item !== best && item.decision !== "REJECT").slice(0, 5);
   const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
-  content.innerHTML = `<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges">${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+  $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
+  content.innerHTML = `<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges"><span class="technical-badge">${result.ai_mode === "qwen" ? "Qwen · AI Studio" : "Без AI · резервный режим"}</span>${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
 }
 
 async function openSourcingForRow(row) {
@@ -655,7 +687,7 @@ async function openSourcingForRow(row) {
   try {
     const result = await api("/api/sourcing/search", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({row, limit:20})});
     state.sourcing.result = result;
-    $("#sourcing-subtitle").textContent = "Результат детерминированного сопоставления";
+    $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
     renderSourcingResult(result, row);
   } catch (error) {
     $("#sourcing-subtitle").textContent = "Поиск не выполнен";

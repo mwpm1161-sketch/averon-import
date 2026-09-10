@@ -54,6 +54,7 @@ from averon_import.services.sourcing.catalog_repository import CatalogRepository
 from averon_import.services.sourcing.models import ProductIntent
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
+from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.workspace import WorkspaceService
 
@@ -97,6 +98,7 @@ coordinator = ProcessingCoordinator(
 )
 sourcing_repository = CatalogRepository(DATA_DIR / "sourcing" / "catalog.sqlite3")
 sourcing_provider = LocalCatalogProvider(sourcing_repository)
+sourcing_ai_transport = create_sourcing_ai_transport(app_settings_service, secret_store)
 sourcing_service = SourcingService(
     {sourcing_provider.key: sourcing_provider},
     default_provider=(
@@ -104,7 +106,7 @@ sourcing_service = SourcingService(
         if app_settings_service.settings.sourcing.provider in {sourcing_provider.key}
         else sourcing_provider.key
     ),
-    ai=SourcingAIService(ai_service),
+    ai=SourcingAIService(sourcing_ai_transport),
     cache=SourcingCache(DATA_DIR / "sourcing" / "cache.json"),
 )
 
@@ -134,6 +136,7 @@ def health():
         "ocr": coordinator.ocr_health(),
         "cloud_ocr": yandex_vision_provider.health(),
         "ai": ai_service.health(),
+        "sourcing": sourcing_service.health(),
         "data_dir": str(DATA_DIR),
         "settings": {
             "warnings": app_settings_service.warnings_snapshot(),
@@ -251,6 +254,9 @@ def put_settings(request: SettingsUpdate):
     patch = {key: value for key, value in patch.items() if value is not None}
     try:
         app_settings_service.update(patch)
+        sourcing_service.set_ai(
+            SourcingAIService(create_sourcing_ai_transport(app_settings_service, secret_store))
+        )
         if app_settings_service.settings.sourcing.provider in sourcing_service.providers:
             sourcing_service.default_provider = app_settings_service.settings.sourcing.provider
     except ValidationError as exc:

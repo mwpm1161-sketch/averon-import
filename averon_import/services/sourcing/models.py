@@ -116,12 +116,14 @@ class SourcingResult(SourcingModel):
     match_results: list[MatchResult] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
+    ai_mode: str = "fallback"
 
 
 class ProjectSourcingResult(SourcingModel):
     positions_total: int = 0
     positions_processed: int = 0
     positions_matched: int = 0
+    positions_alternatives: int = 0
     positions_review: int = 0
     positions_without_offers: int = 0
     estimated_total: Decimal | None = None

@@ -11,6 +11,7 @@ from averon_import.services.sourcing.catalog_repository import CatalogRepository
 from averon_import.services.sourcing.matching import OfferMatcher
 from averon_import.services.sourcing.models import (
     MatchDecision,
+    MatchResult,
     Offer,
     ProductIntent,
 )
@@ -18,6 +19,7 @@ from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
     build_fallback_intent,
 )
+from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
 from averon_import.services.sourcing.providers.base import SourcingProvider
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
 from averon_import.services.sourcing.service import SourcingService
@@ -338,6 +340,22 @@ def test_s20_project_sourcing_aggregates_positions(tmp_path):
     assert result.estimated_total == Decimal("80")
 
 
+def test_project_alternative_is_not_counted_as_confirmed_match(tmp_path):
+    offer = make_offer(manufacturer="Other", title="Клапан")
+    service = service_for(tmp_path, [offer])
+    row = {
+        "id": "alternative-row",
+        "row_type": "item",
+        "name": "Клапан",
+        "manufacturer": "Preferred",
+        "quantity": "1",
+    }
+    result = service.search_project([row])
+    assert result.positions_matched == 0
+    assert result.positions_alternatives == 1
+    assert result.positions_review == 0
+
+
 def test_s21_sourcing_public_api_never_exposes_ai_credentials():
     from averon_import import main
 
@@ -386,3 +404,183 @@ def test_catalog_import_supports_json_and_csv_without_repairing_url(tmp_path):
     assert imported.currency == "RUB"
     assert imported.url == "https://supplier.example/item?id=1"
     assert repository.get_by_id("csv-1").availability is True
+
+
+def test_q1_app_settings_llm_model_configures_sourcing_qwen(tmp_path, monkeypatch):
+    from averon_import.services.app_settings import AppSettingsService
+    from averon_import.services.secrets import MemorySecretStore
+
+    for name in ("AVERON_YANDEX_AI_MODEL", "AVERON_YANDEX_AI_BASE_URL", "AVERON_YANDEX_AI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"folder_id": "folder-1", "llm_model": "gpt://folder-1/custom/latest"}})
+    store = MemorySecretStore()
+    store.set("yandex.api_key", "key-from-store")
+    transport = create_sourcing_ai_transport(settings, store)
+    assert transport.settings.yandex.model == "gpt://folder-1/custom/latest"
+    assert transport.settings.yandex.base_url == "https://ai.api.cloud.yandex.net/v1"
+
+
+def test_q2_environment_model_overrides_app_settings(tmp_path, monkeypatch):
+    from averon_import.services.app_settings import AppSettingsService
+    from averon_import.services.secrets import MemorySecretStore
+
+    monkeypatch.setenv("AVERON_YANDEX_AI_MODEL", "gpt://env/model/latest")
+    monkeypatch.delenv("AVERON_YANDEX_AI_BASE_URL", raising=False)
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"llm_model": "gpt://settings/model/latest"}})
+    transport = create_sourcing_ai_transport(settings, MemorySecretStore())
+    assert transport.settings.yandex.model == "gpt://env/model/latest"
+
+
+def test_q3_secret_store_yandex_key_configures_sourcing_ai(tmp_path, monkeypatch):
+    from averon_import.services.app_settings import AppSettingsService
+    from averon_import.services.secrets import MemorySecretStore
+
+    for name in ("AVERON_YANDEX_AI_MODEL", "AVERON_YANDEX_AI_BASE_URL", "AVERON_YANDEX_AI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"llm_model": "gpt://folder/qwen/latest"}})
+    store = MemorySecretStore()
+    store.set("yandex.api_key", "stored-key")
+    transport = create_sourcing_ai_transport(settings, store)
+    assert transport.providers["yandex"].configured is True
+
+
+def test_q4_sourcing_public_config_never_exposes_secret(tmp_path, monkeypatch):
+    from averon_import.services.app_settings import AppSettingsService
+    from averon_import.services.secrets import MemorySecretStore
+
+    monkeypatch.delenv("AVERON_YANDEX_AI_API_KEY", raising=False)
+    settings = AppSettingsService(tmp_path)
+    settings.update({"yandex": {"llm_model": "gpt://folder/qwen/latest"}})
+    store = MemorySecretStore()
+    store.set("yandex.api_key", "super-secret-key")
+    ai = SourcingAIService(create_sourcing_ai_transport(settings, store))
+    encoded = json.dumps(ai.public_config(), ensure_ascii=False)
+    assert "super-secret-key" not in encoded
+    assert "api_key" not in encoded
+
+
+def test_q5_match_cannot_be_ranked_below_alternative():
+    intent = make_intent(manufacturer="Preferred", preferred_attributes={"manufacturer": "Preferred"})
+    match = OfferMatcher().match(intent, [make_offer(offer_id="match", manufacturer="Preferred")])[0]
+    alternative = OfferMatcher().match(intent, [make_offer(offer_id="alternative", manufacturer="Other")])[0]
+    assert match.decision == MatchDecision.MATCH
+    assert alternative.decision == MatchDecision.ALTERNATIVE
+    provider = FakeAIProvider(json.dumps({"offer_order": ["alternative", "match"]}))
+    ranked, _ = SourcingAIService(FakeAIService(provider)).rank_matches(intent, [alternative, match])
+    assert [item.offer.offer_id for item in ranked] == ["match", "alternative"]
+
+
+def test_q6_likely_match_cannot_be_ranked_below_review():
+    offer_likely = make_offer(offer_id="likely")
+    offer_review = make_offer(offer_id="review")
+    likely = MatchResult(offer=offer_likely, decision=MatchDecision.LIKELY_MATCH, rank=1)
+    review = MatchResult(offer=offer_review, decision=MatchDecision.REVIEW, rank=2)
+    provider = FakeAIProvider(json.dumps({"offer_order": ["review", "likely"]}))
+    ranked, _ = SourcingAIService(FakeAIService(provider)).rank_matches(make_intent(), [review, likely])
+    assert [item.offer.offer_id for item in ranked] == ["likely", "review"]
+
+
+def test_q7_qwen_may_reorder_two_match_offers():
+    first = MatchResult(offer=make_offer(offer_id="first"), decision=MatchDecision.MATCH, rank=1)
+    second = MatchResult(offer=make_offer(offer_id="second"), decision=MatchDecision.MATCH, rank=2)
+    provider = FakeAIProvider(json.dumps({"offer_order": ["second", "first"]}))
+    ranked, _ = SourcingAIService(FakeAIService(provider)).rank_matches(make_intent(), [first, second])
+    assert [item.offer.offer_id for item in ranked] == ["second", "first"]
+
+
+def test_q8_explicit_source_article_cannot_be_replaced_by_ai():
+    provider = FakeAIProvider(json.dumps({"article": "HALLUCINATED", "normalized_name": "Клапан"}))
+    row = {"id": "article-row", "name": "Клапан", "code": "SRC-42", "quantity": "1"}
+    fallback = build_fallback_intent(row)
+    intent, _ = SourcingAIService(FakeAIService(provider)).understand(row, fallback)
+    assert intent.article == "SRC-42"
+
+
+def test_q9_explicit_source_manufacturer_cannot_be_replaced_by_ai():
+    provider = FakeAIProvider(json.dumps({"manufacturer": "Unrelated", "normalized_name": "Клапан"}))
+    row = {"id": "manufacturer-row", "name": "Клапан", "manufacturer": "Источник", "quantity": "1"}
+    fallback = build_fallback_intent(row)
+    intent, _ = SourcingAIService(FakeAIService(provider)).understand(row, fallback)
+    assert intent.manufacturer == "Источник"
+
+
+def test_q10_unsupported_ai_numeric_attribute_is_not_hard_required():
+    provider = FakeAIProvider(json.dumps({
+        "normalized_name": "Насос",
+        "attributes": {"voltage": 380},
+        "required_attributes": {"voltage": 380},
+    }))
+    row = {"id": "numeric-row", "name": "Насос", "quantity": "1"}
+    fallback = build_fallback_intent(row)
+    intent, _ = SourcingAIService(FakeAIService(provider)).understand(row, fallback)
+    assert "voltage" not in intent.required_attributes
+    assert intent.preferred_attributes["voltage"] == 380
+    assert "ai_inferred_attribute:voltage" in intent.uncertainties
+
+
+def test_q11_deterministic_dn50_remains_hard_required():
+    row = {"id": "dn-row", "name": "Клапан Ду50", "quantity": "1"}
+    fallback = build_fallback_intent(row)
+    assert fallback.required_attributes["diameter"] == 50
+
+
+def test_q12_qwen_ranking_preserves_all_offer_commercial_facts():
+    offer = make_offer(
+        offer_id="commercial",
+        source_item_id="source-commercial",
+        price=Decimal("77.70"),
+        currency="RUB",
+        availability=False,
+        availability_text="Под заказ",
+        url="https://supplier.example/real",
+        article="REAL-1",
+        manufacturer="Real maker",
+    )
+    match = MatchResult(offer=offer, decision=MatchDecision.MATCH, rank=1)
+    other = MatchResult(offer=make_offer(offer_id="other"), decision=MatchDecision.MATCH, rank=2)
+    provider = FakeAIProvider(json.dumps({"offer_order": ["other", "commercial"]}))
+    ranked, _ = SourcingAIService(FakeAIService(provider)).rank_matches(make_intent(), [match, other])
+    preserved = next(item.offer for item in ranked if item.offer.offer_id == "commercial")
+    assert preserved.model_dump(mode="json")["price"] == "77.70"
+    assert preserved.url == "https://supplier.example/real"
+    assert preserved.availability is False
+    assert preserved.article == "REAL-1"
+    assert preserved.manufacturer == "Real maker"
+
+
+def test_q13_malformed_qwen_json_uses_safe_fallback():
+    provider = FakeAIProvider("{broken")
+    row = {"id": "malformed", "name": "Насос", "quantity": "1"}
+    fallback = build_fallback_intent(row)
+    intent, warnings = SourcingAIService(FakeAIService(provider)).understand(row, fallback)
+    assert intent == fallback
+    assert warnings and "fallback" in warnings[0]
+
+
+def test_q14_qwen_outage_uses_safe_fallback_without_raw_error():
+    class OutageProvider(FakeAIProvider):
+        def complete(self, messages):
+            raise RuntimeError("HTTP 503 Authorization secret should not leak")
+
+    row = {"id": "outage", "name": "Насос", "quantity": "1"}
+    fallback = build_fallback_intent(row)
+    intent, warnings = SourcingAIService(FakeAIService(OutageProvider(""))).understand(row, fallback)
+    assert intent == fallback
+    assert warnings and "503" not in warnings[0] and "secret" not in warnings[0]
+
+
+def test_q15_source_row_remains_unchanged_after_ai_enrichment(tmp_path):
+    provider = FakeAIProvider(json.dumps({"normalized_name": "Клапан", "attributes": {"diameter": 50}}))
+    row = {"id": "q15", "name": "Клапан Ду50", "quantity": "2", "unit": "шт."}
+    before = json.loads(json.dumps(row, ensure_ascii=False))
+    service = SourcingService(
+        {"stub": StubProvider([])},
+        default_provider="stub",
+        ai=SourcingAIService(FakeAIService(provider)),
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+    service.understand_row(row)
+    assert row == before

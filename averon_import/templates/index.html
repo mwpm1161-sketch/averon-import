@@ -232,8 +232,14 @@
           <label class="field-label" for="settings-api-key">API key</label>
           <input class="input" id="settings-api-key" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
         </div>
+        <div>
+          <label class="field-label" for="settings-llm-model">AI Studio / Qwen model</label>
+          <input class="input" id="settings-llm-model" autocomplete="off" placeholder="gpt://&lt;folder_id&gt;/qwen3.6-35b-a3b/latest">
+          <p class="hint">OpenAI-compatible Yandex endpoint. Модель и base URL не являются секретами.</p>
+        </div>
       </div>
       <p class="mode-status" id="settings-connection"></p>
+      <p class="mode-status" id="settings-ai-connection"></p>
       <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="save-settings">Сохранить</button></div>
     </form>
   </dialog>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
@@ -129,12 +130,143 @@ def build_fallback_intent(row: dict[str, Any]) -> ProductIntent:
     )
 
 
+def _compact(value: object) -> str:
+    text = str(value or "").casefold().replace("ё", "е")
+    text = text.replace("×", "x").replace("х", "x")
+    return re.sub(r"[^\w]+", "", text, flags=re.UNICODE)
+
+
+def _evidence_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        result: list[str] = []
+        for child in value.values():
+            result.extend(_evidence_strings(child))
+        return result
+    if isinstance(value, list):
+        result: list[str] = []
+        for child in value:
+            result.extend(_evidence_strings(child))
+        return result
+    return []
+
+
+def _grounded(value: object, source_text: str, evidence: dict[str, Any], field: str = "") -> bool:
+    needle = _compact(value)
+    if not needle:
+        return False
+    source = _compact(source_text)
+    if needle in source:
+        return True
+    field_evidence = evidence.get(field) if field else None
+    # AI-supplied evidence is useful only when the cited span itself is
+    # present in the OCR-owned source text; a free-standing claim is not
+    # grounding evidence.
+    return any(
+        needle in _compact(item) and _compact(item) in source
+        for item in _evidence_strings(field_evidence)
+    )
+
+
+def _phrase_grounded(value: str, source_text: str) -> bool:
+    if _grounded(value, source_text, {}):
+        return True
+    source_tokens = {token for token in re.findall(r"[\wа-яё]{3,}", source_text.casefold())}
+    value_tokens = {token for token in re.findall(r"[\wа-яё]{3,}", value.casefold())}
+    return bool(source_tokens & value_tokens)
+
+
+def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) -> ProductIntent:
+    """Merge an AI proposal while keeping OCR-owned facts authoritative."""
+
+    candidate_evidence = deepcopy(candidate.evidence)
+    source_owned = {
+        "source_row_id": fallback.source_row_id,
+        "source_text": fallback.source_text,
+        "quantity": fallback.quantity,
+        "unit": fallback.unit,
+    }
+    values = {
+        "article": fallback.article,
+        "manufacturer": fallback.manufacturer,
+        "model": fallback.model,
+        "brand": fallback.brand,
+    }
+    uncertainties = list(dict.fromkeys([*fallback.uncertainties, *candidate.uncertainties]))
+    for field in tuple(values):
+        proposed = str(getattr(candidate, field) or "").strip()
+        if values[field]:
+            continue
+        if proposed and _grounded(proposed, fallback.source_text, candidate_evidence, field):
+            values[field] = proposed
+            continue
+        if proposed:
+            uncertainties.append(f"ai_inferred_{field}_not_grounded")
+            values[field] = ""
+
+    attributes = deepcopy(fallback.attributes)
+    required = deepcopy(fallback.required_attributes)
+    preferred = deepcopy(fallback.preferred_attributes)
+    origins = {key: "source_deterministic" for key in fallback.attributes}
+    for mapping_name in ("attributes", "required_attributes", "preferred_attributes"):
+        mapping = getattr(candidate, mapping_name)
+        for key, proposed in mapping.items():
+            key = str(key)
+            if key in fallback.attributes:
+                continue
+            if _grounded(proposed, fallback.source_text, candidate_evidence, key):
+                attributes.setdefault(key, deepcopy(proposed))
+                origins.setdefault(key, "ai_grounded")
+                if mapping_name == "required_attributes":
+                    required.setdefault(key, deepcopy(proposed))
+                elif key not in required:
+                    preferred.setdefault(key, deepcopy(proposed))
+            else:
+                attributes.setdefault(key, deepcopy(proposed))
+                preferred.setdefault(key, deepcopy(proposed))
+                origins.setdefault(key, "ai_inferred")
+                uncertainties.append(f"ai_inferred_attribute:{key}")
+    preferred = {key: value for key, value in preferred.items() if key not in required}
+
+    queries = list(fallback.search_queries)
+    for query in candidate.search_queries:
+        if _phrase_grounded(query, fallback.source_text):
+            queries.append(query)
+    queries = list(dict.fromkeys(queries))[:4]
+    merged_evidence = deepcopy(candidate_evidence)
+    merged_evidence["fallback_source"] = deepcopy(fallback.evidence)
+    merged_evidence["source_owned_fields"] = source_owned
+    merged_evidence["attribute_origins"] = origins
+    merged_evidence["mode"] = "ai_safety_merge"
+    normalized_name = candidate.normalized_name if _phrase_grounded(candidate.normalized_name, fallback.source_text) else fallback.normalized_name
+    return ProductIntent(
+        source_row_id=source_owned["source_row_id"],
+        source_text=source_owned["source_text"],
+        product_class=candidate.product_class or fallback.product_class,
+        normalized_name=normalized_name,
+        manufacturer=values["manufacturer"],
+        brand=values["brand"],
+        model=values["model"],
+        article=values["article"],
+        attributes=attributes,
+        required_attributes=required,
+        preferred_attributes=preferred,
+        quantity=source_owned["quantity"],
+        unit=source_owned["unit"],
+        search_queries=queries,
+        evidence=merged_evidence,
+        uncertainties=list(dict.fromkeys(uncertainties)),
+    )
+
+
 class SourcingAIService:
     """Typed sourcing-specific AI adapter; it never writes back to OCR rows."""
 
     def __init__(self, ai_service: Any | None = None, provider_key: str = "yandex"):
         self.ai_service = ai_service
         self.provider_key = provider_key
+        self._last_status = "configured"
 
     @property
     def available(self) -> bool:
@@ -145,6 +277,37 @@ class SourcingAIService:
         except (AttributeError, ValueError):
             return False
         return bool(getattr(provider, "configured", False))
+
+    def public_config(self) -> dict[str, Any]:
+        if self.ai_service is None:
+            return {"provider": self.provider_key, "available": False, "status": "not_configured"}
+        provider_info = {}
+        try:
+            provider_info = self.ai_service.public_config().get("providers", {}).get(self.provider_key, {})
+        except Exception:
+            provider_info = {}
+        configured = bool(provider_info.get("configured"))
+        return {
+            "provider": self.provider_key,
+            "label": provider_info.get("label", "Yandex Cloud AI Studio"),
+            "model": provider_info.get("model", ""),
+            "base_url": provider_info.get("base_url", ""),
+            "available": configured,
+            "status": self._last_status if configured else "not_configured",
+        }
+
+    def _record_error(self, exc: Exception) -> None:
+        text = str(exc).casefold()
+        self._last_status = "access_denied" if "401" in text or "403" in text else "unavailable"
+
+    def _safe_warning(self, prefix: str, exc: Exception) -> str:
+        self._record_error(exc)
+        text = str(exc).casefold()
+        if "401" in text or "403" in text:
+            return f"{prefix}: ключ не имеет доступа к AI Studio; использован детерминированный fallback"
+        if "json" in text:
+            return f"{prefix}: Qwen вернул некорректный JSON; использован детерминированный fallback"
+        return f"{prefix}: Qwen недоступен; использован детерминированный fallback"
 
     def understand(self, row: dict[str, Any], fallback: ProductIntent) -> tuple[ProductIntent, list[str]]:
         if not self.available:
@@ -180,21 +343,13 @@ class SourcingAIService:
             payload.setdefault("quantity", fallback.quantity)
             payload.setdefault("unit", fallback.unit)
             candidate = ProductIntent.model_validate(payload)
-            # Source identity, quantity and unit remain owned by the OCR row.
-            candidate = candidate.model_copy(
-                update={
-                    "source_row_id": fallback.source_row_id,
-                    "source_text": fallback.source_text,
-                    "quantity": fallback.quantity,
-                    "unit": fallback.unit,
-                    "evidence": {**candidate.evidence, "fallback_source": fallback.evidence},
-                }
-            )
-            return candidate, []
+            merged = merge_intent_with_source(candidate, fallback)
+            self._last_status = "ready"
+            return merged, []
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
-            return fallback, [f"AI product understanding failed; deterministic fallback used: {exc}"]
+            return fallback, [self._safe_warning("AI product understanding failed", exc)]
         except Exception as exc:  # provider/network failures are a non-fatal sourcing warning
-            return fallback, [f"AI product understanding unavailable; deterministic fallback used: {exc}"]
+            return fallback, [self._safe_warning("AI product understanding unavailable", exc)]
 
     def rank_matches(
         self,
@@ -251,24 +406,32 @@ class SourcingAIService:
             requested = payload.get("offer_order", [])
             if not isinstance(requested, list):
                 raise ValueError("offer_order must be a list")
-            ordered_ids = [offer_id for offer_id in requested if offer_id in known]
-            ordered_ids.extend(offer_id for offer_id in known if offer_id not in ordered_ids)
             evidence = payload.get("evidence", {})
             if not isinstance(evidence, dict):
                 evidence = {}
+            grouped: dict[str, list[MatchResult]] = {}
+            for result in matches:
+                if result.decision != "REJECT":
+                    grouped.setdefault(result.decision.value, []).append(result)
             ordered = []
-            for offer_id in ordered_ids:
-                result = known[offer_id]
-                reasons = evidence.get(offer_id, [])
-                if not isinstance(reasons, list):
-                    reasons = []
-                ordered.append(result.model_copy(update={"ai_evidence": {"reasons": [str(item) for item in reasons[:5]]}}))
+            for decision in ("MATCH", "LIKELY_MATCH", "ALTERNATIVE", "REVIEW"):
+                group = grouped.get(decision, [])
+                group_ids = {result.offer.offer_id for result in group}
+                group_order = [offer_id for offer_id in requested if offer_id in group_ids]
+                group_order.extend(result.offer.offer_id for result in group if result.offer.offer_id not in group_order)
+                for offer_id in group_order:
+                    result = known[offer_id]
+                    reasons = evidence.get(offer_id, [])
+                    if not isinstance(reasons, list):
+                        reasons = []
+                    ordered.append(result.model_copy(update={"ai_evidence": {"reasons": [str(item) for item in reasons[:5]]}}))
             ordered.extend(result for result in matches if result.decision == "REJECT")
+            self._last_status = "ready"
             return [result.model_copy(update={"rank": index}) for index, result in enumerate(ordered, 1)], []
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
-            return matches, [f"AI sourcing ranking failed; deterministic order used: {exc}"]
+            return matches, [self._safe_warning("AI sourcing ranking failed", exc)]
         except Exception as exc:
-            return matches, [f"AI sourcing ranking unavailable; deterministic order used: {exc}"]
+            return matches, [self._safe_warning("AI sourcing ranking unavailable", exc)]
 
 
 def _extract_json(value: str) -> dict[str, Any]:

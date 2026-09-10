@@ -36,7 +36,7 @@ class YandexCloudSettings(BaseModel):
     vision_model: str = "table"
     llm_model: str = ""
     vision_base_url: str = "https://ocr.api.cloud.yandex.net"
-    llm_base_url: str = "https://ai.api.cloud.yandex.net"
+    llm_base_url: str = "https://ai.api.cloud.yandex.net/v1"
     language_codes: list[str] = ["ru", "en"]
     chunk_pages: int = Field(default=8, ge=1, le=50)
     request_timeout_s: float = Field(default=120.0, gt=0, le=1800)

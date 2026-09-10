@@ -238,7 +238,7 @@ button { cursor: pointer; }
 .sourcing-warning { margin-top:16px; padding:12px 14px; border-radius:10px; background:#fff7ed; color:#9a3412; }
 .sourcing-loading { min-height:180px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:#334155; }
 .sourcing-loading small { color:#64748b; }
-.sourcing-project-summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:18px; }
+.sourcing-project-summary { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:10px; margin-bottom:18px; }
 .sourcing-project-summary > div { padding:13px; border-radius:12px; background:#f8fafc; border:1px solid #e2e8f0; }
 .sourcing-project-summary b { font-size:18px; color:#0f172a; }
 .sourcing-project-list { border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; }
