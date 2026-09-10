@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from types import MappingProxyType
 
 import pytest
 
@@ -97,6 +99,92 @@ def _result() -> dict:
         "page_statuses": {"58": status},
         "errors": [],
     }
+
+
+def _frozen_review_result() -> dict:
+    result = _result()
+    result["rows"][0]["ocr_metadata"]["provenance"] = MappingProxyType({
+        "source": MappingProxyType({
+            "stage": "semantic",
+            "refs": (MappingProxyType({"row_index": 10}),),
+        }),
+    })
+    continuation = MappingProxyType({
+        "candidate_parent_physical_refs": tuple(
+            MappingProxyType(ref) for ref in _refs(10)
+        ),
+        "provenance": MappingProxyType({"source": "RowRelationAnalyzer"}),
+    })
+    result["rows"][2]["continuation_evidence"] = continuation
+    result["rows"][2]["ocr_metadata"]["continuation_evidence"] = continuation
+    return result
+
+
+def test_review_boundary_detaches_nested_mappingproxy_without_mutating_source():
+    result = _frozen_review_result()
+    source_provenance = result["rows"][0]["ocr_metadata"]["provenance"]
+    updated = HumanReviewService().apply_saved_decisions(
+        result, [], result["document_fingerprint"]
+    )
+
+    assert isinstance(source_provenance, MappingProxyType)
+    assert isinstance(updated["rows"][0]["ocr_metadata"]["provenance"], dict)
+    updated["rows"][0]["ocr_metadata"]["provenance"]["source"]["stage"] = "changed"
+    assert source_provenance["source"]["stage"] == "semantic"
+    json.dumps(updated, ensure_ascii=False)
+
+
+def test_frozen_result_field_decision_preserves_raw_evidence():
+    result = _frozen_review_result()
+    source_metadata = result["rows"][0]["ocr_metadata"]
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(10),
+        decision=FIELD_DECISION,
+        field="quantity",
+        candidate_value="4",
+    )
+    updated = service.apply_decision(result, decision)
+
+    assert updated["rows"][0]["quantity"] == "4"
+    assert isinstance(source_metadata, dict)
+    assert isinstance(source_metadata["provenance"], MappingProxyType)
+    assert source_metadata["provenance"]["source"]["stage"] == "semantic"
+    json.dumps(updated, ensure_ascii=False)
+
+
+def test_frozen_continuation_evidence_round_trips_and_fingerprints_stably():
+    result = _frozen_review_result()
+    service = HumanReviewService()
+    child = result["rows"][2]
+    parent = result["rows"][0]
+    fragment = child["value_candidates"]["name"]["value_candidate"]
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(11),
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value=fragment,
+        target={"parent_physical_refs": _refs(10)},
+    )
+    fingerprint = service.evidence_fingerprint(
+        child,
+        candidate_value=fragment,
+        parent_refs=_refs(10),
+    )
+    updated = service.apply_saved_decisions(result, [decision], result["document_fingerprint"])
+
+    assert fingerprint == decision.evidence_fingerprint
+    assert updated["rows"][2]["row_type"] == "skip"
+    assert fragment in updated["rows"][0]["name"]
+    assert isinstance(child["continuation_evidence"], MappingProxyType)
+    assert parent["quantity"] == ""
+    json.dumps(updated, ensure_ascii=False)
 
 
 class _Scene:

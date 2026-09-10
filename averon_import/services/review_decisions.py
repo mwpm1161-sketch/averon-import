@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping
@@ -35,6 +34,24 @@ DECISIONS = (FIELD_DECISION, RELATION_DECISION, REJECT_DECISION)
 
 def _stable(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _detached_review_copy(value: Any) -> Any:
+    """Detach a public review DTO without depending on IR pickleability.
+
+    Authoritative OCR/semantic IR values may contain recursively frozen
+    mappings and tuples.  Review mutates only a JSON-shaped DTO, so mappings
+    become plain dictionaries and sequence containers become detached lists.
+    Unknown scalar/object values are preserved rather than stringified.
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: _detached_review_copy(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_detached_review_copy(item) for item in value]
+    return value
 
 
 def _sha256(value: Any) -> str:
@@ -287,7 +304,9 @@ class HumanReviewService:
             "semantic_review_preview": row.get("semantic_review_preview")
             or metadata.get("semantic_review_preview"),
             "continuation_fragments": list(_continuation_fragments(row)),
-            "continuation_evidence": metadata.get("continuation_evidence"),
+            "continuation_evidence": _detached_review_copy(
+                metadata.get("continuation_evidence")
+            ),
             "candidate_parent_physical_refs": [
                 refs for refs in _continuation_parent_candidates(row)
             ],
@@ -491,7 +510,7 @@ class HumanReviewService:
         return False
 
     def apply_decision(self, result: Mapping[str, Any], decision: ReviewDecision) -> dict[str, Any]:
-        updated = deepcopy(dict(result))
+        updated = _detached_review_copy(result)
         if decision.document_fingerprint != str(updated.get("document_fingerprint") or decision.document_fingerprint):
             return updated
         self._apply_one(updated, decision)
@@ -503,7 +522,7 @@ class HumanReviewService:
         decisions: list[ReviewDecision],
         document_fingerprint: str,
     ) -> dict[str, Any]:
-        updated = deepcopy(dict(result))
+        updated = _detached_review_copy(result)
         updated["document_fingerprint"] = document_fingerprint
         for decision in sorted(decisions, key=lambda item: item.created_at):
             if decision.document_fingerprint != document_fingerprint:
@@ -514,7 +533,7 @@ class HumanReviewService:
 
 def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
     """Rebuild page safety counters from the post-review canonical view."""
-    updated = deepcopy(dict(result))
+    updated = _detached_review_copy(result)
     rows = list(updated.get("rows") or [])
     statuses = dict(updated.get("page_statuses") or {})
     for page_key, original in statuses.items():
