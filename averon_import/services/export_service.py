@@ -14,6 +14,9 @@ from averon_import.services.review_policy import critical_blockers_for_row, crit
 
 
 class ExcelExportService:
+    def __init__(self) -> None:
+        self.last_blockers: list[dict[str, str]] = []
+
     def export(
         self,
         rows: list[dict],
@@ -24,6 +27,7 @@ class ExcelExportService:
         only_exportable: bool = True,
         page_statuses: dict | list[dict] | None = None,
         enforce_safety: bool = True,
+        review_export: bool = False,
     ) -> Path:
         valid_columns = [column for column in columns if column in COLUMN_BY_KEY]
         if not valid_columns:
@@ -31,6 +35,7 @@ class ExcelExportService:
 
         if enforce_safety:
             page_blockers = []
+            self.last_blockers = []
             status_items = list(
                 page_statuses.values()
                 if isinstance(page_statuses, dict)
@@ -47,16 +52,26 @@ class ExcelExportService:
                 page = status.get("page", "?")
                 status_pages.add(str(page))
                 output_status = str(status.get("output_status") or "").upper()
+                disposition = str(
+                    status.get("page_disposition")
+                    or (status.get("diagnostics") or {}).get("page_disposition", {}).get("disposition")
+                    or ""
+                ).upper()
                 diagnostics = status.get("diagnostics")
                 diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
                 reasons = [str(item) for item in (status.get("blockers") or []) if str(item)]
                 if diagnostics.get("fallback_reason"):
                     reasons.append(f"reason={diagnostics['fallback_reason']}")
-                if output_status != "USABLE":
+                if output_status != "USABLE" and disposition != "CONFIRMED_NON_SPEC":
                     detail = ", ".join(dict.fromkeys(reasons)) or "нет безопасного результата"
                     page_blockers.append(
                         f"страница {page}: output_status={output_status or 'UNKNOWN'}; {detail}"
                     )
+                    self.last_blockers.append({
+                        "page": str(page),
+                        "category": "page_disposition" if disposition else "page_status",
+                        "reason": detail,
+                    })
                 for blocker in status.get("blockers") or []:
                     if output_status == "USABLE":
                         page_blockers.append(f"страница {page}: {blocker}")
@@ -126,7 +141,7 @@ class ExcelExportService:
                 and isinstance(row.get("ocr_metadata"), dict)
                 and row["ocr_metadata"].get("semantic_review")
             )
-            if only_exportable and (
+            if only_exportable and not review_export and (
                 row.get("row_type") in {"section", "system", "skip"}
                 or (
                     row.get("row_type") == "note"
@@ -192,6 +207,45 @@ class ExcelExportService:
                 cell.border = border
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
+        if review_export:
+            review_sheet = workbook.create_sheet("Проверка")
+            review_sheet.sheet_view.showGridLines = False
+            review_sheet.append(["Страница", "Наименование", "Статус", "Причины проверки"])
+            for cell in review_sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.border = border
+            for row in rows:
+                reasons = row.get("review_reasons") or []
+                metadata_row = row.get("ocr_metadata") if isinstance(row.get("ocr_metadata"), dict) else {}
+                if metadata_row.get("review_reasons"):
+                    reasons = metadata_row["review_reasons"]
+                if not reasons and str(row.get("status") or "").lower() not in {"review", "unrecognized"}:
+                    continue
+                review_sheet.append([
+                    row.get("page", ""),
+                    row.get("name", ""),
+                    row.get("status", ""),
+                    ", ".join(str(item) for item in reasons),
+                ])
+            for row in review_sheet.iter_rows():
+                for cell in row:
+                    cell.border = border
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+                    if cell.row > 1:
+                        cell.fill = PatternFill("solid", fgColor="FEF3C7")
+            review_sheet.column_dimensions["A"].width = 12
+            review_sheet.column_dimensions["B"].width = 48
+            review_sheet.column_dimensions["C"].width = 18
+            review_sheet.column_dimensions["D"].width = 72
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(output_path)
         return output_path
+
+    def export_for_review(self, *args, **kwargs) -> Path:
+        """Explicit inspection export; never changes recognition state."""
+        kwargs["enforce_safety"] = False
+        kwargs["only_exportable"] = False
+        kwargs["review_export"] = True
+        return self.export(*args, **kwargs)

@@ -37,6 +37,17 @@ from averon_import.services.ocr.page_scene import (
 from averon_import.services.ocr.tesseract_adapter import TesseractOcrAdapter
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.ocr.page_contract import PageExtractionStatus
+from averon_import.services.ocr.page_disposition import (
+    CONFIRMED_NON_SPEC,
+    POSSIBLE_SPEC_UNRESOLVED,
+    SPEC_OUTPUT,
+    PageDispositionDecision,
+    page_disposition_from_scene,
+)
+from averon_import.services.ocr.page_scene_arbiter import (
+    PageSceneRegionArbiter,
+    RegionArbitrationResult,
+)
 from averon_import.services.ocr.table_ir import (
     PhysicalCellIR,
     PhysicalCellRef,
@@ -94,6 +105,13 @@ __all__ = [
     "register_provider",
     "create_ocr_provider",
     "PageExtractionStatus",
+    "PageDispositionDecision",
+    "PageSceneRegionArbiter",
+    "RegionArbitrationResult",
+    "SPEC_OUTPUT",
+    "CONFIRMED_NON_SPEC",
+    "POSSIBLE_SPEC_UNRESOLVED",
+    "page_disposition_from_scene",
     "PhysicalCellIR",
     "PhysicalCellRef",
     "PhysicalRowFragmentIR",

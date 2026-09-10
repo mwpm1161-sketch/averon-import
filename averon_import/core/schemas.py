@@ -32,3 +32,4 @@ class ExportRequest(BaseModel):
     only_exportable: bool = True
     filename: str = "averon_import.xlsx"
     sheet_name: str = "Спецификация"
+    review_export: bool = False

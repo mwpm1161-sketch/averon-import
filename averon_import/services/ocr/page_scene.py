@@ -18,6 +18,7 @@ import fitz
 from averon_import.services.ocr.physical_grid import (
     Bounds,
     PhysicalGrid,
+    PhysicalGridCell,
     PhysicalGridDetection,
 )
 from averon_import.services.ocr.raster_grid import (
@@ -26,6 +27,7 @@ from averon_import.services.ocr.raster_grid import (
 )
 from averon_import.services.ocr.semantics import (
     BoundedFamilyContext,
+    ContextRegionEvidence,
     DEFAULT_SCHEMA_GATE,
     DEFAULT_SCHEMA_PROFILE_MATCHER,
     DEFAULT_TABLE_FAMILY_CLASSIFIER,
@@ -33,6 +35,7 @@ from averon_import.services.ocr.semantics import (
     ObservedSchema,
     map_semantic_header,
 )
+from averon_import.services.ocr.semantics.context_evidence import bounded_context_from_words
 
 
 TRUSTED = "TRUSTED"
@@ -798,6 +801,7 @@ def provider_region_proposals(payload: Mapping[str, Any]) -> tuple[TableRegionCa
             "row_count": table.get("rowCount"),
             "column_count": table.get("columnCount"),
             "bbox": list(bounds),
+            "page_size": {"width": page_width, "height": page_height},
         }
         result.append(TableRegionCandidate(
             ref=f"provider:{index}",
@@ -811,6 +815,239 @@ def provider_region_proposals(payload: Mapping[str, Any]) -> tuple[TableRegionCa
             provider_association="unassociated",
         ))
     return tuple(result)
+
+
+def _annotation_words(annotation: Mapping[str, Any]) -> list[dict[str, Any]]:
+    words: list[dict[str, Any]] = []
+    for block in annotation.get("blocks") or ():
+        if not isinstance(block, Mapping):
+            continue
+        for line in block.get("lines") or ():
+            if not isinstance(line, Mapping):
+                continue
+            for word in line.get("words") or ():
+                if not isinstance(word, Mapping):
+                    continue
+                text = str(word.get("text") or "").strip()
+                vertices = (word.get("boundingBox") or {}).get("vertices") if isinstance(word.get("boundingBox"), Mapping) else ()
+                if text and vertices:
+                    words.append({"text": text, "vertices": list(vertices)})
+    return words
+
+
+def _raw_bounds(raw: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    points: list[tuple[float, float]] = []
+    for point in raw.get("vertices") or ():
+        if not isinstance(point, Mapping):
+            continue
+        try:
+            points.append((float(point["x"]), float(point["y"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not points:
+        return None
+    return (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+
+
+def _region_family_context(
+    candidate: TableRegionCandidate,
+    table: Mapping[str, Any],
+    mapping: Any,
+    payload: Mapping[str, Any],
+) -> BoundedFamilyContext:
+    """Build family evidence only from the selected table's local geometry."""
+    annotation = payload.get("textAnnotation") if isinstance(payload, Mapping) else None
+    annotation = annotation if isinstance(annotation, Mapping) else {}
+    page = payload.get("page") if isinstance(payload, Mapping) else None
+    page = page if isinstance(page, Mapping) else {}
+    try:
+        width = float(page.get("width") or annotation.get("width") or 0.0)
+        height = float(page.get("height") or annotation.get("height") or 0.0)
+    except (TypeError, ValueError):
+        width = height = 0.0
+    table_bounds = (
+        candidate.page_bounds[0] * width,
+        candidate.page_bounds[1] * height,
+        candidate.page_bounds[2] * width,
+        candidate.page_bounds[3] * height,
+    ) if width > 0 and height > 0 else candidate.page_bounds
+    context = bounded_context_from_words(
+        table_bounds,
+        _annotation_words(annotation),
+        page_height=height or 1.0,
+    )
+    header_rows = set(getattr(mapping, "header_rows", ()) or ())
+    header_regions: list[ContextRegionEvidence] = []
+    for index, raw_cell in enumerate(table.get("cells") or ()):
+        if not isinstance(raw_cell, Mapping):
+            continue
+        try:
+            row_index = int(raw_cell.get("rowIndex", 0))
+        except (TypeError, ValueError):
+            row_index = 0
+        if header_rows and row_index not in header_rows:
+            continue
+        text = str(raw_cell.get("text") or "").strip()
+        bounds = _raw_bounds(raw_cell.get("boundingBox"))
+        if not text or bounds is None:
+            continue
+        header_regions.append(ContextRegionEvidence(
+            kind="header",
+            bounds=bounds,
+            text=text,
+            source="provider_table_cell",
+            provenance=({
+                "scope": "selected_table",
+                "candidate_ref": candidate.ref,
+                "table_index": (candidate.provider_proposal_evidence or {}).get("table_index"),
+                "cell_index": index,
+                "row_index": row_index,
+            },),
+        ))
+    return BoundedFamilyContext(
+        regions=tuple(context.regions) + tuple(header_regions),
+        provenance=(
+            {
+                "scope": "selected_table",
+                "candidate_ref": candidate.ref,
+                "source": "provider_cells_and_bounded_words",
+                "whole_page_full_text_used": False,
+            },
+        ),
+    )
+
+
+def _cluster_numeric(values: Iterable[float], tolerance: float) -> tuple[float, ...]:
+    groups: list[list[float]] = []
+    for value in sorted(float(item) for item in values):
+        if not groups or value - groups[-1][-1] > tolerance:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return tuple(sum(group) / len(group) for group in groups)
+
+
+def _provider_cell_grid(
+    candidate: TableRegionCandidate,
+    table: Mapping[str, Any],
+) -> PhysicalGrid | None:
+    """Recover a regular local grid from provider cell geometry only when a
+    physical vector/raster proposal also exists.
+
+    The provider cells are secondary evidence here: provider-only candidates
+    are intentionally excluded, and irregular/partial cell topology remains
+    unresolved.  This adapter is useful for vector PDFs whose ruled lines are
+    fragmented by the drawing stream but whose physical table boxes are
+    complete.
+    """
+    if PROVIDER not in candidate.proposal_sources or not (
+        RASTER in candidate.proposal_sources or VECTOR in candidate.proposal_sources
+    ):
+        return None
+    if candidate.provider_association != "unique":
+        return None
+    evidence = candidate.provider_proposal_evidence or {}
+    page_size = evidence.get("page_size") or {}
+    try:
+        width = float(page_size.get("width") or 0.0)
+        height = float(page_size.get("height") or 0.0)
+        row_count = int(table.get("rowCount") or 0)
+        column_count = int(table.get("columnCount") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0 or row_count < 2 or column_count < 2:
+        return None
+    records: list[tuple[int, int, tuple[float, float, float, float], int, int]] = []
+    x_values: list[float] = []
+    y_values: list[float] = []
+    widths: list[float] = []
+    heights: list[float] = []
+    for raw_cell in table.get("cells") or ():
+        if not isinstance(raw_cell, Mapping):
+            continue
+        raw_bounds = _raw_bounds(raw_cell.get("boundingBox"))
+        if raw_bounds is None:
+            return None
+        bounds = (
+            raw_bounds[0] / width,
+            raw_bounds[1] / height,
+            raw_bounds[2] / width,
+            raw_bounds[3] / height,
+        )
+        try:
+            row_index = int(raw_cell.get("rowIndex", 0))
+            column_index = int(raw_cell.get("columnIndex", 0))
+            row_span = max(1, int(raw_cell.get("rowSpan", 1) or 1))
+            column_span = max(1, int(raw_cell.get("columnSpan", 1) or 1))
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= row_index < row_count and 0 <= column_index < column_count):
+            return None
+        records.append((row_index, column_index, bounds, row_span, column_span))
+        x_values.extend((bounds[0], bounds[2]))
+        y_values.extend((bounds[1], bounds[3]))
+        widths.append(bounds[2] - bounds[0])
+        heights.append(bounds[3] - bounds[1])
+    if len(records) < row_count * column_count:
+        return None
+    median_width = sorted(widths)[len(widths) // 2]
+    median_height = sorted(heights)[len(heights) // 2]
+    x_boundaries = _cluster_numeric(x_values, max(0.006, median_width * 0.08))
+    y_boundaries = _cluster_numeric(y_values, max(0.006, median_height * 0.20))
+    if len(x_boundaries) != column_count + 1 or len(y_boundaries) != row_count + 1:
+        return None
+
+    def boundary_index(value: float, boundaries: tuple[float, ...], tolerance: float) -> int | None:
+        index = min(range(len(boundaries)), key=lambda item: abs(boundaries[item] - value))
+        return index if abs(boundaries[index] - value) <= tolerance else None
+
+    occupied: set[tuple[int, int]] = set()
+    tolerance_x = max(0.006, median_width * 0.08)
+    tolerance_y = max(0.006, median_height * 0.20)
+    for row_index, column_index, bounds, row_span, column_span in records:
+        left = boundary_index(bounds[0], x_boundaries, tolerance_x)
+        right = boundary_index(bounds[2], x_boundaries, tolerance_x)
+        top = boundary_index(bounds[1], y_boundaries, tolerance_y)
+        bottom = boundary_index(bounds[3], y_boundaries, tolerance_y)
+        if left is None or right is None or top is None or bottom is None:
+            return None
+        if right - left != column_span or bottom - top != row_span:
+            return None
+        for row in range(top, bottom):
+            for column in range(left, right):
+                occupied.add((row, column))
+    expected = {(row, column) for row in range(row_count) for column in range(column_count)}
+    if occupied != expected:
+        return None
+    return PhysicalGrid(
+        source="provider_secondary_physical_grid",
+        x_boundaries=x_boundaries,
+        y_boundaries=y_boundaries,
+        cells=tuple(
+            PhysicalGridCell(
+                row,
+                column,
+                (x_boundaries[column], y_boundaries[row], x_boundaries[column + 1], y_boundaries[row + 1]),
+            )
+            for row in range(row_count)
+            for column in range(column_count)
+        ),
+        confidence=0.86,
+        high_confidence=True,
+        metrics={
+            "provider_cell_geometry": True,
+            "provider_row_count": row_count,
+            "provider_column_count": column_count,
+            "physical_source_corroborated": True,
+        },
+    )
 
 
 def _region_provider_table(
@@ -862,7 +1099,8 @@ def _evaluate_region_schema(
     )
     mapping = map_semantic_header(cells, column_count)
     observed = ObservedSchema.from_mapping_result(mapping, column_count)
-    family = DEFAULT_TABLE_FAMILY_CLASSIFIER.assess(BoundedFamilyContext())
+    family_context = _region_family_context(candidate, table, mapping, payload)
+    family = DEFAULT_TABLE_FAMILY_CLASSIFIER.assess(family_context)
     profile = DEFAULT_SCHEMA_PROFILE_MATCHER.match(observed, family=family)
     assessment = DEFAULT_SCHEMA_GATE.assess(
         column_count=column_count,
@@ -872,10 +1110,14 @@ def _evaluate_region_schema(
         profile_match=profile,
     )
     evidence = {
+        "family_context": family_context.as_dict(),
+        "family": family.as_dict(),
         "header_mapping": mapping.as_dict(),
         "observed_schema": observed.as_dict(),
         "profile_match": profile.as_dict(),
         "schema": assessment.as_dict(),
+        "provider_cells": [dict(raw_cell) for raw_cell in (table.get("cells") or ()) if isinstance(raw_cell, Mapping)],
+        "provider_page_size": dict((candidate.provider_proposal_evidence or {}).get("page_size") or {}),
     }
     reasons = list(candidate.rejection_reasons)
     if assessment.status == "unsupported":
@@ -1000,6 +1242,29 @@ def compose_page_scene(
     provider_values = tuple(provider_proposals)
     fused = fuse_physical_region_proposals(raster_values + vector_values)
     candidates = _associate_provider(fused, provider_values)
+    if payload is not None:
+        recovered: list[TableRegionCandidate] = []
+        for candidate in candidates:
+            table = _region_provider_table(candidate, payload)
+            grid = _provider_cell_grid(candidate, table) if table is not None else None
+            if grid is not None and candidate.trusted_grid is None:
+                recovered.append(replace(
+                    candidate,
+                    local_grid_hypotheses=candidate.local_grid_hypotheses + (
+                        LocalGridHypothesis(
+                            source="provider_secondary_physical_grid",
+                            bounds=grid.bounds,
+                            grid=grid,
+                            confidence=grid.confidence,
+                            status=TRUSTED,
+                            evidence=grid.metrics,
+                        ),
+                    ),
+                    physical_status=TRUSTED,
+                ))
+            else:
+                recovered.append(candidate)
+        candidates = tuple(recovered)
     if payload is not None:
         candidates = tuple(_evaluate_region_schema(item, payload) for item in candidates)
     diagnostics = {

@@ -37,6 +37,10 @@ from averon_import.services.ocr.base import (
     PageOcrResult,
 )
 from averon_import.services.ocr.page_contract import page_status_from_diagnostics
+from averon_import.services.ocr.page_disposition import (
+    PageDispositionDecision,
+    page_disposition_from_scene,
+)
 from averon_import.services.ocr.reconstruction import (
     collect_words,
     page_geometry,
@@ -57,6 +61,7 @@ from averon_import.services.ocr.physical_grid import (
     validate_physical_grid,
 )
 from averon_import.services.ocr.page_scene import PageSceneDetector
+from averon_import.services.ocr.page_scene_arbiter import PageSceneRegionArbiter
 from averon_import.services.ocr.raster_grid import (
     RasterGridPage,
     RasterRuledTableGridDetector,
@@ -187,6 +192,7 @@ class YandexVisionProvider:
         self._page_scene_detector = PageSceneDetector(
             raster_detector=self._grid_detector
         )
+        self._page_scene_arbiter = PageSceneRegionArbiter()
         self._reconstruction_mode = (
             reconstruction_mode
             if reconstruction_mode in {"table", "shadow", "geometry"}
@@ -1410,6 +1416,7 @@ class YandexVisionProvider:
             "table_region_review_count": 0,
             "table_region_rejected_count": 0,
             "multi_table_pages": 0,
+            "page_disposition_counts": {},
         }
         by_page: dict[int, PageOcrResult] = {
             number: PageOcrResult(page=number, provides_confidence=False)
@@ -1461,6 +1468,7 @@ class YandexVisionProvider:
                 if grid_detection is not None and grid_detection.high_confidence:
                     stats["geometry_high_confidence_pages"] += 1
                 reconstruction_diagnostics: dict = {}
+                page_scene = None
                 try:
                     page_scene = self._page_scene_detector.analyze_page(
                         pdf_path,
@@ -1479,6 +1487,32 @@ class YandexVisionProvider:
                         stats[metric] += int(scene_metrics.get(metric) or 0)
                     if scene_metrics.get("multi_table_page"):
                         stats["multi_table_pages"] += 1
+                    arbiter = self._page_scene_arbiter.decide(page_scene)
+                    disposition = page_disposition_from_scene(page_scene, arbitration=arbiter)
+                    reconstruction_diagnostics["page_scene_arbiter"] = arbiter.as_dict()
+                    reconstruction_diagnostics["page_disposition"] = disposition.as_dict()
+                    disposition_counts = stats.setdefault("page_disposition_counts", {})
+                    disposition_counts[disposition.disposition] = int(
+                        disposition_counts.get(disposition.disposition) or 0
+                    ) + 1
+                    if arbiter.can_activate and arbiter.selected_grid is not None:
+                        # This is the only production bridge from the shadow
+                        # scene.  The existing equipment reconstruction and
+                        # semantic projection remain authoritative.
+                        physical_grid = arbiter.selected_grid
+                        stats["geometry_high_confidence_pages"] += 1 if not (
+                            grid_detection is not None and grid_detection.high_confidence
+                        ) else 0
+                        reconstruction_diagnostics["page_scene_activation"] = {
+                            "activated": True,
+                            "profile": "equipment_material_specification",
+                            "region_ref": arbiter.selected_region_ref,
+                        }
+                    else:
+                        reconstruction_diagnostics["page_scene_activation"] = {
+                            "activated": False,
+                            "reasons": list(arbiter.reasons),
+                        }
                 except (AttributeError, OSError, RuntimeError, ValueError) as exc:
                     # The scene is shadow evidence.  A detector problem must
                     # never change the existing equipment reconstruction path.
@@ -1487,6 +1521,14 @@ class YandexVisionProvider:
                         "error_type": type(exc).__name__,
                         "error": str(exc)[:240],
                     }
+                    reconstruction_diagnostics["page_scene_arbiter"] = {
+                        "can_activate": False,
+                        "activated": False,
+                        "reasons": ["page_scene_construction_error"],
+                    }
+                    reconstruction_diagnostics["page_disposition"] = PageDispositionDecision(
+                        reasons=("page_scene_construction_error",),
+                    ).as_dict()
                 reconstruction_result = reconstruct_page_rows_result(
                     payload,
                     self.key,
@@ -1497,6 +1539,15 @@ class YandexVisionProvider:
                 rows = self._apply_semantic_projection(
                     reconstruction_result, reconstruction_diagnostics
                 )
+                if (
+                    isinstance(reconstruction_diagnostics.get("page_disposition"), dict)
+                    and reconstruction_diagnostics["page_disposition"].get("disposition")
+                    == "CONFIRMED_NON_SPEC"
+                ):
+                    # A positively identified unrelated table must not leak
+                    # legacy rows into specification output.
+                    rows = []
+                    reconstruction_diagnostics["non_spec_rows_suppressed"] = True
                 observed_schema = reconstruction_diagnostics.get("observed_schema")
                 if isinstance(observed_schema, dict):
                     stats["observed_schema_count"] += 1
@@ -1532,7 +1583,7 @@ class YandexVisionProvider:
                     reconstruction_diagnostics["detector_reasons"] = list(
                         grid_detection.reasons
                     )
-                secondary = self._secondary_verify_page(
+                secondary = None if reconstruction_diagnostics.get("non_spec_rows_suppressed") else self._secondary_verify_page(
                     pdf_path,
                     number,
                     payload,

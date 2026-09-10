@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from averon_import.services.ocr.page_disposition import (
+    POSSIBLE_SPEC_UNRESOLVED,
+)
+
 
 LAYOUT_TRUSTED = "TRUSTED"
 LAYOUT_AMBIGUOUS = "AMBIGUOUS"
@@ -31,6 +35,7 @@ class PageExtractionStatus:
     layout_status: str = LAYOUT_FAILED
     schema_status: str = SCHEMA_UNKNOWN
     output_status: str = OUTPUT_NO_SPEC
+    page_disposition: str = POSSIBLE_SPEC_UNRESOLVED
     blockers: list[str] = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
 
@@ -45,6 +50,7 @@ class PageExtractionStatus:
             "layout_status": self.layout_status,
             "schema_status": self.schema_status,
             "output_status": self.output_status,
+            "page_disposition": self.page_disposition,
             "blockers": list(dict.fromkeys(self.blockers)),
             "diagnostics": dict(self.diagnostics),
         }
@@ -94,6 +100,11 @@ def page_status_from_diagnostics(
         page=int(page),
         layout_status=layout,
         schema_status=schema_value,
+        page_disposition=str(
+            ((data.get("page_disposition") or {}).get("disposition")
+             if isinstance(data.get("page_disposition"), dict)
+             else data.get("page_disposition") or POSSIBLE_SPEC_UNRESOLVED)
+        ),
         diagnostics={
             "selected_mode": selected_mode,
             "fallback_reason": fallback_reason,
@@ -164,6 +175,8 @@ def page_status_from_diagnostics(
     else:
         status.output_status = OUTPUT_NO_SPEC
     status.diagnostics["row_count"] = int(row_count)
+    if isinstance(data.get("page_disposition"), dict):
+        status.diagnostics["page_disposition"] = dict(data["page_disposition"])
     status.diagnostics["geometry_trusted"] = bool(high_grid and not geometry_failed)
     for key in (
         "semantic_authoritative",

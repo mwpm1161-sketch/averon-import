@@ -435,6 +435,8 @@ def export(document_id: str, request: ExportRequest):
             include_headers=request.include_headers,
             only_exportable=request.only_exportable,
             page_statuses=stored_result.get("page_statuses") or {},
+            review_export=request.review_export,
+            enforce_safety=not request.review_export,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
