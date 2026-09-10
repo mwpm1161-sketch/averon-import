@@ -651,13 +651,43 @@ function sourceRowIndex(row) {
   return values.length ? Math.min(...values) : Number.MAX_SAFE_INTEGER;
 }
 
+function continuationParentRefs(row) {
+  const asRefSets = (value) => {
+    if (!Array.isArray(value) || !value.length) return [];
+    const isRef = (item) => item && typeof item === "object" && !Array.isArray(item)
+      && (Object.prototype.hasOwnProperty.call(item, "table") || Object.prototype.hasOwnProperty.call(item, "row_index"));
+    return value.every(isRef) ? [value] : value.filter(Array.isArray);
+  };
+  const sources = [
+    row?.continuation_evidence,
+    row?.ocr_metadata?.continuation_evidence,
+    row?.candidate_parent_physical_refs,
+    row?.ocr_metadata?.candidate_parent_physical_refs,
+  ];
+  for (const source of sources) {
+    if (Array.isArray(source)) {
+      const refSets = asRefSets(source);
+      if (refSets.length) return refSets;
+    }
+    if (!source || typeof source !== "object") continue;
+    for (const key of ["candidate_parent_physical_refs", "candidate_parent_refs", "parent_physical_refs", "candidate_target_refs"]) {
+      const refSets = asRefSets(source[key]);
+      if (refSets.length) return refSets;
+    }
+  }
+  return [];
+}
+
+function samePhysicalRefs(left, right) {
+  return JSON.stringify(left || []) === JSON.stringify(right || []);
+}
+
 function continuationParent(row) {
-  const index = sourceRowIndex(row);
-  return state.rows
-    .filter((candidate) => candidate.page === row.page
-      && ["item", "component", "item_candidate"].includes(candidate.row_type)
-      && sourceRowIndex(candidate) < index)
-    .sort((left, right) => sourceRowIndex(right) - sourceRowIndex(left))[0] || null;
+  const candidates = continuationParentRefs(row);
+  if (!candidates.length) return null;
+  return state.rows.find((candidate) => candidate.page === row.page
+    && ["item", "component", "item_candidate"].includes(candidate.row_type)
+    && candidates.some((refs) => samePhysicalRefs(refs, physicalRefs(candidate)))) || null;
 }
 
 function continuationFragment(row) {

@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.requests import Request
 from typing import Any, Literal
 
@@ -608,7 +608,7 @@ class ReviewDecisionRequest(BaseModel):
     field: str | None = None
     relation: str | None = None
     candidate_value: str | None = None
-    target: dict[str, Any] = {}
+    target: dict[str, Any] = Field(default_factory=dict)
 
 
 @app.get("/api/documents/{document_id}/review")

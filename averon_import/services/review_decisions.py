@@ -60,6 +60,100 @@ def _same_refs(left: Any, right: Any) -> bool:
     return _refs(left) == _refs(right) and bool(_refs(left))
 
 
+def _evidence_mappings(row: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Return only the row-level evidence containers used by review decisions."""
+    metadata = row.get("ocr_metadata")
+    return tuple(
+        value
+        for value in (row, metadata if isinstance(metadata, Mapping) else {})
+        if isinstance(value, Mapping)
+    )
+
+
+def _continuation_fragments(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return exact textual fragments already present in review evidence."""
+    fragments: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in fragments:
+            fragments.append(text)
+
+    for source in _evidence_mappings(row):
+        candidates = source.get("value_candidates")
+        if isinstance(candidates, Mapping):
+            for field in ("name", "type_mark", "manufacturer", "note"):
+                candidate = candidates.get(field)
+                if isinstance(candidate, Mapping):
+                    add(candidate.get("value_candidate"))
+        add(source.get("semantic_review_preview"))
+        continuation = source.get("continuation_evidence")
+        if isinstance(continuation, Mapping):
+            for key in ("candidate_value", "fragment"):
+                add(continuation.get(key))
+            for key in ("candidate_fragments", "fragments", "text_candidates"):
+                values = continuation.get(key)
+                if isinstance(values, (list, tuple)):
+                    for value in values:
+                        add(value)
+    return tuple(fragments)
+
+
+def _continuation_parent_candidates(row: Mapping[str, Any]) -> tuple[list[dict[str, Any]], ...]:
+    """Read explicitly bounded parent refs from existing continuation evidence.
+
+    The request target is deliberately not an evidence source.  In particular,
+    this helper does not infer a parent from row order or proximity.
+    """
+    found: list[list[dict[str, Any]]] = []
+    direct_keys = (
+        "candidate_parent_physical_refs",
+        "candidate_parent_refs",
+        "parent_physical_refs",
+        "candidate_target_refs",
+    )
+    nested_keys = (
+        "continuation_evidence",
+        "continuation_candidates",
+        "candidate_parents",
+        "parent_candidates",
+    )
+
+    def add(value: Any) -> None:
+        refs = _refs(value)
+        if refs and refs not in found:
+            found.append(refs)
+
+    def visit(value: Any, *, allow_direct: bool = True) -> None:
+        if isinstance(value, Mapping):
+            if allow_direct:
+                for key in direct_keys:
+                    if key in value:
+                        add(value.get(key))
+            for key in nested_keys:
+                nested = value.get(key)
+                if isinstance(nested, (Mapping, list, tuple)):
+                    visit(nested)
+            for key in ("candidates", "candidate", "evidence"):
+                nested = value.get(key)
+                if isinstance(nested, (Mapping, list, tuple)):
+                    visit(nested)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, Mapping):
+                    visit(item)
+
+    for source in _evidence_mappings(row):
+        for key in direct_keys:
+            if key in source:
+                add(source.get(key))
+        for key in nested_keys:
+            nested = source.get(key)
+            if isinstance(nested, (Mapping, list, tuple)):
+                visit(nested)
+    return tuple(found)
+
+
 class ReviewDecision(BaseModel):
     """One immutable, human-originated review decision."""
 
@@ -177,6 +271,10 @@ class HumanReviewService:
             "raw_physical_cells": metadata.get("raw_physical_cells"),
             "semantic_review_preview": row.get("semantic_review_preview")
             or metadata.get("semantic_review_preview"),
+            "continuation_fragments": list(_continuation_fragments(row)),
+            "candidate_parent_physical_refs": [
+                refs for refs in _continuation_parent_candidates(row)
+            ],
             "parent_physical_refs": _refs(parent_refs),
         }
         return _sha256(evidence)
@@ -212,10 +310,24 @@ class HumanReviewService:
             parent_refs = target_data.get("parent_physical_refs")
             if not _refs(parent_refs):
                 raise ValueError("Для связи продолжения нужна физическая ссылка родителя")
+            parent_candidates = _continuation_parent_candidates(row)
+            if not parent_candidates:
+                raise ValueError(
+                    "Для продолжения отсутствует bounded candidate-parent evidence"
+                )
+            if not any(_same_refs(parent_refs, candidate) for candidate in parent_candidates):
+                raise ValueError(
+                    "Родитель продолжения не совпадает с текущим OCR-доказательством"
+                )
+            fragments = _continuation_fragments(row)
             if not candidate_value:
-                candidate_value = self._continuation_text(row)
+                candidate_value = fragments[0] if fragments else ""
             if not candidate_value:
                 raise ValueError("У продолжения отсутствует текстовый кандидат")
+            if str(candidate_value).strip() not in fragments:
+                raise ValueError(
+                    "Текст продолжения не совпадает с текущим OCR-доказательством"
+                )
         metadata = row.get("ocr_metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
         return ReviewDecision(
@@ -243,16 +355,8 @@ class HumanReviewService:
 
     @staticmethod
     def _continuation_text(row: Mapping[str, Any]) -> str:
-        preview = str(row.get("semantic_review_preview") or "").strip()
-        if not preview:
-            metadata = row.get("ocr_metadata")
-            preview = str(metadata.get("semantic_review_preview") or "").strip() if isinstance(metadata, Mapping) else ""
-        candidates = row.get("value_candidates") or {}
-        for field in ("name", "type_mark", "manufacturer", "note"):
-            candidate = candidates.get(field) if isinstance(candidates, Mapping) else None
-            if isinstance(candidate, Mapping) and candidate.get("value_candidate"):
-                return str(candidate["value_candidate"]).strip()
-        return preview
+        fragments = _continuation_fragments(row)
+        return fragments[0] if fragments else ""
 
     @staticmethod
     def _mark_human(row: dict[str, Any], payload: Mapping[str, Any]) -> None:
@@ -276,6 +380,14 @@ class HumanReviewService:
         )
         if expected != decision.evidence_fingerprint:
             return False
+        if decision.decision == RELATION_DECISION:
+            parent_candidates = _continuation_parent_candidates(row)
+            if not parent_candidates or not any(
+                _same_refs(parent_refs, candidate) for candidate in parent_candidates
+            ):
+                return False
+            if str(decision.candidate_value or "").strip() not in _continuation_fragments(row):
+                return False
         if decision.decision == REJECT_DECISION:
             rejected = list(row.get("human_rejected_candidates") or [])
             rejected.append({

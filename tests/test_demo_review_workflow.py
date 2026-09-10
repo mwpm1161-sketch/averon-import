@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.ocr.page_disposition import (
     POSSIBLE_SPEC_UNRESOLVED,
@@ -61,6 +63,9 @@ def _result() -> dict:
         row["semantic_review"] = True
         row["semantic_state"] = "REVIEW"
         row["semantic_review_preview"] = f"Фрагмент {row['physical_row_refs'][0]['row_index']}"
+        row["continuation_evidence"] = {
+            "candidate_parent_physical_refs": _refs(10),
+        }
         row["value_candidates"] = {
             "name": {
                 "value_candidate": row["semantic_review_preview"],
@@ -144,6 +149,46 @@ def test_d2_shadow_cannot_upgrade_unsafe_authoritative_route():
     assert decision.disposition == POSSIBLE_SPEC_UNRESOLVED
 
 
+def test_d2a_authoritative_route_owns_disposition_without_supported_shadow_candidate():
+    decision = page_disposition_from_scene(
+        _Scene(None),
+        arbitration={"can_activate": False, "reasons": ["shadow_has_no_supported_candidate"]},
+        authoritative={
+            "selected_mode": "geometry_first",
+            "schema": {"status": "supported"},
+            "geometry_grid": {"high_confidence": True},
+            "profile_match": {
+                "selected_profile": {"production_authoritative": True}
+            },
+            "structural_evidence": {"material_disagreement": False},
+        },
+    )
+    assert decision.disposition == SPEC_OUTPUT
+
+
+def test_d2b_shadow_supported_candidate_cannot_upgrade_profile_shadow_only_route():
+    shadow_only = _Candidate()
+    shadow_only.schema_evidence = {
+        "family": {"family": "SUPPORTED_SPECIFICATION", "status": "MATCHED"},
+        "profile_match": {
+            "selected_profile": {"production_authoritative": False}
+        },
+    }
+    decision = page_disposition_from_scene(
+        _Scene(shadow_only),
+        arbitration={"can_activate": True},
+        authoritative={
+            "selected_mode": "geometry_first",
+            "schema": {"status": "supported"},
+            "geometry_grid": {"high_confidence": True},
+            "profile_match": {
+                "selected_profile": {"production_authoritative": False}
+            },
+        },
+    )
+    assert decision.disposition != SPEC_OUTPUT
+
+
 def test_d3_field_decision_is_typed_and_raw_evidence_stays_immutable():
     result = _result()
     before = deepcopy(result["rows"][0]["ocr_metadata"])
@@ -222,6 +267,72 @@ def test_d6_continuation_relation_requires_parent_and_never_composes_numeric_fie
     assert parent["quantity"] == ""
 
 
+def test_d6a_arbitrary_continuation_text_is_rejected():
+    result = _result()
+    with pytest.raises(ValueError, match="Текст продолжения"):
+        HumanReviewService().create_decision(
+            result,
+            document_fingerprint=result["document_fingerprint"],
+            page=58,
+            physical_refs=_refs(11),
+            decision=RELATION_DECISION,
+            relation="human_confirmed_continuation",
+            candidate_value="Не было в OCR",
+            target={"parent_physical_refs": _refs(10)},
+        )
+
+
+def test_d6b_arbitrary_parent_is_rejected_against_bounded_evidence():
+    result = _result()
+    with pytest.raises(ValueError, match="Родитель продолжения"):
+        HumanReviewService().create_decision(
+            result,
+            document_fingerprint=result["document_fingerprint"],
+            page=58,
+            physical_refs=_refs(11),
+            decision=RELATION_DECISION,
+            relation="human_confirmed_continuation",
+            candidate_value="Фрагмент 11",
+            target={"parent_physical_refs": _refs(20)},
+        )
+
+
+def test_d6c_relation_without_candidate_parent_evidence_fails_closed():
+    result = _result()
+    result["rows"][2].pop("continuation_evidence")
+    with pytest.raises(ValueError, match="bounded candidate-parent evidence"):
+        HumanReviewService().create_decision(
+            result,
+            document_fingerprint=result["document_fingerprint"],
+            page=58,
+            physical_refs=_refs(11),
+            decision=RELATION_DECISION,
+            relation="human_confirmed_continuation",
+            candidate_value="Фрагмент 11",
+            target={"parent_physical_refs": _refs(10)},
+        )
+
+
+def test_d6d_valid_relation_keeps_raw_evidence_and_does_not_concatenate_numeric_fields():
+    result = _result()
+    before = deepcopy(result["rows"][2]["ocr_metadata"])
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(12),
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value="Фрагмент 12",
+        target={"parent_physical_refs": _refs(10)},
+    )
+    updated = service.apply_decision(result, decision)
+    assert updated["rows"][0]["quantity"] == ""
+    assert updated["rows"][0]["unit"] == "шт."
+    assert updated["rows"][2]["ocr_metadata"] == before
+
+
 def test_d7_decisions_persist_by_document_and_evidence_fingerprint(tmp_path):
     result = _result()
     service = HumanReviewService()
@@ -266,6 +377,9 @@ def test_d9_p58_style_all_decisions_restore_19_items_and_allow_strict_export(tmp
     child["semantic_review"] = True
     child["semantic_state"] = "REVIEW"
     child["semantic_review_preview"] = "Фрагмент 13"
+    child["continuation_evidence"] = {
+        "candidate_parent_physical_refs": _refs(10),
+    }
     child["value_candidates"] = {"name": {"value_candidate": "Фрагмент 13", "auto_trusted": False}}
     child["ocr_metadata"]["semantic_review_preview"] = "Фрагмент 13"
     child["ocr_metadata"]["value_candidates"] = child["value_candidates"]

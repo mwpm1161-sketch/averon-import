@@ -141,15 +141,10 @@ def page_disposition_from_scene(
             "critical_boundary_conflicts", "unsafe_physical_column_anchoring",
         })
     ]
-    if (
-        authoritative
-        and supported
-        and len(supported) == 1
-        and _authoritative_route_ready(authoritative)
-    ):
+    if authoritative and _authoritative_route_ready(authoritative):
         return PageDispositionDecision(
             disposition=SPEC_OUTPUT,
-            reasons=("supported_specification_region_present", "authoritative_production_route"),
+            reasons=("authoritative_production_route",),
             candidate_refs=refs,
             provenance=(
                 {"source": "authoritative_reconstruction"},
