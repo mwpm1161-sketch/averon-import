@@ -68,6 +68,22 @@ def test_critical_review_ui_is_present_and_export_safety_is_explicit():
     assert "critical-review" in css
 
 
+def test_export_safety_uses_backend_page_status_and_pdf_viewer_resets_cleanly():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert "function backendExportBlockers()" in app_js
+    assert "page_statuses" in app_js
+    assert "output_status" in app_js
+    assert "Backend подтвердил: экспорт разрешён." in app_js
+    assert "loadResult(authoritative, {announce:false})" in app_js
+    assert "state.previewPage = null" in app_js
+    assert "if (pageChanged) setZoom(1)" in app_js
+    assert "justify-content:flex-start" in css
+    assert "flex:0 0 auto" in css
+    assert "transform-origin:top left" in css
+
+
 def test_semantic_review_preview_is_visible_without_canonical_values():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 

@@ -480,6 +480,8 @@ function refreshClientReview(row) {
 
 function loadResult(result, options = {}) {
   state.result = result;
+  state.previewPage = null;
+  setZoom(1);
   state.rows = result.rows.map((row) => ({
     ...row,
     selected: row.selected ?? (
@@ -871,7 +873,9 @@ async function selectRow(id) {
   const row = rowById(id); if (!row) return;
   state.activeRowId = id;
   $("#result-body").querySelectorAll("tr").forEach((tr) => tr.classList.toggle("active", tr.dataset.id === id));
-  if (state.previewPage !== row.page || !$("#pdf-preview").src) {
+  const pageChanged = state.previewPage !== row.page;
+  if (pageChanged || !$("#pdf-preview").src) {
+    if (pageChanged) setZoom(1);
     state.previewPage = row.page;
     $("#preview-page-label").textContent = `Страница ${row.page}`;
     const image = $("#pdf-preview");
@@ -888,7 +892,7 @@ function positionHighlight(row) {
   highlight.style.top = `${row.bbox.y * 100}%`;
   highlight.style.width = `${row.bbox.width * 100}%`;
   highlight.style.height = `${row.bbox.height * 100}%`;
-  requestAnimationFrame(() => highlight.scrollIntoView({block:"center",inline:"center",behavior:"smooth"}));
+  requestAnimationFrame(() => highlight.scrollIntoView({block:"center",inline:"nearest",behavior:"smooth"}));
 }
 
 function updateSummary() {
@@ -904,16 +908,65 @@ function updateSummary() {
   updateExportSafety();
 }
 
+function backendExportBlockers() {
+  const result = state.result || {};
+  const rows = state.rows || [];
+  const statuses = Object.values(result.page_statuses || {});
+  const blockers = [];
+  if (rows.length && result.page_statuses && !statuses.length) {
+    blockers.push("Статус страниц отсутствует");
+  }
+  const statusPages = new Set();
+  statuses.forEach((status) => {
+    if (!status || typeof status !== "object") return;
+    const page = status.page ?? "?";
+    statusPages.add(String(page));
+    const output = String(status.output_status || "UNKNOWN").toUpperCase();
+    const disposition = String(
+      status.page_disposition
+      || status.diagnostics?.page_disposition?.disposition
+      || ""
+    ).toUpperCase();
+    const pageReasons = Array.isArray(status.blockers)
+      ? status.blockers.map((item) => String(item)).filter(Boolean)
+      : [];
+    if (output !== "USABLE" && disposition !== "CONFIRMED_NON_SPEC") {
+      blockers.push(`Страница ${page}: output_status=${output}${pageReasons.length ? ` · ${pageReasons.join(", ")}` : ""}`);
+    } else if (output === "USABLE" && pageReasons.length) {
+      blockers.push(`Страница ${page}: ${pageReasons.join(", ")}`);
+    }
+  });
+  const rowPages = new Set(
+    rows
+      .map((row) => row.page)
+      .filter((page) => page !== undefined && page !== null)
+      .map(String)
+  );
+  for (const page of rowPages) {
+    if (statuses.length && !statusPages.has(page)) blockers.push(`Страница ${page}: статус отсутствует`);
+  }
+  const unresolved = rows.reduce((total, row) => {
+    if (row.selected === false || ["section", "system", "skip"].includes(row.row_type)) return total;
+    if (row.row_type === "note" && !row.structured_table) return total;
+    return total + criticalFieldCount(row);
+  }, 0);
+  if (unresolved) blockers.push(`Не проверено критичных значений: ${unresolved}`);
+  return [...new Set(blockers)];
+}
+
 function updateExportSafety() {
   const node = $("#export-safety");
   if (!node) return;
-  const unresolved = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
-  node.classList.toggle("blocked", unresolved > 0);
-  node.textContent = unresolved
-    ? `Не проверено ${unresolved} критичных значений. Перед экспортом подтвердите их.`
-    : "Критичные значения проверены. Экспорт разрешён.";
+  const blockers = backendExportBlockers();
+  node.classList.toggle("blocked", blockers.length > 0);
+  node.textContent = blockers.length
+    ? `Экспорт заблокирован: ${blockers.slice(0, 3).join("; ")}`
+    : "Backend подтвердил: экспорт разрешён.";
   const button = $("#download-excel");
-  if (button) button.disabled = unresolved > 0 && $("#export-items-only")?.checked !== false;
+  if (button) {
+    button.disabled = blockers.length > 0;
+    button.title = blockers.length ? "Экспорт заблокирован проверками backend" : "Скачать XLSX";
+  }
 }
 
 function markDirty() {
@@ -923,12 +976,15 @@ function markDirty() {
 }
 
 async function saveRows(showToast = true) {
-  if (!state.document || !state.rows.length) return;
+  if (!state.document || !state.rows.length) return null;
   await api(`/api/documents/${state.document.document_id}/results`, {
     method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows}),
   });
+  const authoritative = await api(`/api/documents/${state.document.document_id}/results`);
+  loadResult(authoritative, {announce:false});
   state.dirty = false; $("#save-button").textContent = "Сохранить правки";
   if (showToast) toast("Правки сохранены", "success");
+  return authoritative;
 }
 
 function copyRows(rows, columns, includeHeader = true) {
@@ -982,23 +1038,22 @@ function renderExportColumns() {
 async function downloadExcel() {
   const columns = selectedExportColumns();
   if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
-  if ($("#export-items-only").checked) {
-    const unresolved = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
-    if (unresolved) {
-      toast(`Не проверено ${unresolved} критичных значений. Перед экспортом подтвердите их.`, "error");
+  try {
+    const authoritative = await saveRows(false);
+    if (!authoritative) return;
+    const blockers = backendExportBlockers();
+    if (blockers.length) {
       updateExportSafety();
+      toast(`Экспорт заблокирован: ${blockers.slice(0, 3).join("; ")}`, "error");
       return;
     }
-  }
-  const payload = {
-    columns, rows:state.rows,
-    include_headers:$("#export-headers").checked,
-    only_exportable:$("#export-items-only").checked,
-    filename:$("#export-filename").value,
-    sheet_name:$("#export-sheet").value,
-  };
-  try {
-    await saveRows(false);
+    const payload = {
+      columns, rows:state.rows,
+      include_headers:$("#export-headers").checked,
+      only_exportable:$("#export-items-only").checked,
+      filename:$("#export-filename").value,
+      sheet_name:$("#export-sheet").value,
+    };
     const response = await api(`/api/documents/${state.document.document_id}/export`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     const blob = await response.blob();
     const url=URL.createObjectURL(blob); const link=document.createElement("a");
