@@ -19,7 +19,7 @@
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html, body { min-width: 1160px; margin: 0; background: var(--bg); color: var(--ink); }
+html, body { width:100%; min-width:0; margin:0; background:var(--bg); color:var(--ink); }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 250px minmax(0, 1fr); }
@@ -45,11 +45,12 @@ button { cursor: pointer; }
 .status-dot.ok { background:#55c68b; }.status-dot.bad { background:#ef6a62; }
 .sidebar-footer { display:flex; flex-direction:column; gap:5px; color:#747b86; font-size:10px; line-height:1.35; padding:18px 7px 0; }
 .main { min-width:0; }
-.topbar { height:92px; padding:22px 34px; display:flex; align-items:center; border-bottom:1px solid var(--line); background:rgba(255,255,255,.75); backdrop-filter: blur(14px); position:sticky; top:0; z-index:20; }
+.topbar { min-width:0; min-height:92px; height:auto; padding:22px 34px; display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; border-bottom:1px solid var(--line); background:rgba(255,255,255,.75); backdrop-filter: blur(14px); position:sticky; top:0; z-index:20; }
+.topbar > div:first-child { min-width:0; }
 .topbar h1 { margin:0; font-size:22px; letter-spacing:-.02em; }
 .topbar p { margin:4px 0 0; color:var(--muted); font-size:13px; }
-.top-actions { margin-left:auto; display:flex; gap:10px; }
-.view { display:none; padding:32px 34px 42px; }
+.top-actions { min-width:0; margin-left:auto; display:flex; flex-wrap:wrap; justify-content:flex-end; gap:10px; }
+.view { display:none; min-width:0; padding:32px 34px 42px; }
 .view.visible { display:block; }
 .hero-grid { max-width:1200px; min-height:680px; margin:auto; display:grid; grid-template-columns:1.05fr .85fr; gap:56px; align-items:center; }
 .hero-copy h2 { font-size:48px; line-height:1.08; letter-spacing:-.045em; margin:14px 0 20px; max-width:700px; }
@@ -120,7 +121,8 @@ button { cursor: pointer; }
 .summary-card { background:#fff; border:1px solid var(--line); border-radius:13px; padding:14px 16px; display:flex; align-items:center; justify-content:space-between; }
 .summary-card small { color:var(--muted); }.summary-card b { font-size:22px; }
 .summary-card.warning { background:var(--warning-bg); border-color:#f0d997; }.summary-card.warning b { color:#966314; }
-.review-toolbar { display:flex; gap:9px; align-items:center; margin-bottom:12px; }
+.review-toolbar { display:flex; min-width:0; flex-wrap:wrap; gap:9px; align-items:center; margin-bottom:12px; }
+.review-toolbar .spacer { min-width:0; }
 .search-field { height:40px; min-width:290px; display:flex; gap:8px; align-items:center; background:#fff; border:1px solid var(--line); border-radius:10px; padding:0 11px; }
 .search-field input { width:100%; border:0; outline:none; }.search-field span { color:#7b8189; font-size:20px; }
 .review-toolbar .select { width:auto; min-width:170px; height:40px; padding:7px 10px; font-size:12px; }
@@ -131,7 +133,7 @@ button { cursor: pointer; }
 .pane-header b,.pane-header small { display:block; font-size:12px; }.pane-header small { color:var(--muted); margin-top:2px; }
 .zoom-actions { margin-left:auto; display:flex; align-items:center; border:1px solid var(--line); border-radius:9px; overflow:hidden; background:#fff; }
 .zoom-actions button { width:31px; height:29px; border:0; background:#fff; font-size:16px; }.zoom-actions span { min-width:52px; text-align:center; font-size:11px; }
-.pdf-stage { flex:1; overflow:auto; padding:18px; display:flex; align-items:flex-start; justify-content:flex-start; }
+.pdf-stage { flex:1; min-width:0; overflow:auto; padding:18px 18px 18px 0; display:flex; align-items:flex-start; justify-content:flex-start; }
 .pdf-image-wrap { position:relative; flex:0 0 auto; transform-origin:top left; transition:transform .15s; box-shadow:0 12px 35px rgba(17,24,39,.13); }
 .pdf-image-wrap img { display:block; max-width:none; width:1000px; height:auto; background:#fff; }
 .row-highlight { position:absolute; border:2px solid #111318; background:rgba(255,218,77,.25); pointer-events:none; }

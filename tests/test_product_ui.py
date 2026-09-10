@@ -84,6 +84,16 @@ def test_export_safety_uses_backend_page_status_and_pdf_viewer_resets_cleanly():
     assert "transform-origin:top left" in css
 
 
+def test_review_layout_contains_overflow_inside_workspace_and_pdf_pane():
+    css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert "html, body { width:100%; min-width:0" in css
+    assert ".topbar { min-width:0" in css
+    assert ".review-toolbar { display:flex; min-width:0; flex-wrap:wrap" in css
+    assert ".pdf-stage { flex:1; min-width:0; overflow:auto; padding:18px 18px 18px 0" in css
+    assert "overflow-x:hidden" not in css
+
+
 def test_semantic_review_preview_is_visible_without_canonical_values():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 
