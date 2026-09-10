@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.requests import Request
-from typing import Literal
+from typing import Any, Literal
 
 from averon_import import __version__
 from averon_import.ai import AiCorrectionService, SmartAIIntegration
@@ -49,6 +49,12 @@ from averon_import.services.secrets import (
     create_secret_store,
     resolve_secret,
 )
+from averon_import.services.sourcing.cache import SourcingCache
+from averon_import.services.sourcing.catalog_repository import CatalogRepository
+from averon_import.services.sourcing.models import ProductIntent
+from averon_import.services.sourcing.product_understanding import SourcingAIService
+from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
+from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.workspace import WorkspaceService
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -88,6 +94,18 @@ coordinator = ProcessingCoordinator(
     smart_ai=smart_ai,
     settings_service=app_settings_service,
     providers={"cloud": yandex_vision_provider},
+)
+sourcing_repository = CatalogRepository(DATA_DIR / "sourcing" / "catalog.sqlite3")
+sourcing_provider = LocalCatalogProvider(sourcing_repository)
+sourcing_service = SourcingService(
+    {sourcing_provider.key: sourcing_provider},
+    default_provider=(
+        app_settings_service.settings.sourcing.provider
+        if app_settings_service.settings.sourcing.provider in {sourcing_provider.key}
+        else sourcing_provider.key
+    ),
+    ai=SourcingAIService(ai_service),
+    cache=SourcingCache(DATA_DIR / "sourcing" / "cache.json"),
 )
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
@@ -138,6 +156,7 @@ def config():
             "accurate": "Точный инженерный",
         },
         "ai": ai_service.public_config(),
+        "sourcing": sourcing_service.public_config(),
         "settings": {
             "processing_mode": app_settings_service.settings.processing_mode,
             "processing_modes": list(PROCESSING_MODES),
@@ -179,6 +198,12 @@ class PipelineSettingsUpdate(BaseModel):
     min_confidence: float | None = None
 
 
+class SourcingSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    provider: str | None = None
+
+
 class SettingsUpdate(BaseModel):
     """api_key is write-only: it goes to the SecretStore and is never returned."""
 
@@ -188,6 +213,7 @@ class SettingsUpdate(BaseModel):
     local: LocalSettingsUpdate | None = None
     yandex: YandexSettingsUpdate | None = None
     pipeline: PipelineSettingsUpdate | None = None
+    sourcing: SourcingSettingsUpdate | None = None
     api_key: str | None = None
     delete_yandex_api_key: bool = False
 
@@ -225,6 +251,8 @@ def put_settings(request: SettingsUpdate):
     patch = {key: value for key, value in patch.items() if value is not None}
     try:
         app_settings_service.update(patch)
+        if app_settings_service.settings.sourcing.provider in sourcing_service.providers:
+            sourcing_service.default_provider = app_settings_service.settings.sourcing.provider
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {}
         location = ".".join(str(part) for part in first.get("loc", ()))
@@ -445,6 +473,112 @@ def export(document_id: str, request: ExportRequest):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename,
     )
+
+
+class SourcingRowRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    row: dict[str, Any]
+    provider: str | None = None
+    limit: int = 20
+
+
+class SourcingIntentRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    intent: ProductIntent
+    provider: str | None = None
+    limit: int = 20
+
+
+class SourcingProjectRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    rows: list[dict[str, Any]]
+    provider: str | None = None
+    limit: int = 20
+
+
+def _sourcing_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return value
+
+
+@app.get("/api/sourcing/providers")
+def sourcing_providers():
+    return sourcing_service.public_config()
+
+
+@app.get("/api/sourcing/catalog/stats")
+def sourcing_catalog_stats():
+    return sourcing_repository.stats()
+
+
+@app.post("/api/sourcing/understand")
+def sourcing_understand(request: SourcingRowRequest):
+    intent, warnings = sourcing_service.understand_row_with_warnings(request.row)
+    return {"intent": _sourcing_payload(intent), "warnings": warnings}
+
+
+@app.post("/api/sourcing/search")
+def sourcing_search(request: SourcingRowRequest):
+    try:
+        result = sourcing_service.search_row(
+            request.row,
+            provider_key=request.provider,
+            limit=max(1, min(request.limit, 100)),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _sourcing_payload(result)
+
+
+@app.post("/api/sourcing/search-intent")
+def sourcing_search_intent(request: SourcingIntentRequest):
+    try:
+        result = sourcing_service.search_intent(
+            request.intent,
+            provider_key=request.provider,
+            limit=max(1, min(request.limit, 100)),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _sourcing_payload(result)
+
+
+@app.post("/api/sourcing/search-all")
+def sourcing_search_all(request: SourcingProjectRequest):
+    try:
+        result = sourcing_service.search_project(
+            request.rows,
+            provider_key=request.provider,
+            limit=max(1, min(request.limit, 100)),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _sourcing_payload(result)
+
+
+def _ensure_document(document_id: str) -> None:
+    try:
+        workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+
+
+@app.post("/api/documents/{document_id}/sourcing/search")
+def document_sourcing_search(document_id: str, request: SourcingRowRequest):
+    _ensure_document(document_id)
+    return sourcing_search(request)
+
+
+@app.post("/api/documents/{document_id}/sourcing/search-all")
+def document_sourcing_search_all(document_id: str, request: SourcingProjectRequest):
+    _ensure_document(document_id)
+    # The client sends the current selected/exportable rows, including any
+    # reviewed edits.  The document id is used only to scope the operation.
+    return sourcing_search_all(request)
 
 
 @app.get("/favicon.ico")

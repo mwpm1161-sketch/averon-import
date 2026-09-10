@@ -212,3 +212,40 @@ button { cursor: pointer; }
 .settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
 .settings-grid .hint { margin:6px 0 0; }
 @media (max-width:720px) { .settings-grid { grid-template-columns:1fr; } }
+
+/* Sourcing panel: existing neutral engineering UI language. */
+.sourcing-column, .sourcing-cell { min-width:150px; }
+.sourcing-cell { vertical-align:top; padding-top:12px !important; }
+.sourcing-row-button { white-space:nowrap; }
+.sourcing-modal { width:min(920px,calc(100vw - 32px)); }
+.sourcing-card { width:min(920px,calc(100vw - 32px)); }
+.sourcing-content { min-height:160px; }
+.intent-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; padding:16px; border:1px solid var(--line); border-radius:14px; background:#f8fafc; }
+.intent-summary small, .sourcing-project-summary small { display:block; color:#64748b; margin-bottom:5px; }
+.intent-summary b { display:block; color:#0f172a; }
+.intent-badges { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:8px; }
+.technical-badge { padding:5px 9px; border-radius:999px; background:#e0f2fe; color:#075985; font-size:12px; }
+.offer-card { padding:18px; border-radius:16px; border:1px solid #dbe4ee; background:#fff; box-shadow:0 10px 25px rgba(15,23,42,.06); margin:12px 0 20px; }
+.offer-card.recommended { border-color:#7dd3fc; background:linear-gradient(135deg,#f0f9ff,#fff); }
+.offer-card-heading { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.offer-card-heading b { font-size:16px; }
+.offer-price { font-size:25px; font-weight:700; color:#0f172a; margin-bottom:12px; }
+.offer-price small { font-size:13px; font-weight:500; color:#64748b; }
+.offer-meta { display:flex; flex-wrap:wrap; gap:8px 18px; color:#475569; font-size:13px; }
+.offer-explanation { margin:12px 0; color:#334155; }
+.offer-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.offer-card.compact { margin:0; box-shadow:none; }
+.sourcing-warning { margin-top:16px; padding:12px 14px; border-radius:10px; background:#fff7ed; color:#9a3412; }
+.sourcing-loading { min-height:180px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:#334155; }
+.sourcing-loading small { color:#64748b; }
+.sourcing-project-summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:18px; }
+.sourcing-project-summary > div { padding:13px; border-radius:12px; background:#f8fafc; border:1px solid #e2e8f0; }
+.sourcing-project-summary b { font-size:18px; color:#0f172a; }
+.sourcing-project-list { border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; }
+.project-result-row { display:grid; grid-template-columns:1.1fr 70px 1.3fr 100px 120px 110px 100px; gap:10px; padding:12px 14px; border-bottom:1px solid #e2e8f0; align-items:center; font-size:13px; }
+.project-result-row:last-child { border-bottom:0; }
+.offer-total { display:flex; flex-wrap:wrap; gap:16px; margin:12px 0; color:#475569; font-size:13px; }
+@media (max-width:760px) {
+  .intent-summary, .sourcing-project-summary, .offer-grid { grid-template-columns:1fr; }
+  .project-result-row { grid-template-columns:1fr; gap:4px; }
+}

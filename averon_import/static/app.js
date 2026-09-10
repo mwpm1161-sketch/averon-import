@@ -17,6 +17,7 @@ const state = {
   aiProvider: "off",
   reviewFilter: "",
   settings: null,
+  sourcing: {row: null, result: null},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -492,7 +493,7 @@ function buildResultHeader() {
   head.innerHTML = `<tr><th class="selector"><input type="checkbox" id="select-all-rows" title="Выбрать все позиции"></th>${displayColumns.map((key) => {
     const column = state.config.columns.find((item) => item.key === key);
     return `<th style="min-width:${columnWidth(key)}px">${escapeHtml(column?.title || key)}</th>`;
-  }).join("")}</tr>`;
+  }).join("")}<th class="sourcing-column">Подбор</th></tr>`;
   $("#select-all-rows").addEventListener("change", (event) => {
     filteredRows().forEach((row) => row.selected = event.target.checked);
     renderRows(); updateSummary(); markDirty();
@@ -581,6 +582,11 @@ function renderRows() {
       .find((element) => element.dataset.key === button.dataset.key);
     if (input) { input.focus(); input.select(); }
   }));
+  body.querySelectorAll(".sourcing-row-button").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = rowById(button.dataset.id);
+    if (row) openSourcingForRow(row);
+  }));
 }
 
 function rowHtml(row) {
@@ -590,7 +596,87 @@ function rowHtml(row) {
   return `<tr data-id="${row.id}" class="${active} ${review} ${critical}">
     <td class="selector"><input class="row-select" data-id="${row.id}" type="checkbox" ${row.selected ? "checked" : ""}></td>
     ${displayColumns.map((key) => cellHtml(row,key)).join("")}
+    <td class="sourcing-cell">${sourcingEligible(row) ? `<button type="button" class="button text sourcing-row-button" data-id="${row.id}">Найти предложения</button>` : ""}</td>
   </tr>`;
+}
+
+function sourcingEligible(row) {
+  return ["item", "component", "item_candidate"].includes(row.row_type)
+    && Boolean(String(row.name || row.type_mark || row.code || "").trim());
+}
+
+function formatMoney(value, currency = "") {
+  if (value === null || value === undefined || value === "") return "Цена не указана";
+  return `${escapeHtml(String(value))}${currency ? ` ${escapeHtml(currency)}` : ""}`;
+}
+
+function estimatedOfferTotal(offer, intent) {
+  const quantity = Number(String(intent?.quantity || "").replace(",", "."));
+  const price = Number(offer?.price);
+  if (!Number.isFinite(quantity) || quantity < 0 || !Number.isFinite(price) || price < 0) return null;
+  return (quantity * price).toFixed(2);
+}
+
+function renderOfferCard(result, compact = false, intent = null) {
+  const offer = result.offer || result;
+  const decision = result.decision || "";
+  const explanation = result.explanation || "";
+  const total = estimatedOfferTotal(offer, intent);
+  return `<article class="offer-card ${compact ? "compact" : "recommended"}">
+    <div class="offer-card-heading"><span class="status-pill">${escapeHtml(decision || "Предложение")}</span><b>${escapeHtml(offer.title || "Без названия")}</b></div>
+    <div class="offer-price">${formatMoney(offer.price, offer.currency)} <small>/ ${escapeHtml(offer.price_unit || "шт.")}</small></div>
+    <div class="offer-meta"><span>${escapeHtml(offer.manufacturer || offer.brand || "Производитель не указан")}</span><span>${escapeHtml(offer.article || "Артикул не указан")}</span><span>${escapeHtml(offer.availability_text || (offer.availability === true ? "В наличии" : "Наличие уточняется"))}</span></div>
+    ${intent?.quantity ? `<div class="offer-total"><span>Количество: <b>${escapeHtml(String(intent.quantity))} ${escapeHtml(intent.unit || "")}</b></span><span>Расчётная стоимость: <b>${total === null ? "требует проверки" : formatMoney(total, offer.currency)}</b></span></div>` : ""}
+    ${explanation ? `<p class="offer-explanation">${escapeHtml(explanation)}</p>` : ""}
+    ${offer.url ? `<a class="button text" target="_blank" rel="noopener" href="${escapeHtml(offer.url)}">Открыть предложение</a>` : ""}
+  </article>`;
+}
+
+function renderSourcingResult(result, row = null) {
+  const content = $("#sourcing-content");
+  if (result.positions_total !== undefined) {
+    const currency = result.currency || "";
+    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Совпали</small><b>${result.positions_matched}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>Расчётный итог</small><b>${result.estimated_total === null ? "Требует проверки" : formatMoney(result.estimated_total, currency)}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const offer = item.recommended_offer; const total = offer ? estimatedOfferTotal(offer, item.intent) : null; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${item.match_results?.[0]?.decision || "REVIEW"}</span><span>${escapeHtml(offer?.provider || "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+    return;
+  }
+  const intent = result.intent || {};
+  const best = result.match_results?.find((item) => ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(item.decision));
+  const alternatives = (result.match_results || []).filter((item) => item !== best && item.decision !== "REJECT").slice(0, 5);
+  const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
+  content.innerHTML = `<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges">${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+}
+
+async function openSourcingForRow(row) {
+  state.sourcing.row = row;
+  state.sourcing.result = null;
+  $("#sourcing-subtitle").textContent = "Анализируем позицию и ищем в каталоге…";
+  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Ищем в каталоге</b><small>Сравниваем структурированные характеристики</small></div>`;
+  $("#sourcing-modal").showModal();
+  try {
+    const result = await api("/api/sourcing/search", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({row, limit:20})});
+    state.sourcing.result = result;
+    $("#sourcing-subtitle").textContent = "Результат детерминированного сопоставления";
+    renderSourcingResult(result, row);
+  } catch (error) {
+    $("#sourcing-subtitle").textContent = "Поиск не выполнен";
+    $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}<br><small>Можно продолжить с локальным каталогом после его наполнения.</small></div>`;
+  }
+}
+
+async function openProjectSourcing() {
+  const rows = state.rows.filter((row) => row.selected && sourcingEligible(row));
+  if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
+  $("#sourcing-subtitle").textContent = "Подбираем предложения для выбранных позиций…";
+  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Анализируем проект</b><small>Ищем в каталоге и проверяем характеристики</small></div>`;
+  $("#sourcing-modal").showModal();
+  try {
+    const url = state.document ? `/api/documents/${state.document.document_id}/sourcing/search-all` : "/api/sourcing/search-all";
+    const result = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows, limit:20})});
+    $("#sourcing-subtitle").textContent = "Проектный подбор завершён";
+    renderSourcingResult(result);
+  } catch (error) {
+    $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
+  }
 }
 
 function cellHtml(row, key) {
@@ -827,6 +913,8 @@ function setupEvents() {
   $("#export-items-only").addEventListener("change",updateExportSafety);
   $("#copy-export").addEventListener("click",()=>copyRows(state.rows,selectedExportColumns(),$("#export-headers").checked));
   $("#download-excel").addEventListener("click",downloadExcel);
+  $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
+  $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());
   $("#zoom-in").addEventListener("click",()=>setZoom(Math.min(1.8,state.zoom+.1))); $("#zoom-out").addEventListener("click",()=>setZoom(Math.max(.5,state.zoom-.1)));
   $("#clear-crop").addEventListener("click",()=>{state.crop=null;positionCropBox();$("#clear-crop").hidden=true;});

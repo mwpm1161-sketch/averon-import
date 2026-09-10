@@ -55,6 +55,12 @@ class PipelineTuningSettings(BaseModel):
     min_confidence: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
+class SourcingSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    provider: str = "local_catalog"
+
+
 class AppSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -62,6 +68,7 @@ class AppSettings(BaseModel):
     local: LocalAiSettings = Field(default_factory=LocalAiSettings)
     yandex: YandexCloudSettings = Field(default_factory=YandexCloudSettings)
     pipeline: PipelineTuningSettings = Field(default_factory=PipelineTuningSettings)
+    sourcing: SourcingSettings = Field(default_factory=SourcingSettings)
 
     def public(self) -> dict:
         return {
@@ -69,6 +76,7 @@ class AppSettings(BaseModel):
             "local": self.local.model_dump(),
             "yandex": self.yandex.model_dump(),
             "pipeline": self.pipeline.model_dump(),
+            "sourcing": self.sourcing.model_dump(),
         }
 
 
@@ -152,6 +160,8 @@ class AppSettingsService:
             settings.pipeline.min_confidence = value
         if (value := _env_int("AVERON_AI_BATCH_SIZE")) is not None:
             settings.pipeline.batch_size = value
+        if value := os.environ.get("AVERON_SOURCING_PROVIDER", "").strip():
+            settings.sourcing.provider = value
 
     def update(self, patch: dict) -> AppSettings:
         current = json.loads(self.settings.model_dump_json())
