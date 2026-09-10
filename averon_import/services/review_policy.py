@@ -319,6 +319,7 @@ def refresh_review_state(row: dict) -> dict:
     elif identity_flagged and "identity_cell_missing" not in reasons:
         reasons.append("identity_cell_missing")
     conflict_fields = set(_as_list(row.get("secondary_conflict_fields")))
+    human_verified_fields = set(_as_list(row.get("human_verified_fields")))
     if (
         "secondary_conflict" in edited_fields
         or conflict_fields.intersection(edited_fields)
@@ -335,6 +336,10 @@ def refresh_review_state(row: dict) -> dict:
         reasons.append("numeric_suspect")
     for field, candidate in (row.get("value_candidates") or {}).items():
         if isinstance(candidate, dict) and candidate.get("review_reason"):
+            if field in human_verified_fields:
+                # The candidate remains immutable OCR evidence, but an
+                # explicit human confirmation resolves its review obligation.
+                continue
             if (
                 field in edited_fields
                 and candidate.get("review_reason") == "secondary_conflict"

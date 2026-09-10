@@ -26,6 +26,10 @@ class Workspace:
         return self.root / "result.json"
 
     @property
+    def review_decisions_path(self) -> Path:
+        return self.root / "review_decisions.json"
+
+    @property
     def pages_dir(self) -> Path:
         path = self.root / "pages"
         path.mkdir(parents=True, exist_ok=True)

@@ -43,6 +43,13 @@ from averon_import.services.processing_coordinator import (
     ProcessingError,
 )
 from averon_import.services.recognition import RecognitionService
+from averon_import.services.review_decisions import (
+    FIELD_DECISION,
+    HumanReviewService,
+    RELATION_DECISION,
+    REJECT_DECISION,
+    ReviewDecisionStore,
+)
 from averon_import.services.review_policy import refresh_rows
 from averon_import.services.secrets import (
     YANDEX_API_KEY,
@@ -109,6 +116,7 @@ sourcing_service = SourcingService(
     ai=SourcingAIService(sourcing_ai_transport),
     cache=SourcingCache(DATA_DIR / "sourcing" / "cache.json"),
 )
+human_review_service = HumanReviewService()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
@@ -399,6 +407,12 @@ def recognize(document_id: str, request: RecognitionRequest):
         result = coordinator.process_document(
             workspace.pdf_path, request.processing_mode, options, progress
         )
+        document_fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+        result = human_review_service.apply_saved_decisions(
+            result,
+            ReviewDecisionStore(workspace.review_decisions_path).load(),
+            document_fingerprint,
+        )
         workspace_service.write_json(workspace.result_path, result)
         return result
 
@@ -421,6 +435,12 @@ def get_results(document_id: str):
         result = workspace_service.read_json(workspace.result_path)
         if not result:
             raise HTTPException(404, "Результат распознавания отсутствует")
+        result = human_review_service.apply_saved_decisions(
+            result,
+            ReviewDecisionStore(workspace.review_decisions_path).load(),
+            human_review_service.document_fingerprint(workspace.pdf_path),
+        )
+        workspace_service.write_json(workspace.result_path, result)
         return result
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
@@ -433,6 +453,12 @@ def save_results(document_id: str, request: SaveRowsRequest):
         existing = workspace_service.read_json(workspace.result_path, default={})
         rows = refresh_rows(request.rows)
         existing["rows"] = rows
+        existing = human_review_service.apply_saved_decisions(
+            existing,
+            ReviewDecisionStore(workspace.review_decisions_path).load(),
+            human_review_service.document_fingerprint(workspace.pdf_path),
+        )
+        rows = existing.get("rows") or []
         existing["summary"] = recognition_service._summary(
             rows, existing.get("errors", [])
         )
@@ -571,6 +597,66 @@ def _ensure_document(document_id: str) -> None:
         workspace_service.get(document_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+
+
+class ReviewDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    page: int
+    physical_refs: list[dict[str, Any]]
+    decision: Literal[FIELD_DECISION, RELATION_DECISION, REJECT_DECISION]
+    field: str | None = None
+    relation: str | None = None
+    candidate_value: str | None = None
+    target: dict[str, Any] = {}
+
+
+@app.get("/api/documents/{document_id}/review")
+def get_review_decisions(document_id: str):
+    try:
+        workspace = workspace_service.get(document_id)
+        decisions = ReviewDecisionStore(workspace.review_decisions_path).load()
+        fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+        return {
+            "document_fingerprint": fingerprint,
+            "decisions": [item.model_dump(mode="json") for item in decisions if item.document_fingerprint == fingerprint],
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+
+
+@app.post("/api/documents/{document_id}/review/decision")
+def save_review_decision(document_id: str, request: ReviewDecisionRequest):
+    try:
+        workspace = workspace_service.get(document_id)
+        result = workspace_service.read_json(workspace.result_path, default={})
+        if not result:
+            raise HTTPException(404, "Результат распознавания отсутствует")
+        fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+        decision = human_review_service.create_decision(
+            result,
+            document_fingerprint=fingerprint,
+            page=request.page,
+            physical_refs=request.physical_refs,
+            decision=request.decision,
+            field=request.field,
+            relation=request.relation,
+            candidate_value=request.candidate_value,
+            target=request.target,
+        )
+        store = ReviewDecisionStore(workspace.review_decisions_path)
+        decisions = store.upsert(decision)
+        updated = human_review_service.apply_saved_decisions(result, decisions, fingerprint)
+        workspace_service.write_json(workspace.result_path, updated)
+        return {
+            "saved": True,
+            "decision": decision.model_dump(mode="json"),
+            "result": updated,
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/documents/{document_id}/sourcing/search")

@@ -1488,12 +1488,13 @@ class YandexVisionProvider:
                     if scene_metrics.get("multi_table_page"):
                         stats["multi_table_pages"] += 1
                     arbiter = self._page_scene_arbiter.decide(page_scene)
-                    disposition = page_disposition_from_scene(page_scene, arbitration=arbiter)
+                    shadow_disposition = page_disposition_from_scene(page_scene, arbitration=arbiter)
                     reconstruction_diagnostics["page_scene_arbiter"] = arbiter.as_dict()
-                    reconstruction_diagnostics["page_disposition"] = disposition.as_dict()
+                    reconstruction_diagnostics["page_disposition_shadow"] = shadow_disposition.as_dict()
+                    reconstruction_diagnostics["page_disposition"] = shadow_disposition.as_dict()
                     disposition_counts = stats.setdefault("page_disposition_counts", {})
-                    disposition_counts[disposition.disposition] = int(
-                        disposition_counts.get(disposition.disposition) or 0
+                    disposition_counts[shadow_disposition.disposition] = int(
+                        disposition_counts.get(shadow_disposition.disposition) or 0
                     ) + 1
                     if arbiter.can_activate and arbiter.selected_grid is not None:
                         # This is the only production bridge from the shadow
@@ -1540,8 +1541,8 @@ class YandexVisionProvider:
                     reconstruction_result, reconstruction_diagnostics
                 )
                 if (
-                    isinstance(reconstruction_diagnostics.get("page_disposition"), dict)
-                    and reconstruction_diagnostics["page_disposition"].get("disposition")
+                    isinstance(reconstruction_diagnostics.get("page_disposition_shadow"), dict)
+                    and reconstruction_diagnostics["page_disposition_shadow"].get("disposition")
                     == "CONFIRMED_NON_SPEC"
                 ):
                     # A positively identified unrelated table must not leak
@@ -1689,6 +1690,17 @@ class YandexVisionProvider:
                         rows,
                         reconstruction_diagnostics,
                     )
+                # The production reconstruction route is authoritative for
+                # output safety.  A rejected shadow scene remains diagnostic
+                # evidence but must not downgrade an otherwise safe route.
+                authoritative_disposition = page_disposition_from_scene(
+                    page_scene,
+                    arbitration=reconstruction_diagnostics.get("page_scene_arbiter"),
+                    authoritative=reconstruction_diagnostics,
+                ) if page_scene is not None else None
+                if authoritative_disposition is not None:
+                    reconstruction_diagnostics["page_disposition"] = authoritative_disposition.as_dict()
+                    reconstruction_diagnostics["page_disposition_authoritative"] = authoritative_disposition.as_dict()
                 target.page_status = page_status_from_diagnostics(
                     number,
                     reconstruction_diagnostics,

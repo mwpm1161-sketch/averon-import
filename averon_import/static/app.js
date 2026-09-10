@@ -478,7 +478,7 @@ function refreshClientReview(row) {
   return row;
 }
 
-function loadResult(result) {
+function loadResult(result, options = {}) {
   state.result = result;
   state.rows = result.rows.map((row) => ({
     ...row,
@@ -496,6 +496,7 @@ function loadResult(result) {
   setView("review");
   const first = state.rows.find((row) => row.selected) || state.rows[0];
   if (first) selectRow(first.id);
+  if (options.announce === false) return;
   if (result.errors?.length) {
     const pages = result.errors.map((error) => error.page).join(", ");
     const details = [...new Set(result.errors.map((error) => error.error).filter(Boolean))]
@@ -594,13 +595,35 @@ function renderRows() {
     const row = rowById(button.dataset.id);
     const candidate = row?.value_candidates?.[button.dataset.key];
     if (!row || !candidate?.value_candidate) return;
-    row[button.dataset.key] = candidate.value_candidate;
-    row.edited_fields = [...new Set([...(row.edited_fields || []), button.dataset.key])];
-    row.edited = true;
-    row.status = "edited";
-    refreshClientReview(row);
-    markDirty(); updateSummary(); renderRows();
-    toast(`${CRITICAL_LABELS[button.dataset.key]} принято из secondary OCR`, "success");
+    submitHumanDecision(row, {
+      decision: "ACCEPT_FIELD_CANDIDATE",
+      field: button.dataset.key,
+      candidate_value: String(candidate.value_candidate),
+    }, `${CRITICAL_LABELS[button.dataset.key]} подтверждено пользователем`);
+  }));
+  body.querySelectorAll(".continuation-accept").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = rowById(button.dataset.id);
+    const parent = row && continuationParent(row);
+    if (!row || !parent) return;
+    const fragment = continuationFragment(row);
+    submitHumanDecision(row, {
+      decision: "ACCEPT_CONTINUATION_RELATION",
+      relation: "human_confirmed_continuation",
+      candidate_value: fragment,
+      target: {parent_physical_refs: physicalRefs(parent)},
+    }, "Продолжение привязано пользователем");
+  }));
+  body.querySelectorAll(".candidate-reject").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = rowById(button.dataset.id);
+    const candidate = row?.value_candidates?.[button.dataset.key];
+    if (!row || !candidate?.value_candidate) return;
+    submitHumanDecision(row, {
+      decision: "REJECT_CANDIDATE",
+      field: button.dataset.key,
+      candidate_value: String(candidate.value_candidate),
+    }, "Кандидат отклонён и оставлен на проверке");
   }));
   body.querySelectorAll(".candidate-edit").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -618,14 +641,60 @@ function renderRows() {
   }));
 }
 
+function physicalRefs(row) {
+  return row?.ocr_metadata?.physical_row_refs || row?.physical_row_refs || [];
+}
+
+function sourceRowIndex(row) {
+  const refs = physicalRefs(row);
+  const values = refs.map((ref) => Number(ref.row_index)).filter(Number.isFinite);
+  return values.length ? Math.min(...values) : Number.MAX_SAFE_INTEGER;
+}
+
+function continuationParent(row) {
+  const index = sourceRowIndex(row);
+  return state.rows
+    .filter((candidate) => candidate.page === row.page
+      && ["item", "component", "item_candidate"].includes(candidate.row_type)
+      && sourceRowIndex(candidate) < index)
+    .sort((left, right) => sourceRowIndex(right) - sourceRowIndex(left))[0] || null;
+}
+
+function continuationFragment(row) {
+  const preview = String(row.semantic_review_preview || row.ocr_metadata?.semantic_review_preview || "").trim();
+  const candidates = row.value_candidates || {};
+  for (const key of ["name", "type_mark", "manufacturer", "note"]) {
+    const value = candidates[key]?.value_candidate;
+    if (value) return String(value).trim();
+  }
+  return preview;
+}
+
+async function submitHumanDecision(row, payload, successMessage) {
+  if (!state.document) return;
+  try {
+    const response = await api(`/api/documents/${state.document.document_id}/review/decision`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({page: row.page, physical_refs: physicalRefs(row), ...payload}),
+    });
+    loadResult(response.result, {announce: false});
+    toast(`${successMessage} · Проверено пользователем ✓`, "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
 function rowHtml(row) {
   const active = row.id === state.activeRowId ? "active" : "";
   const review = ["review","unrecognized"].includes(row.status) ? "review" : "";
   const critical = criticalBlockers(row).length ? "critical-review" : "";
+  const human = row.verification_state === "HUMAN_VERIFIED" || row.human_review ? `<span class="human-verified">Проверено пользователем ✓</span>` : "";
+  const ocrVerified = !human && (row.status === "verified" || row.ocr_metadata?.semantic_state === "VERIFIED") ? `<span class="ocr-verified">Подтверждено OCR</span>` : "";
   return `<tr data-id="${row.id}" class="${active} ${review} ${critical}">
     <td class="selector"><input class="row-select" data-id="${row.id}" type="checkbox" ${row.selected ? "checked" : ""}></td>
     ${displayColumns.map((key) => cellHtml(row,key)).join("")}
-    <td class="sourcing-cell">${sourcingEligible(row) ? `<button type="button" class="button text sourcing-row-button" data-id="${row.id}">Найти предложения</button>` : ""}</td>
+    <td class="sourcing-cell">${human || ocrVerified}${sourcingEligible(row) ? `<button type="button" class="button text sourcing-row-button" data-id="${row.id}">Найти предложения</button>` : ""}</td>
   </tr>`;
 }
 
@@ -723,7 +792,11 @@ function cellHtml(row, key) {
   if (key === "name" && row.row_type === "semantic_review") {
     const preview = String(row.semantic_review_preview || row.ocr_metadata?.semantic_review_preview || "").trim();
     const label = preview ? `Проверить: ${preview}` : "Проверить: строка не разрешена";
-    return `<td><div class="semantic-review-preview">${escapeHtml(label)}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
+    const parent = continuationParent(row);
+    const fragment = continuationFragment(row);
+    const parentLabel = parent ? String(parent.name || parent.type_mark || parent.code || `строка ${sourceRowIndex(parent)}`) : "";
+    const action = parent && fragment ? `<div class="candidate-actions"><small>Кандидат родителя: ${escapeHtml(parentLabel)}</small><button type="button" class="continuation-accept" data-id="${row.id}">Привязать продолжение</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Оставить на проверке</button></div>` : "";
+    return `<td><div class="semantic-review-preview">${escapeHtml(label)}${action}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
   }
   if (!CRITICAL_FIELDS.includes(key) || !isYandexCriticalRow(row)) {
     return `<td><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
@@ -732,9 +805,15 @@ function cellHtml(row, key) {
   const suspect = numericSuspectFields(row).includes(key);
   const candidate = row.value_candidates?.[key];
   let annotation = "";
-  if (candidate?.value_candidate) {
-    annotation = `<div class="secondary-candidate">Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
-      <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;
+  const humanConfirmed = (row.human_verified_fields || []).includes(key);
+  const humanRejected = (row.human_rejected_candidates || []).some((item) => item.field === key && String(item.candidate_value) === String(candidate?.value_candidate));
+  if (humanConfirmed) {
+    annotation = `<small class="human-verified">Проверено пользователем ✓</small>`;
+  } else if (humanRejected) {
+    annotation = `<small class="critical-warning">Кандидат отклонён пользователем · оставлено на проверке</small>`;
+  } else if (candidate?.value_candidate) {
+    annotation = `<div class="secondary-candidate">Проверить · Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
+      <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;
   } else if (missing) {
     annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small>`;
   } else if (suspect) {

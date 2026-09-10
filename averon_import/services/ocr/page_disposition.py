@@ -58,7 +58,64 @@ def _family(candidate: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def page_disposition_from_scene(scene: Any, *, arbitration: Any = None) -> PageDispositionDecision:
+def _authoritative_route_ready(authoritative: Mapping[str, Any]) -> bool:
+    """Return whether the already-selected production route is safe.
+
+    Page-scene arbitration is shadow evidence.  The production reconstruction
+    route is allowed to remain authoritative when it has its own trusted grid
+    and schema contract.  This helper deliberately accepts diagnostics only;
+    it never promotes a route that still carries a material safety blocker.
+    """
+    grid = authoritative.get("geometry_grid")
+    grid = grid if isinstance(grid, Mapping) else {}
+    schema = authoritative.get("schema")
+    schema = schema if isinstance(schema, Mapping) else {}
+    schema_status = str(
+        schema.get("status") or authoritative.get("schema_status") or ""
+    ).lower()
+    if schema_status != "supported" or not bool(grid.get("high_confidence")):
+        return False
+    if str(authoritative.get("selected_mode") or "") != "geometry_first":
+        return False
+    if authoritative.get("physical_row_loss_suspected"):
+        return False
+    if int(authoritative.get("identity_cell_missing_count") or 0) > 0:
+        return False
+    if authoritative.get("schema_profile_shadow_only"):
+        return False
+    if authoritative.get("semantic_resolution_error"):
+        return False
+    if authoritative.get("assignment_safety") == "fallback_required":
+        return False
+    if authoritative.get("material_disagreement"):
+        return False
+    if authoritative.get("material_column_disagreement"):
+        return False
+    if authoritative.get("critical_boundary_conflicts"):
+        return False
+    structural = authoritative.get("structural_evidence")
+    if isinstance(structural, Mapping):
+        if structural.get("material_disagreement"):
+            return False
+        if structural.get("critical_boundary_conflicts"):
+            return False
+        if structural.get("material_column_disagreement"):
+            return False
+    profile = authoritative.get("profile_match")
+    if not isinstance(profile, Mapping):
+        return False
+    selected = profile.get("selected_profile")
+    if not isinstance(selected, Mapping) or not bool(selected.get("production_authoritative")):
+        return False
+    return True
+
+
+def page_disposition_from_scene(
+    scene: Any,
+    *,
+    arbitration: Any = None,
+    authoritative: Mapping[str, Any] | None = None,
+) -> PageDispositionDecision:
     """Classify a PageScene without using page text, filenames or page numbers.
 
     A missing scene, missing table candidate, or ambiguous family is always
@@ -84,6 +141,22 @@ def page_disposition_from_scene(scene: Any, *, arbitration: Any = None) -> PageD
             "critical_boundary_conflicts", "unsafe_physical_column_anchoring",
         })
     ]
+    if (
+        authoritative
+        and supported
+        and len(supported) == 1
+        and _authoritative_route_ready(authoritative)
+    ):
+        return PageDispositionDecision(
+            disposition=SPEC_OUTPUT,
+            reasons=("supported_specification_region_present", "authoritative_production_route"),
+            candidate_refs=refs,
+            provenance=(
+                {"source": "authoritative_reconstruction"},
+                {"source": "page_scene_shadow", "arbitration_allowed": arbitration_allowed},
+            ),
+        )
+
     if supported and len(supported) == 1 and len(supported_ready) == 1 and arbitration_allowed:
         return PageDispositionDecision(
             disposition=SPEC_OUTPUT,
