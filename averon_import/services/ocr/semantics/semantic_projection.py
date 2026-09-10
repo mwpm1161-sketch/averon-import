@@ -23,6 +23,8 @@ from averon_import.services.ocr.table_ir import (
 )
 from averon_import.services.ocr.semantics.row_evidence import (
     RowRole,
+    RowRelationState,
+    RowRelationType,
     RowRoleState,
 )
 from averon_import.services.ocr.semantics.semantic_table import (
@@ -126,6 +128,118 @@ def _physical_cell_records(
             "word_refs": [ref.as_dict() for ref in cell.word_refs],
         })
     return records
+
+
+_UNSAFE_RELATION_CONTRADICTIONS = frozenset({
+    "continuation_parent_unavailable",
+    "parent_not_confirmed_item_root",
+    "independent_item_root_anchor",
+    "material_structural_ambiguity",
+    "critical_boundary_conflict",
+    "relation_cycle",
+    "orphan",
+    "root_conflict",
+    "foreign_physical_ref",
+})
+_MATERIAL_STRUCTURAL_KEYS = frozenset({
+    "material_disagreement",
+    "material_column_disagreement",
+    "material_column_conflict",
+    "relevant_material_column_conflict",
+    "unsafe_physical_column_anchoring",
+})
+
+
+def _safe_continuation_evidence(
+    semantic: SemanticTableIR,
+    table: PhysicalTableIR,
+    row: PhysicalRowIR,
+    mapping: Mapping[int, tuple[str, ...]],
+) -> dict[str, Any] | None:
+    """Project existing relation evidence that is safe for human choice.
+
+    This function intentionally does not infer a parent.  It only serializes
+    explicit candidate targets already present in ``SemanticTableIR.relations``.
+    """
+    context = semantic.analysis_context
+    structural = dict(context.structural_evidence or table.structural_evidence or {})
+    if (
+        any(bool(structural.get(key)) for key in _MATERIAL_STRUCTURAL_KEYS)
+        or bool(structural.get("critical_boundary_conflicts"))
+    ):
+        return None
+    if row.ref.key in set(semantic.diagnostics.get("cycle_row_keys") or ()):
+        return None
+    if row.ref.key in set(semantic.diagnostics.get("relation_conflict_sources") or ()):
+        return None
+    if any(
+        str(field) in CRITICAL_FIELDS
+        and str(cell.raw_text or "").strip()
+        for cell in row.cells
+        for field in mapping.get(cell.ref.column_index, ())
+    ):
+        # A continuation relation must never be used to compose a numeric or
+        # unit field from another physical row.
+        return None
+
+    rows_by_key = {physical.ref.key: physical for physical in table.rows}
+    dispositions_by_key = {
+        disposition.physical_row_ref.key: disposition
+        for disposition in semantic.dispositions
+    }
+    safe_relations: list[Any] = []
+    candidate_sets: list[list[dict[str, Any]]] = []
+    for relation in semantic.relations:
+        if relation.source_row_ref != row.ref:
+            continue
+        if relation.relation_type != RowRelationType.CONTINUATION_OF:
+            continue
+        if relation.state not in {RowRelationState.AMBIGUOUS, RowRelationState.UNRESOLVED}:
+            continue
+        if set(relation.contradictions).intersection(_UNSAFE_RELATION_CONTRADICTIONS):
+            continue
+        candidate_refs = tuple(relation.candidate_target_refs)
+        if not candidate_refs:
+            continue
+        valid_candidates = []
+        for candidate in candidate_refs:
+            target = rows_by_key.get(candidate.key)
+            if target is None or target.ref != candidate or candidate.table != row.ref.table:
+                valid_candidates = []
+                break
+            disposition = dispositions_by_key.get(candidate.key)
+            if disposition is not None and (
+                disposition.role not in {RowRole.ITEM_ROOT, RowRole.COMPONENT}
+                or disposition.role_state != RowRoleState.CONFIRMED
+            ):
+                valid_candidates = []
+                break
+            valid_candidates.append(candidate)
+        if not valid_candidates:
+            continue
+        safe_relations.append(relation)
+        candidate_sets.append([candidate.as_dict() for candidate in valid_candidates])
+
+    if not safe_relations:
+        return None
+    first = safe_relations[0]
+    return {
+        "relation_type": first.relation_type.value,
+        "state": first.state.value,
+        "source_physical_ref": row.ref.as_dict(),
+        "candidate_parent_physical_refs": (
+            candidate_sets[0] if len(candidate_sets) == 1 else candidate_sets
+        ),
+        "candidate_target_refs": (
+            candidate_sets[0] if len(candidate_sets) == 1 else candidate_sets
+        ),
+        "evidence_strength": first.evidence_strength,
+        "evidence": list(first.evidence),
+        "contradictions": list(first.contradictions),
+        "reasons": list(first.reasons),
+        "provenance": dict(first.provenance),
+        "relations": [relation.as_dict() for relation in safe_relations],
+    }
 
 
 def _field_candidate_values(field_value: Any) -> list[dict[str, Any]]:
@@ -422,6 +536,7 @@ def _review_row(
     page_size: tuple[float, float],
     disposition: Any | None,
     provider_key: str,
+    continuation_evidence: Mapping[str, Any] | None = None,
 ) -> OcrRow:
     raw_cells = _physical_cell_records(row, mapping, page_size)
     bboxes: dict[str, dict[str, float]] = {}
@@ -496,6 +611,8 @@ def _review_row(
         ),
         "provides_confidence": False,
     }
+    if continuation_evidence is not None:
+        metadata["continuation_evidence"] = dict(continuation_evidence)
     # No raw OCR text is copied into canonical values on an unresolved row.
     # In particular, a numbering-band quantity remains audit evidence only.
     return OcrRow(
@@ -614,10 +731,16 @@ def project_semantic_table(
         if not row.nonempty or row.ref.key in consumed:
             continue
         disposition = disposition_by_key.get(row.ref.key)
+        continuation_evidence = _safe_continuation_evidence(
+            semantic, table, row, mapping
+        )
         if disposition is None:
             context_rows.append((
                 row.ref.row_index,
-                _review_row(row, mapping, result.page_size, None, provider_key),
+                _review_row(
+                    row, mapping, result.page_size, None, provider_key,
+                    continuation_evidence,
+                ),
                 {row.ref.key},
             ))
             continue
@@ -628,7 +751,10 @@ def project_semantic_table(
         if not is_confirmed or disposition.role in {RowRole.UNKNOWN, RowRole.CONTINUATION}:
             context_rows.append((
                 row.ref.row_index,
-                _review_row(row, mapping, result.page_size, disposition, provider_key),
+                _review_row(
+                    row, mapping, result.page_size, disposition, provider_key,
+                    continuation_evidence,
+                ),
                 {row.ref.key},
             ))
             continue

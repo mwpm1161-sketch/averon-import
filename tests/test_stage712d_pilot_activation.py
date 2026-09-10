@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
+from collections.abc import Mapping
+import json
 from pathlib import Path
+
+import pytest
 
 from averon_import.core.normalizers import normalize_cell
 from averon_import.services.export_service import ExcelExportService
@@ -10,6 +15,11 @@ from averon_import.services.ocr.page_contract import page_status_from_diagnostic
 from averon_import.services.ocr.reconstruction import reconstruct_page_rows_result
 from averon_import.services.ocr.semantics.semantic_projection import (
     project_semantic_table,
+)
+from averon_import.services.ocr.semantics.row_evidence import (
+    RowRelationAssessment,
+    RowRelationState,
+    RowRelationType,
 )
 from averon_import.services.ocr.semantics.semantic_table import (
     LogicalFieldValue,
@@ -22,6 +32,10 @@ from averon_import.services.review_policy import (
     critical_blockers_for_row,
     missing_critical_fields,
     refresh_review_state,
+)
+from averon_import.services.review_decisions import (
+    RELATION_DECISION,
+    HumanReviewService,
 )
 
 from tests.test_stage712c_row_relations import _geometry_payload, _grid
@@ -294,6 +308,210 @@ def _unresolve_first_item(result):
         ),
     )
     return result
+
+
+def _relation_result(*, state=RowRelationState.AMBIGUOUS, contradictions=()):
+    result = _unresolve_first_item(_semantic_result())
+    semantic = result.semantic_table
+    table = semantic.analysis_context.physical_table
+    source_row = table.rows[1]
+    source_row = replace(
+        source_row,
+        cells=tuple(cell for cell in source_row.cells if cell.ref.column_index == 1),
+    )
+    updated_table = replace(
+        table,
+        rows=(table.rows[0], source_row, *table.rows[2:]),
+        cells=tuple(
+            cell
+            for physical_row in (table.rows[0], source_row, *table.rows[2:])
+            for cell in physical_row.cells
+        ),
+    )
+    updated_context = replace(semantic.analysis_context, physical_table=updated_table)
+    semantic = replace(semantic, analysis_context=updated_context)
+    result.physical_table = updated_table
+    result.semantic_table = semantic
+    relation = RowRelationAssessment(
+        source_row_ref=source_row.ref,
+        candidate_target_refs=(updated_table.rows[2].ref,),
+        relation_type=RowRelationType.CONTINUATION_OF,
+        state=state,
+        evidence_strength="SUPPORTING",
+        evidence=("source_fields_subset_of_parent",),
+        contradictions=tuple(contradictions),
+        provenance={"source": "sanitized-relation-fixture"},
+    )
+    result.semantic_table = replace(semantic, relations=(relation,))
+    return result
+
+
+def _projected_review_result(result):
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    presented = [
+        SpecificationRowAssembler().build_semantic_row(58, row)
+        for row in projected
+    ]
+    presented = json.loads(
+        json.dumps(
+            presented,
+            ensure_ascii=False,
+            default=lambda value: dict(value) if isinstance(value, Mapping) else value,
+        )
+    )
+    review = next(row for row in presented if row.get("source_row_index") == 1)
+    parent = next(row for row in presented if row.get("source_row_index") == 2)
+    return {
+        "document_fingerprint": "b" * 64,
+        "rows": presented,
+        "page_statuses": {},
+        "errors": [],
+    }, review, parent
+
+
+def test_e1_existing_semantic_relation_is_projected_to_review_dto():
+    result = _relation_result()
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("source_row_index") == 1)
+    evidence = review.metadata.get("continuation_evidence")
+    assert evidence["relation_type"] == "CONTINUATION_OF"
+    assert evidence["state"] == "AMBIGUOUS"
+    assert evidence["evidence_strength"] == "SUPPORTING"
+
+
+def test_e2_projected_parent_refs_equal_relation_candidate_target_refs():
+    result = _relation_result()
+    relation = result.semantic_table.relations[0]
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("source_row_index") == 1)
+    assert review.metadata["continuation_evidence"]["candidate_parent_physical_refs"] == [
+        relation.candidate_target_refs[0].as_dict()
+    ]
+
+
+def test_e3_no_semantic_relation_means_no_continuation_candidate():
+    result = _unresolve_first_item(_semantic_result())
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("source_row_index") == 1)
+    assert "continuation_evidence" not in review.metadata
+
+
+def test_e4_contradicted_relation_is_not_human_actionable():
+    result = _relation_result(contradictions=("parent_not_confirmed_item_root",))
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("source_row_index") == 1)
+    assert "continuation_evidence" not in review.metadata
+
+
+def test_e5_projection_preserves_existing_relation_state():
+    result = _relation_result(state=RowRelationState.UNRESOLVED)
+    projected = _pilot_provider()._apply_semantic_projection(result, result.diagnostics)
+    review = next(row for row in projected if row.metadata.get("source_row_index") == 1)
+    assert review.metadata["continuation_evidence"]["state"] == "UNRESOLVED"
+
+
+def test_e6_review_parent_selection_has_no_nearest_row_fallback():
+    source = Path("averon_import/static/app.js").read_text(encoding="utf-8")
+    assert "sourceRowIndex(candidate) < index" not in source
+    assert "candidate_parent_physical_refs" in source
+
+
+def test_e7_human_service_accepts_a_projected_bounded_parent():
+    result, review, parent = _projected_review_result(_relation_result())
+    service = HumanReviewService()
+    fragment = review["value_candidates"]["name"]["value_candidate"]
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=review["physical_row_refs"],
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value=fragment,
+        target={"parent_physical_refs": parent["physical_row_refs"]},
+    )
+    updated = service.apply_decision(result, decision)
+    updated_parent = next(row for row in updated["rows"] if row.get("source_row_index") == 2)
+    updated_child = next(row for row in updated["rows"] if row.get("source_row_index") == 1)
+    assert fragment in updated_parent["name"]
+    assert updated_child["row_type"] == "skip"
+
+
+def test_e8_non_projected_parent_remains_rejected():
+    result, review, _parent = _projected_review_result(_relation_result())
+    service = HumanReviewService()
+    fragment = review["value_candidates"]["name"]["value_candidate"]
+    with pytest.raises(ValueError, match="Родитель продолжения"):
+        service.create_decision(
+            result,
+            document_fingerprint=result["document_fingerprint"],
+            page=58,
+            physical_refs=review["physical_row_refs"],
+            decision=RELATION_DECISION,
+            relation="human_confirmed_continuation",
+            candidate_value=fragment,
+            target={"parent_physical_refs": [{"table": {"page_number": 58}, "row_index": 999}]},
+        )
+
+
+def test_e10_projection_and_review_leave_raw_physical_evidence_unchanged():
+    result, review, parent = _projected_review_result(_relation_result())
+    before = deepcopy(review["ocr_metadata"])
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=review["physical_row_refs"],
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value=review["value_candidates"]["name"]["value_candidate"],
+        target={"parent_physical_refs": parent["physical_row_refs"]},
+    )
+    updated = service.apply_decision(result, decision)
+    updated_review = next(row for row in updated["rows"] if row.get("source_row_index") == 1)
+    assert updated_review["ocr_metadata"] == before
+
+
+def test_e11_projected_relation_cannot_compose_numeric_fields():
+    result, review, parent = _projected_review_result(_relation_result())
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=review["physical_row_refs"],
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value=review["value_candidates"]["name"]["value_candidate"],
+        target={"parent_physical_refs": parent["physical_row_refs"]},
+    )
+    updated = service.apply_decision(result, decision)
+    updated_parent = next(row for row in updated["rows"] if row.get("source_row_index") == 2)
+    assert updated_parent["quantity"] == "2"
+    assert updated_parent["unit"] == parent["unit"]
+
+
+def test_e12_changed_projected_relation_evidence_invalidates_saved_decision():
+    result, review, parent = _projected_review_result(_relation_result())
+    service = HumanReviewService()
+    fragment = review["value_candidates"]["name"]["value_candidate"]
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=review["physical_row_refs"],
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value=fragment,
+        target={"parent_physical_refs": parent["physical_row_refs"]},
+    )
+    changed = deepcopy(result)
+    changed_review = next(row for row in changed["rows"] if row.get("source_row_index") == 1)
+    changed_review["ocr_metadata"]["continuation_evidence"]["state"] = "REJECTED"
+    updated = service.apply_decision(changed, decision)
+    updated_parent = next(row for row in updated["rows"] if row.get("source_row_index") == 2)
+    assert fragment not in updated_parent.get("name", "")
 
 
 def test_d17_optional_blank_mass_does_not_review_semantic_item():

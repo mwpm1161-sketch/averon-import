@@ -48,6 +48,21 @@ def _refs(value: Any) -> list[dict[str, Any]]:
     return sorted(result, key=_stable)
 
 
+def _ref_sets(value: Any) -> tuple[list[dict[str, Any]], ...]:
+    """Normalize one or more bounded physical-ref sets."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return ()
+    if all(isinstance(item, Mapping) for item in value):
+        refs = _refs(value)
+        return (refs,) if refs else ()
+    result: list[list[dict[str, Any]]] = []
+    for item in value:
+        refs = _refs(item)
+        if refs and refs not in result:
+            result.append(refs)
+    return tuple(result)
+
+
 def _row_refs(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     metadata = row.get("ocr_metadata")
     refs = row.get("physical_row_refs")
@@ -120,9 +135,9 @@ def _continuation_parent_candidates(row: Mapping[str, Any]) -> tuple[list[dict[s
     )
 
     def add(value: Any) -> None:
-        refs = _refs(value)
-        if refs and refs not in found:
-            found.append(refs)
+        for refs in _ref_sets(value):
+            if refs not in found:
+                found.append(refs)
 
     def visit(value: Any, *, allow_direct: bool = True) -> None:
         if isinstance(value, Mapping):
@@ -272,6 +287,7 @@ class HumanReviewService:
             "semantic_review_preview": row.get("semantic_review_preview")
             or metadata.get("semantic_review_preview"),
             "continuation_fragments": list(_continuation_fragments(row)),
+            "continuation_evidence": metadata.get("continuation_evidence"),
             "candidate_parent_physical_refs": [
                 refs for refs in _continuation_parent_candidates(row)
             ],
