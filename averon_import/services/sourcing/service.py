@@ -491,16 +491,19 @@ def _row_telemetry(
     current_ai_mode: str,
 ) -> dict[str, Any]:
     match = None
-    if decision_match is not None:
+    if decision_match in {
+        MatchDecision.MATCH,
+        MatchDecision.LIKELY_MATCH,
+        MatchDecision.ALTERNATIVE,
+    } and result.recommended_offer is not None:
         match = next(
             (
                 item for item in result.match_results
-                if result.recommended_offer is not None
-                and item.offer.offer_id == result.recommended_offer.offer_id
+                if item.offer.offer_id == result.recommended_offer.offer_id
             ),
             None,
         )
-    if match is None:
+    elif decision == MatchDecision.REVIEW.value:
         match = result.review_candidate
     kind = _understanding_provenance_kind(
         understanding,
@@ -508,11 +511,10 @@ def _row_telemetry(
         current_ai_mode=current_ai_mode,
     )
     provenance = understanding.provenance
-    preferred = [
-        str(item.field)
-        for item in understanding.suggestions
-        if str(getattr(item.resolution, "value", item.resolution)) == "PREFERRED_AI_INFERENCE"
-    ]
+    deterministic_evidence = match.deterministic_evidence if match else {}
+    preferred = deterministic_evidence.get("preferred_differences", [])
+    if not isinstance(preferred, (list, tuple, set)):
+        preferred = []
     return {
         "source_row_id": understanding.resolved_intent.source_row_id,
         "source_page": row.get("page"),

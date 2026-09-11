@@ -7,7 +7,17 @@ from decimal import Decimal
 
 from averon_import.services.jobs import JobService
 from averon_import.services.sourcing.cache import SourcingCache
-from averon_import.services.sourcing.models import Offer
+from averon_import.services.sourcing.models import (
+    MatchDecision,
+    MatchResult,
+    Offer,
+    ProductIntent,
+    ProductUnderstandingProvenance,
+    ProductUnderstandingResult,
+    ProductUnderstandingSuggestion,
+    SuggestionResolution,
+    SourcingResult,
+)
 from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.workspace import WorkspaceService
@@ -301,3 +311,164 @@ def test_recent_document_ui_has_explicit_open_flow_without_recognition_call():
     assert "/suggest-pages" not in open_flow
     assert "localStorage.setItem(\"averonCurrentDocument\"" in open_flow
     assert re.search(r"api\(`/api/documents/\$\{encodedId\}/results`\)", open_flow)
+
+
+def _telemetry_understanding() -> ProductUnderstandingResult:
+    intent = ProductIntent(
+        source_row_id="row-1",
+        source_text="Насос",
+        normalized_name="Насос",
+    )
+    return ProductUnderstandingResult(
+        baseline_intent=intent,
+        resolved_intent=intent,
+        suggestions=[ProductUnderstandingSuggestion(
+            field="attributes.features",
+            proposed_value="влагозащищённый",
+            resolution=SuggestionResolution.PREFERRED_AI_INFERENCE,
+        )],
+        mode="qwen",
+        provenance=ProductUnderstandingProvenance(
+            provider="test",
+            model="test-model",
+            parser_revision="test",
+        ),
+    )
+
+
+def _telemetry_match(
+    *,
+    decision: MatchDecision,
+    offer_id: str,
+    matched: list[str] | None = None,
+    missing: list[str] | None = None,
+    conflicting: list[str] | None = None,
+    preferred: list[str] | None = None,
+) -> MatchResult:
+    offer = Offer(offer_id=offer_id, provider="test", title="Тест")
+    return MatchResult(
+        offer=offer,
+        decision=decision,
+        rank=1,
+        matched_attributes=matched or [],
+        missing_attributes=missing or [],
+        conflicting_attributes=conflicting or [],
+        deterministic_evidence={"preferred_differences": preferred or []},
+    )
+
+
+def _row_telemetry_for_test(
+    result: SourcingResult,
+    *,
+    decision: str,
+    decision_match: MatchDecision | None,
+) -> dict:
+    from averon_import.services.sourcing.service import _row_telemetry
+
+    return _row_telemetry(
+        {"page": 58, "source_row": 1},
+        _telemetry_understanding(),
+        False,
+        result,
+        decision,
+        decision_match,
+        current_ai_mode="qwen",
+    )
+
+
+def test_run_telemetry_uses_matcher_preferred_differences_not_ai_suggestions():
+    match = _telemetry_match(
+        decision=MatchDecision.MATCH,
+        offer_id="match",
+        matched=["model", "manufacturer"],
+        preferred=["model", "manufacturer"],
+    )
+    result = SourcingResult(
+        intent=_telemetry_understanding().resolved_intent,
+        recommended_offer=match.offer,
+        offers=[match.offer],
+        match_results=[match],
+    )
+
+    telemetry = _row_telemetry_for_test(
+        result,
+        decision="MATCH",
+        decision_match=MatchDecision.MATCH,
+    )
+
+    assert telemetry["preferred_differences"] == ["model", "manufacturer"]
+    assert "features" not in telemetry["preferred_differences"]
+
+
+def test_run_telemetry_match_without_preferred_differences_is_empty():
+    match = _telemetry_match(decision=MatchDecision.MATCH, offer_id="match")
+    result = SourcingResult(
+        intent=_telemetry_understanding().resolved_intent,
+        recommended_offer=match.offer,
+        offers=[match.offer],
+        match_results=[match],
+    )
+
+    telemetry = _row_telemetry_for_test(
+        result,
+        decision="MATCH",
+        decision_match=MatchDecision.MATCH,
+    )
+
+    assert telemetry["preferred_differences"] == []
+
+
+def test_run_telemetry_review_candidate_uses_actual_matcher_evidence():
+    candidate = _telemetry_match(
+        decision=MatchDecision.REVIEW,
+        offer_id="review",
+        matched=["model"],
+        missing=["power"],
+        conflicting=["article"],
+        preferred=["mounting_type"],
+    )
+    result = SourcingResult(
+        intent=_telemetry_understanding().resolved_intent,
+        review_candidate=candidate,
+        offers=[candidate.offer],
+        match_results=[candidate],
+    )
+
+    telemetry = _row_telemetry_for_test(
+        result,
+        decision="REVIEW",
+        decision_match=None,
+    )
+
+    assert telemetry["matched_attributes"] == ["model"]
+    assert telemetry["missing_attributes"] == ["power"]
+    assert telemetry["conflicting_attributes"] == ["article"]
+    assert telemetry["preferred_differences"] == ["mounting_type"]
+
+
+def test_run_telemetry_without_offers_has_empty_matcher_evidence():
+    candidate = _telemetry_match(
+        decision=MatchDecision.REVIEW,
+        offer_id="should-not-be-used",
+        matched=["model"],
+        missing=["power"],
+        conflicting=["article"],
+        preferred=["mounting_type"],
+    )
+    result = SourcingResult(
+        intent=_telemetry_understanding().resolved_intent,
+        review_candidate=candidate,
+        offers=[],
+        match_results=[],
+    )
+
+    telemetry = _row_telemetry_for_test(
+        result,
+        decision="WITHOUT_OFFERS",
+        decision_match=None,
+    )
+
+    assert telemetry["matched_attributes"] == []
+    assert telemetry["missing_attributes"] == []
+    assert telemetry["conflicting_attributes"] == []
+    assert telemetry["preferred_differences"] == []
