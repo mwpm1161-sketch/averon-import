@@ -63,7 +63,7 @@ class JobService:
             except Exception as exc:
                 with self.lock:
                     job.status = "failed"
-                    job.error = str(exc)
+                    job.error = _safe_job_error(exc)
                     job.traceback = traceback.format_exc()
                     job.message = "Ошибка"
 
@@ -75,3 +75,13 @@ class JobService:
             if job_id not in self.jobs:
                 raise KeyError(job_id)
             return self.jobs[job_id]
+
+
+def _safe_job_error(exc: Exception) -> str:
+    message = " ".join(str(exc).split())
+    lowered = message.casefold()
+    if not message or len(message) > 240 or any(
+        marker in lowered for marker in ("api-key", "authorization", "secret", "token", "password")
+    ):
+        return "Задание не выполнено. Подробности доступны в журнале приложения."
+    return message

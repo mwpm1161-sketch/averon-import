@@ -4,7 +4,7 @@ import time
 from decimal import Decimal
 import hashlib
 import json
-from typing import Any
+from typing import Any, Callable
 
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.matching import OfferMatcher, recommended_offer
@@ -39,6 +39,7 @@ class SourcingService:
         self.ai = ai or SourcingAIService()
         self.matcher = matcher or OfferMatcher()
         self.cache = cache or SourcingCache()
+        self._last_understanding_cache_hit = False
 
     def provider(self, key: str | None = None) -> SourcingProvider:
         selected = key or self.default_provider
@@ -58,7 +59,9 @@ class SourcingService:
         cache_key = self._intent_cache_key(source)
         cached = self.cache.get_understanding(cache_key)
         if cached is not None:
+            self._last_understanding_cache_hit = True
             return cached
+        self._last_understanding_cache_hit = False
         fallback = build_fallback_intent(source)
         result = self.ai.understand_with_audit(source, fallback)
         self.cache.set_understanding(cache_key, result)
@@ -74,6 +77,8 @@ class SourcingService:
         *,
         provider_key: str | None = None,
         limit: int = 20,
+        ai_rerank: bool = True,
+        catalog_version: str | None = None,
     ) -> SourcingResult:
         understanding = self.understand_row_result(row)
         return self.search_intent(
@@ -82,6 +87,8 @@ class SourcingService:
             limit=limit,
             warnings=list(understanding.warnings),
             understanding=understanding,
+            ai_rerank=ai_rerank,
+            catalog_version=catalog_version,
         )
 
     def search_intent(
@@ -92,10 +99,13 @@ class SourcingService:
         limit: int = 20,
         warnings: list[str] | None = None,
         understanding: ProductUnderstandingResult | None = None,
+        ai_rerank: bool = True,
+        catalog_version: str | None = None,
     ) -> SourcingResult:
         provider = self.provider(provider_key)
-        stats = provider.stats() if hasattr(provider, "stats") else {}
-        catalog_version = (stats or {}).get("catalog_version", "unknown")
+        if catalog_version is None:
+            stats = provider.stats() if hasattr(provider, "stats") else {}
+            catalog_version = (stats or {}).get("catalog_version", "unknown")
         cache_key = f"search:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -103,8 +113,15 @@ class SourcingService:
         started = time.perf_counter()
         offers = provider.search(intent, limit=limit)
         retrieval_time = time.perf_counter() - started
+        matching_started = time.perf_counter()
         match_results = self.matcher.match(intent, offers)
-        match_results, ranking_warnings = self.ai.rank_matches(intent, match_results)
+        matching_time = time.perf_counter() - matching_started
+        ranking_warnings: list[str] = []
+        ranking_time = 0.0
+        if ai_rerank:
+            ranking_started = time.perf_counter()
+            match_results, ranking_warnings = self.ai.rank_matches(intent, match_results)
+            ranking_time = time.perf_counter() - ranking_started
         result = SourcingResult(
             intent=intent,
             understanding=understanding,
@@ -112,7 +129,12 @@ class SourcingService:
             offers=offers,
             match_results=match_results,
             warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
-            timings={"retrieval_s": round(retrieval_time, 6)},
+            timings={
+                "retrieval_s": round(retrieval_time, 6),
+                "matching_s": round(matching_time, 6),
+                "ai_rank_s": round(ranking_time, 6),
+                "search_cache_hit": 0.0,
+            },
             ai_mode=self._current_ai_mode(understanding),
         )
         # Catalog offers and deterministic match facts are reusable. Audit
@@ -143,6 +165,7 @@ class SourcingService:
             "understanding": understanding,
             "ai_mode": self._current_ai_mode(understanding),
             "warnings": merged_warnings,
+            "timings": {**cached.timings, "search_cache_hit": 1.0},
         })
 
     def search_project(
@@ -151,20 +174,61 @@ class SourcingService:
         *,
         provider_key: str | None = None,
         limit: int = 20,
+        progress: Callable[[int, int, str], None] | None = None,
+        ai_rerank: bool = False,
     ) -> ProjectSourcingResult:
         eligible = [
             dict(row) for row in rows
             if row.get("selected", True) is not False
             and row.get("row_type") in {"item", "component", "item_candidate"}
         ]
+        total = len(eligible)
+        started_project = time.perf_counter()
+        provider = self.provider(provider_key)
+        catalog_version = self._project_catalog_version(provider)
+        if progress:
+            progress(0, total, "Проверяем каталог предложений")
         results: list[SourcingResult] = []
         warnings: list[str] = []
         totals: dict[str, Decimal] = {}
         matched = alternatives = review = without = 0
-        for row in eligible:
-            result = self.search_row(row, provider_key=provider_key, limit=limit)
+        understanding_time = retrieval_time = matching_time = ranking_time = 0.0
+        understanding_cache_hits = search_cache_hits = 0
+        for index, row in enumerate(eligible):
+            label = _project_row_label(row)
+            if progress:
+                progress(index, total, f"Анализируем позицию {index + 1} из {total}: {label}")
+            understanding_started = time.perf_counter()
+            understanding = self.understand_row_result(row)
+            understanding_time += time.perf_counter() - understanding_started
+            if self._last_understanding_cache_hit:
+                understanding_cache_hits += 1
+            try:
+                result = self.search_intent(
+                    understanding.resolved_intent,
+                    provider_key=provider_key,
+                    limit=limit,
+                    warnings=list(understanding.warnings),
+                    understanding=understanding,
+                    ai_rerank=ai_rerank,
+                    catalog_version=catalog_version,
+                )
+            except ValueError as exc:
+                result = SourcingResult(
+                    intent=understanding.resolved_intent,
+                    understanding=understanding,
+                    warnings=[_safe_provider_warning(exc)],
+                    timings={"provider_error": 1.0, "search_cache_hit": 0.0},
+                    ai_mode=self._current_ai_mode(understanding),
+                )
             results.append(result)
             warnings.extend(result.warnings)
+            if result.timings.get("search_cache_hit"):
+                search_cache_hits += 1
+            else:
+                retrieval_time += result.timings.get("retrieval_s", 0.0)
+                matching_time += result.timings.get("matching_s", 0.0)
+                ranking_time += result.timings.get("ai_rank_s", 0.0)
             best = result.recommended_offer
             if not result.offers:
                 without += 1
@@ -184,10 +248,10 @@ class SourcingService:
                 quantity = _trusted_quantity(row)
                 if quantity is None:
                     warnings.append(f"{result.intent.source_row_id}: quantity requires confirmation")
-                    continue
-                if best.price is None or not best.currency:
-                    continue
-                totals[best.currency] = totals.get(best.currency, Decimal("0")) + best.price * quantity
+                elif best.price is not None and best.currency:
+                    totals[best.currency] = totals.get(best.currency, Decimal("0")) + best.price * quantity
+            if progress:
+                progress(index + 1, total, f"Готово {index + 1} из {total}: {label}")
         currencies = sorted(totals)
         if len(currencies) > 1:
             warnings.append("В проекте несколько валют; итог не суммировался в одну сумму")
@@ -203,7 +267,30 @@ class SourcingService:
             estimated_totals=totals,
             warnings=list(dict.fromkeys(warnings)),
             results=results,
+            timings={
+                "total_s": round(time.perf_counter() - started_project, 6),
+                "understanding_s": round(understanding_time, 6),
+                "retrieval_s": round(retrieval_time, 6),
+                "matching_s": round(matching_time, 6),
+                "ai_rank_s": round(ranking_time, 6),
+                "understanding_cache_hits": float(understanding_cache_hits),
+                "search_cache_hits": float(search_cache_hits),
+                "provider_stats_calls": 1.0,
+            },
         )
+
+    def _project_catalog_version(self, provider: SourcingProvider) -> str:
+        try:
+            stats = provider.stats() if hasattr(provider, "stats") else {}
+        except Exception as exc:
+            if provider.key == "demo_store_http":
+                raise ValueError("Averon Demo Store: проверка каталога не выполнена") from exc
+            return "unknown"
+        if not isinstance(stats, dict):
+            stats = {}
+        if provider.key == "demo_store_http" and stats.get("reachable") is False:
+            raise ValueError(str(stats.get("error") or "Averon Demo Store: каталог недоступен"))
+        return str(stats.get("catalog_version") or "unknown")
 
     def public_config(self) -> dict[str, Any]:
         active = self.provider()
@@ -281,3 +368,21 @@ def _trusted_quantity(row: dict[str, Any]) -> Decimal | None:
     except Exception:
         return None
     return value if value.is_finite() and value >= 0 else None
+
+
+def _project_row_label(row: dict[str, Any]) -> str:
+    for key in ("name", "type_mark", "model", "source_text", "id"):
+        value = " ".join(str(row.get(key) or "").split())
+        if value:
+            return value[:120]
+    return "без названия"
+
+
+def _safe_provider_warning(exc: ValueError) -> str:
+    message = " ".join(str(exc).split())
+    lowered = message.casefold()
+    if not message or len(message) > 240 or any(
+        marker in lowered for marker in ("api-key", "authorization", "secret", "token", "password")
+    ):
+        message = "провайдер не вернул предложения"
+    return f"Ошибка поиска: {message}"

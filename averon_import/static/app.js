@@ -874,15 +874,34 @@ async function openProjectSourcing() {
   const rows = state.rows.filter((row) => row.selected && sourcingEligible(row));
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
   $("#sourcing-subtitle").textContent = "Подбираем предложения для выбранных позиций…";
-  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Qwen анализирует выбранные позиции</b><small>Позиции обрабатываются последовательно; после анализа выполняется быстрый поиск в локальном каталоге.</small></div>`;
+  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Анализируем выбранные позиции</b><small>Позиции обрабатываются последовательно; после анализа выполняется поиск в выбранном каталоге.</small></div>`;
   $("#sourcing-modal").showModal();
   try {
     const url = state.document ? `/api/documents/${state.document.document_id}/sourcing/search-all` : "/api/sourcing/search-all";
-    const result = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows, limit:20})});
-    $("#sourcing-subtitle").textContent = "Проектный подбор завершён";
-    renderSourcingResult(result);
+    const job = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows, limit:20})});
+    await pollSourcingJob(job.id, rows.length);
   } catch (error) {
+    $("#sourcing-subtitle").textContent = "Подбор не выполнен";
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function pollSourcingJob(jobId, expectedTotal) {
+  while (true) {
+    const job = await api(`/api/jobs/${jobId}`);
+    const total = job.total || expectedTotal;
+    const current = Math.min(Number(job.current || 0), total || Number(job.current || 0));
+    $("#sourcing-subtitle").textContent = "Подбираем предложения";
+    if (job.status === "running" || job.status === "queued") {
+      $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${escapeHtml(job.message || "Обрабатываем позиции")}</b><strong>${current} из ${total}</strong><small>Product Understanding → поиск → deterministic matching</small></div>`;
+    }
+    if (job.status === "completed") {
+      $("#sourcing-subtitle").textContent = "Проектный подбор завершён";
+      renderSourcingResult(job.result);
+      return;
+    }
+    if (job.status === "failed") throw new Error(job.error || "Ошибка подбора");
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
 

@@ -151,5 +151,8 @@ def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
     assert "Конфликт:" in app_js
     assert 'target="_blank" rel="noopener noreferrer"' in app_js
     assert "Открыть предложение" in app_js
-    assert "Qwen анализирует выбранные позиции" in app_js
+    assert "pollSourcingJob" in app_js
+    assert "job.current" in app_js
+    assert "job.message" in app_js
+    assert "Product Understanding → поиск → deterministic matching" in app_js
     assert "Позиции обрабатываются последовательно" in app_js

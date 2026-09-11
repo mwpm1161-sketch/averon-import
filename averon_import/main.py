@@ -650,15 +650,20 @@ def sourcing_search_intent(request: SourcingIntentRequest):
 
 @app.post("/api/sourcing/search-all")
 def sourcing_search_all(request: SourcingProjectRequest):
-    try:
-        result = sourcing_service.search_project(
-            request.rows,
-            provider_key=request.provider,
-            limit=max(1, min(request.limit, 100)),
+    rows = [dict(row) for row in request.rows]
+    provider_key = request.provider
+    limit = max(1, min(request.limit, 100))
+
+    def run(progress):
+        return sourcing_service.search_project(
+            rows,
+            provider_key=provider_key,
+            limit=limit,
+            progress=progress,
+            ai_rerank=False,
         )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    return _sourcing_payload(result)
+
+    return job_service.submit(run).public()
 
 
 def _ensure_document(document_id: str) -> None:

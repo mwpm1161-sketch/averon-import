@@ -174,6 +174,7 @@ class ProjectSourcingResult(SourcingModel):
     estimated_totals: dict[str, Decimal] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     results: list[SourcingResult] = Field(default_factory=list)
+    timings: dict[str, float] = Field(default_factory=dict)
 
 
 class SourcingProviderInfo(SourcingModel):
