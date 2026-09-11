@@ -193,6 +193,17 @@ class CatalogRepository:
             ).fetchone()
         return self._from_row(row) if row else None
 
+    def list_by_source(self, source: str, *, limit: int = 100) -> list[Offer]:
+        """Return provider-owned offers for a bounded read-only catalog view."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM catalog_items WHERE source=? "
+                "ORDER BY normalized_title, id LIMIT ?",
+                (str(source), max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def count(self) -> int:
         with self._connect() as connection:
             return int(connection.execute("SELECT COUNT(*) FROM catalog_items").fetchone()[0])
@@ -240,12 +251,14 @@ class CatalogRepository:
                 "OR normalized_attributes LIKE ?)"
             )
             params.extend([pattern] * 5)
+        result_limit = max(1, min(int(limit), 100))
+        candidate_limit = min(max(result_limit * 5, 100), 500)
         sql = (
             "SELECT * FROM catalog_items WHERE "
             + " OR ".join(clauses)
             + " ORDER BY updated_at DESC LIMIT ?"
         )
-        params.append(str(max(1, min(int(limit), 100))))
+        params.append(str(candidate_limit))
         with self._connect() as connection:
             rows = connection.execute(sql, params).fetchall()
         ranked = []
@@ -254,7 +267,7 @@ class CatalogRepository:
             score = self._score(intent, offer, terms)
             ranked.append((score, offer))
         ranked.sort(key=lambda item: (-item[0], item[1].offer_id))
-        return [offer for _, offer in ranked[: max(1, min(int(limit), 100))]]
+        return [offer for _, offer in ranked[:result_limit]]
 
     @staticmethod
     def _score(intent: ProductIntent, offer: Offer, terms: list[str]) -> int:

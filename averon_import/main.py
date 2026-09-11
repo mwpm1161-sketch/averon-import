@@ -59,6 +59,10 @@ from averon_import.services.secrets import (
 )
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.catalog_repository import CatalogRepository
+from averon_import.services.sourcing.demo_catalog import (
+    DEMO_CATALOG_NOTICE,
+    DEMO_CATALOG_SOURCE,
+)
 from averon_import.services.sourcing.models import ProductIntent
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
@@ -570,6 +574,28 @@ def sourcing_providers():
 @app.get("/api/sourcing/catalog/stats")
 def sourcing_catalog_stats():
     return sourcing_repository.stats()
+
+
+@app.get("/demo-catalog", response_class=HTMLResponse)
+def demo_catalog(request: Request):
+    offers = sourcing_repository.list_by_source(DEMO_CATALOG_SOURCE, limit=500)
+    return templates.TemplateResponse(
+        request=request,
+        name="demo_catalog.html",
+        context={"offers": offers, "notice": DEMO_CATALOG_NOTICE},
+    )
+
+
+@app.get("/demo-catalog/products/{offer_id}", response_class=HTMLResponse)
+def demo_catalog_product(request: Request, offer_id: str):
+    offer = sourcing_repository.get_by_id(offer_id)
+    if offer is None or offer.data_provenance.get("source") != DEMO_CATALOG_SOURCE:
+        raise HTTPException(404, "Демонстрационное предложение не найдено")
+    return templates.TemplateResponse(
+        request=request,
+        name="demo_product.html",
+        context={"offer": offer, "notice": DEMO_CATALOG_NOTICE},
+    )
 
 
 @app.post("/api/sourcing/understand")

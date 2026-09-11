@@ -129,3 +129,15 @@ def test_settings_ui_separates_vision_and_qwen_credentials():
     assert "vision_api_key_configured" in app_js
     assert "ai_api_key_configured" in app_js
     assert "payload.ai_api_key = aiApiKey" in app_js
+
+
+def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "offer.data_provenance?.source || offer.provider" in app_js
+    assert "Совпало:" in app_js
+    assert "Конфликт:" in app_js
+    assert 'target="_blank" rel="noopener noreferrer"' in app_js
+    assert "Открыть предложение" in app_js
+    assert "Qwen анализирует выбранные позиции" in app_js
+    assert "Позиции обрабатываются последовательно" in app_js

@@ -18,8 +18,19 @@ class ValidationResult:
 def _norm(value: object) -> str:
     text = str(value or "").casefold().replace("ё", "е")
     text = text.replace("×", "x").replace("х", "x")
-    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^\w]+", "", text)
     return text
+
+
+def _same_identity(left: object, right: object) -> bool:
+    expected = _norm(left)
+    actual = _norm(right)
+    if not expected or not actual:
+        return False
+    return expected == actual or (
+        min(len(expected), len(actual)) >= 4
+        and (expected in actual or actual in expected)
+    )
 
 
 def _number(value: object) -> float | None:
@@ -53,6 +64,12 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
             matched.append("article")
         else:
             conflicts.append("article")
+    if intent.model:
+        offer_model = offer_attrs.get("model") or offer.article
+        if offer_model and _same_identity(intent.model, offer_model):
+            matched.append("model")
+        elif offer_model:
+            preferred.append("model")
     for key, expected in intent.required_attributes.items():
         actual = offer_attrs.get(key)
         if actual is None:

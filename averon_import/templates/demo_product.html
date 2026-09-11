@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ offer.title }} · Averon Demo Store</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/demo_catalog.css') }}">
+</head>
+<body>
+  <header class="store-header">
+    <a class="store-brand" href="/demo-catalog">Averon Demo Store</a>
+    <a class="back-link" href="/">Вернуться в Averon Import</a>
+  </header>
+  <main class="store-shell">
+    <nav class="breadcrumbs"><a href="/demo-catalog">Каталог</a><span>→</span><span>{{ offer.article or offer.source_item_id }}</span></nav>
+    <article class="product-detail">
+      <section class="product-visual" aria-label="Демонстрационное изображение товара">
+        <span>{{ offer.brand or offer.manufacturer or "Averon" }}</span>
+        <strong>{{ offer.article or offer.source_item_id }}</strong>
+      </section>
+      <section class="product-info">
+        <p class="eyebrow">Поставщик: {{ offer.data_provenance.get('source', offer.provider) }}</p>
+        <h1>{{ offer.title }}</h1>
+        <dl class="identity-list">
+          <div><dt>Производитель</dt><dd>{{ offer.manufacturer or "Не указан" }}</dd></div>
+          <div><dt>Бренд</dt><dd>{{ offer.brand or "Не указан" }}</dd></div>
+          <div><dt>Модель / артикул</dt><dd>{{ offer.article or offer.source_item_id }}</dd></div>
+        </dl>
+        <div class="purchase-panel">
+          <p class="price">{{ "%.2f"|format(offer.price|float) if offer.price is not none else "По запросу" }} <small>{{ offer.currency }} / {{ offer.price_unit }}</small></p>
+          <p class="stock {{ 'available' if offer.availability else 'order' }}">{{ offer.availability_text or "Наличие уточняется" }}</p>
+        </div>
+      </section>
+      <section class="attributes-panel">
+        <h2>Технические характеристики</h2>
+        <dl class="attribute-list">
+          {% for key, value in offer.attributes.items() %}
+          <div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>
+          {% endfor %}
+        </dl>
+      </section>
+      <aside class="demo-notice">{{ notice }}. Цены и наличие не являются рыночным предложением.</aside>
+    </article>
+  </main>
+</body>
+</html>

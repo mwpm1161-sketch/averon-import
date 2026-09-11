@@ -763,13 +763,17 @@ function renderOfferCard(result, compact = false, intent = null) {
   const decision = result.decision || "";
   const explanation = result.explanation || "";
   const total = estimatedOfferTotal(offer, intent);
+  const supplier = offer.data_provenance?.source || offer.provider || "Поставщик не указан";
+  const matched = (result.matched_attributes || []).map((key) => `<span class="matched">Совпало: ${escapeHtml(key)}</span>`).join("");
+  const conflicts = (result.conflicting_attributes || []).map((key) => `<span class="conflict">Конфликт: ${escapeHtml(key)}</span>`).join("");
   return `<article class="offer-card ${compact ? "compact" : "recommended"}">
     <div class="offer-card-heading"><span class="status-pill">${escapeHtml(decision || "Предложение")}</span><b>${escapeHtml(offer.title || "Без названия")}</b></div>
     <div class="offer-price">${formatMoney(offer.price, offer.currency)} <small>/ ${escapeHtml(offer.price_unit || "шт.")}</small></div>
-    <div class="offer-meta"><span>${escapeHtml(offer.manufacturer || offer.brand || "Производитель не указан")}</span><span>${escapeHtml(offer.article || "Артикул не указан")}</span><span>${escapeHtml(offer.availability_text || (offer.availability === true ? "В наличии" : "Наличие уточняется"))}</span></div>
+    <div class="offer-meta"><span>Поставщик: ${escapeHtml(supplier)}</span><span>${escapeHtml(offer.manufacturer || offer.brand || "Производитель не указан")}</span><span>${escapeHtml(offer.article || "Артикул не указан")}</span><span>${escapeHtml(offer.availability_text || (offer.availability === true ? "В наличии" : "Наличие уточняется"))}</span></div>
     ${intent?.quantity ? `<div class="offer-total"><span>Количество: <b>${escapeHtml(String(intent.quantity))} ${escapeHtml(intent.unit || "")}</b></span><span>Расчётная стоимость: <b>${total === null ? "требует проверки" : formatMoney(total, offer.currency)}</b></span></div>` : ""}
+    ${matched || conflicts ? `<div class="offer-evidence">${matched}${conflicts}</div>` : ""}
     ${explanation ? `<p class="offer-explanation">${escapeHtml(explanation)}</p>` : ""}
-    ${offer.url ? `<a class="button text" target="_blank" rel="noopener" href="${escapeHtml(offer.url)}">Открыть предложение</a>` : ""}
+    ${offer.url ? `<a class="button text" target="_blank" rel="noopener noreferrer" href="${escapeHtml(offer.url)}">Открыть предложение</a>` : ""}
   </article>`;
 }
 
@@ -854,7 +858,7 @@ async function openProjectSourcing() {
   const rows = state.rows.filter((row) => row.selected && sourcingEligible(row));
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
   $("#sourcing-subtitle").textContent = "Подбираем предложения для выбранных позиций…";
-  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Анализируем проект</b><small>Ищем в каталоге и проверяем характеристики</small></div>`;
+  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Qwen анализирует выбранные позиции</b><small>Позиции обрабатываются последовательно; после анализа выполняется быстрый поиск в локальном каталоге.</small></div>`;
   $("#sourcing-modal").showModal();
   try {
     const url = state.document ? `/api/documents/${state.document.document_id}/sourcing/search-all` : "/api/sourcing/search-all";

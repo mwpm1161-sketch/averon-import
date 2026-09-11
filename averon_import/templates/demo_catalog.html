@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Демо-каталог Averon</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/demo_catalog.css') }}">
+</head>
+<body>
+  <header class="store-header">
+    <a class="store-brand" href="/demo-catalog">Averon Demo Store</a>
+    <a class="back-link" href="/">Вернуться в Averon Import</a>
+  </header>
+  <main class="store-shell">
+    <section class="hero">
+      <p class="eyebrow">Локальный поставщик · SQLite</p>
+      <h1>Каталог инженерного оборудования</h1>
+      <p>{{ notice }}</p>
+    </section>
+    {% if offers %}
+    <section class="product-grid" aria-label="Демонстрационные предложения">
+      {% for offer in offers %}
+      <article class="product-card">
+        <div class="product-card-top">
+          <span class="supplier">{{ offer.manufacturer or offer.brand or "Averon Demo Store" }}</span>
+          <span class="stock {{ 'available' if offer.availability else 'order' }}">{{ offer.availability_text or "Наличие уточняется" }}</span>
+        </div>
+        <h2>{{ offer.title }}</h2>
+        <p class="article">Артикул: {{ offer.article or offer.source_item_id }}</p>
+        <p class="price">{{ "%.2f"|format(offer.price|float) if offer.price is not none else "По запросу" }} <small>{{ offer.currency }} / {{ offer.price_unit }}</small></p>
+        <a class="primary-link" href="{{ offer.url }}">Открыть предложение</a>
+      </article>
+      {% endfor %}
+    </section>
+    {% else %}
+    <section class="empty-state">
+      <h2>Демо-каталог ещё не заполнен</h2>
+      <p>Запустите <code>python -m averon_import.tools.seed_demo_catalog</code>.</p>
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>
