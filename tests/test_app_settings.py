@@ -35,6 +35,8 @@ def test_defaults_match_documented_values():
     assert settings.yandex.folder_id == ""
     assert settings.yandex.vision_model == "table"
     assert settings.yandex.llm_model == ""
+    assert settings.sourcing.provider == "local_catalog"
+    assert settings.sourcing.demo_store_base_url == "http://127.0.0.1:8877"
     assert settings.yandex.chunk_pages == 8
     assert settings.yandex.request_timeout_s == 120.0
     assert settings.yandex.operation_timeout_s == 600.0
@@ -63,9 +65,20 @@ def test_env_overrides_settings_file(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setenv("AVERON_LOCAL_AI_MODEL", "from-env")
     monkeypatch.setenv("AVERON_AI_MIN_CONFIDENCE", "0.7")
+    monkeypatch.setenv("AVERON_DEMO_STORE_BASE_URL", "https://demo.example///")
     service = AppSettingsService(tmp_path)
     assert service.settings.local.model == "from-env"
     assert service.settings.pipeline.min_confidence == 0.7
+    assert service.settings.sourcing.demo_store_base_url == "https://demo.example"
+
+
+def test_demo_store_url_is_validated_and_persisted(tmp_path):
+    service = AppSettingsService(tmp_path)
+    service.update({"sourcing": {"demo_store_base_url": "http://store.example///"}})
+    assert service.settings.sourcing.demo_store_base_url == "http://store.example"
+    assert AppSettingsService(tmp_path).settings.sourcing.demo_store_base_url == "http://store.example"
+    with pytest.raises(ValidationError):
+        service.update({"sourcing": {"demo_store_base_url": "ftp://store.example"}})
 
 
 def test_invalid_json_falls_back_to_defaults_with_warning(tmp_path):
@@ -299,6 +312,21 @@ def test_put_partial_section_merge_keeps_other_fields(api, tmp_path):
     assert service.settings.yandex.folder_id == "keep-me"
     assert service.settings.yandex.chunk_pages == 16
     assert service.settings.yandex.llm_model == "qwen3.6-35b"
+
+
+def test_put_selects_demo_store_without_changing_vision_or_ai_credentials(api):
+    app_module, _, service = api
+    payload = app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            provider="demo_store_http",
+            demo_store_base_url="http://demo.example///",
+        ),
+    ))
+    assert service.settings.sourcing.provider == "demo_store_http"
+    assert service.settings.sourcing.demo_store_base_url == "http://demo.example"
+    assert app_module.sourcing_service.default_provider == "demo_store_http"
+    assert app_module.sourcing_service.provider().key == "demo_store_http"
+    assert payload["sourcing"]["demo_store_base_url"] == "http://demo.example"
 
 
 def test_replace_and_delete_api_key_without_reading_it_back(api):

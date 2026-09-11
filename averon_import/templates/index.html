@@ -229,6 +229,18 @@
           <p class="hint">Через запятую, например: ru,en</p>
         </div>
         <div>
+          <label class="field-label" for="settings-sourcing-provider">Провайдер предложений</label>
+          <select class="select" id="settings-sourcing-provider">
+            <option value="local_catalog">Локальный каталог</option>
+            <option value="demo_store_http">Averon Demo Store</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-label" for="settings-demo-store-url">Demo Store URL</label>
+          <input class="input" id="settings-demo-store-url" autocomplete="off" placeholder="http://127.0.0.1:8877">
+          <p class="hint">Только http/https. Используется, когда выбран Averon Demo Store.</p>
+        </div>
+        <div>
           <label class="field-label" for="settings-api-key">Yandex Vision API key</label>
           <input class="input" id="settings-api-key" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
         </div>

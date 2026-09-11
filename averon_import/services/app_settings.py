@@ -14,8 +14,9 @@ import json
 import os
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from averon_import.core.constants import PROCESSING_MODES
 
@@ -59,6 +60,12 @@ class SourcingSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str = "local_catalog"
+    demo_store_base_url: str = "http://127.0.0.1:8877"
+
+    @field_validator("demo_store_base_url")
+    @classmethod
+    def _validate_demo_store_base_url(cls, value: str) -> str:
+        return normalize_http_base_url(value)
 
 
 class AppSettings(BaseModel):
@@ -162,6 +169,13 @@ class AppSettingsService:
             settings.pipeline.batch_size = value
         if value := os.environ.get("AVERON_SOURCING_PROVIDER", "").strip():
             settings.sourcing.provider = value
+        if value := os.environ.get("AVERON_DEMO_STORE_BASE_URL", "").strip():
+            try:
+                settings.sourcing.demo_store_base_url = normalize_http_base_url(value)
+            except ValueError:
+                self.warnings.append(
+                    "AVERON_DEMO_STORE_BASE_URL имеет недопустимый URL; используется значение из settings.json."
+                )
 
     def update(self, patch: dict) -> AppSettings:
         current = json.loads(self.settings.model_dump_json())
@@ -202,3 +216,16 @@ def _env_int(name: str) -> int | None:
         return int(os.environ[name])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def normalize_http_base_url(value: str) -> str:
+    normalized = str(value or "").strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("Demo Store URL must use http or https without credentials")
+    return normalized

@@ -207,23 +207,49 @@ class SourcingService:
 
     def public_config(self) -> dict[str, Any]:
         active = self.provider()
-        stats = active.stats() if hasattr(active, "stats") else {}
         ai = self.ai.public_config()
-        return {
-            "provider": {"key": active.key, "label": active.label},
-            "providers": [
+        provider_rows = []
+        stats_by_key: dict[str, dict[str, Any]] = {}
+        for provider in self.providers.values():
+            provider_stats = self._safe_stats(provider)
+            stats_by_key[provider.key] = provider_stats
+            provider_rows.append(
                 {
                     "key": provider.key,
                     "label": provider.label,
-                    "catalog_item_count": (provider.stats() or {}).get("item_count", 0),
-                    "configured": True,
+                    "catalog_item_count": provider_stats.get("item_count", 0),
+                    "configured": provider_stats.get("configured", True),
+                    "reachable": provider_stats.get("reachable", True),
+                    **(
+                        {"error": provider_stats["error"]}
+                        if provider_stats.get("error")
+                        else {}
+                    ),
                 }
-                for provider in self.providers.values()
-            ],
-            "catalog_item_count": stats.get("item_count", 0),
+            )
+        return {
+            "provider": {"key": active.key, "label": active.label},
+            "providers": provider_rows,
+            "catalog_item_count": stats_by_key.get(active.key, {}).get("item_count", 0),
             "ai_available": ai["available"],
             "ai": ai,
         }
+
+    @staticmethod
+    def _safe_stats(provider: SourcingProvider) -> dict[str, Any]:
+        if not hasattr(provider, "stats"):
+            return {}
+        try:
+            stats = provider.stats()
+        except Exception:
+            return {
+                "configured": True,
+                "reachable": False,
+                "item_count": 0,
+                "catalog_version": "unavailable",
+                "error": "provider health unavailable",
+            }
+        return stats if isinstance(stats, dict) else {}
 
     def health(self) -> dict[str, Any]:
         return {"ai": self.ai.public_config()}

@@ -216,6 +216,7 @@ button { cursor: pointer; }
 .settings-card { width:min(720px,calc(100vw - 80px)); }
 .settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
 .settings-grid .hint { margin:6px 0 0; }
+.settings-grid input:disabled { background:#f3f4f6; color:#8a919b; }
 @media (max-width:720px) { .settings-grid { grid-template-columns:1fr; } }
 
 /* Sourcing panel: existing neutral engineering UI language. */

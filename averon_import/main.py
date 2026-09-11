@@ -65,6 +65,7 @@ from averon_import.services.sourcing.demo_catalog import (
 )
 from averon_import.services.sourcing.models import ProductIntent
 from averon_import.services.sourcing.product_understanding import SourcingAIService
+from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
 from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
 from averon_import.services.sourcing.service import SourcingService
@@ -110,12 +111,19 @@ coordinator = ProcessingCoordinator(
 )
 sourcing_repository = CatalogRepository(DATA_DIR / "sourcing" / "catalog.sqlite3")
 sourcing_provider = LocalCatalogProvider(sourcing_repository)
+demo_store_provider = DemoStoreHttpProvider(
+    app_settings_service.settings.sourcing.demo_store_base_url,
+)
 sourcing_ai_transport = create_sourcing_ai_transport(app_settings_service, secret_store)
 sourcing_service = SourcingService(
-    {sourcing_provider.key: sourcing_provider},
+    {
+        sourcing_provider.key: sourcing_provider,
+        demo_store_provider.key: demo_store_provider,
+    },
     default_provider=(
         app_settings_service.settings.sourcing.provider
-        if app_settings_service.settings.sourcing.provider in {sourcing_provider.key}
+        if app_settings_service.settings.sourcing.provider
+        in {sourcing_provider.key, demo_store_provider.key}
         else sourcing_provider.key
     ),
     ai=SourcingAIService(sourcing_ai_transport),
@@ -218,6 +226,7 @@ class SourcingSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str | None = None
+    demo_store_base_url: str | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -288,7 +297,12 @@ def put_settings(request: SettingsUpdate):
         sourcing_service.set_ai(
             SourcingAIService(create_sourcing_ai_transport(app_settings_service, secret_store))
         )
-        if app_settings_service.settings.sourcing.provider in sourcing_service.providers:
+        providers = getattr(sourcing_service, "providers", {})
+        if "demo_store_http" in providers:
+            providers["demo_store_http"] = DemoStoreHttpProvider(
+                app_settings_service.settings.sourcing.demo_store_base_url,
+            )
+        if app_settings_service.settings.sourcing.provider in providers:
             sourcing_service.default_provider = app_settings_service.settings.sourcing.provider
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {}

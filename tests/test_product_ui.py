@@ -131,6 +131,18 @@ def test_settings_ui_separates_vision_and_qwen_credentials():
     assert "payload.ai_api_key = aiApiKey" in app_js
 
 
+def test_settings_ui_exposes_separate_sourcing_provider_and_demo_store_url():
+    html = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="settings-sourcing-provider"' in html
+    assert 'value="local_catalog"' in html
+    assert 'value="demo_store_http"' in html
+    assert 'id="settings-demo-store-url"' in html
+    assert "demo_store_base_url" in app_js
+    assert "updateSourcingProviderFields" in app_js
+    assert "sourcing: {" in app_js
+
+
 def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 

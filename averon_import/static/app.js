@@ -113,6 +113,11 @@ function initializeSettings(settings) {
   $("#settings-folder-id").value = settings?.yandex?.folder_id || "";
   $("#settings-vision-model").value = settings?.yandex?.vision_model || "table";
   $("#settings-language-codes").value = (settings?.yandex?.language_codes || ["ru", "en"]).join(",");
+  const sourcingProvider = settings?.sourcing?.provider;
+  $("#settings-sourcing-provider").value = ["local_catalog", "demo_store_http"].includes(sourcingProvider)
+    ? sourcingProvider : "local_catalog";
+  $("#settings-demo-store-url").value = settings?.sourcing?.demo_store_base_url || "http://127.0.0.1:8877";
+  updateSourcingProviderFields();
   const ready = Boolean(state.ocrHealth?.available);
   const visionKeyReady = Boolean(settings?.yandex?.vision_api_key_configured ?? settings?.yandex?.api_key_configured);
   $("#settings-connection").textContent = ready
@@ -126,6 +131,13 @@ function initializeSettings(settings) {
   $("#settings-ai-connection").textContent = `Qwen / AI Studio: ключ ${aiKeyReady ? "настроен" : "не настроен"}.`;
   $("#settings-ai-connection").className = aiKeyReady ? "mode-status ok" : "mode-status warning";
   updateSourcingStatus();
+}
+
+function updateSourcingProviderFields() {
+  const provider = $("#settings-sourcing-provider");
+  const url = $("#settings-demo-store-url");
+  if (!provider || !url) return;
+  url.disabled = provider.value !== "demo_store_http";
 }
 
 function updateSourcingStatus() {
@@ -164,6 +176,10 @@ async function saveSettings() {
       vision_model: $("#settings-vision-model").value,
       language_codes: codes,
       llm_model: $("#settings-llm-model").value.trim(),
+    },
+    sourcing: {
+      provider: $("#settings-sourcing-provider").value,
+      demo_store_base_url: $("#settings-demo-store-url").value.trim(),
     },
   };
   if (apiKey) payload.api_key = apiKey;
@@ -1159,6 +1175,7 @@ function setupEvents() {
     $("#settings-modal").showModal();
   });
   $("#save-settings").addEventListener("click",saveSettings);
+  $("#settings-sourcing-provider").addEventListener("change",updateSourcingProviderFields);
   $("#table-search").addEventListener("input",renderRows); $("#type-filter").addEventListener("change",renderRows); $("#status-filter").addEventListener("change",renderRows);
   $("#review-filter").addEventListener("change",(event)=>{state.reviewFilter=event.target.value;renderRows();});
   $("#save-button").addEventListener("click",()=>saveRows().catch((e)=>toast(e.message,"error")));
