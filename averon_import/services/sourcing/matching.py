@@ -70,3 +70,31 @@ def recommended_offer(results: list[MatchResult]) -> Offer | None:
             if result.decision == decision:
                 return result.offer
     return None
+
+
+_IDENTITY_FIELDS = frozenset({"article", "model", "manufacturer", "brand"})
+
+
+def review_candidate(results: list[MatchResult]) -> MatchResult | None:
+    """Select a strong identity REVIEW candidate without changing decisions."""
+
+    candidates: list[tuple[tuple[int, int, int, int, int], MatchResult]] = []
+    for result in results:
+        if result.decision != MatchDecision.REVIEW or result.conflicting_attributes:
+            continue
+        identity = _IDENTITY_FIELDS.intersection(result.matched_attributes)
+        has_exact_primary_identity = bool(identity.intersection({"article", "model"}))
+        if not has_exact_primary_identity and len(identity) < 2:
+            continue
+        score = (
+            int("article" in identity),
+            int("model" in identity),
+            len(identity),
+            -len(result.missing_attributes),
+            -result.rank,
+        )
+        candidates.append((score, result))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]

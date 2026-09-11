@@ -313,7 +313,11 @@ def test_representative_p58_subset_uses_provider_prices(demo_repository, tmp_pat
     assert result.positions_matched == 3
     assert result.positions_alternatives == 2
     assert result.positions_review == result.positions_without_offers == 0
-    assert result.estimated_total == Decimal("357180")
+    assert result.estimated_total == Decimal("208800")
+    assert result.confirmed_total == Decimal("208800")
+    assert result.alternative_total == Decimal("148380")
+    assert result.confirmed_totals == {"RUB": Decimal("208800")}
+    assert result.alternative_totals == {"RUB": Decimal("148380")}
     assert result.currency == "RUB"
     assert [
         item.recommended_offer.offer_id for item in result.results

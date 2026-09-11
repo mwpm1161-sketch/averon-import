@@ -155,6 +155,9 @@ class SourcingResult(SourcingModel):
     intent: ProductIntent
     understanding: ProductUnderstandingResult | None = None
     recommended_offer: Offer | None = None
+    # Keep a strong deterministic REVIEW candidate separate from an
+    # ALTERNATIVE recommendation so the UI cannot hide it.
+    review_candidate: MatchResult | None = None
     offers: list[Offer] = Field(default_factory=list)
     match_results: list[MatchResult] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -163,12 +166,27 @@ class SourcingResult(SourcingModel):
 
 
 class ProjectSourcingResult(SourcingModel):
+    """Project summary with explicit confirmed and alternative totals.
+
+    ``estimated_total`` remains a compatibility field whose meaning is the
+    confirmed MATCH/LIKELY_MATCH priced subtotal only.
+    """
+
     positions_total: int = 0
     positions_processed: int = 0
     positions_matched: int = 0
     positions_alternatives: int = 0
     positions_review: int = 0
     positions_without_offers: int = 0
+    confirmed_total: Decimal | None = None
+    confirmed_totals: dict[str, Decimal] = Field(default_factory=dict)
+    confirmed_currency: str | None = None
+    alternative_total: Decimal | None = None
+    alternative_totals: dict[str, Decimal] = Field(default_factory=dict)
+    alternative_currency: str | None = None
+    matched_unpriced_count: int = 0
+    alternative_unpriced_count: int = 0
+    unresolved_count: int = 0
     estimated_total: Decimal | None = None
     currency: str | None = None
     estimated_totals: dict[str, Decimal] = Field(default_factory=dict)

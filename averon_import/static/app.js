@@ -845,10 +845,17 @@ function renderProductUnderstanding(understanding) {
   </section>`;
 }
 
-function projectMatch(item) {
+function projectRecommendedMatch(item) {
   const offer = item.recommended_offer;
-  if (offer) return (item.match_results || []).find((match) => match.offer?.offer_id === offer.offer_id) || null;
-  return (item.match_results || []).find((match) => match.decision === "REVIEW")
+  return offer ? (item.match_results || []).find((match) => match.offer?.offer_id === offer.offer_id) || null : null;
+}
+
+function projectMatch(item) {
+  const recommended = projectRecommendedMatch(item);
+  if (recommended && ["MATCH", "LIKELY_MATCH"].includes(recommended.decision)) return recommended;
+  if (item.review_candidate) return item.review_candidate;
+  return recommended
+    || (item.match_results || []).find((match) => match.decision === "REVIEW")
     || (item.match_results || []).find((match) => match.decision === "REJECT")
     || null;
 }
@@ -874,30 +881,41 @@ function projectReason(item) {
   return "Предложение требует проверки";
 }
 
+function formatProjectTotals(value, totals, currency) {
+  if (value !== null && value !== undefined && value !== "") return formatMoney(value, currency);
+  const entries = Object.entries(totals || {});
+  return entries.length
+    ? entries.map(([code, amount]) => formatMoney(amount, code)).join(", ")
+    : "Требует проверки";
+}
+
 function renderSourcingResult(result, row = null) {
   const content = $("#sourcing-content");
   if (result.positions_total !== undefined) {
     const qwenUsed = (result.results || []).some((item) => item.ai_mode === "qwen");
     $("#sourcing-subtitle").textContent = qwenUsed ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
-    const currency = result.currency || "";
-    const partialTotal = (result.results || []).some((item) => {
-      const offer = item.recommended_offer;
-      const decision = projectDecision(item);
-      return !offer
-        || decision === "ALTERNATIVE"
-        || !["MATCH", "LIKELY_MATCH"].includes(decision)
-        || estimatedOfferTotal(offer, item.intent) === null;
-    });
-    const totalLabel = partialTotal ? "Частичный итог" : "Расчётный итог";
-    const totalValue = result.estimated_total === null ? "Требует проверки" : formatMoney(result.estimated_total, currency);
-    const totalNote = partialTotal && result.estimated_total !== null
-      ? `<small class="project-total-note">Не включает позиции без подтверждённой цены; альтернативы показаны отдельно.</small>`
-      : "";
-    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${totalLabel}</small><b>${totalValue}</b>${totalNote}</div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const offer = item.recommended_offer; const total = offer ? estimatedOfferTotal(offer, item.intent) : null; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${projectDecision(item)}<small class="project-result-reason">${escapeHtml(projectReason(item))}</small></span><span>${escapeHtml(offer ? sourcingProviderLabel(offer) : "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+    const confirmedTotal = result.confirmed_total ?? result.estimated_total;
+    const confirmedTotals = result.confirmed_totals || result.estimated_totals || {};
+    const alternativeTotal = result.alternative_total;
+    const alternativeTotals = result.alternative_totals || {};
+    const confirmedCurrency = result.confirmed_currency || result.currency || "";
+    const alternativeCurrency = result.alternative_currency || "";
+    const matchedUnpriced = Number(result.matched_unpriced_count || 0);
+    const alternativeUnpriced = Number(result.alternative_unpriced_count || 0);
+    const unresolved = Number(result.unresolved_count ?? ((result.positions_review || 0) + (result.positions_without_offers || 0)));
+    const confirmedIncomplete = matchedUnpriced > 0 || unresolved > 0;
+    const confirmedLabel = confirmedIncomplete
+      ? "Подтверждённая стоимость по позициям с ценой"
+      : "Подтверждённая стоимость";
+    const unpricedText = `${matchedUnpriced} подтверждённых + ${alternativeUnpriced} альтернативы`;
+    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div><div><small>Без цены</small><b>${unpricedText}</b></div><div><small>Требуют проверки</small><b>${unresolved}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const match = projectMatch(item); const offer = match?.offer || item.recommended_offer; const decision = match?.decision || projectDecision(item); const total = offer && ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(decision) ? estimatedOfferTotal(offer, item.intent) : null; const alternative = item.review_candidate && item.recommended_offer && item.recommended_offer.offer_id !== offer?.offer_id ? `<small class="project-result-secondary">Альтернатива: ${escapeHtml(item.recommended_offer.title)}</small>` : ""; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}${alternative}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${decision}<small class="project-result-reason">${escapeHtml(projectReason(item))}</small></span><span>${escapeHtml(offer ? sourcingProviderLabel(offer) : "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
     return;
   }
   const intent = result.intent || {};
-  const best = result.match_results?.find((item) => ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(item.decision));
+  const recommended = result.match_results?.find((item) => ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(item.decision));
+  const best = (recommended && ["MATCH", "LIKELY_MATCH"].includes(recommended.decision))
+    ? recommended
+    : result.review_candidate || recommended;
   const alternatives = (result.match_results || []).filter((item) => item !== best && item.decision !== "REJECT").slice(0, 5);
   const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
   $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";

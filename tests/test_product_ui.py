@@ -168,13 +168,24 @@ def test_project_sourcing_ui_explains_deterministic_match_state():
     assert "function projectReason(item)" in app_js
     assert "Точное предложение не найдено" in app_js
     assert "Не подтверждено:" in app_js
-    assert 'projectDecision(item)}<small class="project-result-reason">' in app_js
+    assert '${decision}<small class="project-result-reason">' in app_js
 
 
 def test_project_sourcing_ui_marks_partial_totals_and_hides_provider_keys():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 
-    assert 'const totalLabel = partialTotal ? "Частичный итог" : "Расчётный итог";' in app_js
-    assert "Не включает позиции без подтверждённой цены" in app_js
+    assert "Подтверждённая стоимость по позициям с ценой" in app_js
+    assert "Стоимость альтернатив" in app_js
+    assert "matched_unpriced_count" in app_js
+    assert "alternative_unpriced_count" in app_js
     assert "offer?.provider || \"—\"" not in app_js
     assert "sourcingProviderLabel(offer)" in app_js
+
+
+def test_project_sourcing_ui_surfaces_review_candidate_before_weak_alternative():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "function projectRecommendedMatch(item)" in app_js
+    assert "if (item.review_candidate) return item.review_candidate;" in app_js
+    assert "result.review_candidate || recommended" in app_js
+    assert "Альтернатива:" in app_js

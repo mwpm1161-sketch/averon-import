@@ -7,7 +7,11 @@ import json
 from typing import Any, Callable
 
 from averon_import.services.sourcing.cache import SourcingCache
-from averon_import.services.sourcing.matching import OfferMatcher, recommended_offer
+from averon_import.services.sourcing.matching import (
+    OfferMatcher,
+    recommended_offer,
+    review_candidate,
+)
 from averon_import.services.sourcing.models import (
     MatchDecision,
     ProductIntent,
@@ -156,6 +160,7 @@ class SourcingService:
             intent=intent,
             understanding=understanding,
             recommended_offer=recommended_offer(match_results),
+            review_candidate=review_candidate(match_results),
             offers=offers,
             match_results=match_results,
             warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
@@ -220,8 +225,10 @@ class SourcingService:
             progress(0, total, "Проверяем каталог предложений")
         results: list[SourcingResult] = []
         warnings: list[str] = []
-        totals: dict[str, Decimal] = {}
+        confirmed_totals: dict[str, Decimal] = {}
+        alternative_totals: dict[str, Decimal] = {}
         matched = alternatives = review = without = 0
+        matched_unpriced = alternative_unpriced = unresolved = 0
         understanding_time = retrieval_time = matching_time = ranking_time = 0.0
         understanding_cache_hits = search_cache_hits = 0
         for index, row in enumerate(eligible):
@@ -262,8 +269,10 @@ class SourcingService:
             best = result.recommended_offer
             if not result.offers:
                 without += 1
+                unresolved += 1
             elif best is None:
                 review += 1
+                unresolved += 1
             else:
                 decision = next(
                     (item.decision for item in result.match_results if item.offer.offer_id == best.offer_id),
@@ -275,16 +284,40 @@ class SourcingService:
                     matched += 1
                 else:
                     review += 1
+                    unresolved += 1
                 quantity = _trusted_quantity(row)
                 if quantity is None:
                     warnings.append(f"{result.intent.source_row_id}: quantity requires confirmation")
                 elif best.price is not None and best.currency:
-                    totals[best.currency] = totals.get(best.currency, Decimal("0")) + best.price * quantity
+                    target = (
+                        confirmed_totals
+                        if decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
+                        else alternative_totals
+                        if decision == MatchDecision.ALTERNATIVE
+                        else None
+                    )
+                    if target is not None:
+                        target[best.currency] = target.get(best.currency, Decimal("0")) + best.price * quantity
+                elif decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                    matched_unpriced += 1
+                elif decision == MatchDecision.ALTERNATIVE:
+                    alternative_unpriced += 1
             if progress:
                 progress(index + 1, total, f"Готово {index + 1} из {total}: {label}")
-        currencies = sorted(totals)
-        if len(currencies) > 1:
+        confirmed_currencies = sorted(confirmed_totals)
+        alternative_currencies = sorted(alternative_totals)
+        if len(confirmed_currencies) > 1 or len(alternative_currencies) > 1:
             warnings.append("В проекте несколько валют; итог не суммировался в одну сумму")
+        confirmed_total = (
+            confirmed_totals[confirmed_currencies[0]]
+            if len(confirmed_currencies) == 1
+            else None
+        )
+        alternative_total = (
+            alternative_totals[alternative_currencies[0]]
+            if len(alternative_currencies) == 1
+            else None
+        )
         return ProjectSourcingResult(
             positions_total=len(eligible),
             positions_processed=len(results),
@@ -292,9 +325,19 @@ class SourcingService:
             positions_alternatives=alternatives,
             positions_review=review,
             positions_without_offers=without,
-            estimated_total=(totals[currencies[0]] if len(currencies) == 1 else None),
-            currency=(currencies[0] if len(currencies) == 1 else None),
-            estimated_totals=totals,
+            confirmed_total=confirmed_total,
+            confirmed_totals=confirmed_totals,
+            confirmed_currency=(confirmed_currencies[0] if len(confirmed_currencies) == 1 else None),
+            alternative_total=alternative_total,
+            alternative_totals=alternative_totals,
+            alternative_currency=(alternative_currencies[0] if len(alternative_currencies) == 1 else None),
+            matched_unpriced_count=matched_unpriced,
+            alternative_unpriced_count=alternative_unpriced,
+            unresolved_count=unresolved,
+            # Compatibility: estimated_total is the confirmed subtotal only.
+            estimated_total=confirmed_total,
+            currency=(confirmed_currencies[0] if len(confirmed_currencies) == 1 else None),
+            estimated_totals=confirmed_totals,
             warnings=list(dict.fromkeys(warnings)),
             results=results,
             timings={

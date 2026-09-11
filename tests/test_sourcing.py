@@ -112,6 +112,20 @@ class StubProvider:
         return {"item_count": len(self.offers), "catalog_version": "stub-1"}
 
 
+class RowOffersProvider:
+    key = "row-offers"
+    label = "Тестовый поставщик"
+
+    def __init__(self, offers_by_row):
+        self.offers_by_row = offers_by_row
+
+    def search(self, intent, *, limit=20):
+        return list(self.offers_by_row.get(intent.source_row_id, ()))[:limit]
+
+    def stats(self):
+        return {"item_count": sum(len(items) for items in self.offers_by_row.values()), "catalog_version": "row-1"}
+
+
 def service_for(tmp_path, offers=()):
     repository = CatalogRepository(tmp_path / "catalog.sqlite3")
     repository.bulk_upsert(offers)
@@ -454,6 +468,106 @@ def test_s17_multiple_currencies_are_not_summed(tmp_path):
     result = service.search_project(rows)
     assert result.estimated_total is None
     assert set(result.estimated_totals) == {"EUR", "RUB"}
+    assert result.confirmed_total is None
+    assert result.confirmed_totals == {"EUR": Decimal("20"), "RUB": Decimal("10")}
+
+
+def test_project_totals_separate_confirmed_alternative_and_unpriced(tmp_path):
+    provider = RowOffersProvider({
+        "confirmed": [make_offer(offer_id="confirmed", price=Decimal("10"))],
+        "alternative": [make_offer(offer_id="alternative", manufacturer="Other", price=Decimal("5"))],
+        "unpriced": [make_offer(offer_id="unpriced", price=None)],
+        "untrusted": [make_offer(offer_id="untrusted", price=Decimal("20"))],
+    })
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+    rows = [
+        {"id": "confirmed", "row_type": "item", "name": "Клапан", "quantity": "2"},
+        {"id": "alternative", "row_type": "item", "name": "Клапан", "manufacturer": "Preferred", "quantity": "3"},
+        {"id": "unpriced", "row_type": "item", "name": "Насос", "quantity": "1"},
+        {"id": "untrusted", "row_type": "item", "name": "Фильтр", "quantity": "2", "status": "review"},
+    ]
+
+    result = service.search_project(rows)
+
+    assert result.confirmed_total == Decimal("20")
+    assert result.confirmed_totals == {"RUB": Decimal("20")}
+    assert result.alternative_total == Decimal("15")
+    assert result.alternative_totals == {"RUB": Decimal("15")}
+    assert result.estimated_total == Decimal("20")
+    assert result.estimated_totals == {"RUB": Decimal("20")}
+    assert result.matched_unpriced_count == 1
+    assert result.alternative_unpriced_count == 0
+    assert result.unresolved_count == 0
+    assert any("quantity requires confirmation" in warning for warning in result.warnings)
+
+
+def test_review_identity_candidate_is_separate_from_weak_alternative(tmp_path):
+    provider = RowOffersProvider({
+        "identity": [
+            make_offer(
+                offer_id="identity-review",
+                manufacturer="",
+                attributes={"model": "M-1"},
+            ),
+            make_offer(
+                offer_id="weak-alternative",
+                manufacturer="Other",
+                attributes={"power": 1},
+            ),
+        ],
+    })
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+    intent = make_intent(
+        source_row_id="identity",
+        model="M-1",
+        manufacturer="Maker",
+        attributes={"power": 1},
+        required_attributes={"power": 1},
+        preferred_attributes={},
+    )
+
+    result = service.search_intent(intent)
+
+    assert result.recommended_offer.offer_id == "weak-alternative"
+    assert result.review_candidate is not None
+    assert result.review_candidate.offer.offer_id == "identity-review"
+    assert result.review_candidate.decision == MatchDecision.REVIEW
+    assert any(item.offer.offer_id == "weak-alternative" and item.decision == MatchDecision.ALTERNATIVE for item in result.match_results)
+
+
+def test_match_remains_primary_over_review_candidate_and_alternative(tmp_path):
+    provider = RowOffersProvider({
+        "mixed": [
+            make_offer(offer_id="review", manufacturer="", attributes={"model": "M-1"}),
+            make_offer(offer_id="alternative", manufacturer="Other", attributes={"power": 1}),
+            make_offer(offer_id="match", manufacturer="Maker", attributes={"model": "M-1", "power": 1}),
+        ],
+    })
+    service = SourcingService({provider.key: provider}, default_provider=provider.key, ai=SourcingAIService())
+    intent = make_intent(
+        source_row_id="mixed",
+        model="M-1",
+        manufacturer="Maker",
+        attributes={"power": 1},
+        required_attributes={"power": 1},
+        preferred_attributes={},
+    )
+
+    result = service.search_intent(intent)
+
+    assert result.recommended_offer.offer_id == "match"
+    assert result.review_candidate is not None
+    assert result.review_candidate.offer.offer_id == "review"
 
 
 def test_s18_provider_swap_keeps_domain_result_contract():
