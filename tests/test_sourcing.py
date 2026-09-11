@@ -285,6 +285,101 @@ def test_s14_preferred_manufacturer_difference_is_alternative():
     assert "manufacturer" in result.deterministic_evidence["preferred_differences"]
 
 
+def test_q16_ai_inferred_preferred_attribute_does_not_downgrade_match():
+    intent = make_intent(
+        evidence={
+            "attribute_origins": {
+                "diameter": "source_deterministic",
+                "pressure": "source_deterministic",
+                "mounting_type": "ai_inferred",
+            }
+        },
+        preferred_attributes={"mounting_type": "wall"},
+    )
+    result = OfferMatcher().match(intent, [make_offer()])[0]
+
+    assert result.decision == MatchDecision.MATCH
+    assert "mounting_type" not in result.deterministic_evidence["preferred_differences"]
+    assert intent.preferred_attributes["mounting_type"] == "wall"
+
+
+def test_q17_ai_inferred_required_attribute_is_advisory_not_missing():
+    intent = make_intent(
+        required_attributes={"diameter": 50, "pressure": 16, "mounting_type": "wall"},
+        evidence={
+            "attribute_origins": {
+                "diameter": "source_deterministic",
+                "pressure": "source_deterministic",
+                "mounting_type": "ai_inferred",
+            }
+        },
+    )
+    result = OfferMatcher().match(intent, [make_offer()])[0]
+
+    assert result.decision == MatchDecision.MATCH
+    assert "mounting_type" not in result.missing_attributes
+
+
+def test_q18_source_required_power_mismatch_still_rejects():
+    intent = make_intent(
+        attributes={"power": 0.75},
+        required_attributes={"power": 0.75},
+        evidence={"attribute_origins": {"power": "source_deterministic"}},
+    )
+    result = OfferMatcher().match(intent, [make_offer(attributes={"power": 1.0})])[0]
+
+    assert result.decision == MatchDecision.REJECT
+    assert "power" in result.conflicting_attributes
+
+
+def test_q19_source_preferred_attribute_difference_stays_alternative():
+    intent = make_intent(
+        preferred_attributes={"material": "steel"},
+        evidence={"attribute_origins": {"material": "source_deterministic"}},
+    )
+    result = OfferMatcher().match(intent, [make_offer()])[0]
+
+    assert result.decision == MatchDecision.ALTERNATIVE
+    assert "material" in result.deterministic_evidence["preferred_differences"]
+
+
+def test_q20_ai_grounded_attribute_keeps_existing_matching_behavior():
+    intent = make_intent(
+        required_attributes={"diameter": 50, "pressure": 16, "mounting_type": "wall"},
+        evidence={
+            "attribute_origins": {
+                "diameter": "source_deterministic",
+                "pressure": "source_deterministic",
+                "mounting_type": "ai_grounded",
+            }
+        },
+    )
+    result = OfferMatcher().match(
+        intent,
+        [make_offer(attributes={"diameter": 50, "pressure": 16, "mounting_type": "wall"})],
+    )[0]
+
+    assert result.decision == MatchDecision.MATCH
+    assert "mounting_type" in result.matched_attributes
+
+
+def test_q21_source_required_attribute_missing_still_reviews():
+    intent = make_intent(
+        required_attributes={"diameter": 50, "pressure": 16, "power": 11},
+        evidence={
+            "attribute_origins": {
+                "diameter": "source_deterministic",
+                "pressure": "source_deterministic",
+                "power": "source_deterministic",
+            }
+        },
+    )
+    result = OfferMatcher().match(intent, [make_offer()])[0]
+
+    assert result.decision == MatchDecision.REVIEW
+    assert "power" in result.missing_attributes
+
+
 def test_s15_quantity_times_price_is_calculated_without_mutating_row(tmp_path):
     service = service_for(tmp_path, [make_offer(price=Decimal("10"))])
     row = {"id": "q1", "row_type": "item", "name": "Клапан", "quantity": "3", "unit": "шт."}

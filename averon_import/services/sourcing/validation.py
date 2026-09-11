@@ -51,6 +51,13 @@ def _same_value(left: object, right: object) -> bool:
     return _norm(left) == _norm(right)
 
 
+def _attribute_origin(intent: ProductIntent, key: str) -> str:
+    origins = intent.evidence.get("attribute_origins", {})
+    if not isinstance(origins, dict):
+        return ""
+    return str(origins.get(key) or "").strip()
+
+
 def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
     matched: list[str] = []
     conflicts: list[str] = []
@@ -71,6 +78,8 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
         elif offer_model:
             preferred.append("model")
     for key, expected in intent.required_attributes.items():
+        if _attribute_origin(intent, key) == "ai_inferred":
+            continue
         actual = offer_attrs.get(key)
         if actual is None:
             missing.append(key)
@@ -88,6 +97,11 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
     for key, expected in intent.preferred_attributes.items():
         actual = offer_attrs.get(key)
         if key == "manufacturer":
+            continue
+        # AI-inferred attributes remain available on ProductIntent and in the
+        # audit envelope, but they are advisory and cannot change a
+        # deterministic match class.
+        if _attribute_origin(intent, key) == "ai_inferred":
             continue
         if actual is None:
             preferred.append(key)
