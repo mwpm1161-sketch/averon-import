@@ -210,6 +210,8 @@ class SourcingService:
         provider_key: str | None = None,
         limit: int = 20,
         progress: Callable[[int, int, str], None] | None = None,
+        telemetry: Callable[[dict[str, Any]], None] | None = None,
+        catalog_version: str | None = None,
         ai_rerank: bool = False,
     ) -> ProjectSourcingResult:
         eligible = [
@@ -220,7 +222,7 @@ class SourcingService:
         total = len(eligible)
         started_project = time.perf_counter()
         provider = self.provider(provider_key)
-        catalog_version = self._project_catalog_version(provider)
+        catalog_version = catalog_version or self._project_catalog_version(provider)
         if progress:
             progress(0, total, "Проверяем каталог предложений")
         results: list[SourcingResult] = []
@@ -267,20 +269,24 @@ class SourcingService:
                 matching_time += result.timings.get("matching_s", 0.0)
                 ranking_time += result.timings.get("ai_rank_s", 0.0)
             best = result.recommended_offer
+            decision = "WITHOUT_OFFERS"
+            decision_match = None
             if not result.offers:
                 without += 1
                 unresolved += 1
             elif best is None:
+                decision = "REVIEW"
                 review += 1
                 unresolved += 1
             else:
-                decision = next(
+                decision_match = next(
                     (item.decision for item in result.match_results if item.offer.offer_id == best.offer_id),
                     MatchDecision.REVIEW,
                 )
-                if decision == MatchDecision.ALTERNATIVE:
+                decision = decision_match.value
+                if decision_match == MatchDecision.ALTERNATIVE:
                     alternatives += 1
-                elif decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                elif decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
                     matched += 1
                 else:
                     review += 1
@@ -291,17 +297,27 @@ class SourcingService:
                 elif best.price is not None and best.currency:
                     target = (
                         confirmed_totals
-                        if decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
+                        if decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
                         else alternative_totals
-                        if decision == MatchDecision.ALTERNATIVE
+                        if decision_match == MatchDecision.ALTERNATIVE
                         else None
                     )
                     if target is not None:
                         target[best.currency] = target.get(best.currency, Decimal("0")) + best.price * quantity
-                elif decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                elif decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
                     matched_unpriced += 1
-                elif decision == MatchDecision.ALTERNATIVE:
+                elif decision_match == MatchDecision.ALTERNATIVE:
                     alternative_unpriced += 1
+            if telemetry:
+                telemetry(_row_telemetry(
+                    row,
+                    understanding,
+                    understanding_cache_hit,
+                    result,
+                    decision,
+                    decision_match,
+                    current_ai_mode=str(self.ai.cache_identity().get("mode") or "fallback"),
+                ))
             if progress:
                 progress(index + 1, total, f"Готово {index + 1} из {total}: {label}")
         confirmed_currencies = sorted(confirmed_totals)
@@ -350,6 +366,9 @@ class SourcingService:
                 "search_cache_hits": float(search_cache_hits),
                 "provider_stats_calls": 1.0,
             },
+            provider_key=provider.key,
+            provider_label=provider.label,
+            catalog_version=catalog_version,
         )
 
     def _project_catalog_version(self, provider: SourcingProvider) -> str:
@@ -459,3 +478,76 @@ def _safe_provider_warning(exc: ValueError) -> str:
     ):
         message = "провайдер не вернул предложения"
     return f"Ошибка поиска: {message}"
+
+
+def _row_telemetry(
+    row: dict[str, Any],
+    understanding: ProductUnderstandingResult,
+    understanding_cache_hit: bool,
+    result: SourcingResult,
+    decision: str,
+    decision_match: MatchDecision | None,
+    *,
+    current_ai_mode: str,
+) -> dict[str, Any]:
+    match = None
+    if decision_match is not None:
+        match = next(
+            (
+                item for item in result.match_results
+                if result.recommended_offer is not None
+                and item.offer.offer_id == result.recommended_offer.offer_id
+            ),
+            None,
+        )
+    if match is None:
+        match = result.review_candidate
+    kind = _understanding_provenance_kind(
+        understanding,
+        understanding_cache_hit,
+        current_ai_mode=current_ai_mode,
+    )
+    provenance = understanding.provenance
+    preferred = [
+        str(item.field)
+        for item in understanding.suggestions
+        if str(getattr(item.resolution, "value", item.resolution)) == "PREFERRED_AI_INFERENCE"
+    ]
+    return {
+        "source_row_id": understanding.resolved_intent.source_row_id,
+        "source_page": row.get("page"),
+        "source_row": row.get("source_row") if row.get("source_row") not in (None, "") else row.get("source_row_index"),
+        "intent_fingerprint": understanding.resolved_intent.fingerprint,
+        "ai_mode": understanding.mode,
+        "understanding_cache_hit": understanding_cache_hit,
+        "understanding_provenance": {
+            "kind": kind,
+            "provider": provenance.provider,
+            "model": provenance.model,
+            "parser_revision": provenance.parser_revision,
+            "latency_ms": provenance.latency_ms,
+        },
+        "search_cache_hit": bool(result.timings.get("search_cache_hit")),
+        "decision": decision,
+        "recommended_offer_id": result.recommended_offer.offer_id if result.recommended_offer else None,
+        "review_candidate_offer_id": result.review_candidate.offer.offer_id if result.review_candidate else None,
+        "matched_attributes": list(match.matched_attributes) if match else [],
+        "missing_attributes": list(match.missing_attributes) if match else [],
+        "conflicting_attributes": list(match.conflicting_attributes) if match else [],
+        "preferred_differences": preferred,
+    }
+
+
+def _understanding_provenance_kind(
+    understanding: ProductUnderstandingResult,
+    cache_hit: bool,
+    *,
+    current_ai_mode: str,
+) -> str:
+    if cache_hit:
+        return "cached_qwen" if understanding.mode == "qwen" else "cached_fallback"
+    if understanding.mode == "qwen":
+        return "fresh_qwen"
+    if current_ai_mode == "qwen":
+        return "fresh_fallback_after_qwen_failure"
+    return "offline_deterministic_fallback"

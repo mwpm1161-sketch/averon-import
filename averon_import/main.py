@@ -6,6 +6,7 @@ import re
 import tempfile
 import threading
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -68,6 +69,7 @@ from averon_import.services.sourcing.product_understanding import SourcingAIServ
 from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
 from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
+from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.workspace import WorkspaceService
 
@@ -365,13 +367,22 @@ async def upload_document(file: UploadFile = File(...)):
         temp_path.unlink(missing_ok=True)
 
 
+@app.get("/api/documents")
+def list_documents(limit: int = 50):
+    return {"documents": workspace_service.list_recent(limit)}
+
+
 @app.get("/api/documents/{document_id}")
 def get_document(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
         metadata = workspace_service.read_json(workspace.metadata_path)
         result = workspace_service.read_json(workspace.result_path)
-        return {**metadata, "has_result": bool(result)}
+        return {
+            **metadata,
+            "has_result": bool(result),
+            "has_review_decisions": workspace.review_decisions_path.is_file(),
+        }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
@@ -648,22 +659,91 @@ def sourcing_search_intent(request: SourcingIntentRequest):
     return _sourcing_payload(result)
 
 
+def _submit_sourcing_project_job(
+    rows: list[dict[str, Any]],
+    *,
+    provider_key: str | None,
+    limit: int,
+    document_id: str | None = None,
+):
+    provider = sourcing_service.provider(provider_key)
+    history = None
+    run_id = None
+    created_at = datetime.now(timezone.utc).isoformat()
+    if document_id is not None:
+        workspace = workspace_service.get(document_id)
+        history = SourcingRunHistory(workspace.sourcing_runs_dir)
+        run_id = history.new_run_id()
+    eligible_total = sum(
+        1 for row in rows
+        if row.get("selected", True) is not False
+        and row.get("row_type") in {"item", "component", "item_candidate"}
+    )
+    progress_state = {"current": 0, "total": eligible_total}
+
+    def run(progress):
+        telemetry: list[dict[str, Any]] = []
+        catalog_version = "unknown"
+
+        def tracked_progress(current: int, total: int, message: str) -> None:
+            progress_state["current"] = current
+            progress_state["total"] = total
+            progress(current, total, message)
+
+        try:
+            catalog_version = sourcing_service._project_catalog_version(provider)
+            result = sourcing_service.search_project(
+                rows,
+                provider_key=provider_key,
+                limit=limit,
+                progress=tracked_progress,
+                telemetry=telemetry.append,
+                catalog_version=catalog_version,
+                ai_rerank=False,
+            )
+            payload = _sourcing_payload(result)
+            if history is not None and run_id is not None:
+                completed_at = datetime.now(timezone.utc).isoformat()
+                history.write_completed(
+                    run_id=run_id,
+                    document_id=document_id or "",
+                    created_at=created_at,
+                    completed_at=completed_at,
+                    provider_key=payload.get("provider_key") or provider.key,
+                    provider_label=payload.get("provider_label") or provider.label,
+                    catalog_version=payload.get("catalog_version") or catalog_version,
+                    result=result,
+                    row_telemetry=telemetry,
+                )
+                payload["run_id"] = run_id
+                payload["run_created_at"] = created_at
+                payload["run_completed_at"] = completed_at
+            return payload
+        except Exception as exc:
+            if history is not None and run_id is not None:
+                history.write_failed(
+                    run_id=run_id,
+                    document_id=document_id or "",
+                    created_at=created_at,
+                    provider_key=provider.key,
+                    provider_label=provider.label,
+                    catalog_version=catalog_version,
+                    positions_total=eligible_total,
+                    progress_current=progress_state["current"],
+                    progress_total=progress_state["total"],
+                    exc=exc,
+                )
+            raise
+
+    return job_service.submit(run).public()
+
+
 @app.post("/api/sourcing/search-all")
 def sourcing_search_all(request: SourcingProjectRequest):
     rows = [dict(row) for row in request.rows]
     provider_key = request.provider
     limit = max(1, min(request.limit, 100))
-
-    def run(progress):
-        return sourcing_service.search_project(
-            rows,
-            provider_key=provider_key,
-            limit=limit,
-            progress=progress,
-            ai_rerank=False,
-        )
-
-    return job_service.submit(run).public()
+    return _submit_sourcing_project_job(rows, provider_key=provider_key, limit=limit)
 
 
 def _ensure_document(document_id: str) -> None:
@@ -744,7 +824,30 @@ def document_sourcing_search_all(document_id: str, request: SourcingProjectReque
     _ensure_document(document_id)
     # The client sends the current selected/exportable rows, including any
     # reviewed edits.  The document id is used only to scope the operation.
-    return sourcing_search_all(request)
+    rows = [dict(row) for row in request.rows]
+    return _submit_sourcing_project_job(
+        rows,
+        provider_key=request.provider,
+        limit=max(1, min(request.limit, 100)),
+        document_id=document_id,
+    )
+
+
+@app.get("/api/documents/{document_id}/sourcing/runs")
+def list_sourcing_runs(document_id: str):
+    _ensure_document(document_id)
+    workspace = workspace_service.get(document_id)
+    return {"runs": SourcingRunHistory(workspace.sourcing_runs_dir).list_public()}
+
+
+@app.get("/api/documents/{document_id}/sourcing/runs/{run_id}")
+def get_sourcing_run(document_id: str, run_id: str):
+    _ensure_document(document_id)
+    workspace = workspace_service.get(document_id)
+    record = SourcingRunHistory(workspace.sourcing_runs_dir).get(run_id)
+    if record is None or record.get("document_id") != document_id:
+        raise HTTPException(404, "Запуск подбора не найден")
+    return record
 
 
 @app.get("/favicon.ico")

@@ -65,6 +65,13 @@
             <small>До 250 МБ · исходный PDF хранится локально</small>
           </label>
         </div>
+        <section class="panel recent-documents" id="recent-documents-panel" hidden>
+          <div class="panel-heading">
+            <div><h3>Недавние документы</h3><p>Откройте сохранённый workspace без повторного распознавания.</p></div>
+            <button class="button ghost" type="button" id="refresh-recent-documents">Обновить</button>
+          </div>
+          <div id="recent-documents-list" class="recent-documents-list"></div>
+        </section>
       </section>
 
       <section id="pages-view" class="view">

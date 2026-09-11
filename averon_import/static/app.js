@@ -19,6 +19,7 @@ const state = {
   settings: null,
   sourcing: {row: null, result: null},
   sourcingHealth: null,
+  recentDocuments: [],
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -88,6 +89,7 @@ async function boot() {
     initializeSettings(settings);
     populateFilters();
     initializeExportColumns();
+    try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
     await resumeLastDocument();
   } catch (error) {
     toast(error.message, "error");
@@ -233,22 +235,65 @@ async function resumeLastDocument() {
   const documentId = localStorage.getItem("averonCurrentDocument");
   if (!documentId) return;
   try {
-    const documentData = await api(`/api/documents/${documentId}`);
-    state.document = documentData;
-    $("#document-name").textContent = documentData.filename;
-    $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
-    $("#new-document-button").hidden = false;
-    if (documentData.has_result) {
-      const result = await api(`/api/documents/${documentId}/results`);
-      loadResult(result);
-      toast("Последний документ восстановлен", "success");
-    } else {
-      setView("pages");
-      renderThumbnails();
-    }
+    await openExistingDocument(documentId, {announce: false});
+    toast("Последний документ восстановлен", "success");
   } catch (_) {
     localStorage.removeItem("averonCurrentDocument");
   }
+}
+
+async function loadRecentDocuments() {
+  const payload = await api("/api/documents?limit=50");
+  state.recentDocuments = Array.isArray(payload?.documents) ? payload.documents : [];
+  renderRecentDocuments();
+}
+
+function formatRecentTimestamp(value) {
+  if (!value) return "Дата неизвестна";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "Дата неизвестна";
+  return new Intl.DateTimeFormat("ru-RU", {dateStyle:"short", timeStyle:"short"}).format(parsed);
+}
+
+function renderRecentDocuments() {
+  const panel = $("#recent-documents-panel");
+  const list = $("#recent-documents-list");
+  if (!panel || !list) return;
+  panel.hidden = !state.recentDocuments.length;
+  list.innerHTML = state.recentDocuments.map((item) => {
+    const unavailable = item.available === false;
+    const meta = `${item.page_count || 0} стр. · ${item.has_result ? "результат сохранён" : "без результата"} · ${formatRecentTimestamp(item.updated_at)}`;
+    return `<div class="recent-document-item${unavailable ? " unavailable" : ""}"><div><b>${escapeHtml(item.filename || item.title || "Документ")}</b><small>${escapeHtml(meta)}${unavailable ? ` · ${escapeHtml(item.availability_error || "недоступен")}` : ""}</small></div><button class="button ghost recent-document-open" type="button" data-document-id="${escapeHtml(item.document_id)}"${unavailable ? " disabled" : ""}>${unavailable ? "Недоступен" : "Открыть"}</button></div>`;
+  }).join("");
+  list.querySelectorAll(".recent-document-open").forEach((button) => button.addEventListener("click", () => {
+    openExistingDocument(button.dataset.documentId).catch((error) => toast(error.message, "error"));
+  }));
+}
+
+async function openExistingDocument(documentId, {announce = true} = {}) {
+  if (!documentId) throw new Error("Документ не выбран");
+  const encodedId = encodeURIComponent(documentId);
+  const documentData = await api(`/api/documents/${encodedId}`);
+  state.document = documentData;
+  state.selectedPages = new Set();
+  state.previewPage = null;
+  state.crop = null;
+  state.rows = [];
+  state.result = null;
+  state.activeRowId = null;
+  state.dirty = false;
+  localStorage.setItem("averonCurrentDocument", documentData.document_id);
+  $("#document-name").textContent = documentData.filename;
+  $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
+  $("#new-document-button").hidden = false;
+  if (documentData.has_result) {
+    const result = await api(`/api/documents/${encodedId}/results`);
+    loadResult(result, {announce});
+  } else {
+    setView("pages");
+    renderThumbnails();
+  }
+  if (announce && !documentData.has_result) toast("Документ открыт", "success");
 }
 
 async function uploadFile(file) {
@@ -272,6 +317,7 @@ async function uploadFile(file) {
     $("#new-document-button").hidden = false;
     setView("pages");
     renderThumbnails();
+    loadRecentDocuments().catch(() => {});
   } catch (error) {
     toast(error.message, "error");
   } finally {
@@ -518,8 +564,8 @@ function loadResult(result, options = {}) {
   }));
   state.rows.forEach(refreshClientReview);
   state.reviewFilter = "";
-  state.dirty = false;
-  buildResultHeader();
+    state.dirty = false;
+    buildResultHeader();
   renderRows();
   updateSummary();
   setView("review");
@@ -908,7 +954,8 @@ function renderSourcingResult(result, row = null) {
       ? "Подтверждённая стоимость по позициям с ценой"
       : "Подтверждённая стоимость";
     const unpricedText = `${matchedUnpriced} подтверждённых + ${alternativeUnpriced} альтернативы`;
-    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div><div><small>Без цены</small><b>${unpricedText}</b></div><div><small>Требуют проверки</small><b>${unresolved}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const match = projectMatch(item); const offer = match?.offer || item.recommended_offer; const decision = match?.decision || projectDecision(item); const total = offer && ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(decision) ? estimatedOfferTotal(offer, item.intent) : null; const alternative = item.review_candidate && item.recommended_offer && item.recommended_offer.offer_id !== offer?.offer_id ? `<small class="project-result-secondary">Альтернатива: ${escapeHtml(item.recommended_offer.title)}</small>` : ""; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}${alternative}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${decision}<small class="project-result-reason">${escapeHtml(projectReason(item))}</small></span><span>${escapeHtml(offer ? sourcingProviderLabel(offer) : "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+    const runMeta = result.run_id ? `<div class="sourcing-run-meta"><span>Поставщик: <b>${escapeHtml(result.provider_label || "Поставщик")}</b></span><span>Версия каталога: <b>${escapeHtml(result.catalog_version || "—")}</b></span><span>Запуск: <b>${escapeHtml(String(result.run_id).slice(0, 10))}</b></span><span>Время: <b>${escapeHtml(formatRecentTimestamp(result.run_completed_at || result.run_created_at))}</b></span></div>` : "";
+    content.innerHTML = `${runMeta}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div><div><small>Без цены</small><b>${unpricedText}</b></div><div><small>Требуют проверки</small><b>${unresolved}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const match = projectMatch(item); const offer = match?.offer || item.recommended_offer; const decision = match?.decision || projectDecision(item); const total = offer && ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"].includes(decision) ? estimatedOfferTotal(offer, item.intent) : null; const alternative = item.review_candidate && item.recommended_offer && item.recommended_offer.offer_id !== offer?.offer_id ? `<small class="project-result-secondary">Альтернатива: ${escapeHtml(item.recommended_offer.title)}</small>` : ""; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}${alternative}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${decision}<small class="project-result-reason">${escapeHtml(projectReason(item))}</small></span><span>${escapeHtml(offer ? sourcingProviderLabel(offer) : "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
     return;
   }
   const intent = result.intent || {};
@@ -1240,6 +1287,7 @@ function setupEvents() {
   ["dragenter","dragover"].forEach((name)=>drop.addEventListener(name,(e)=>{e.preventDefault();drop.classList.add("drag");}));
   ["dragleave","drop"].forEach((name)=>drop.addEventListener(name,(e)=>{e.preventDefault();drop.classList.remove("drag");}));
   drop.addEventListener("drop",(e)=>uploadFile(e.dataTransfer.files[0]));
+  $("#refresh-recent-documents").addEventListener("click",()=>loadRecentDocuments().catch((e)=>toast(e.message,"error")));
   $("#apply-range").addEventListener("click",()=>{try{state.selectedPages=parseRanges($("#page-range").value);updatePageSelection();const p=[...state.selectedPages][0];if(p)showCropPreview(p);}catch(e){toast(e.message,"error");}});
   $("#suggest-pages").addEventListener("click",async()=>{
     const button=$("#suggest-pages"); const old=button.textContent; button.disabled=true; button.textContent="Анализируем…";

@@ -193,6 +193,9 @@ class ProjectSourcingResult(SourcingModel):
     warnings: list[str] = Field(default_factory=list)
     results: list[SourcingResult] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
+    provider_key: str = ""
+    provider_label: str = ""
+    catalog_version: str = ""
 
 
 class SourcingProviderInfo(SourcingModel):
