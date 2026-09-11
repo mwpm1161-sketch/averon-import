@@ -146,7 +146,9 @@ def test_settings_ui_exposes_separate_sourcing_provider_and_demo_store_url():
 def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 
-    assert "offer.data_provenance?.source || offer.provider" in app_js
+    assert "function sourcingProviderLabel(offer)" in app_js
+    assert 'averon_demo_store: "Averon Demo Store"' in app_js
+    assert 'demo_store_http: "Averon Demo Store"' in app_js
     assert "Совпало:" in app_js
     assert "Конфликт:" in app_js
     assert 'target="_blank" rel="noopener noreferrer"' in app_js
@@ -167,3 +169,12 @@ def test_project_sourcing_ui_explains_deterministic_match_state():
     assert "Точное предложение не найдено" in app_js
     assert "Не подтверждено:" in app_js
     assert 'projectDecision(item)}<small class="project-result-reason">' in app_js
+
+
+def test_project_sourcing_ui_marks_partial_totals_and_hides_provider_keys():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'const totalLabel = partialTotal ? "Частичный итог" : "Расчётный итог";' in app_js
+    assert "Не включает позиции без подтверждённой цены" in app_js
+    assert "offer?.provider || \"—\"" not in app_js
+    assert "sourcingProviderLabel(offer)" in app_js
