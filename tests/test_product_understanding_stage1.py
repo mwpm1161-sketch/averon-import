@@ -256,6 +256,100 @@ def make_service(tmp_path, ai):
     )
 
 
+def test_cache_unconfigured_fallback_is_cached_and_reused(tmp_path):
+    service = make_service(tmp_path, SourcingAIService())
+
+    first, first_hit = service._understand_row_result_with_cache(source_row())
+    second, second_hit = service._understand_row_result_with_cache(source_row())
+
+    assert first.mode == second.mode == "fallback"
+    assert first_hit is False
+    assert second_hit is True
+    assert second == first
+
+
+def test_cache_configured_qwen_success_is_cached(tmp_path):
+    ai, provider = ai_for({"normalized_name": "Конвектор"})
+    service = make_service(tmp_path, ai)
+
+    first, first_hit = service._understand_row_result_with_cache(source_row())
+    second, second_hit = service._understand_row_result_with_cache(source_row())
+
+    assert first.mode == second.mode == "qwen"
+    assert first_hit is False
+    assert second_hit is True
+    assert provider.calls == 1
+
+
+def test_cache_configured_qwen_transient_failure_is_not_cached(tmp_path):
+    ai, provider = ai_for(RuntimeError("temporary provider failure"))
+    service = make_service(tmp_path, ai)
+
+    first, first_hit = service._understand_row_result_with_cache(source_row())
+    second, second_hit = service._understand_row_result_with_cache(source_row())
+
+    assert first.mode == second.mode == "fallback"
+    assert first_hit is False
+    assert second_hit is False
+    assert provider.calls == 2
+    assert service.cache.get_understanding(service._intent_cache_key(source_row())) is None
+
+
+def test_cache_failure_then_success_then_cache_hit(tmp_path):
+    ai, provider = ai_for(RuntimeError("temporary provider failure"))
+    service = make_service(tmp_path, ai)
+
+    first, first_hit = service._understand_row_result_with_cache(source_row())
+    provider.response = json.dumps({"normalized_name": "Конвектор"}, ensure_ascii=False)
+    second, second_hit = service._understand_row_result_with_cache(source_row())
+    third, third_hit = service._understand_row_result_with_cache(source_row())
+
+    assert first.mode == "fallback"
+    assert second.mode == third.mode == "qwen"
+    assert first_hit is False
+    assert second_hit is False
+    assert third_hit is True
+    assert provider.calls == 2
+
+
+def test_cache_poisoned_qwen_fallback_is_retried_and_replaced(tmp_path):
+    ai, provider = ai_for({"normalized_name": "Конвектор"})
+    service = make_service(tmp_path, ai)
+    row = source_row()
+    key = service._intent_cache_key(row)
+    poisoned = SourcingAIService().understand_with_audit(row, build_fallback_intent(row))
+    service.cache.set_understanding(key, poisoned)
+
+    result, cache_hit = service._understand_row_result_with_cache(row)
+
+    assert result.mode == "qwen"
+    assert cache_hit is False
+    assert provider.calls == 1
+    assert service.cache.get_understanding(key).mode == "qwen"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "not-json",
+        {"price": "invented", "normalized_name": "Конвектор"},
+    ],
+)
+def test_cache_malformed_or_invalid_qwen_result_is_not_cached(tmp_path, response):
+    ai, provider = ai_for(response)
+    service = make_service(tmp_path, ai)
+    row = source_row()
+
+    first, first_hit = service._understand_row_result_with_cache(row)
+    second, second_hit = service._understand_row_result_with_cache(row)
+
+    assert first.mode == second.mode == "fallback"
+    assert first_hit is False
+    assert second_hit is False
+    assert provider.calls == 2
+    assert service.cache.get_understanding(service._intent_cache_key(row)) is None
+
+
 def test_p19_parser_prompt_and_revision_participate_in_cache_identity(tmp_path, monkeypatch):
     import averon_import.services.sourcing.product_understanding as module
 

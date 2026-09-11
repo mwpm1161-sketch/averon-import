@@ -39,7 +39,6 @@ class SourcingService:
         self.ai = ai or SourcingAIService()
         self.matcher = matcher or OfferMatcher()
         self.cache = cache or SourcingCache()
-        self._last_understanding_cache_hit = False
 
     def provider(self, key: str | None = None) -> SourcingProvider:
         selected = key or self.default_provider
@@ -55,17 +54,48 @@ class SourcingService:
         return intent
 
     def understand_row_result(self, row: dict[str, Any]) -> ProductUnderstandingResult:
+        result, _ = self._understand_row_result_with_cache(row)
+        return result
+
+    def _understand_row_result_with_cache(
+        self,
+        row: dict[str, Any],
+    ) -> tuple[ProductUnderstandingResult, bool]:
         source = dict(row)
         cache_key = self._intent_cache_key(source)
+        current_ai_identity = self.ai.cache_identity()
         cached = self.cache.get_understanding(cache_key)
-        if cached is not None:
-            self._last_understanding_cache_hit = True
-            return cached
-        self._last_understanding_cache_hit = False
+        if cached is not None and self._can_reuse_understanding(cached, current_ai_identity):
+            return cached, True
         fallback = build_fallback_intent(source)
         result = self.ai.understand_with_audit(source, fallback)
-        self.cache.set_understanding(cache_key, result)
-        return result
+        if self._can_persist_understanding(result, current_ai_identity):
+            self.cache.set_understanding(cache_key, result)
+        return result, False
+
+    @staticmethod
+    def _can_reuse_understanding(
+        cached: ProductUnderstandingResult,
+        current_ai_identity: dict[str, Any],
+    ) -> bool:
+        """Reject fallback entries stored under an active Qwen identity."""
+
+        return not (
+            str(current_ai_identity.get("mode") or "") == "qwen"
+            and cached.mode == "fallback"
+        )
+
+    @staticmethod
+    def _can_persist_understanding(
+        result: ProductUnderstandingResult,
+        current_ai_identity: dict[str, Any],
+    ) -> bool:
+        """Persist fallback only when fallback is the configured cache mode."""
+
+        return not (
+            str(current_ai_identity.get("mode") or "") == "qwen"
+            and result.mode == "fallback"
+        )
 
     def understand_row_with_warnings(self, row: dict[str, Any]) -> tuple[ProductIntent, list[str]]:
         result = self.understand_row_result(row)
@@ -199,9 +229,9 @@ class SourcingService:
             if progress:
                 progress(index, total, f"Анализируем позицию {index + 1} из {total}: {label}")
             understanding_started = time.perf_counter()
-            understanding = self.understand_row_result(row)
+            understanding, understanding_cache_hit = self._understand_row_result_with_cache(row)
             understanding_time += time.perf_counter() - understanding_started
-            if self._last_understanding_cache_hit:
+            if understanding_cache_hit:
                 understanding_cache_hits += 1
             try:
                 result = self.search_intent(
