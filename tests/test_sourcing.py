@@ -84,7 +84,7 @@ class FakeAIProvider:
         self.response = response
         self.calls = 0
 
-    def complete(self, messages):
+    def complete(self, messages, **kwargs):
         self.calls += 1
         return self.response
 
@@ -620,7 +620,7 @@ def test_q13_malformed_qwen_json_uses_safe_fallback():
 
 def test_q14_qwen_outage_uses_safe_fallback_without_raw_error():
     class OutageProvider(FakeAIProvider):
-        def complete(self, messages):
+        def complete(self, messages, **kwargs):
             raise RuntimeError("HTTP 503 Authorization secret should not leak")
 
     row = {"id": "outage", "name": "Насос", "quantity": "1"}

@@ -30,7 +30,7 @@ class FakeQwenProvider:
         self.model = model
         self.calls = 0
 
-    def complete(self, messages):
+    def complete(self, messages, **kwargs):
         self.calls += 1
         if isinstance(self.response, Exception):
             raise self.response

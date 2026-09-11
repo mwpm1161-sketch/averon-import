@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from averon_import.ai.provider import AiProviderError
 from averon_import.services.sourcing.models import (
     MatchResult,
     ProductIntent,
@@ -19,7 +20,7 @@ from averon_import.services.sourcing.models import (
 )
 
 
-PRODUCT_UNDERSTANDING_REVISION = "1"
+PRODUCT_UNDERSTANDING_REVISION = "2"
 
 # Existing matcher/catalog attribute names are the canonical compatibility
 # contract. Values use these stable units throughout sourcing.
@@ -92,6 +93,47 @@ PRODUCT_UNDERSTANDING_SYSTEM_PROMPT = """Ты — консервативный �
 - не создавай варианты ключей вроде power_w, wattage или rated_power;
 - uncertainties и search_queries должны быть короткими списками строк.
 """
+
+
+_PRODUCT_INTENT_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "source_row_id": {"type": "string"},
+        "source_text": {"type": "string"},
+        "product_class": {"type": "string"},
+        "normalized_name": {"type": "string"},
+        "manufacturer": {"type": "string"},
+        "brand": {"type": "string"},
+        "model": {"type": "string"},
+        "article": {"type": "string"},
+        "attributes": {"type": "object"},
+        "required_attributes": {"type": "object"},
+        "preferred_attributes": {"type": "object"},
+        "quantity": {"type": "string"},
+        "unit": {"type": "string"},
+        "search_queries": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "object"},
+        "uncertainties": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "source_row_id", "source_text", "product_class", "normalized_name",
+        "manufacturer", "brand", "model", "article", "attributes",
+        "required_attributes", "preferred_attributes", "quantity", "unit",
+        "search_queries", "evidence", "uncertainties",
+    ],
+}
+
+
+def _product_intent_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "product_intent",
+            "schema": deepcopy(_PRODUCT_INTENT_JSON_SCHEMA),
+            "strict": True,
+        },
+    }
 
 
 def _prompt_fingerprint() -> str:
@@ -636,16 +678,34 @@ class SourcingAIService:
         }
 
     def _record_error(self, exc: Exception) -> None:
+        category = str(getattr(exc, "category", "") or "").strip()
+        if category:
+            self._last_status = category
+            return
         text = str(exc).casefold()
-        self._last_status = "access_denied" if "401" in text or "403" in text else "unavailable"
+        if "401" in text or "403" in text:
+            self._last_status = "access_denied"
+        elif "json" in text:
+            self._last_status = "invalid_json"
+        elif "validation" in text:
+            self._last_status = "validation_error"
+        elif "timeout" in text or "время ожидания" in text:
+            self._last_status = "timeout"
+        else:
+            self._last_status = "request_error"
 
     def _safe_warning(self, prefix: str, exc: Exception) -> str:
         self._record_error(exc)
+        category = self._last_status
         text = str(exc).casefold()
-        if "401" in text or "403" in text:
+        if category == "access_denied" or "401" in text or "403" in text:
             return f"{prefix}: ключ не имеет доступа к AI Studio; использован детерминированный fallback"
-        if "json" in text:
+        if category == "invalid_json" or "json" in text:
             return f"{prefix}: Qwen вернул некорректный JSON; использован детерминированный fallback"
+        if category == "validation_error":
+            return f"{prefix}: Qwen вернул данные вне ProductIntent; использован детерминированный fallback"
+        if category == "timeout":
+            return f"{prefix}: истекло время ожидания Qwen; использован детерминированный fallback"
         return f"{prefix}: Qwen недоступен; использован детерминированный fallback"
 
     def _fallback_result(
@@ -694,13 +754,30 @@ class SourcingAIService:
                 "quantity": fallback.quantity,
                 "note": row.get("note", ""),
             }
-            raw = provider.complete([
+            messages = [
                 {
                     "role": "system",
                     "content": PRODUCT_UNDERSTANDING_SYSTEM_PROMPT,
                 },
                 {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-            ])
+            ]
+            try:
+                raw = provider.complete(
+                    messages,
+                    response_format=_product_intent_response_format(),
+                    reasoning_effort="none",
+                )
+            except AiProviderError as exc:
+                # JSON Schema is the preferred contract.  A documented JSON
+                # object response remains a narrow compatibility fallback for
+                # endpoints/models that reject the schema form itself.
+                if exc.status_code not in {400, 422}:
+                    raise
+                raw = provider.complete(
+                    messages,
+                    response_format={"type": "json_object"},
+                    reasoning_effort="none",
+                )
             payload = _extract_json(raw)
             # The OCR-owned source identity is always supplied locally.  It is
             # valid for a provider to omit these transport fields while still
@@ -731,6 +808,12 @@ class SourcingAIService:
                     parser_revision=PRODUCT_UNDERSTANDING_REVISION,
                     latency_ms=round((time.perf_counter() - started) * 1000, 3),
                 ),
+            )
+        except AiProviderError as exc:
+            return self._fallback_result(
+                fallback,
+                [self._safe_warning("AI product understanding unavailable", exc)],
+                latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
             return self._fallback_result(

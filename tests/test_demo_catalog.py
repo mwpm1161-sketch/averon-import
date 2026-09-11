@@ -225,7 +225,7 @@ def test_qwen_commercial_fields_are_rejected_and_never_become_offer_facts():
         model = "test-qwen"
         configured = True
 
-        def complete(self, messages):
+        def complete(self, messages, **kwargs):
             return json.dumps({
                 "normalized_name": "Конвектор",
                 "price": 1,
