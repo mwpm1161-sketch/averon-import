@@ -380,6 +380,52 @@ def test_q21_source_required_attribute_missing_still_reviews():
     assert "power" in result.missing_attributes
 
 
+def test_q22_cyrillic_latin_product_identifier_is_equivalent():
+    intent = make_intent(
+        model="КЭВ-9П2012Е",
+        article="КЭВ-9П2012Е",
+        manufacturer="Тепломаш",
+        attributes={},
+        required_attributes={},
+    )
+    offer = make_offer(
+        article="KEV-9P2012E",
+        manufacturer="Тепломаш",
+        attributes={"model": "KEV-9P2012E"},
+    )
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.MATCH
+    assert result.conflicting_attributes == []
+    assert set(result.matched_attributes) >= {"article", "model", "manufacturer"}
+
+
+def test_q23_same_alternative_class_prefers_more_supported_candidate():
+    intent = make_intent(
+        model="Model 10",
+        manufacturer="NOBO",
+        attributes={"power": 1},
+        required_attributes={"power": 1},
+        preferred_attributes={"features": "waterproof"},
+    )
+    weaker = make_offer(
+        offer_id="adax-10",
+        manufacturer="ADAX",
+        attributes={"power": 1},
+    )
+    stronger = make_offer(
+        offer_id="nobo-10",
+        manufacturer="NOBO",
+        attributes={"model": "Model 10", "power": 1},
+    )
+
+    results = OfferMatcher().match(intent, [weaker, stronger])
+
+    assert [result.offer.offer_id for result in results] == ["nobo-10", "adax-10"]
+    assert all(result.decision == MatchDecision.ALTERNATIVE for result in results)
+
+
 def test_s15_quantity_times_price_is_calculated_without_mutating_row(tmp_path):
     service = service_for(tmp_path, [make_offer(price=Decimal("10"))])
     row = {"id": "q1", "row_type": "item", "name": "Клапан", "quantity": "3", "unit": "шт."}

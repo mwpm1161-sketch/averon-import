@@ -156,3 +156,14 @@ def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
     assert "job.message" in app_js
     assert "Product Understanding → поиск → deterministic matching" in app_js
     assert "Позиции обрабатываются последовательно" in app_js
+
+
+def test_project_sourcing_ui_explains_deterministic_match_state():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "function projectMatch(item)" in app_js
+    assert "function projectDecision(item)" in app_js
+    assert "function projectReason(item)" in app_js
+    assert "Точное предложение не найдено" in app_js
+    assert "Не подтверждено:" in app_js
+    assert 'projectDecision(item)}<small class="project-result-reason">' in app_js

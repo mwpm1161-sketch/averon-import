@@ -836,13 +836,42 @@ function renderProductUnderstanding(understanding) {
   </section>`;
 }
 
+function projectMatch(item) {
+  const offer = item.recommended_offer;
+  if (offer) return (item.match_results || []).find((match) => match.offer?.offer_id === offer.offer_id) || null;
+  return (item.match_results || []).find((match) => match.decision === "REVIEW")
+    || (item.match_results || []).find((match) => match.decision === "REJECT")
+    || null;
+}
+
+function projectDecision(item) {
+  const match = projectMatch(item);
+  if (match?.decision) return match.decision;
+  return item.offers?.length ? "REVIEW" : "WITHOUT_OFFERS";
+}
+
+function projectReason(item) {
+  const match = projectMatch(item);
+  if (!item.offers?.length) return "Точное предложение не найдено";
+  if (match?.decision === "MATCH" || match?.decision === "LIKELY_MATCH") {
+    const matched = match.matched_attributes || [];
+    return matched.length ? `Совпали: ${matched.join(", ")}` : "Совпали обязательные характеристики";
+  }
+  if (match?.missing_attributes?.length) return `Не подтверждено: ${match.missing_attributes.join(", ")}`;
+  if (match?.conflicting_attributes?.length) return `Конфликт: ${match.conflicting_attributes.join(", ")}`;
+  const differences = match?.deterministic_evidence?.preferred_differences || [];
+  if (projectDecision(item) === "ALTERNATIVE" && differences.length) return `Альтернатива; отличается: ${differences.join(", ")}`;
+  if (projectDecision(item) === "ALTERNATIVE") return "Найдена другая модель или производитель";
+  return "Предложение требует проверки";
+}
+
 function renderSourcingResult(result, row = null) {
   const content = $("#sourcing-content");
   if (result.positions_total !== undefined) {
     const qwenUsed = (result.results || []).some((item) => item.ai_mode === "qwen");
     $("#sourcing-subtitle").textContent = qwenUsed ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
     const currency = result.currency || "";
-    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>Расчётный итог</small><b>${result.estimated_total === null ? "Требует проверки" : formatMoney(result.estimated_total, currency)}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const offer = item.recommended_offer; const total = offer ? estimatedOfferTotal(offer, item.intent) : null; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${item.match_results?.find((match) => match.offer?.offer_id === offer?.offer_id)?.decision || "REVIEW"}</span><span>${escapeHtml(offer?.provider || "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+    content.innerHTML = `<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Review</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>Расчётный итог</small><b>${result.estimated_total === null ? "Требует проверки" : formatMoney(result.estimated_total, currency)}</b></div></div><div class="sourcing-project-list">${(result.results || []).map((item) => { const offer = item.recommended_offer; const total = offer ? estimatedOfferTotal(offer, item.intent) : null; return `<div class="project-result-row"><span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span><span>${escapeHtml(item.intent.quantity || "—")}</span><span>${offer ? escapeHtml(offer.title) : "Нет подтверждённого предложения"}</span><span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span><span>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</span><span>${projectDecision(item)}<small class="project-result-reason">${escapeHtml(projectReason(item))}</small></span><span>${escapeHtml(offer?.provider || "—")}</span></div>`; }).join("")}</div>${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
     return;
   }
   const intent = result.intent || {};

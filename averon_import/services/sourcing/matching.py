@@ -45,8 +45,18 @@ class OfferMatcher:
                     "preferred_differences": list(evidence.preferred_differences),
                 },
             )
-            provisional.append((_DECISION_ORDER[decision], result))
-        provisional.sort(key=lambda item: (item[0], item[1].offer.offer_id))
+            provisional.append((
+                (
+                    _DECISION_ORDER[decision],
+                    len(evidence.conflicts),
+                    len(evidence.missing),
+                    len(evidence.preferred_differences),
+                    -len(evidence.matched),
+                    result.offer.offer_id,
+                ),
+                result,
+            ))
+        provisional.sort(key=lambda item: item[0])
         return [item[1].model_copy(update={"rank": index}) for index, item in enumerate(provisional, 1)]
 
 

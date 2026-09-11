@@ -149,6 +149,22 @@ def test_search_sends_product_intent_and_maps_provider_owned_offer():
     assert "decision" not in offer.model_dump(mode="json")
 
 
+def test_search_uses_primary_line_of_multiline_model_for_retrieval_only():
+    intent = make_intent().model_copy(update={
+        "model": "КЭВ-9П2012Е\nСерия 200Е Оптима",
+        "search_queries": ["тепловая завеса"],
+    })
+    transport = FakeTransport([FakeResponse({"items": []})])
+
+    assert DemoStoreHttpProvider(transport=transport).search(intent) == []
+
+    request, _ = transport.calls[0]
+    payload = json.loads(request.data.decode())
+    assert payload["model"] == "КЭВ-9П2012Е"
+    assert payload["search_queries"][0] == "КЭВ-9П2012Е"
+    assert intent.model == "КЭВ-9П2012Е\nСерия 200Е Оптима"
+
+
 def test_power_w_is_converted_to_kw_and_canonical_values_are_preserved():
     transport = FakeTransport([FakeResponse({"items": [{
         "id": "power-w",

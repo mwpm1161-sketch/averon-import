@@ -7,6 +7,13 @@ from typing import Any
 from averon_import.services.sourcing.models import Offer, ProductIntent
 
 
+_CYRILLIC_IDENTIFIER_TRANSLATION = str.maketrans({
+    "а": "a", "в": "v", "е": "e", "з": "z", "и": "i", "к": "k",
+    "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "х": "x", "э": "e",
+})
+
+
 @dataclass(frozen=True)
 class ValidationResult:
     matched: tuple[str, ...] = ()
@@ -16,7 +23,12 @@ class ValidationResult:
 
 
 def _norm(value: object) -> str:
-    text = str(value or "").casefold().replace("ё", "е")
+    # Product identifiers may cross the Cyrillic/Latin boundary in OCR and
+    # catalog data (for example КЭВ-9П2012Е vs KEV-9P2012E).  Normalize only
+    # for comparison; source and provider values remain unchanged.
+    text = str(value or "").casefold().replace("ё", "е").translate(
+        _CYRILLIC_IDENTIFIER_TRANSLATION
+    )
     text = text.replace("×", "x").replace("х", "x")
     text = re.sub(r"[^\w]+", "", text)
     return text

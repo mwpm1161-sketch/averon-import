@@ -80,6 +80,20 @@ def _default_transport(request: urllib.request.Request, timeout: float):
     return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
+def _retrieval_payload(intent: ProductIntent) -> dict[str, Any]:
+    """Prepare search-only identifiers without changing the source intent."""
+    body = intent.model_dump(mode="json")
+    model = body.get("model")
+    if isinstance(model, str):
+        primary_model = next((line.strip() for line in model.splitlines() if line.strip()), "")
+        if primary_model and primary_model != model:
+            body["model"] = primary_model
+            queries = body.get("search_queries")
+            if isinstance(queries, list):
+                body["search_queries"] = list(dict.fromkeys([primary_model, *queries]))[:4]
+    return body
+
+
 class DemoStoreHttpProvider:
     key = "demo_store_http"
     label = "Averon Demo Store"
@@ -100,7 +114,7 @@ class DemoStoreHttpProvider:
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
         bounded_limit = _bounded_limit(limit)
-        body = intent.model_dump(mode="json")
+        body = _retrieval_payload(intent)
         data = self._request_json(
             "POST",
             f"/api/v1/search?{urlencode({'limit': bounded_limit})}",
