@@ -6,6 +6,7 @@ from averon_import.services.sourcing.models import (
     Offer,
     ProductIntent,
     SourcingProviderCapabilities,
+    SourcingProviderRuntimeState,
 )
 
 
@@ -43,7 +44,7 @@ class SourcingProvider(Protocol):
         """Return provider-owned commercial offers for an intent."""
         ...
 
-    def stats(self) -> dict:
+    def stats(self) -> dict | SourcingProviderRuntimeState:
         ...
 
 
@@ -61,3 +62,25 @@ def get_provider_capabilities(provider: object) -> SourcingProviderCapabilities:
         return SourcingProviderCapabilities.model_validate(payload)
     except Exception:
         return SourcingProviderCapabilities()
+
+
+def normalize_provider_runtime_state(stats: object) -> SourcingProviderRuntimeState:
+    """Rebuild provider runtime data from a strict whitelist."""
+
+    try:
+        if isinstance(stats, SourcingProviderRuntimeState):
+            payload = {
+                field_name: getattr(stats, field_name)
+                for field_name in SourcingProviderRuntimeState.model_fields
+            }
+        elif isinstance(stats, dict):
+            payload = {
+                field_name: stats[field_name]
+                for field_name in SourcingProviderRuntimeState.model_fields
+                if field_name in stats
+            }
+        else:
+            return SourcingProviderRuntimeState()
+        return SourcingProviderRuntimeState.model_validate(payload)
+    except Exception:
+        return SourcingProviderRuntimeState()

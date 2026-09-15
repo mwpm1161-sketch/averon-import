@@ -42,6 +42,45 @@ class SourcingProviderCapabilities(SourcingModel):
     supports_stock_quantity: bool = False
 
 
+class SourcingProviderRuntimeState(SourcingModel):
+    """Immutable runtime health snapshot, separate from static capabilities."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    configured: bool = True
+    reachable: bool = True
+    item_count: int = Field(default=0, ge=0)
+    catalog_version: str = "unknown"
+    latency_ms: float | None = Field(default=None, ge=0)
+    error: str = ""
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _normalize_error(cls, value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("error must be a string")
+        message = " ".join(value.split())
+        lowered = message.casefold()
+        if not message or len(message) > 240 or any(
+            marker in lowered
+            for marker in (
+                "api-key",
+                "api_key",
+                "authorization",
+                "secret",
+                "token",
+                "password",
+                "raw_response",
+                "debug_payload",
+                "traceback",
+            )
+        ):
+            return "Проверка каталога поставщика не выполнена"
+        return message
+
+
 def dedupe_sourcing_notices(notices: Iterable[SourcingNotice]) -> list[SourcingNotice]:
     """Keep the first occurrence of each stable notice identity."""
 

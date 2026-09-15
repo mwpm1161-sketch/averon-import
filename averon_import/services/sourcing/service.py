@@ -19,6 +19,7 @@ from averon_import.services.sourcing.models import (
     ProjectSourcingResult,
     SourcingRankingResult,
     SourcingNotice,
+    SourcingProviderRuntimeState,
     SourcingResult,
     dedupe_sourcing_notices,
 )
@@ -30,6 +31,7 @@ from averon_import.services.sourcing.providers.base import (
     SourcingProvider,
     SourcingProviderError,
     get_provider_capabilities,
+    normalize_provider_runtime_state,
 )
 
 
@@ -149,12 +151,13 @@ class SourcingService:
         if catalog_version is None:
             try:
                 stats = provider.stats() if hasattr(provider, "stats") else {}
-                if isinstance(stats, dict) and stats.get("reachable") is False:
+                runtime_state = normalize_provider_runtime_state(stats)
+                if runtime_state.reachable is False:
                     raise SourcingProviderError(
-                        str(stats.get("error") or "Поставщик недоступен"),
+                        runtime_state.error or "Поставщик недоступен",
                         category="health_error",
                     )
-                catalog_version = (stats or {}).get("catalog_version", "unknown")
+                catalog_version = runtime_state.catalog_version
             except (SourcingProviderError, ValueError) as exc:
                 return self._provider_failure_result(intent, understanding, warnings, notices, exc)
             except Exception as exc:
@@ -476,34 +479,33 @@ class SourcingService:
                 "Проверка каталога поставщика не выполнена",
                 category="health_error",
             ) from exc
-        if not isinstance(stats, dict):
-            stats = {}
-        if stats.get("reachable") is False:
+        runtime_state = normalize_provider_runtime_state(stats)
+        if runtime_state.reachable is False:
             raise SourcingProviderError(
-                str(stats.get("error") or "Поставщик недоступен"),
+                runtime_state.error or "Поставщик недоступен",
                 category="health_error",
             )
-        return str(stats.get("catalog_version") or "unknown")
+        return runtime_state.catalog_version
 
     def public_config(self) -> dict[str, Any]:
         active = self.provider()
         ai = self.ai.public_config()
         provider_rows = []
-        stats_by_key: dict[str, dict[str, Any]] = {}
+        stats_by_key: dict[str, SourcingProviderRuntimeState] = {}
         for provider in self.providers.values():
-            provider_stats = self._safe_stats(provider)
-            stats_by_key[provider.key] = provider_stats
+            provider_state = self._safe_stats(provider)
+            stats_by_key[provider.key] = provider_state
             provider_rows.append(
                 {
                     "key": provider.key,
                     "label": provider.label,
-                    "catalog_item_count": provider_stats.get("item_count", 0),
-                    "configured": provider_stats.get("configured", True),
+                    "catalog_item_count": provider_state.item_count,
+                    "configured": provider_state.configured,
                     "capabilities": get_provider_capabilities(provider).model_dump(mode="json"),
-                    "reachable": provider_stats.get("reachable", True),
+                    "reachable": provider_state.reachable,
                     **(
-                        {"error": provider_stats["error"]}
-                        if provider_stats.get("error")
+                        {"error": provider_state.error}
+                        if provider_state.error
                         else {}
                     ),
                 }
@@ -515,26 +517,29 @@ class SourcingService:
                 "capabilities": get_provider_capabilities(active).model_dump(mode="json"),
             },
             "providers": provider_rows,
-            "catalog_item_count": stats_by_key.get(active.key, {}).get("item_count", 0),
+            "catalog_item_count": stats_by_key.get(
+                active.key,
+                SourcingProviderRuntimeState(),
+            ).item_count,
             "ai_available": ai["available"],
             "ai": ai,
         }
 
     @staticmethod
-    def _safe_stats(provider: SourcingProvider) -> dict[str, Any]:
-        if not hasattr(provider, "stats"):
-            return {}
+    def _safe_stats(provider: SourcingProvider) -> SourcingProviderRuntimeState:
         try:
-            stats = provider.stats()
+            stats_method = getattr(provider, "stats", None)
+            if not callable(stats_method):
+                return SourcingProviderRuntimeState()
+            stats = stats_method()
+            return normalize_provider_runtime_state(stats)
         except Exception:
-            return {
-                "configured": True,
-                "reachable": False,
-                "item_count": 0,
-                "catalog_version": "unavailable",
-                "error": "provider health unavailable",
-            }
-        return stats if isinstance(stats, dict) else {}
+            return SourcingProviderRuntimeState(
+                configured=True,
+                reachable=False,
+                catalog_version="unavailable",
+                error="Проверка каталога поставщика не выполнена",
+            )
 
     def health(self) -> dict[str, Any]:
         return {"ai": self.ai.public_config()}
