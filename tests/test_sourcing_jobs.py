@@ -141,6 +141,10 @@ def test_project_continues_after_one_provider_error_without_fabricating_offer(tm
     assert result.results[0].offers == []
     assert result.results[0].recommended_offer is None
     assert "temporary provider failure" in result.results[0].warnings[0]
+    provider_notices = [notice for notice in result.results[0].notices if notice.code == "PROVIDER_ERROR"]
+    assert len(provider_notices) == 1
+    assert provider_notices[0].user_visible is True
+    assert "temporary provider failure" not in provider_notices[0].message
     assert result.results[1].offers
 
 

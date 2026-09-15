@@ -630,6 +630,7 @@ def sourcing_understand(request: SourcingRowRequest):
         "intent": _sourcing_payload(understanding.resolved_intent),
         "understanding": _sourcing_payload(understanding),
         "warnings": list(understanding.warnings),
+        "notices": [_sourcing_payload(notice) for notice in understanding.notices],
     }
 
 

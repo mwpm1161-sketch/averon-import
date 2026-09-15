@@ -21,6 +21,10 @@ from averon_import.services.sourcing.models import (
     MatchResult,
     Offer,
     ProductIntent,
+    ProjectSourcingResult,
+    SourcingNotice,
+    SourcingResult,
+    dedupe_sourcing_notices,
 )
 from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
@@ -455,6 +459,8 @@ def test_s16_unresolved_quantity_never_creates_trusted_total(tmp_path):
     result = service.search_project([row])
     assert result.estimated_total is None
     assert any("quantity requires confirmation" in warning for warning in result.warnings)
+    assert [notice.code for notice in result.notices].count("QUANTITY_REQUIRES_CONFIRMATION") == 1
+    assert result.notices[-1].user_visible is True
 
 
 def test_s17_multiple_currencies_are_not_summed(tmp_path):
@@ -470,6 +476,38 @@ def test_s17_multiple_currencies_are_not_summed(tmp_path):
     assert set(result.estimated_totals) == {"EUR", "RUB"}
     assert result.confirmed_total is None
     assert result.confirmed_totals == {"EUR": Decimal("20"), "RUB": Decimal("10")}
+    assert any(
+        notice.code == "MULTIPLE_CURRENCIES" and notice.severity == "warning"
+        for notice in result.notices
+    )
+
+
+def test_sourcing_notice_dedupe_is_deterministic_by_stable_identity():
+    first = SourcingNotice(code="TEST", severity="info", message="Первое")
+    duplicate = SourcingNotice(code="TEST", severity="info", message="Первое")
+    different_visibility = SourcingNotice(
+        code="TEST", severity="info", message="Первое", user_visible=False,
+    )
+
+    assert dedupe_sourcing_notices([first, duplicate, different_visibility]) == [
+        first, different_visibility,
+    ]
+
+
+def test_legacy_serialized_sourcing_models_without_notices_still_validate():
+    understanding = SourcingAIService().understand_with_audit(
+        {"id": "legacy", "name": "Клапан", "quantity": "1"},
+        build_fallback_intent({"id": "legacy", "name": "Клапан", "quantity": "1"}),
+    )
+    sourcing = SourcingResult(intent=understanding.resolved_intent)
+    project = ProjectSourcingResult(results=[sourcing])
+
+    for model in (understanding, sourcing, project):
+        payload = model.model_dump(mode="json")
+        payload.pop("notices")
+        restored = type(model).model_validate(payload)
+        assert restored.notices == []
+
 
 
 def test_project_totals_separate_confirmed_alternative_and_unpriced(tmp_path):

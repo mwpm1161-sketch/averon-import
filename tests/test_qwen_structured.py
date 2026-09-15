@@ -138,6 +138,7 @@ def test_malformed_structured_response_uses_safe_fallback():
     assert result.mode == "fallback"
     assert result.ai_proposal is None
     assert result.warnings and "fallback" in result.warnings[0]
+    assert [notice.code for notice in result.notices] == ["AI_INVALID_RESPONSE"]
     assert service.public_config()["status"] == "invalid_json"
 
 
@@ -156,7 +157,35 @@ def test_timeout_and_provider_error_use_safe_fallback(error):
     assert result.warnings and "fallback" in result.warnings[0]
     assert "503" not in result.warnings[0]
     assert "timed out" not in result.warnings[0]
+    expected_code = "AI_TIMEOUT" if service.public_config()["status"] == "timeout" else "AI_UNAVAILABLE"
+    assert [notice.code for notice in result.notices] == [expected_code]
     assert service.public_config()["status"] in {"timeout", "response_error"}
+
+
+def test_access_denied_uses_actionable_typed_notice():
+    result, _, _ = run_understanding(AiProviderError("HTTP 403", category="access_denied", status_code=403))
+
+    assert result.resolved_intent == result.baseline_intent
+    assert [notice.code for notice in result.notices] == ["AI_ACCESS_DENIED"]
+    assert "AI Studio" in result.notices[0].message
+    assert "403" not in result.notices[0].message
+
+
+def test_unsupported_qwen_attribute_is_a_non_error_user_notice():
+    result, _, _ = run_understanding(product_json(
+        attributes={"diameter": 50, "unsupported_finish": "gold"},
+    ))
+
+    assert "unsupported_finish" not in result.resolved_intent.attributes
+    assert any(item.field == "attributes.unsupported_finish" for item in result.suggestions)
+    assert "Qwen returned unsupported attribute keys; they were ignored" in result.warnings
+    assert len(result.notices) == 1
+    assert result.notices[0].code == "AI_UNSUPPORTED_ATTRIBUTES"
+    assert result.notices[0].severity == "info"
+    assert result.notices[0].user_visible is True
+    assert result.notices[0].message == (
+        "AI предложил дополнительные характеристики, которые не используются при сопоставлении."
+    )
 
 
 def test_commercial_field_still_fails_closed_after_structured_transport():

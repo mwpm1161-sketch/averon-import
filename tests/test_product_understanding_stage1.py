@@ -200,6 +200,8 @@ def test_p13_fallback_result_is_usable_when_ai_is_not_configured():
     assert result.mode == "fallback"
     assert result.resolved_intent.normalized_name
     assert result.resolved_intent.quantity == "4"
+    assert [notice.code for notice in result.notices] == ["AI_NOT_CONFIGURED"]
+    assert result.notices[0].user_visible is True
 
 
 def test_p14_common_measurements_are_normalized_to_existing_matcher_contract():
@@ -442,12 +444,16 @@ def test_search_cache_reuses_facts_but_attaches_current_understanding_and_mode(t
     assert second.ai_mode == "qwen"
     assert [item.offer.offer_id for item in first.match_results] == ["cached-offer"]
     assert [item.offer.offer_id for item in second.match_results] == ["cached-offer"]
+    assert [(notice.code, notice.user_visible) for notice in second.notices] == [
+        ("CATALOG_CACHE_HIT", False),
+    ]
 
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
     cached_payload = next(value for key, value in payload.items() if key.startswith("search:"))
     assert cached_payload["understanding"] is None
     assert cached_payload["ai_mode"] == "fallback"
     assert cached_payload["warnings"] == []
+    assert cached_payload["notices"] == []
     assert "baseline_intent" not in cached_payload
 
 

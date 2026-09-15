@@ -16,11 +16,62 @@ from averon_import.services.sourcing.models import (
     ProductUnderstandingProvenance,
     ProductUnderstandingResult,
     ProductUnderstandingSuggestion,
+    SourcingNotice,
     SuggestionResolution,
+    dedupe_sourcing_notices,
 )
 
 
 PRODUCT_UNDERSTANDING_REVISION = "2"
+
+AI_UNSUPPORTED_ATTRIBUTES_MESSAGE = (
+    "AI предложил дополнительные характеристики, которые не используются при сопоставлении."
+)
+
+_AI_NOTICE_MESSAGES = {
+    "not_configured": (
+        "AI-разбор не настроен — использован детерминированный разбор позиции. "
+        "Настройте доступ к Qwen, если нужен интеллектуальный разбор."
+    ),
+    "access_denied": (
+        "Нет доступа к AI Studio — использован детерминированный разбор позиции. "
+        "Проверьте ключ и права доступа."
+    ),
+    "invalid_json": (
+        "AI вернул некорректный ответ — использован детерминированный разбор позиции. "
+        "Повторите попытку или проверьте настройки модели."
+    ),
+    "validation_error": (
+        "AI вернул ответ вне контракта ProductIntent — использован детерминированный разбор позиции. "
+        "Повторите попытку или проверьте настройки модели."
+    ),
+    "invalid_response": (
+        "AI вернул некорректный ответ — использован детерминированный разбор позиции. "
+        "Повторите попытку или проверьте настройки модели."
+    ),
+    "timeout": (
+        "AI не ответил вовремя — использован детерминированный разбор позиции. "
+        "Повторите попытку."
+    ),
+}
+
+
+def _ai_notice(status: str) -> SourcingNotice:
+    normalized = str(status or "").strip().casefold()
+    if normalized == "not_configured":
+        code = "AI_NOT_CONFIGURED"
+    elif normalized == "access_denied":
+        code = "AI_ACCESS_DENIED"
+    elif normalized in {"invalid_json", "validation_error", "invalid_response"}:
+        code = "AI_INVALID_RESPONSE"
+    elif normalized == "timeout":
+        code = "AI_TIMEOUT"
+    else:
+        code = "AI_UNAVAILABLE"
+    message = _AI_NOTICE_MESSAGES.get(normalized)
+    if not message:
+        message = "AI временно недоступен — использован детерминированный разбор позиции. Повторите попытку позже."
+    return SourcingNotice(code=code, message=message)
 
 # Existing matcher/catalog attribute names are the canonical compatibility
 # contract. Values use these stable units throughout sourcing.
@@ -619,6 +670,11 @@ class SourcingAIService:
         self.ai_service = ai_service
         self.provider_key = provider_key
         self._last_status = "configured"
+        self._last_notices: list[SourcingNotice] = []
+
+    @property
+    def last_notices(self) -> list[SourcingNotice]:
+        return list(self._last_notices)
 
     @property
     def model_identity(self) -> str:
@@ -713,6 +769,7 @@ class SourcingAIService:
         fallback: ProductIntent,
         warnings: list[str],
         *,
+        notices: list[SourcingNotice] | None = None,
         latency_ms: float | None = None,
     ) -> ProductUnderstandingResult:
         return ProductUnderstandingResult(
@@ -721,6 +778,7 @@ class SourcingAIService:
             resolved_intent=fallback,
             suggestions=[],
             warnings=list(dict.fromkeys(warnings)),
+            notices=dedupe_sourcing_notices(notices or []),
             mode="fallback",
             provenance=ProductUnderstandingProvenance(
                 provider=self.provider_key,
@@ -736,9 +794,12 @@ class SourcingAIService:
         fallback: ProductIntent,
     ) -> ProductUnderstandingResult:
         if not self.available:
+            self._last_status = "not_configured"
+            notice = _ai_notice(self._last_status)
             return self._fallback_result(
                 fallback,
                 ["Qwen не настроен; использован детерминированный fallback"],
+                notices=[notice],
             )
         started = time.perf_counter()
         try:
@@ -791,8 +852,14 @@ class SourcingAIService:
             merged = merge_intent_with_source(candidate, fallback)
             self._last_status = "ready"
             warnings = []
+            notices: list[SourcingNotice] = []
             if rejected_attributes:
                 warnings.append("Qwen returned unsupported attribute keys; they were ignored")
+                notices.append(SourcingNotice(
+                    code="AI_UNSUPPORTED_ATTRIBUTES",
+                    severity="info",
+                    message=AI_UNSUPPORTED_ATTRIBUTES_MESSAGE,
+                ))
             return ProductUnderstandingResult(
                 baseline_intent=fallback,
                 ai_proposal=candidate,
@@ -801,6 +868,7 @@ class SourcingAIService:
                     fallback, candidate, merged, rejected_attributes
                 ),
                 warnings=warnings,
+                notices=notices,
                 mode="qwen",
                 provenance=ProductUnderstandingProvenance(
                     provider=self.provider_key,
@@ -810,21 +878,27 @@ class SourcingAIService:
                 ),
             )
         except AiProviderError as exc:
+            self._record_error(exc)
             return self._fallback_result(
                 fallback,
                 [self._safe_warning("AI product understanding unavailable", exc)],
+                notices=[_ai_notice(self._last_status)],
                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
+            self._record_error(exc)
             return self._fallback_result(
                 fallback,
                 [self._safe_warning("AI product understanding failed", exc)],
+                notices=[_ai_notice(self._last_status)],
                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
         except Exception as exc:  # provider/network failures are a non-fatal sourcing warning
+            self._record_error(exc)
             return self._fallback_result(
                 fallback,
                 [self._safe_warning("AI product understanding unavailable", exc)],
+                notices=[_ai_notice(self._last_status)],
                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
 
@@ -846,7 +920,12 @@ class SourcingAIService:
         provider-owned commercial fields.
         """
 
-        if not self.available or len(matches) < 2:
+        self._last_notices = []
+        if not self.available:
+            self._last_status = "not_configured"
+            self._last_notices = [_ai_notice(self._last_status)]
+            return matches, []
+        if len(matches) < 2:
             return matches, []
         try:
             provider = self.ai_service.ensure_provider(self.provider_key)
@@ -912,9 +991,13 @@ class SourcingAIService:
             self._last_status = "ready"
             return [result.model_copy(update={"rank": index}) for index, result in enumerate(ordered, 1)], []
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
-            return matches, [self._safe_warning("AI sourcing ranking failed", exc)]
+            warning = self._safe_warning("AI sourcing ranking failed", exc)
+            self._last_notices = [_ai_notice(self._last_status)]
+            return matches, [warning]
         except Exception as exc:
-            return matches, [self._safe_warning("AI sourcing ranking unavailable", exc)]
+            warning = self._safe_warning("AI sourcing ranking unavailable", exc)
+            self._last_notices = [_ai_notice(self._last_status)]
+            return matches, [warning]
 
 
 def _extract_json(value: str) -> dict[str, Any]:

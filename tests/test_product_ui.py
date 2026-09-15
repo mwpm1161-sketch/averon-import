@@ -173,6 +173,18 @@ def test_project_sourcing_ui_explains_deterministic_match_state():
     assert 'MATCH: "Совпадение"' in app_js
 
 
+def test_sourcing_notices_are_typed_and_do_not_render_raw_diagnostics():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "function renderSourcingNotices(notices)" in app_js
+    assert "notice.user_visible === false" in app_js
+    assert "sourcing-notice-${severity}" in app_js
+    assert "escapeHtml(message)" in app_js
+    assert app_js.count("renderSourcingNotices(result.notices)") == 2
+    assert "(result.warnings || []).length" not in app_js
+    assert "Qwen returned unsupported attribute keys; they were ignored" not in app_js
+
+
 def test_project_sourcing_ui_marks_partial_totals_and_hides_provider_keys():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 

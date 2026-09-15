@@ -17,7 +17,9 @@ from averon_import.services.sourcing.models import (
     ProductIntent,
     ProductUnderstandingResult,
     ProjectSourcingResult,
+    SourcingNotice,
     SourcingResult,
+    dedupe_sourcing_notices,
 )
 from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
@@ -120,6 +122,7 @@ class SourcingService:
             provider_key=provider_key,
             limit=limit,
             warnings=list(understanding.warnings),
+            notices=list(understanding.notices),
             understanding=understanding,
             ai_rerank=ai_rerank,
             catalog_version=catalog_version,
@@ -132,6 +135,7 @@ class SourcingService:
         provider_key: str | None = None,
         limit: int = 20,
         warnings: list[str] | None = None,
+        notices: list[SourcingNotice] | None = None,
         understanding: ProductUnderstandingResult | None = None,
         ai_rerank: bool = True,
         catalog_version: str | None = None,
@@ -143,7 +147,7 @@ class SourcingService:
         cache_key = f"search:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
         cached = self.cache.get(cache_key)
         if cached is not None:
-            return self._compose_cached_result(cached, understanding, warnings)
+            return self._compose_cached_result(cached, understanding, warnings, notices)
         started = time.perf_counter()
         offers = provider.search(intent, limit=limit)
         retrieval_time = time.perf_counter() - started
@@ -151,10 +155,12 @@ class SourcingService:
         match_results = self.matcher.match(intent, offers)
         matching_time = time.perf_counter() - matching_started
         ranking_warnings: list[str] = []
+        ranking_notices: list[SourcingNotice] = []
         ranking_time = 0.0
         if ai_rerank:
             ranking_started = time.perf_counter()
             match_results, ranking_warnings = self.ai.rank_matches(intent, match_results)
+            ranking_notices = list(getattr(self.ai, "last_notices", []))
             ranking_time = time.perf_counter() - ranking_started
         result = SourcingResult(
             intent=intent,
@@ -164,6 +170,7 @@ class SourcingService:
             offers=offers,
             match_results=match_results,
             warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
+            notices=dedupe_sourcing_notices([*(notices or []), *ranking_notices]),
             timings={
                 "retrieval_s": round(retrieval_time, 6),
                 "matching_s": round(matching_time, 6),
@@ -173,10 +180,15 @@ class SourcingService:
             ai_mode=self._current_ai_mode(understanding),
         )
         # Catalog offers and deterministic match facts are reusable. Audit
-        # provenance and parser warnings belong to the current response only.
+        # Provenance, parser warnings and notices belong to the current response only.
         self.cache.set(
             cache_key,
-            result.model_copy(update={"understanding": None, "warnings": [], "ai_mode": "fallback"}),
+            result.model_copy(update={
+                "understanding": None,
+                "warnings": [],
+                "notices": [],
+                "ai_mode": "fallback",
+            }),
         )
         return result
 
@@ -189,6 +201,7 @@ class SourcingService:
         cached: SourcingResult,
         understanding: ProductUnderstandingResult | None,
         warnings: list[str] | None,
+        notices: list[SourcingNotice] | None,
     ) -> SourcingResult:
         # Deliberately overwrite any legacy cached understanding/ai_mode too:
         # old cache entries must not leak stale parser provenance.
@@ -196,10 +209,20 @@ class SourcingService:
             *(warnings or []),
             "Результат взят из актуального cache каталога",
         ]))
+        merged_notices = dedupe_sourcing_notices([
+            *(notices or []),
+            SourcingNotice(
+                code="CATALOG_CACHE_HIT",
+                severity="info",
+                message="Результат взят из актуального cache каталога",
+                user_visible=False,
+            ),
+        ])
         return cached.model_copy(update={
             "understanding": understanding,
             "ai_mode": self._current_ai_mode(understanding),
             "warnings": merged_warnings,
+            "notices": merged_notices,
             "timings": {**cached.timings, "search_cache_hit": 1.0},
         })
 
@@ -227,6 +250,7 @@ class SourcingService:
             progress(0, total, "Проверяем каталог предложений")
         results: list[SourcingResult] = []
         warnings: list[str] = []
+        notices: list[SourcingNotice] = []
         confirmed_totals: dict[str, Decimal] = {}
         alternative_totals: dict[str, Decimal] = {}
         matched = alternatives = review = without = 0
@@ -248,6 +272,7 @@ class SourcingService:
                     provider_key=provider_key,
                     limit=limit,
                     warnings=list(understanding.warnings),
+                    notices=list(understanding.notices),
                     understanding=understanding,
                     ai_rerank=ai_rerank,
                     catalog_version=catalog_version,
@@ -257,11 +282,16 @@ class SourcingService:
                     intent=understanding.resolved_intent,
                     understanding=understanding,
                     warnings=[_safe_provider_warning(exc)],
+                    notices=dedupe_sourcing_notices([
+                        *understanding.notices,
+                        _provider_notice(exc),
+                    ]),
                     timings={"provider_error": 1.0, "search_cache_hit": 0.0},
                     ai_mode=self._current_ai_mode(understanding),
                 )
             results.append(result)
             warnings.extend(result.warnings)
+            notices.extend(result.notices)
             if result.timings.get("search_cache_hit"):
                 search_cache_hits += 1
             else:
@@ -294,6 +324,10 @@ class SourcingService:
                 quantity = _trusted_quantity(row)
                 if quantity is None:
                     warnings.append(f"{result.intent.source_row_id}: quantity requires confirmation")
+                    notices.append(SourcingNotice(
+                        code="QUANTITY_REQUIRES_CONFIRMATION",
+                        message="Для одной или нескольких позиций требуется подтвердить количество.",
+                    ))
                 elif best.price is not None and best.currency:
                     target = (
                         confirmed_totals
@@ -324,6 +358,10 @@ class SourcingService:
         alternative_currencies = sorted(alternative_totals)
         if len(confirmed_currencies) > 1 or len(alternative_currencies) > 1:
             warnings.append("В проекте несколько валют; итог не суммировался в одну сумму")
+            notices.append(SourcingNotice(
+                code="MULTIPLE_CURRENCIES",
+                message="В проекте несколько валют; итоговые суммы показаны раздельно и не суммируются.",
+            ))
         confirmed_total = (
             confirmed_totals[confirmed_currencies[0]]
             if len(confirmed_currencies) == 1
@@ -355,6 +393,7 @@ class SourcingService:
             currency=(confirmed_currencies[0] if len(confirmed_currencies) == 1 else None),
             estimated_totals=confirmed_totals,
             warnings=list(dict.fromkeys(warnings)),
+            notices=dedupe_sourcing_notices(notices),
             results=results,
             timings={
                 "total_s": round(time.perf_counter() - started_project, 6),
@@ -478,6 +517,18 @@ def _safe_provider_warning(exc: ValueError) -> str:
     ):
         message = "провайдер не вернул предложения"
     return f"Ошибка поиска: {message}"
+
+
+def _provider_notice(_exc: ValueError) -> SourcingNotice:
+    """Return a safe actionable notice without exposing provider internals."""
+
+    return SourcingNotice(
+        code="PROVIDER_ERROR",
+        message=(
+            "Не удалось получить предложения от поставщика. "
+            "Проверьте доступность каталога или повторите поиск."
+        ),
+    )
 
 
 def _row_telemetry(

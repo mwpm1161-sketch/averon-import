@@ -852,6 +852,20 @@ function renderSourcingDecision(decision, reason = "") {
   return `<span class="sourcing-decision sourcing-decision-${sourcingDecisionClass(decision)}"><span class="sourcing-decision-label">${escapeHtml(sourcingDecisionLabel(decision))}</span>${reason ? `<small class="sourcing-decision-reason">${escapeHtml(reason)}</small>` : ""}</span>`;
 }
 
+function renderSourcingNotices(notices) {
+  if (!Array.isArray(notices)) return "";
+  const rendered = notices.map((notice) => {
+    if (!notice || notice.user_visible === false) return "";
+    const message = String(notice.message ?? "").trim();
+    if (!message) return "";
+    const severity = ["info", "warning", "error"].includes(notice.severity)
+      ? notice.severity : "warning";
+    const role = severity === "error" ? "alert" : "status";
+    return `<div class="sourcing-notice sourcing-notice-${severity}" role="${role}">${escapeHtml(message)}</div>`;
+  }).join("");
+  return rendered ? `<div class="sourcing-notices">${rendered}</div>` : "";
+}
+
 function safeOfferUrl(value) {
   if (value === null || value === undefined || value === "") return null;
   try {
@@ -1105,7 +1119,7 @@ function renderSourcingResult(result, row = null) {
       ? `<div><small>Без цены</small><b>${escapeHtml(formatUnpricedSummary(matchedUnpriced, alternativeUnpriced))}</b></div>`
       : "";
     const runMeta = result.run_id ? `<div class="sourcing-run-meta"><span>Поставщик: <b>${escapeHtml(result.provider_label || "Поставщик")}</b></span><span>Версия каталога: <b>${escapeHtml(result.catalog_version || "—")}</b></span><span>Запуск: <b>${escapeHtml(String(result.run_id).slice(0, 10))}</b></span><span>Время: <b>${escapeHtml(formatRecentTimestamp(result.run_completed_at || result.run_created_at))}</b></span></div>` : "";
-    content.innerHTML = `${runMeta}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${renderProjectSourcingList(result)}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+     content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${renderProjectSourcingList(result)}`;
     bindSourcingFilters(result);
     return;
   }
@@ -1117,7 +1131,7 @@ function renderSourcingResult(result, row = null) {
   const alternatives = (result.match_results || []).filter((item) => item !== best && item.decision !== "REJECT").slice(0, 5);
   const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
   $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
-  content.innerHTML = `${renderProductUnderstanding(result.understanding)}<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges"><span class="technical-badge">${result.ai_mode === "qwen" ? "Qwen · AI Studio" : "Без AI · резервный режим"}</span>${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}${(result.warnings || []).length ? `<div class="sourcing-warning">${escapeHtml(result.warnings.join("; "))}</div>` : ""}`;
+  content.innerHTML = `${renderSourcingNotices(result.notices)}${renderProductUnderstanding(result.understanding)}<div class="intent-summary"><div><small>Нормализованное наименование</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Класс</small><b>${escapeHtml(intent.product_class || "Не определён")}</b></div><div><small>Количество</small><b>${quantity}</b></div><div class="intent-badges"><span class="technical-badge">${result.ai_mode === "qwen" ? "Qwen · AI Studio" : "Без AI · резервный режим"}</span>${Object.entries(intent.attributes || {}).map(([key, value]) => `<span class="technical-badge">${escapeHtml(key)}: ${escapeHtml(String(value))}</span>`).join("")}</div></div>${best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}` : `<div class="sourcing-warning">Подтверждённого совпадения нет. Показаны результаты для проверки.</div>`}${alternatives.length ? `<h3>Альтернативы</h3><div class="offer-grid">${alternatives.map((item) => renderOfferCard(item, true, intent)).join("")}</div>` : ""}`;
 }
 
 async function openSourcingForRow(row) {

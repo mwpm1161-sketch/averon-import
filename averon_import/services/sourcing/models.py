@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -14,6 +15,29 @@ class SourcingModel(BaseModel):
     """Strict transport/domain model shared by providers and API layers."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class SourcingNotice(SourcingModel):
+    """Typed user-facing sourcing message, separate from legacy diagnostics."""
+
+    code: str
+    severity: Literal["info", "warning", "error"] = "warning"
+    message: str
+    user_visible: bool = True
+
+
+def dedupe_sourcing_notices(notices: Iterable[SourcingNotice]) -> list[SourcingNotice]:
+    """Keep the first occurrence of each stable notice identity."""
+
+    seen: set[tuple[str, str, str, bool]] = set()
+    result: list[SourcingNotice] = []
+    for notice in notices:
+        identity = (notice.code, notice.message, notice.severity, notice.user_visible)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(notice)
+    return result
 
 
 class ProductIntent(SourcingModel):
@@ -88,6 +112,7 @@ class ProductUnderstandingResult(SourcingModel):
     resolved_intent: ProductIntent
     suggestions: list[ProductUnderstandingSuggestion] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    notices: list[SourcingNotice] = Field(default_factory=list)
     mode: Literal["qwen", "fallback"] = "fallback"
     provenance: ProductUnderstandingProvenance
 
@@ -161,6 +186,7 @@ class SourcingResult(SourcingModel):
     offers: list[Offer] = Field(default_factory=list)
     match_results: list[MatchResult] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    notices: list[SourcingNotice] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
     ai_mode: str = "fallback"
 
@@ -191,6 +217,7 @@ class ProjectSourcingResult(SourcingModel):
     currency: str | None = None
     estimated_totals: dict[str, Decimal] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    notices: list[SourcingNotice] = Field(default_factory=list)
     results: list[SourcingResult] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
     provider_key: str = ""
