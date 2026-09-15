@@ -168,7 +168,9 @@ def test_project_sourcing_ui_explains_deterministic_match_state():
     assert "function projectReason(item)" in app_js
     assert "Точное предложение не найдено" in app_js
     assert "Не подтверждено:" in app_js
-    assert '${decision}<small class="project-result-reason">' in app_js
+    assert 'function renderSourcingDecision(decision, reason = "")' in app_js
+    assert 'renderSourcingDecision(decision, reason)' in app_js
+    assert 'MATCH: "Совпадение"' in app_js
 
 
 def test_project_sourcing_ui_marks_partial_totals_and_hides_provider_keys():
