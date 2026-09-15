@@ -2,6 +2,7 @@
 venv/
 __pycache__/
 .pytest_cache/
+.pytest-*/
 *.pyc
 
 .vscode/
@@ -15,5 +16,10 @@ workspace/
 workspaces/
 temp/
 tmp/
+dist/
+build/
+.release-stage-*/
+
+setup_log.txt
 
 *.pdf
