@@ -17,6 +17,7 @@ from averon_import.services.sourcing.models import (
     ProductIntent,
     ProductUnderstandingResult,
     ProjectSourcingResult,
+    SourcingRankingResult,
     SourcingNotice,
     SourcingResult,
     dedupe_sourcing_notices,
@@ -25,7 +26,7 @@ from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
     build_fallback_intent,
 )
-from averon_import.services.sourcing.providers.base import SourcingProvider
+from averon_import.services.sourcing.providers.base import SourcingProvider, SourcingProviderError
 
 
 class SourcingService:
@@ -142,14 +143,41 @@ class SourcingService:
     ) -> SourcingResult:
         provider = self.provider(provider_key)
         if catalog_version is None:
-            stats = provider.stats() if hasattr(provider, "stats") else {}
-            catalog_version = (stats or {}).get("catalog_version", "unknown")
+            try:
+                stats = provider.stats() if hasattr(provider, "stats") else {}
+                if isinstance(stats, dict) and stats.get("reachable") is False:
+                    raise SourcingProviderError(
+                        str(stats.get("error") or "Поставщик недоступен"),
+                        category="health_error",
+                    )
+                catalog_version = (stats or {}).get("catalog_version", "unknown")
+            except (SourcingProviderError, ValueError) as exc:
+                return self._provider_failure_result(intent, understanding, warnings, notices, exc)
+            except Exception as exc:
+                return self._provider_failure_result(
+                    intent,
+                    understanding,
+                    warnings,
+                    notices,
+                    _as_provider_error(exc),
+                )
         cache_key = f"search:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return self._compose_cached_result(cached, understanding, warnings, notices)
         started = time.perf_counter()
-        offers = provider.search(intent, limit=limit)
+        try:
+            offers = provider.search(intent, limit=limit)
+        except (SourcingProviderError, ValueError) as exc:
+            return self._provider_failure_result(intent, understanding, warnings, notices, exc)
+        except Exception as exc:
+            return self._provider_failure_result(
+                intent,
+                understanding,
+                warnings,
+                notices,
+                _as_provider_error(exc),
+            )
         retrieval_time = time.perf_counter() - started
         matching_started = time.perf_counter()
         match_results = self.matcher.match(intent, offers)
@@ -159,8 +187,16 @@ class SourcingService:
         ranking_time = 0.0
         if ai_rerank:
             ranking_started = time.perf_counter()
-            match_results, ranking_warnings = self.ai.rank_matches(intent, match_results)
-            ranking_notices = list(getattr(self.ai, "last_notices", []))
+            ranking_result = self.ai.rank_matches(intent, match_results)
+            if isinstance(ranking_result, SourcingRankingResult):
+                match_results = ranking_result.matches
+                ranking_warnings = ranking_result.warnings
+                ranking_notices = ranking_result.notices
+            else:
+                # Compatibility for injected legacy AI adapters that still
+                # return the original two-value tuple contract.
+                match_results, ranking_warnings, *extra_notices = ranking_result
+                ranking_notices = list(extra_notices[0]) if extra_notices else []
             ranking_time = time.perf_counter() - ranking_started
         result = SourcingResult(
             intent=intent,
@@ -195,6 +231,26 @@ class SourcingService:
     @staticmethod
     def _current_ai_mode(understanding: ProductUnderstandingResult | None) -> str:
         return understanding.mode if understanding is not None else "fallback"
+
+    def _provider_failure_result(
+        self,
+        intent: ProductIntent,
+        understanding: ProductUnderstandingResult | None,
+        warnings: list[str] | None,
+        notices: list[SourcingNotice] | None,
+        exc: ValueError,
+    ) -> SourcingResult:
+        return SourcingResult(
+            intent=intent,
+            understanding=understanding,
+            warnings=list(dict.fromkeys([_safe_provider_warning(exc), *(warnings or [])])),
+            notices=dedupe_sourcing_notices([
+                *(notices or []),
+                _provider_notice(exc),
+            ]),
+            timings={"provider_error": 1.0, "search_cache_hit": 0.0},
+            ai_mode=self._current_ai_mode(understanding),
+        )
 
     def _compose_cached_result(
         self,
@@ -278,16 +334,12 @@ class SourcingService:
                     catalog_version=catalog_version,
                 )
             except ValueError as exc:
-                result = SourcingResult(
-                    intent=understanding.resolved_intent,
-                    understanding=understanding,
-                    warnings=[_safe_provider_warning(exc)],
-                    notices=dedupe_sourcing_notices([
-                        *understanding.notices,
-                        _provider_notice(exc),
-                    ]),
-                    timings={"provider_error": 1.0, "search_cache_hit": 0.0},
-                    ai_mode=self._current_ai_mode(understanding),
+                result = self._provider_failure_result(
+                    understanding.resolved_intent,
+                    understanding,
+                    list(understanding.warnings),
+                    list(understanding.notices),
+                    exc,
                 )
             results.append(result)
             warnings.extend(result.warnings)
@@ -413,14 +465,20 @@ class SourcingService:
     def _project_catalog_version(self, provider: SourcingProvider) -> str:
         try:
             stats = provider.stats() if hasattr(provider, "stats") else {}
+        except SourcingProviderError:
+            raise
         except Exception as exc:
-            if provider.key == "demo_store_http":
-                raise ValueError("Averon Demo Store: проверка каталога не выполнена") from exc
-            return "unknown"
+            raise SourcingProviderError(
+                "Проверка каталога поставщика не выполнена",
+                category="health_error",
+            ) from exc
         if not isinstance(stats, dict):
             stats = {}
-        if provider.key == "demo_store_http" and stats.get("reachable") is False:
-            raise ValueError(str(stats.get("error") or "Averon Demo Store: каталог недоступен"))
+        if stats.get("reachable") is False:
+            raise SourcingProviderError(
+                str(stats.get("error") or "Поставщик недоступен"),
+                category="health_error",
+            )
         return str(stats.get("catalog_version") or "unknown")
 
     def public_config(self) -> dict[str, Any]:
@@ -510,13 +568,22 @@ def _project_row_label(row: dict[str, Any]) -> str:
 
 
 def _safe_provider_warning(exc: ValueError) -> str:
-    message = " ".join(str(exc).split())
+    message = " ".join(str(getattr(exc, "public_message", "") or str(exc)).split())
     lowered = message.casefold()
     if not message or len(message) > 240 or any(
         marker in lowered for marker in ("api-key", "authorization", "secret", "token", "password")
     ):
         message = "провайдер не вернул предложения"
     return f"Ошибка поиска: {message}"
+
+
+def _as_provider_error(exc: Exception) -> SourcingProviderError:
+    if isinstance(exc, SourcingProviderError):
+        return exc
+    return SourcingProviderError(
+        "Поставщик не вернул предложения",
+        category="provider_error",
+    )
 
 
 def _provider_notice(_exc: ValueError) -> SourcingNotice:

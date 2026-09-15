@@ -16,6 +16,7 @@ from averon_import.services.sourcing.models import (
     ProductUnderstandingProvenance,
     ProductUnderstandingResult,
     ProductUnderstandingSuggestion,
+    SourcingRankingResult,
     SourcingNotice,
     SuggestionResolution,
     dedupe_sourcing_notices,
@@ -670,11 +671,6 @@ class SourcingAIService:
         self.ai_service = ai_service
         self.provider_key = provider_key
         self._last_status = "configured"
-        self._last_notices: list[SourcingNotice] = []
-
-    @property
-    def last_notices(self) -> list[SourcingNotice]:
-        return list(self._last_notices)
 
     @property
     def model_identity(self) -> str:
@@ -733,26 +729,35 @@ class SourcingAIService:
             "parser_revision": PRODUCT_UNDERSTANDING_REVISION,
         }
 
-    def _record_error(self, exc: Exception) -> None:
-        category = str(getattr(exc, "category", "") or "").strip()
+    @staticmethod
+    def _classify_error(exc: Exception) -> str:
+        category = str(getattr(exc, "category", "") or "").strip().casefold()
         if category:
-            self._last_status = category
-            return
+            return category
         text = str(exc).casefold()
         if "401" in text or "403" in text:
-            self._last_status = "access_denied"
-        elif "json" in text:
-            self._last_status = "invalid_json"
-        elif "validation" in text:
-            self._last_status = "validation_error"
-        elif "timeout" in text or "время ожидания" in text:
-            self._last_status = "timeout"
-        else:
-            self._last_status = "request_error"
+            return "access_denied"
+        if "json" in text:
+            return "invalid_json"
+        if "validation" in text:
+            return "validation_error"
+        if "timeout" in text or "время ожидания" in text:
+            return "timeout"
+        return "request_error"
 
-    def _safe_warning(self, prefix: str, exc: Exception) -> str:
-        self._record_error(exc)
-        category = self._last_status
+    def _record_error(self, exc: Exception) -> str:
+        category = self._classify_error(exc)
+        self._last_status = category
+        return category
+
+    def _safe_warning(
+        self,
+        prefix: str,
+        exc: Exception,
+        *,
+        category: str | None = None,
+    ) -> str:
+        category = category or self._record_error(exc)
         text = str(exc).casefold()
         if category == "access_denied" or "401" in text or "403" in text:
             return f"{prefix}: ключ не имеет доступа к AI Studio; использован детерминированный fallback"
@@ -794,8 +799,9 @@ class SourcingAIService:
         fallback: ProductIntent,
     ) -> ProductUnderstandingResult:
         if not self.available:
-            self._last_status = "not_configured"
-            notice = _ai_notice(self._last_status)
+            category = "not_configured"
+            self._last_status = category
+            notice = _ai_notice(category)
             return self._fallback_result(
                 fallback,
                 ["Qwen не настроен; использован детерминированный fallback"],
@@ -878,27 +884,27 @@ class SourcingAIService:
                 ),
             )
         except AiProviderError as exc:
-            self._record_error(exc)
+            category = self._record_error(exc)
             return self._fallback_result(
                 fallback,
-                [self._safe_warning("AI product understanding unavailable", exc)],
-                notices=[_ai_notice(self._last_status)],
+                [self._safe_warning("AI product understanding unavailable", exc, category=category)],
+                notices=[_ai_notice(category)],
                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
-            self._record_error(exc)
+            category = self._record_error(exc)
             return self._fallback_result(
                 fallback,
-                [self._safe_warning("AI product understanding failed", exc)],
-                notices=[_ai_notice(self._last_status)],
+                [self._safe_warning("AI product understanding failed", exc, category=category)],
+                notices=[_ai_notice(category)],
                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
         except Exception as exc:  # provider/network failures are a non-fatal sourcing warning
-            self._record_error(exc)
+            category = self._record_error(exc)
             return self._fallback_result(
                 fallback,
-                [self._safe_warning("AI product understanding unavailable", exc)],
-                notices=[_ai_notice(self._last_status)],
+                [self._safe_warning("AI product understanding unavailable", exc, category=category)],
+                notices=[_ai_notice(category)],
                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
             )
 
@@ -912,7 +918,7 @@ class SourcingAIService:
         self,
         intent: ProductIntent,
         matches: list[MatchResult],
-    ) -> tuple[list[MatchResult], list[str]]:
+    ) -> SourcingRankingResult:
         """Optionally reorder existing candidates without changing their facts.
 
         The provider receives a bounded comparison view and may return only
@@ -920,13 +926,11 @@ class SourcingAIService:
         provider-owned commercial fields.
         """
 
-        self._last_notices = []
         if not self.available:
             self._last_status = "not_configured"
-            self._last_notices = [_ai_notice(self._last_status)]
-            return matches, []
+            return SourcingRankingResult(matches=matches)
         if len(matches) < 2:
-            return matches, []
+            return SourcingRankingResult(matches=matches)
         try:
             provider = self.ai_service.ensure_provider(self.provider_key)
             comparison = [
@@ -989,15 +993,17 @@ class SourcingAIService:
                     ordered.append(result.model_copy(update={"ai_evidence": {"reasons": [str(item) for item in reasons[:5]]}}))
             ordered.extend(result for result in matches if result.decision == "REJECT")
             self._last_status = "ready"
-            return [result.model_copy(update={"rank": index}) for index, result in enumerate(ordered, 1)], []
+            return SourcingRankingResult(
+                matches=[result.model_copy(update={"rank": index}) for index, result in enumerate(ordered, 1)],
+            )
         except (ValueError, ValidationError, TypeError, KeyError) as exc:
-            warning = self._safe_warning("AI sourcing ranking failed", exc)
-            self._last_notices = [_ai_notice(self._last_status)]
-            return matches, [warning]
+            category = self._record_error(exc)
+            warning = self._safe_warning("AI sourcing ranking failed", exc, category=category)
+            return SourcingRankingResult(matches=matches, warnings=[warning], notices=[_ai_notice(category)])
         except Exception as exc:
-            warning = self._safe_warning("AI sourcing ranking unavailable", exc)
-            self._last_notices = [_ai_notice(self._last_status)]
-            return matches, [warning]
+            category = self._record_error(exc)
+            warning = self._safe_warning("AI sourcing ranking unavailable", exc, category=category)
+            return SourcingRankingResult(matches=matches, warnings=[warning], notices=[_ai_notice(category)])
 
 
 def _extract_json(value: str) -> dict[str, Any]:

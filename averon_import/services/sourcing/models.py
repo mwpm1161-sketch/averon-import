@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -174,6 +175,21 @@ class MatchResult(SourcingModel):
     explanation: str = ""
     ai_evidence: dict[str, Any] = Field(default_factory=dict)
     deterministic_evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SourcingRankingResult:
+    """Request-local ranking output, including typed notices explicitly."""
+
+    matches: list[MatchResult]
+    warnings: list[str] = field(default_factory=list)
+    notices: list[SourcingNotice] = field(default_factory=list)
+
+    def __iter__(self):
+        """Keep legacy two-value unpacking working for existing callers."""
+
+        yield self.matches
+        yield self.warnings
 
 
 class SourcingResult(SourcingModel):

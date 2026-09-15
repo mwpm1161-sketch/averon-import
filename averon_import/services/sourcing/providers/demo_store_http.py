@@ -18,21 +18,11 @@ from urllib.parse import urlencode
 
 from averon_import.services.app_settings import normalize_http_base_url
 from averon_import.services.sourcing.models import Offer, ProductIntent
+from averon_import.services.sourcing.providers.base import SourcingProviderError
 
 
-class DemoStoreProviderError(ValueError):
-    """Sanitized, client-safe error raised by the Demo Store adapter."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        category: str = "provider_error",
-        status_code: int | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.category = category
-        self.status_code = status_code
+class DemoStoreProviderError(SourcingProviderError):
+    """Demo Store-specific subtype of the common provider error contract."""
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):

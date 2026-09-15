@@ -1,4 +1,7 @@
-from averon_import.services.sourcing.providers.base import SourcingProvider
+from averon_import.services.sourcing.providers.base import (
+    SourcingProvider,
+    SourcingProviderError,
+)
 from averon_import.services.sourcing.providers.demo_store_http import (
     DemoStoreHttpProvider,
     DemoStoreProviderError,
@@ -14,4 +17,5 @@ __all__ = [
     "LemanaB2BProvider",
     "LocalCatalogProvider",
     "SourcingProvider",
+    "SourcingProviderError",
 ]

@@ -22,6 +22,7 @@ from averon_import.services.sourcing.models import (
     Offer,
     ProductIntent,
     ProjectSourcingResult,
+    SourcingRankingResult,
     SourcingNotice,
     SourcingResult,
     dedupe_sourcing_notices,
@@ -267,6 +268,34 @@ def test_s10b_ai_ranking_reorders_known_candidates_only():
     assert ranked[0].ai_evidence == {"reasons": ["closer model"]}
 
 
+def test_ai_ranking_notices_are_request_local_without_last_notice_side_channel():
+    class RaisingProvider(FakeAIProvider):
+        def __init__(self, error):
+            super().__init__("")
+            self.error = error
+
+        def complete(self, messages, **kwargs):
+            raise self.error
+
+    matches = OfferMatcher().match(
+        make_intent(),
+        [make_offer(offer_id="first"), make_offer(offer_id="second")],
+    )
+    invalid_result = SourcingAIService(
+        FakeAIService(RaisingProvider(ValueError("AI response did not contain JSON")))
+    ).rank_matches(make_intent(), matches)
+    unavailable_ai = SourcingAIService(
+        FakeAIService(RaisingProvider(RuntimeError("temporary provider outage")))
+    )
+    unavailable_result = unavailable_ai.rank_matches(make_intent(), matches)
+
+    assert isinstance(invalid_result, SourcingRankingResult)
+    assert invalid_result.notices[0].code == "AI_INVALID_RESPONSE"
+    assert unavailable_result.notices[0].code == "AI_UNAVAILABLE"
+    assert invalid_result.notices[0].code == "AI_INVALID_RESPONSE"
+    assert not hasattr(unavailable_ai, "last_notices")
+
+
 def test_s11_dn_mismatch_prevents_match():
     offer = make_offer(attributes={"diameter": 80, "pressure": 16})
     result = OfferMatcher().match(make_intent(), [offer])[0]
@@ -507,6 +536,29 @@ def test_legacy_serialized_sourcing_models_without_notices_still_validate():
         payload.pop("notices")
         restored = type(model).model_validate(payload)
         assert restored.notices == []
+
+
+def test_legacy_understanding_cache_json_without_notices_still_reads(tmp_path):
+    understanding = SourcingAIService().understand_with_audit(
+        {"id": "legacy-cache", "name": "Клапан", "quantity": "1"},
+        build_fallback_intent({"id": "legacy-cache", "name": "Клапан", "quantity": "1"}),
+    )
+    payload = understanding.model_dump(mode="json")
+    payload.pop("notices")
+    cache_path = tmp_path / "legacy-cache.json"
+    cache_path.write_text(json.dumps({
+        "__intents__": {
+            "legacy-key": {
+                "intent": understanding.resolved_intent.model_dump(mode="json"),
+                "warnings": [],
+                "understanding": payload,
+            },
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+
+    restored = SourcingCache(cache_path).get_understanding("legacy-key")
+    assert restored is not None
+    assert restored.notices == []
 
 
 

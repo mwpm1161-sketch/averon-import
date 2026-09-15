@@ -148,6 +148,28 @@ def test_project_continues_after_one_provider_error_without_fabricating_offer(tm
     assert result.results[1].offers
 
 
+def test_single_search_provider_failure_uses_safe_typed_notice(tmp_path):
+    class UnsafeProvider(CountingProvider):
+        def search(self, requested, *, limit=20):
+            raise RuntimeError("HTTP 503 Authorization token=internal-secret")
+
+    result = service_for(tmp_path, UnsafeProvider()).search_row({
+        "id": "row-1",
+        "row_type": "item",
+        "name": "Клапан",
+        "quantity": "1",
+    })
+    serialized = result.model_dump_json()
+    provider_notices = [notice for notice in result.notices if notice.code == "PROVIDER_ERROR"]
+
+    assert result.offers == []
+    assert len(provider_notices) == 1
+    assert provider_notices[0].user_visible is True
+    assert "HTTP 503" not in serialized
+    assert "Authorization" not in serialized
+    assert "internal-secret" not in serialized
+
+
 def test_demo_store_unreachable_fails_before_processing_rows(tmp_path):
     class OfflineDemoStore:
         key = "demo_store_http"

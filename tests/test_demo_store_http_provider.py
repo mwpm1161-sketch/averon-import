@@ -10,6 +10,7 @@ from averon_import.services.sourcing.providers.demo_store_http import (
     DemoStoreHttpProvider,
     DemoStoreProviderError,
 )
+from averon_import.services.sourcing.providers.base import SourcingProviderError
 
 
 def make_intent() -> ProductIntent:
@@ -86,6 +87,22 @@ def test_offline_stats_is_safe_and_does_not_raise():
     assert stats["reachable"] is False
     assert stats["catalog_version"] == "unavailable"
     assert "ошибка" in stats["error"] or "ожидания" in stats["error"]
+
+
+def test_demo_store_provider_error_uses_common_safe_contract():
+    transport = FakeTransport([FakeResponse({}, status=503)])
+    provider = DemoStoreHttpProvider("http://127.0.0.1:8877", transport=transport)
+
+    with pytest.raises(DemoStoreProviderError) as caught:
+        provider.search(make_intent())
+
+    error = caught.value
+    assert isinstance(error, SourcingProviderError)
+    assert error.code == "PROVIDER_ERROR"
+    assert error.category == "http_error"
+    assert error.status_code == 503
+    assert error.public_message == str(error)
+    assert "Authorization" not in str(error)
 
 
 def test_search_sends_product_intent_and_maps_provider_owned_offer():
