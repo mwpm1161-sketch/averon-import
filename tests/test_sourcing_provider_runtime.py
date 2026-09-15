@@ -128,16 +128,51 @@ def test_runtime_subclass_secrets_are_removed_by_whitelist_reconstruction():
     assert "raw_response" not in encoded
 
 
-def test_malformed_or_unknown_runtime_stats_use_safe_default():
-    malformed = normalize_provider_runtime_state({
-        "item_count": -1,
-        "latency_ms": "not-a-number",
-        "raw_response": "private",
-    })
-    unknown = normalize_provider_runtime_state(object())
+@pytest.mark.parametrize(
+    "stats",
+    [
+        {"reachable": False, "item_count": -1, "error": "store offline"},
+        {"reachable": True, "item_count": -1},
+    ],
+)
+def test_malformed_runtime_stats_fail_closed(stats):
+    normalized = normalize_provider_runtime_state(stats)
 
-    assert malformed == SourcingProviderRuntimeState()
-    assert unknown == SourcingProviderRuntimeState()
+    assert normalized.reachable is False
+    assert normalized.catalog_version == "unavailable"
+    assert normalized.error == "Проверка каталога поставщика не выполнена"
+
+
+def test_unknown_runtime_stats_fail_closed_without_exposing_input():
+    normalized = normalize_provider_runtime_state(object())
+
+    assert normalized.reachable is False
+    assert normalized.catalog_version == "unavailable"
+    assert normalized.error == "Проверка каталога поставщика не выполнена"
+
+
+def test_sensitive_malformed_runtime_stats_do_not_leak_fields_or_values():
+    normalized = normalize_provider_runtime_state({
+        "reachable": True,
+        "item_count": -1,
+        "api_key": "must-not-escape",
+        "authorization": "Bearer private-token",
+        "raw_response": "private-body",
+        "debug_payload": {"secret": "private"},
+    })
+    encoded = json.dumps(normalized.model_dump(), ensure_ascii=False).casefold()
+
+    assert normalized.reachable is False
+    assert "must-not-escape" not in encoded
+    assert "authorization" not in encoded
+    assert "private-token" not in encoded
+    assert "private-body" not in encoded
+    assert "debug_payload" not in encoded
+    assert "secret" not in encoded
+
+
+def test_empty_legacy_stats_dict_keeps_unknown_compatible_defaults():
+    assert normalize_provider_runtime_state({}) == SourcingProviderRuntimeState()
 
 
 class StatsProvider:
@@ -278,12 +313,13 @@ def test_unreachable_project_provider_fails_before_processing_rows():
         def stats(self):
             return {
                 "reachable": False,
+                "item_count": -1,
                 "catalog_version": "unavailable",
                 "error": "store offline",
             }
 
     provider = UnreachableProvider()
-    with pytest.raises(ValueError, match="store offline"):
+    with pytest.raises(ValueError, match="Проверка каталога поставщика не выполнена"):
         _service({"project": provider}, default_provider="project").search_project([
             {"id": "row-1", "row_type": "item", "name": "Клапан", "quantity": "1"},
         ])

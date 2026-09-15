@@ -64,8 +64,19 @@ def get_provider_capabilities(provider: object) -> SourcingProviderCapabilities:
         return SourcingProviderCapabilities()
 
 
+def _unavailable_provider_runtime_state() -> SourcingProviderRuntimeState:
+    return SourcingProviderRuntimeState(
+        configured=True,
+        reachable=False,
+        item_count=0,
+        catalog_version="unavailable",
+        latency_ms=None,
+        error="Проверка каталога поставщика не выполнена",
+    )
+
+
 def normalize_provider_runtime_state(stats: object) -> SourcingProviderRuntimeState:
-    """Rebuild provider runtime data from a strict whitelist."""
+    """Rebuild provider runtime data from a strict whitelist, failing closed."""
 
     try:
         if isinstance(stats, SourcingProviderRuntimeState):
@@ -79,8 +90,10 @@ def normalize_provider_runtime_state(stats: object) -> SourcingProviderRuntimeSt
                 for field_name in SourcingProviderRuntimeState.model_fields
                 if field_name in stats
             }
+            if stats and not payload:
+                return _unavailable_provider_runtime_state()
         else:
-            return SourcingProviderRuntimeState()
+            return _unavailable_provider_runtime_state()
         return SourcingProviderRuntimeState.model_validate(payload)
     except Exception:
-        return SourcingProviderRuntimeState()
+        return _unavailable_provider_runtime_state()
