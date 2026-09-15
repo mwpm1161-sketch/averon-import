@@ -4,7 +4,7 @@ import json
 from decimal import Decimal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.models import (
@@ -104,6 +104,22 @@ class MalformedCapabilitiesProvider(LegacyStubProvider):
     capabilities = {"supports_price": True, "api_key": "must-not-escape"}
 
 
+class ExtendedCapabilities(SourcingProviderCapabilities):
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    api_key: str
+    internal_note: str = "private"
+
+
+class ExtendedCapabilitiesProvider(LegacyStubProvider):
+    key = "extended"
+    capabilities = ExtendedCapabilities(
+        supports_price=True,
+        api_key="must-not-escape",
+        internal_note="private",
+    )
+
+
 def test_public_config_adds_safe_capabilities_for_legacy_and_typed_providers():
     service = SourcingService(
         {
@@ -144,6 +160,33 @@ def test_malformed_capabilities_fall_back_without_serializing_provider_data():
     }
     assert "must-not-escape" not in encoded
     assert "api_key" not in encoded.casefold()
+
+
+def test_typed_capability_subclass_is_whitelist_normalized_for_api():
+    provider = ExtendedCapabilitiesProvider()
+    normalized = get_provider_capabilities(provider)
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(),
+    )
+
+    payload = service.public_config()
+    row_capabilities = payload["providers"][0]["capabilities"]
+    active_capabilities = payload["provider"]["capabilities"]
+
+    assert type(normalized) is SourcingProviderCapabilities
+    assert normalized.supports_price is True
+    assert set(normalized.model_dump()) == set(CAPABILITY_FIELDS)
+    assert normalized.model_dump()["supports_price"] is True
+    assert "api_key" not in normalized.model_dump()
+    assert "internal_note" not in normalized.model_dump()
+    assert row_capabilities == active_capabilities == normalized.model_dump()
+    encoded = json.dumps(payload, ensure_ascii=False).casefold()
+    assert "must-not-escape" not in encoded
+    assert "api_key" not in encoded
+    assert "internal_note" not in encoded
 
 
 def _intent() -> ProductIntent:

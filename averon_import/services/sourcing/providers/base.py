@@ -52,8 +52,12 @@ def get_provider_capabilities(provider: object) -> SourcingProviderCapabilities:
 
     try:
         capabilities = getattr(provider, "capabilities", None)
+        if not isinstance(capabilities, SourcingProviderCapabilities):
+            return SourcingProviderCapabilities()
+        payload = {
+            field_name: getattr(capabilities, field_name)
+            for field_name in SourcingProviderCapabilities.model_fields
+        }
+        return SourcingProviderCapabilities.model_validate(payload)
     except Exception:
-        capabilities = None
-    if isinstance(capabilities, SourcingProviderCapabilities):
-        return capabilities
-    return SourcingProviderCapabilities()
+        return SourcingProviderCapabilities()
