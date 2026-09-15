@@ -58,19 +58,13 @@ from averon_import.services.secrets import (
     create_secret_store,
     resolve_secret,
 )
-from averon_import.services.sourcing.cache import SourcingCache
-from averon_import.services.sourcing.catalog_repository import CatalogRepository
 from averon_import.services.sourcing.demo_catalog import (
     DEMO_CATALOG_NOTICE,
     DEMO_CATALOG_SOURCE,
 )
 from averon_import.services.sourcing.models import ProductIntent
-from averon_import.services.sourcing.product_understanding import SourcingAIService
-from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
-from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
-from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
+from averon_import.services.sourcing.runtime import create_sourcing_runtime
 from averon_import.services.sourcing.run_history import SourcingRunHistory
-from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.workspace import WorkspaceService
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -111,26 +105,13 @@ coordinator = ProcessingCoordinator(
     settings_service=app_settings_service,
     providers={"cloud": yandex_vision_provider},
 )
-sourcing_repository = CatalogRepository(DATA_DIR / "sourcing" / "catalog.sqlite3")
-sourcing_provider = LocalCatalogProvider(sourcing_repository)
-demo_store_provider = DemoStoreHttpProvider(
-    app_settings_service.settings.sourcing.demo_store_base_url,
-)
-sourcing_ai_transport = create_sourcing_ai_transport(app_settings_service, secret_store)
-sourcing_service = SourcingService(
-    {
-        sourcing_provider.key: sourcing_provider,
-        demo_store_provider.key: demo_store_provider,
-    },
-    default_provider=(
-        app_settings_service.settings.sourcing.provider
-        if app_settings_service.settings.sourcing.provider
-        in {sourcing_provider.key, demo_store_provider.key}
-        else sourcing_provider.key
-    ),
-    ai=SourcingAIService(sourcing_ai_transport),
-    cache=SourcingCache(DATA_DIR / "sourcing" / "cache.json"),
-)
+sourcing_runtime = create_sourcing_runtime(DATA_DIR, app_settings_service, secret_store)
+# Compatibility aliases for endpoints and integrations that historically used
+# these module-level objects directly.
+sourcing_repository = sourcing_runtime.repository
+sourcing_provider = sourcing_runtime.providers["local_catalog"]
+demo_store_provider = sourcing_runtime.providers["demo_store_http"]
+sourcing_service = sourcing_runtime.service
 human_review_service = HumanReviewService()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
@@ -276,6 +257,8 @@ def get_settings():
 
 @app.put("/api/settings")
 def put_settings(request: SettingsUpdate):
+    global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
+
     if request.api_key is not None and request.api_key.strip():
         secret_store.set(YANDEX_API_KEY, request.api_key.strip())
     if request.ai_api_key is not None and request.ai_api_key.strip():
@@ -296,16 +279,11 @@ def put_settings(request: SettingsUpdate):
     patch = {key: value for key, value in patch.items() if value is not None}
     try:
         app_settings_service.update(patch)
-        sourcing_service.set_ai(
-            SourcingAIService(create_sourcing_ai_transport(app_settings_service, secret_store))
-        )
-        providers = getattr(sourcing_service, "providers", {})
-        if "demo_store_http" in providers:
-            providers["demo_store_http"] = DemoStoreHttpProvider(
-                app_settings_service.settings.sourcing.demo_store_base_url,
-            )
-        if app_settings_service.settings.sourcing.provider in providers:
-            sourcing_service.default_provider = app_settings_service.settings.sourcing.provider
+        sourcing_runtime = create_sourcing_runtime(DATA_DIR, app_settings_service, secret_store)
+        sourcing_repository = sourcing_runtime.repository
+        sourcing_provider = sourcing_runtime.providers["local_catalog"]
+        demo_store_provider = sourcing_runtime.providers["demo_store_http"]
+        sourcing_service = sourcing_runtime.service
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {}
         location = ".".join(str(part) for part in first.get("loc", ()))

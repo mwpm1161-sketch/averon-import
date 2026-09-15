@@ -13,7 +13,11 @@ from averon_import.services.sourcing.models import (
     SourcingResult,
 )
 from averon_import.services.sourcing.service import SourcingService
-from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
+from averon_import.services.sourcing.runtime import (
+    SourcingRuntime,
+    create_sourcing_ai_transport,
+    create_sourcing_runtime,
+)
 
 __all__ = [
     "MatchDecision",
@@ -26,6 +30,8 @@ __all__ = [
     "SourcingProviderCapabilities",
     "SourcingProviderRuntimeState",
     "SourcingResult",
+    "SourcingRuntime",
     "SourcingService",
     "create_sourcing_ai_transport",
+    "create_sourcing_runtime",
 ]

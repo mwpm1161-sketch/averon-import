@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
+from pathlib import Path
 from typing import Any
 
 from averon_import.ai.config import AiSettings, ProviderSettings
 from averon_import.ai.provider import OpenAICompatibleProvider
 from averon_import.ai.service import AiCorrectionService
+from averon_import.services.sourcing.cache import SourcingCache
+from averon_import.services.sourcing.catalog_repository import CatalogRepository
+from averon_import.services.sourcing.providers.base import SourcingProvider
+from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
+from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
+from averon_import.services.sourcing.product_understanding import SourcingAIService
+from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.secrets import YANDEX_AI_API_KEY, resolve_secret
 
 
@@ -59,3 +68,48 @@ def create_sourcing_ai_transport(settings_service: Any, secret_store: Any) -> Ai
         max_tokens=runtime_settings.max_tokens,
     )
     return AiCorrectionService(settings=runtime_settings, providers={"yandex": provider})
+
+
+@dataclass(frozen=True)
+class SourcingRuntime:
+    """Explicit composition root for the sourcing runtime dependencies."""
+
+    repository: CatalogRepository
+    providers: dict[str, SourcingProvider]
+    service: SourcingService
+
+
+def create_sourcing_runtime(
+    data_dir: Path,
+    settings_service: Any,
+    secret_store: Any,
+) -> SourcingRuntime:
+    """Build the current sourcing providers and service from owned dependencies."""
+
+    data_root = Path(data_dir)
+    repository = CatalogRepository(data_root / "sourcing" / "catalog.sqlite3")
+    local_provider = LocalCatalogProvider(repository)
+    demo_store_provider = DemoStoreHttpProvider(
+        settings_service.settings.sourcing.demo_store_base_url,
+    )
+    providers: dict[str, SourcingProvider] = {
+        local_provider.key: local_provider,
+        demo_store_provider.key: demo_store_provider,
+    }
+    configured_provider = str(settings_service.settings.sourcing.provider or "")
+    default_provider = (
+        configured_provider
+        if configured_provider in providers
+        else local_provider.key
+    )
+    sourcing_service = SourcingService(
+        providers,
+        default_provider=default_provider,
+        ai=SourcingAIService(create_sourcing_ai_transport(settings_service, secret_store)),
+        cache=SourcingCache(data_root / "sourcing" / "cache.json"),
+    )
+    return SourcingRuntime(
+        repository=repository,
+        providers=providers,
+        service=sourcing_service,
+    )

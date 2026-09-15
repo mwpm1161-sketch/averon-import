@@ -16,6 +16,9 @@ from averon_import.services.sourcing.models import (
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.providers.base import normalize_provider_runtime_state
 from averon_import.services.sourcing.service import SourcingService
+from averon_import.services.sourcing.runtime import create_sourcing_runtime
+from averon_import.services.app_settings import AppSettingsService
+from averon_import.services.secrets import MemorySecretStore
 
 
 RUNTIME_FIELDS = {
@@ -285,3 +288,116 @@ def test_unreachable_project_provider_fails_before_processing_rows():
             {"id": "row-1", "row_type": "item", "name": "Клапан", "quantity": "1"},
         ])
     assert provider.search_calls == []
+
+
+def test_runtime_factory_registers_only_current_providers_without_health_calls(tmp_path, monkeypatch):
+    settings = AppSettingsService(tmp_path / "settings")
+    ai_transport_calls = []
+
+    def fake_ai_transport(settings_service, secret_store):
+        from averon_import.ai.service import AiCorrectionService
+
+        ai_transport_calls.append((settings_service, secret_store))
+        return AiCorrectionService()
+
+    def fail_health(_provider):
+        raise AssertionError("factory must not call provider stats")
+
+    monkeypatch.setattr(
+        "averon_import.services.sourcing.runtime.create_sourcing_ai_transport",
+        fake_ai_transport,
+    )
+    monkeypatch.setattr(
+        "averon_import.services.sourcing.providers.demo_store_http.DemoStoreHttpProvider.stats",
+        fail_health,
+    )
+
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, MemorySecretStore())
+
+    assert set(runtime.providers) == {"local_catalog", "demo_store_http"}
+    assert "lemana" not in runtime.providers
+    assert runtime.repository.path == tmp_path / "data" / "sourcing" / "catalog.sqlite3"
+    assert runtime.service.providers is runtime.providers
+    assert len(ai_transport_calls) == 1
+
+
+def test_runtime_factory_preserves_provider_capabilities_and_normalizes_runtime_state(tmp_path):
+    settings = AppSettingsService(tmp_path / "settings")
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, MemorySecretStore())
+
+    local = runtime.providers["local_catalog"]
+    demo = runtime.providers["demo_store_http"]
+    local_state = normalize_provider_runtime_state(local.stats())
+
+    assert local.capabilities == demo.capabilities
+    assert local.capabilities.supports_price is True
+    assert local.capabilities.supports_batch_search is False
+    assert type(local_state) is SourcingProviderRuntimeState
+    assert set(local_state.model_dump()) == RUNTIME_FIELDS
+    assert "supports_price" not in local_state.model_dump()
+
+
+@pytest.mark.parametrize(
+    ("configured_provider", "expected_provider"),
+    [
+        ("local_catalog", "local_catalog"),
+        ("demo_store_http", "demo_store_http"),
+        ("unknown-provider", "local_catalog"),
+    ],
+)
+def test_runtime_factory_default_provider_selection(
+    tmp_path,
+    configured_provider,
+    expected_provider,
+):
+    settings = AppSettingsService(tmp_path / configured_provider)
+    settings.update({"sourcing": {"provider": configured_provider}})
+
+    runtime = create_sourcing_runtime(
+        tmp_path / f"data-{configured_provider}",
+        settings,
+        MemorySecretStore(),
+    )
+
+    assert runtime.service.provider().key == expected_provider
+
+
+def test_runtime_factory_public_config_keeps_shape_and_does_not_expose_secrets(
+    tmp_path,
+    monkeypatch,
+):
+    settings = AppSettingsService(tmp_path / "settings")
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, MemorySecretStore())
+    monkeypatch.setattr(
+        runtime.providers["demo_store_http"],
+        "stats",
+        lambda: {"configured": True, "reachable": True, "item_count": 0, "catalog_version": "test"},
+    )
+
+    payload = runtime.service.public_config()
+    encoded = json.dumps(payload, ensure_ascii=False).casefold()
+
+    assert set(payload) >= {"provider", "providers", "catalog_item_count", "ai_available", "ai"}
+    assert set(payload["provider"]) >= {"key", "label", "capabilities"}
+    assert all("capabilities" in row for row in payload["providers"])
+    assert "api_key" not in encoded
+    assert "authorization" not in encoded
+    assert "secret" not in encoded
+    assert "token" not in encoded
+
+
+def test_runtime_factory_does_not_change_local_search_semantics(tmp_path):
+    settings = AppSettingsService(tmp_path / "settings")
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, MemorySecretStore())
+    runtime.repository.upsert(Offer(
+        offer_id="factory-offer",
+        provider="local_catalog",
+        title="Клапан",
+        price=Decimal("10"),
+        currency="RUB",
+    ))
+
+    result = runtime.service.search_intent(_intent("factory-row"), ai_rerank=False)
+
+    assert result.recommended_offer is not None
+    assert result.recommended_offer.offer_id == "factory-offer"
