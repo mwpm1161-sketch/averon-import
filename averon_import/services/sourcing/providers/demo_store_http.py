@@ -17,7 +17,11 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 
 from averon_import.services.app_settings import normalize_http_base_url
-from averon_import.services.sourcing.models import Offer, ProductIntent
+from averon_import.services.sourcing.models import (
+    Offer,
+    ProductIntent,
+    SourcingProviderCapabilities,
+)
 from averon_import.services.sourcing.providers.base import SourcingProviderError
 
 
@@ -87,6 +91,14 @@ def _retrieval_payload(intent: ProductIntent) -> dict[str, Any]:
 class DemoStoreHttpProvider:
     key = "demo_store_http"
     label = "Averon Demo Store"
+    capabilities = SourcingProviderCapabilities(
+        supports_price=True,
+        supports_availability=True,
+        supports_product_url=True,
+        supports_article_search=True,
+        supports_model_search=True,
+        supports_catalog_version=True,
+    )
 
     def __init__(
         self,

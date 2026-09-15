@@ -26,7 +26,11 @@ from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
     build_fallback_intent,
 )
-from averon_import.services.sourcing.providers.base import SourcingProvider, SourcingProviderError
+from averon_import.services.sourcing.providers.base import (
+    SourcingProvider,
+    SourcingProviderError,
+    get_provider_capabilities,
+)
 
 
 class SourcingService:
@@ -495,6 +499,7 @@ class SourcingService:
                     "label": provider.label,
                     "catalog_item_count": provider_stats.get("item_count", 0),
                     "configured": provider_stats.get("configured", True),
+                    "capabilities": get_provider_capabilities(provider).model_dump(mode="json"),
                     "reachable": provider_stats.get("reachable", True),
                     **(
                         {"error": provider_stats["error"]}
@@ -504,7 +509,11 @@ class SourcingService:
                 }
             )
         return {
-            "provider": {"key": active.key, "label": active.label},
+            "provider": {
+                "key": active.key,
+                "label": active.label,
+                "capabilities": get_provider_capabilities(active).model_dump(mode="json"),
+            },
             "providers": provider_rows,
             "catalog_item_count": stats_by_key.get(active.key, {}).get("item_count", 0),
             "ai_available": ai["available"],

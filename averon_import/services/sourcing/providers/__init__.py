@@ -1,6 +1,7 @@
 from averon_import.services.sourcing.providers.base import (
     SourcingProvider,
     SourcingProviderError,
+    get_provider_capabilities,
 )
 from averon_import.services.sourcing.providers.demo_store_http import (
     DemoStoreHttpProvider,
@@ -18,4 +19,5 @@ __all__ = [
     "LocalCatalogProvider",
     "SourcingProvider",
     "SourcingProviderError",
+    "get_provider_capabilities",
 ]

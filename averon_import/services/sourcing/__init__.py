@@ -8,6 +8,7 @@ from averon_import.services.sourcing.models import (
     ProductUnderstandingResult,
     ProductUnderstandingSuggestion,
     ProjectSourcingResult,
+    SourcingProviderCapabilities,
     SourcingResult,
 )
 from averon_import.services.sourcing.service import SourcingService
@@ -21,6 +22,7 @@ __all__ = [
     "ProductUnderstandingResult",
     "ProductUnderstandingSuggestion",
     "ProjectSourcingResult",
+    "SourcingProviderCapabilities",
     "SourcingResult",
     "SourcingService",
     "create_sourcing_ai_transport",

@@ -27,6 +27,21 @@ class SourcingNotice(SourcingModel):
     user_visible: bool = True
 
 
+class SourcingProviderCapabilities(SourcingModel):
+    """Immutable, request-independent provider contract metadata."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    supports_price: bool = False
+    supports_availability: bool = False
+    supports_product_url: bool = False
+    supports_article_search: bool = False
+    supports_model_search: bool = False
+    supports_batch_search: bool = False
+    supports_catalog_version: bool = False
+    supports_stock_quantity: bool = False
+
+
 def dedupe_sourcing_notices(notices: Iterable[SourcingNotice]) -> list[SourcingNotice]:
     """Keep the first occurrence of each stable notice identity."""
 
@@ -246,3 +261,6 @@ class SourcingProviderInfo(SourcingModel):
     label: str
     catalog_item_count: int = 0
     configured: bool = True
+    capabilities: SourcingProviderCapabilities = Field(
+        default_factory=SourcingProviderCapabilities,
+    )

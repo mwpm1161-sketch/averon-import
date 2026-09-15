@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from averon_import.services.sourcing.models import Offer, ProductIntent
+from averon_import.services.sourcing.models import (
+    Offer,
+    ProductIntent,
+    SourcingProviderCapabilities,
+)
 
 
 class SourcingProviderError(ValueError):
@@ -33,6 +37,7 @@ class SourcingProviderError(ValueError):
 class SourcingProvider(Protocol):
     key: str
     label: str
+    capabilities: SourcingProviderCapabilities
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
         """Return provider-owned commercial offers for an intent."""
@@ -40,3 +45,15 @@ class SourcingProvider(Protocol):
 
     def stats(self) -> dict:
         ...
+
+
+def get_provider_capabilities(provider: object) -> SourcingProviderCapabilities:
+    """Return a safe capability contract for current and legacy providers."""
+
+    try:
+        capabilities = getattr(provider, "capabilities", None)
+    except Exception:
+        capabilities = None
+    if isinstance(capabilities, SourcingProviderCapabilities):
+        return capabilities
+    return SourcingProviderCapabilities()
