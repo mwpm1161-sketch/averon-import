@@ -8,9 +8,48 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from averon_import.core.constants import COLUMN_BY_KEY
+from averon_import.core.constants import COLUMN_BY_KEY, ROW_TYPES, STATUSES
 from averon_import.core.normalizers import as_excel_number
 from averon_import.services.review_policy import critical_blockers_for_row, critical_field_count
+
+
+REVIEW_DIAGNOSTIC_COLUMNS = ("page", "row_type", "status", "confidence")
+
+
+def _text_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _unique_text(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value.strip()))
+
+
+def _row_metadata(row: dict) -> dict:
+    metadata = row.get("ocr_metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _review_reasons(row: dict) -> list[str]:
+    metadata = _row_metadata(row)
+    return _unique_text(
+        _text_values(row.get("review_reasons"))
+        + _text_values(metadata.get("review_reasons"))
+    )
+
+
+def _review_blockers(row: dict, reasons: list[str]) -> list[str]:
+    metadata = _row_metadata(row)
+    policy_row = dict(row)
+    policy_row["review_reasons"] = _unique_text(
+        reasons
+        + _text_values(row.get("critical_blockers"))
+        + _text_values(metadata.get("critical_blockers"))
+    )
+    return _unique_text(critical_blockers_for_row(policy_row))
 
 
 class ExcelExportService:
@@ -29,18 +68,24 @@ class ExcelExportService:
         enforce_safety: bool = True,
         review_export: bool = False,
     ) -> Path:
-        valid_columns = [column for column in columns if column in COLUMN_BY_KEY]
-        if not valid_columns:
+        selected_columns = [column for column in columns if column in COLUMN_BY_KEY]
+        valid_columns = list(selected_columns)
+        if review_export:
+            valid_columns.extend(
+                column for column in REVIEW_DIAGNOSTIC_COLUMNS
+                if column not in valid_columns
+            )
+        if not selected_columns:
             raise ValueError("Не выбрано ни одного столбца для экспорта")
 
-        if enforce_safety:
+        status_items = list(
+            page_statuses.values()
+            if isinstance(page_statuses, dict)
+            else (page_statuses or [])
+        )
+        if enforce_safety and not review_export:
             page_blockers = []
             self.last_blockers = []
-            status_items = list(
-                page_statuses.values()
-                if isinstance(page_statuses, dict)
-                else (page_statuses or [])
-            )
             if page_statuses is not None and not status_items and rows:
                 page_blockers.append(
                     "страница ?: output_status=UNKNOWN; reason=missing_page_status"
@@ -150,7 +195,7 @@ class ExcelExportService:
                 or semantic_review
             ):
                 continue
-            if row.get("selected") is False:
+            if row.get("selected") is False and not review_export:
                 continue
             values = []
             for key in valid_columns:
@@ -210,23 +255,44 @@ class ExcelExportService:
         if review_export:
             review_sheet = workbook.create_sheet("Проверка")
             review_sheet.sheet_view.showGridLines = False
-            review_sheet.append(["Страница", "Наименование", "Статус", "Причины проверки"])
+            review_sheet.append([
+                "Страница",
+                "Тип строки",
+                "Наименование",
+                "Статус",
+                "Причины проверки",
+                "Критичные блокеры",
+            ])
             for cell in review_sheet[1]:
                 cell.fill = header_fill
                 cell.font = header_font
                 cell.border = border
             for row in rows:
-                reasons = row.get("review_reasons") or []
-                metadata_row = row.get("ocr_metadata") if isinstance(row.get("ocr_metadata"), dict) else {}
-                if metadata_row.get("review_reasons"):
-                    reasons = metadata_row["review_reasons"]
-                if not reasons and str(row.get("status") or "").lower() not in {"review", "unrecognized"}:
+                reasons = _review_reasons(row)
+                blockers = _review_blockers(row, reasons)
+                status = str(row.get("status") or "")
+                semantic_review = bool(
+                    row.get("semantic_review")
+                    or row.get("semantic_state") == "REVIEW"
+                    or (
+                        row.get("semantic_authoritative")
+                        and _row_metadata(row).get("semantic_review")
+                    )
+                )
+                if not (
+                    reasons
+                    or blockers
+                    or semantic_review
+                    or status.lower() in {"review", "unrecognized"}
+                ):
                     continue
                 review_sheet.append([
                     row.get("page", ""),
+                    ROW_TYPES.get(str(row.get("row_type") or ""), row.get("row_type", "")),
                     row.get("name", ""),
-                    row.get("status", ""),
-                    ", ".join(str(item) for item in reasons),
+                    STATUSES.get(status, status),
+                    ", ".join(reasons),
+                    ", ".join(blockers),
                 ])
             for row in review_sheet.iter_rows():
                 for cell in row:
@@ -235,9 +301,43 @@ class ExcelExportService:
                     if cell.row > 1:
                         cell.fill = PatternFill("solid", fgColor="FEF3C7")
             review_sheet.column_dimensions["A"].width = 12
-            review_sheet.column_dimensions["B"].width = 48
-            review_sheet.column_dimensions["C"].width = 18
-            review_sheet.column_dimensions["D"].width = 72
+            review_sheet.column_dimensions["B"].width = 22
+            review_sheet.column_dimensions["C"].width = 48
+            review_sheet.column_dimensions["D"].width = 22
+            review_sheet.column_dimensions["E"].width = 72
+            review_sheet.column_dimensions["F"].width = 48
+
+            page_sheet = workbook.create_sheet("Страницы")
+            page_sheet.sheet_view.showGridLines = False
+            page_sheet.append(["Страница", "Статус результата", "Решение страницы", "Блокеры"])
+            for cell in page_sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.border = border
+            for status in status_items:
+                if not isinstance(status, dict):
+                    continue
+                diagnostics = status.get("diagnostics")
+                diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+                page_disposition = status.get("page_disposition")
+                if not page_disposition:
+                    page_disposition = diagnostics.get("page_disposition")
+                if isinstance(page_disposition, dict):
+                    page_disposition = page_disposition.get("disposition", "")
+                page_sheet.append([
+                    status.get("page", ""),
+                    status.get("output_status", ""),
+                    page_disposition or "",
+                    ", ".join(_text_values(status.get("blockers"))),
+                ])
+            for row in page_sheet.iter_rows():
+                for cell in row:
+                    cell.border = border
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+            page_sheet.column_dimensions["A"].width = 12
+            page_sheet.column_dimensions["B"].width = 24
+            page_sheet.column_dimensions["C"].width = 24
+            page_sheet.column_dimensions["D"].width = 72
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(output_path)

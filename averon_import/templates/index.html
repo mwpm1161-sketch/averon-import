@@ -205,9 +205,10 @@
           <label class="check-row"><input type="checkbox" id="export-items-only" checked><span>Экспортировать только позиции и компоненты</span></label>
           <div class="export-safety" id="export-safety" role="status"></div>
           <div class="export-note"><b>В Excel попадут исправленные данные</b><p>Строки со статусом «Требует проверки» будут подсвечены. Неточность OCR без критичного blocker сама по себе экспорт не блокирует.</p></div>
+          <div class="export-note review-export-note"><b>Экспорт для проверки</b><p>Проверочный файл может содержать строки, требующие проверки. Он не подтверждает данные и не меняет статус распознавания.</p></div>
         </div>
       </div>
-      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button secondary" type="button" id="copy-export">Копировать таблицу</button><button class="button primary" type="button" id="download-excel">Скачать XLSX</button></div>
+      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button secondary" type="button" id="copy-export">Копировать таблицу</button><button class="button secondary" type="button" id="download-review-excel">Экспорт для проверки</button><button class="button primary" type="button" id="download-excel">Скачать Excel</button></div>
     </form>
   </dialog>
 

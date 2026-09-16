@@ -68,6 +68,20 @@ def test_critical_review_ui_is_present_and_export_safety_is_explicit():
     assert "critical-review" in css
 
 
+def test_review_export_is_explicit_and_not_gated_by_production_blockers():
+    html = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="download-review-excel"' in html
+    assert "Экспорт для проверки" in html
+    assert "Проверочный файл может содержать строки, требующие проверки." in html
+    assert "function downloadReviewExcel()" in app_js
+    assert "review_export:true" in app_js
+    assert "only_exportable:false" in app_js
+    assert "saveRows(false)" in app_js
+    assert "function reviewExportFilename()" in app_js
+
+
 def test_export_safety_uses_backend_page_status_and_pdf_viewer_resets_cleanly():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")

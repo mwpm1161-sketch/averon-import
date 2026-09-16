@@ -548,6 +548,14 @@ def safe_filename(value: str) -> str:
     return value[:160]
 
 
+def review_export_filename(value: str) -> str:
+    filename = safe_filename(value)
+    path = Path(filename)
+    if path.stem.lower().endswith("_review"):
+        return filename
+    return safe_filename(f"{path.stem}_review.xlsx")
+
+
 @app.post("/api/documents/{document_id}/export")
 def export(document_id: str, request: ExportRequest):
     try:
@@ -555,7 +563,11 @@ def export(document_id: str, request: ExportRequest):
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
-    filename = safe_filename(request.filename)
+    filename = (
+        review_export_filename(request.filename)
+        if request.review_export
+        else safe_filename(request.filename)
+    )
     output = workspace.exports_dir / filename
     try:
         stored_result = workspace_service.read_json(workspace.result_path, default={})

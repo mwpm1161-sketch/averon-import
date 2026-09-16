@@ -1426,6 +1426,7 @@ async function downloadExcel() {
       columns, rows:state.rows,
       include_headers:$("#export-headers").checked,
       only_exportable:$("#export-items-only").checked,
+      review_export:false,
       filename:$("#export-filename").value,
       sheet_name:$("#export-sheet").value,
     };
@@ -1437,6 +1438,37 @@ async function downloadExcel() {
     link.download=match?decodeURIComponent(match[1]):payload.filename;
     link.href=url; link.click(); URL.revokeObjectURL(url);
     $("#export-modal").close(); toast("Excel сформирован", "success");
+  } catch (error) { toast(error.message,"error"); }
+}
+
+function reviewExportFilename() {
+  const filename = ($("#export-filename").value || "averon_import.xlsx").trim();
+  const stem = filename.replace(/\.xlsx$/i, "") || "averon_import";
+  return /_review$/i.test(stem) ? `${stem}.xlsx` : `${stem}_review.xlsx`;
+}
+
+async function downloadReviewExcel() {
+  const columns = selectedExportColumns();
+  if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
+  try {
+    const authoritative = await saveRows(false);
+    if (!authoritative) return;
+    const payload = {
+      columns, rows:state.rows,
+      include_headers:$("#export-headers").checked,
+      only_exportable:false,
+      review_export:true,
+      filename:reviewExportFilename(),
+      sheet_name:$("#export-sheet").value,
+    };
+    const response = await api(`/api/documents/${state.document.document_id}/export`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const blob = await response.blob();
+    const url=URL.createObjectURL(blob); const link=document.createElement("a");
+    const disposition=response.headers.get("content-disposition")||"";
+    const match=disposition.match(/filename\*=UTF-8''([^;]+)/i) || disposition.match(/filename="?([^";]+)"?/i);
+    link.download=match?decodeURIComponent(match[1]):payload.filename;
+    link.href=url; link.click(); URL.revokeObjectURL(url);
+    $("#export-modal").close(); toast("Проверочный Excel сформирован", "success");
   } catch (error) { toast(error.message,"error"); }
 }
 
@@ -1486,6 +1518,7 @@ function setupEvents() {
   $("#export-items-only").addEventListener("change",updateExportSafety);
   $("#copy-export").addEventListener("click",()=>copyRows(state.rows,selectedExportColumns(),$("#export-headers").checked));
   $("#download-excel").addEventListener("click",downloadExcel);
+  $("#download-review-excel").addEventListener("click",downloadReviewExcel);
   $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
   $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());
