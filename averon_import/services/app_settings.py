@@ -20,7 +20,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from averon_import.core.constants import PROCESSING_MODES
 
-_FORBIDDEN_FILE_KEYS = {"api_key", "api-key", "secret", "secrets", "password", "token"}
+_FORBIDDEN_FILE_KEYS = {
+    "api_key",
+    "api-key",
+    "secret",
+    "secrets",
+    "password",
+    "token",
+    "client_secret",
+}
 
 
 class LocalAiSettings(BaseModel):
@@ -56,11 +64,24 @@ class PipelineTuningSettings(BaseModel):
     min_confidence: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
+class LemanaB2BSettings(BaseModel):
+    """Non-secret configuration for the Lemana PRO B2B provider."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    environment: Literal["test", "prod"] = "test"
+    client_id: str = ""
+    region_id: int | None = Field(default=None, ge=1, le=9999)
+    request_timeout_s: float = Field(default=10.0, gt=0, le=120.0)
+
+
 class SourcingSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str = "local_catalog"
     demo_store_base_url: str = "http://127.0.0.1:8877"
+    lemana_b2b: LemanaB2BSettings = Field(default_factory=LemanaB2BSettings)
 
     @field_validator("demo_store_base_url")
     @classmethod
@@ -176,6 +197,30 @@ class AppSettingsService:
                 self.warnings.append(
                     "AVERON_DEMO_STORE_BASE_URL имеет недопустимый URL; используется значение из settings.json."
                 )
+        if (value := os.environ.get("AVERON_LEMANA_B2B_ENABLED", "").strip()):
+            parsed = _env_bool(value)
+            if parsed is None:
+                self.warnings.append(
+                    "AVERON_LEMANA_B2B_ENABLED имеет недопустимое значение; используется значение из settings.json."
+                )
+            else:
+                settings.sourcing.lemana_b2b.enabled = parsed
+        if value := os.environ.get("AVERON_LEMANA_B2B_ENVIRONMENT", "").strip().lower():
+            if value in {"test", "prod"}:
+                settings.sourcing.lemana_b2b.environment = value
+            else:
+                self.warnings.append(
+                    "AVERON_LEMANA_B2B_ENVIRONMENT должен быть test или prod; используется значение из settings.json."
+                )
+        if value := os.environ.get("AVERON_LEMANA_B2B_CLIENT_ID", "").strip():
+            settings.sourcing.lemana_b2b.client_id = value
+        if (value := _env_int("AVERON_LEMANA_B2B_REGION_ID")) is not None:
+            try:
+                settings.sourcing.lemana_b2b.region_id = value
+            except (TypeError, ValueError):
+                self.warnings.append(
+                    "AVERON_LEMANA_B2B_REGION_ID имеет недопустимое значение; используется значение из settings.json."
+                )
 
     def update(self, patch: dict) -> AppSettings:
         current = json.loads(self.settings.model_dump_json())
@@ -216,6 +261,15 @@ def _env_int(name: str) -> int | None:
         return int(os.environ[name])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _env_bool(value: str) -> bool | None:
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "on", "да"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "нет"}:
+        return False
+    return None
 
 
 def normalize_http_base_url(value: str) -> str:
