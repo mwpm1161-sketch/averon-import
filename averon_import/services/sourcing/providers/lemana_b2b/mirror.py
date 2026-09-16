@@ -54,6 +54,7 @@ class LemanaCatalogMirror:
                 INSERT OR IGNORE INTO lemana_mirror_meta(key, value) VALUES ('last_synced_at', '');
                 INSERT OR IGNORE INTO lemana_mirror_meta(key, value) VALUES ('if_modified_since', '');
                 INSERT OR IGNORE INTO lemana_mirror_meta(key, value) VALUES ('region_id', '');
+                INSERT OR IGNORE INTO lemana_mirror_meta(key, value) VALUES ('environment', '');
                 CREATE TABLE IF NOT EXISTS lemana_products (
                     product_item TEXT PRIMARY KEY,
                     product_available INTEGER,
@@ -61,6 +62,7 @@ class LemanaCatalogMirror:
                     product_description TEXT NOT NULL,
                     product_url TEXT NOT NULL,
                     product_model TEXT NOT NULL,
+                    normalized_model TEXT NOT NULL DEFAULT '',
                     product_brand TEXT NOT NULL,
                     product_photo_json TEXT,
                     product_barcode TEXT NOT NULL,
@@ -71,9 +73,25 @@ class LemanaCatalogMirror:
                 );
                 CREATE INDEX IF NOT EXISTS idx_lemana_products_text
                     ON lemana_products(normalized_text);
-                CREATE INDEX IF NOT EXISTS idx_lemana_products_model
-                    ON lemana_products(product_model);
                 """
+            )
+            existing = {row[1] for row in connection.execute("PRAGMA table_info(lemana_products)")}
+            if "normalized_model" not in existing:
+                connection.execute(
+                    "ALTER TABLE lemana_products ADD COLUMN normalized_model TEXT NOT NULL DEFAULT ''"
+                )
+            rows = connection.execute(
+                "SELECT product_item, product_model FROM lemana_products"
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE lemana_products SET normalized_model=? WHERE product_item=?",
+                    (normalize_catalog_text(row["product_model"]), row["product_item"]),
+                )
+            connection.execute("DROP INDEX IF EXISTS idx_lemana_products_model")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lemana_products_model "
+                "ON lemana_products(normalized_model)"
             )
 
     @property
@@ -95,6 +113,10 @@ class LemanaCatalogMirror:
             return int(value) if value else None
         except ValueError:
             return None
+
+    @property
+    def environment(self) -> str:
+        return self._meta("environment")
 
     def _meta(self, key: str) -> str:
         with self._connect() as connection:
@@ -118,6 +140,7 @@ class LemanaCatalogMirror:
             "catalog_version": self.revision,
             "last_synced_at": self.last_synced_at,
             "region_id": self.region_id,
+            "environment": self.environment,
         }
 
     def sync(
@@ -125,6 +148,7 @@ class LemanaCatalogMirror:
         client: Any,
         *,
         region_id: int,
+        environment: str = "test",
         per_page: int = _DEFAULT_PAGE_SIZE,
         max_pages: int = _MAX_PAGES,
         max_items: int = _MAX_ITEMS,
@@ -137,42 +161,143 @@ class LemanaCatalogMirror:
                 code="INVALID_REQUEST",
                 category="invalid_request",
             )
+        if environment not in {"test", "prod"}:
+            raise SourcingProviderError(
+                "Для зеркала Lemana PRO B2B указано неизвестное окружение",
+                code="INVALID_REQUEST",
+                category="invalid_request",
+            )
         page_size = max(1, min(int(per_page), _DEFAULT_PAGE_SIZE))
         page_limit = max(1, min(int(max_pages), _MAX_PAGES))
         item_limit = max(1, min(int(max_items), _MAX_ITEMS))
         request_if_modified_since = (
             if_modified_since if if_modified_since is not None else self.if_modified_since
         ) or None
+        snapshot_started = _as_utc(now or datetime.now(timezone.utc))
+        safe_marker = _utc_marker(snapshot_started)
+        can_probe = bool(
+            self.has_content()
+            and request_if_modified_since
+            and self.region_id == region_id
+            and self.environment == environment
+        )
+        if can_probe:
+            probe = self._fetch_page(
+                client,
+                region_id=region_id,
+                page_number=1,
+                page_size=page_size,
+                if_modified_since=request_if_modified_since,
+            )
+            if probe is None:
+                # 304 is a no-op: neither content nor sync marker moves.
+                return LemanaMirrorSyncResult(
+                    changed=False,
+                    not_modified=True,
+                    item_count=self.count(),
+                    revision=self.revision,
+                    malformed_count=0,
+                    synced_at=self.last_synced_at,
+                )
+            # A 200 probe is a delta response, not a snapshot.  Discard it and
+            # restart page 1 without If-Modified-Since.
+        collected, malformed_count = self._fetch_snapshot(
+            client,
+            region_id=region_id,
+            page_size=page_size,
+            page_limit=page_limit,
+            item_limit=item_limit,
+        )
+        completed_at = _utc_marker(datetime.now(timezone.utc))
+        revision = self._fingerprint(collected, region_id, environment)
+        changed = (
+            revision != self.revision
+            or self.region_id != region_id
+            or self.environment != environment
+        )
+        with self._connect() as connection:
+            if changed:
+                connection.execute("DELETE FROM lemana_products")
+                for product in sorted(collected.values(), key=lambda item: item.product_item):
+                    connection.execute(
+                        """INSERT INTO lemana_products(
+                           product_item, product_available, product_name,
+                           product_description, product_url, product_model,
+                           normalized_model, product_brand, product_photo_json,
+                           product_barcode, product_params_json,
+                           product_unit_sale_json, categories_json, normalized_text
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        self._record(product),
+                    )
+            self._set_meta(connection, "revision", revision)
+            self._set_meta(connection, "last_synced_at", completed_at)
+            # This marker is the beginning of the full snapshot, never its
+            # completion time, so changes during a long sync are not skipped.
+            self._set_meta(connection, "if_modified_since", safe_marker)
+            self._set_meta(connection, "region_id", str(region_id))
+            self._set_meta(connection, "environment", environment)
+        return LemanaMirrorSyncResult(
+            changed=changed,
+            not_modified=False,
+            item_count=len(collected),
+            revision=revision,
+            malformed_count=malformed_count,
+            synced_at=completed_at,
+        )
+
+    def _fetch_page(
+        self,
+        client: Any,
+        *,
+        region_id: int,
+        page_number: int,
+        page_size: int,
+        if_modified_since: str | None,
+    ) -> LemanaProductsPage | None:
+        try:
+            page = client.get_products(
+                region_id=region_id,
+                page=page_number,
+                per_page=page_size,
+                if_modified_since=if_modified_since,
+            )
+        except SourcingProviderError:
+            raise
+        except Exception as exc:
+            raise SourcingProviderError(
+                "Синхронизация каталога Lemana PRO B2B не выполнена",
+                category="upstream_error",
+            ) from exc
+        if page is not None and not isinstance(page, LemanaProductsPage):
+            raise SourcingProviderError(
+                "Лемана PRO B2B вернула некорректную страницу каталога",
+                category="invalid_response",
+            )
+        return page
+
+    def _fetch_snapshot(
+        self,
+        client: Any,
+        *,
+        region_id: int,
+        page_size: int,
+        page_limit: int,
+        item_limit: int,
+    ) -> tuple[dict[str, LemanaProductRecord], int]:
         collected: dict[str, LemanaProductRecord] = {}
         malformed_count = 0
         total_count: int | None = None
-        not_modified = False
         for page_number in range(1, page_limit + 1):
-            try:
-                page = client.get_products(
-                    region_id=region_id,
-                    page=page_number,
-                    per_page=page_size,
-                    if_modified_since=request_if_modified_since,
-                )
-            except SourcingProviderError:
-                raise
-            except Exception as exc:
-                raise SourcingProviderError(
-                    "Синхронизация каталога Lemana PRO B2B не выполнена",
-                    category="upstream_error",
-                ) from exc
+            page = self._fetch_page(
+                client,
+                region_id=region_id,
+                page_number=page_number,
+                page_size=page_size,
+                if_modified_since=None,
+            )
             if page is None:
-                if page_number == 1:
-                    not_modified = True
-                    break
                 raise SourcingProviderError(
                     "Лемана PRO B2B вернула неполную синхронизацию каталога",
-                    category="invalid_response",
-                )
-            if not isinstance(page, LemanaProductsPage):
-                raise SourcingProviderError(
-                    "Лемана PRO B2B вернула некорректную страницу каталога",
                     category="invalid_response",
                 )
             malformed_count += max(0, int(page.malformed_count))
@@ -187,50 +312,10 @@ class LemanaCatalogMirror:
             if len(page.products) < page_size or (
                 total_count is not None and len(collected) >= total_count
             ):
-                break
-        else:
-            raise SourcingProviderError(
-                "Каталог Lemana PRO B2B превышает безопасный лимит страниц",
-                category="invalid_response",
-            )
-
-        timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
-        if not_modified:
-            return LemanaMirrorSyncResult(
-                changed=False,
-                not_modified=True,
-                item_count=self.count(),
-                revision=self.revision,
-                malformed_count=0,
-                synced_at=self.last_synced_at,
-            )
-        revision = self._fingerprint(collected, region_id)
-        changed = revision != self.revision or self.region_id != region_id
-        with self._connect() as connection:
-            if changed:
-                connection.execute("DELETE FROM lemana_products")
-                for product in sorted(collected.values(), key=lambda item: item.product_item):
-                    connection.execute(
-                        """INSERT INTO lemana_products(
-                           product_item, product_available, product_name,
-                           product_description, product_url, product_model,
-                           product_brand, product_photo_json, product_barcode,
-                           product_params_json, product_unit_sale_json,
-                           categories_json, normalized_text
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        self._record(product),
-                    )
-            self._set_meta(connection, "revision", revision)
-            self._set_meta(connection, "last_synced_at", timestamp)
-            self._set_meta(connection, "if_modified_since", timestamp)
-            self._set_meta(connection, "region_id", str(region_id))
-        return LemanaMirrorSyncResult(
-            changed=changed,
-            not_modified=False,
-            item_count=len(collected),
-            revision=revision,
-            malformed_count=malformed_count,
-            synced_at=timestamp,
+                return collected, malformed_count
+        raise SourcingProviderError(
+            "Каталог Lemana PRO B2B превышает безопасный лимит страниц",
+            category="invalid_response",
         )
 
     @staticmethod
@@ -268,6 +353,7 @@ class LemanaCatalogMirror:
             product.product_description,
             product.product_url,
             product.product_model,
+            normalize_catalog_text(product.product_model),
             product.product_brand,
             cls._json(product.product_photo, "null"),
             product.product_barcode,
@@ -279,9 +365,10 @@ class LemanaCatalogMirror:
 
     @classmethod
     def _fingerprint(
-        cls, products: dict[str, LemanaProductRecord], region_id: int
+        cls, products: dict[str, LemanaProductRecord], region_id: int, environment: str
     ) -> str:
         payload = {
+            "environment": environment,
             "region_id": region_id,
             "products": [
                 json.loads(json.dumps(product.model_dump(mode="json"), ensure_ascii=False))
@@ -309,16 +396,36 @@ class LemanaCatalogMirror:
         terms = list(dict.fromkeys(terms))[:32]
         if not terms:
             return []
-        clauses = " OR ".join("normalized_text LIKE ?" for _ in terms)
-        params = [f"%{term}%" for term in terms]
         candidate_limit = min(max(max(1, int(limit)) * 10, 100), 1_000)
+        rows_by_id: dict[str, sqlite3.Row] = {}
         with self._connect() as connection:
-            rows = connection.execute(
+            article = str(intent.article or "").strip()
+            if article:
+                exact_rows = connection.execute(
+                    "SELECT * FROM lemana_products WHERE product_item=?",
+                    (article,),
+                ).fetchall()
+                rows_by_id.update({row["product_item"]: row for row in exact_rows})
+            model = normalize_catalog_text(intent.model)
+            if model:
+                model_rows = connection.execute(
+                    "SELECT * FROM lemana_products WHERE normalized_model=? "
+                    "ORDER BY product_item LIMIT ?",
+                    (model, candidate_limit),
+                ).fetchall()
+                rows_by_id.update({row["product_item"]: row for row in model_rows})
+            clauses = " OR ".join("normalized_text LIKE ?" for _ in terms)
+            params = [f"%{term}%" for term in terms]
+            broad_rows = connection.execute(
                 f"SELECT * FROM lemana_products WHERE {clauses} "
                 "ORDER BY product_item LIMIT ?",
                 [*params, candidate_limit],
             ).fetchall()
-        ranked = [(self._score(intent, row, terms), self._from_row(row)) for row in rows]
+            rows_by_id.update({row["product_item"]: row for row in broad_rows})
+        ranked = [
+            (self._score(intent, row, terms), self._from_row(row))
+            for row in rows_by_id.values()
+        ]
         ranked.sort(key=lambda item: (-item[0], item[1].product_item))
         return [product for _, product in ranked[: max(1, min(int(limit), 100))]]
 
@@ -363,3 +470,13 @@ class LemanaCatalogMirror:
 
 def _tokens(value: Any) -> list[str]:
     return [token for token in normalize_catalog_text(value).split() if len(token) > 1]
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _utc_marker(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")

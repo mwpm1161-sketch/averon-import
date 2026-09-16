@@ -107,7 +107,17 @@ def test_multi_page_sync_deduplicates_by_product_item_and_is_incremental(tmp_pat
 
     first = mirror.sync(client, region_id=34, per_page=2)
     revision = first.revision
-    same_client = FakeMirrorClient([page([product("1"), product("2", name="Updated duplicate"), product("3")], total_count=3)])
+    same_client = FakeMirrorClient(
+        [
+            # A 200 response to the If-Modified-Since probe is a delta, not
+            # a snapshot.  The following response is the complete snapshot.
+            page([product("2", name="Updated duplicate")], total_count=1),
+            page(
+                [product("1"), product("2", name="Updated duplicate"), product("3")],
+                total_count=3,
+            ),
+        ]
+    )
     second = mirror.sync(
         same_client,
         region_id=34,
@@ -119,8 +129,9 @@ def test_multi_page_sync_deduplicates_by_product_item_and_is_incremental(tmp_pat
     assert mirror.search(intent(query="Updated duplicate"))[0].product_name == "Updated duplicate"
     assert second.changed is False
     assert second.revision == revision
-    assert mirror.last_synced_at.endswith("+00:00")
+    assert mirror.last_synced_at.endswith("Z")
     assert same_client.calls[0]["if_modified_since"] is not None
+    assert same_client.calls[1]["if_modified_since"] is None
 
 
 def test_not_modified_does_not_change_revision_or_content(tmp_path):
@@ -150,6 +161,32 @@ def test_failed_multi_page_sync_preserves_previous_mirror(tmp_path):
     with pytest.raises(SourcingProviderError):
         mirror.sync(broken, region_id=34, per_page=1)
 
+    assert mirror.revision == old_revision
+    assert mirror.count() == 1
+    assert mirror.search(intent(article="old"))[0].product_item == "old"
+
+
+def test_failed_full_snapshot_after_delta_probe_preserves_previous_mirror(tmp_path):
+    mirror = LemanaCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync(FakeMirrorClient([page([product("old")], total_count=1)]), region_id=34)
+    old_revision = mirror.revision
+
+    class FailAfterProbeClient:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def get_products(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return page([product("new")], total_count=1)
+            raise SourcingProviderError("temporary upstream failure", category="network")
+
+    broken = FailAfterProbeClient()
+    with pytest.raises(SourcingProviderError):
+        mirror.sync(broken, region_id=34)
+
+    assert broken.calls[0]["if_modified_since"] is not None
+    assert broken.calls[1]["if_modified_since"] is None
     assert mirror.revision == old_revision
     assert mirror.count() == 1
     assert mirror.search(intent(article="old"))[0].product_item == "old"
@@ -201,10 +238,85 @@ def test_revision_changes_only_after_accepted_content_update(tmp_path):
     original = mirror.revision
 
     updated = mirror.sync(
-        FakeMirrorClient([page([product("1", price_hint="b")], total_count=1)]),
+        FakeMirrorClient(
+            [
+                page([product("1", price_hint="b")], total_count=1),
+                page([product("1", price_hint="b")], total_count=1),
+            ]
+        ),
         region_id=34,
     )
 
     assert updated.changed is True
     assert updated.revision != original
     assert mirror.search(intent(article="1"))[0].product_params["hint"] == "b"
+
+
+def test_region_switch_does_not_probe_or_reuse_old_mirror(tmp_path):
+    mirror = LemanaCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync(FakeMirrorClient([page([product("old")], total_count=1)]), region_id=34)
+
+    switched = FakeMirrorClient([page([product("new")], total_count=1)])
+    result = mirror.sync(switched, region_id=35)
+
+    assert result.changed is True
+    assert switched.calls[0]["if_modified_since"] is None
+    assert mirror.region_id == 35
+    assert "old" not in {item.product_item for item in mirror.search(intent(article="old"))}
+    assert mirror.search(intent(article="new"))[0].product_item == "new"
+
+
+def test_environment_switch_does_not_probe_or_reuse_old_mirror(tmp_path):
+    mirror = LemanaCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync(
+        FakeMirrorClient([page([product("test")], total_count=1)]),
+        region_id=34,
+        environment="test",
+    )
+
+    switched = FakeMirrorClient([page([product("prod")], total_count=1)])
+    result = mirror.sync(switched, region_id=34, environment="prod")
+
+    assert result.changed is True
+    assert switched.calls[0]["if_modified_since"] is None
+    assert mirror.environment == "prod"
+    assert "test" not in {item.product_item for item in mirror.search(intent(article="test"))}
+    assert mirror.search(intent(article="prod"))[0].product_item == "prod"
+
+
+def test_revision_includes_region_and_environment(tmp_path):
+    mirror = LemanaCatalogMirror(tmp_path / "catalog.sqlite3")
+    first = mirror.sync(
+        FakeMirrorClient([page([product("same")], total_count=1)]),
+        region_id=34,
+        environment="test",
+    )
+    second = mirror.sync(
+        FakeMirrorClient([page([product("same")], total_count=1)]),
+        region_id=35,
+        environment="prod",
+    )
+
+    assert second.revision != first.revision
+    assert mirror.region_id == 35
+    assert mirror.environment == "prod"
+
+
+def test_exact_item_is_retrieved_before_broad_candidate_limit(tmp_path):
+    mirror = LemanaCatalogMirror(tmp_path / "catalog.sqlite3")
+    products = [product(f"{index:06d}", name="Клапан массовый") for index in range(1001)]
+    products.append(product("999999", name="Клапан точный"))
+    pages = [
+        page(chunk, page_number=page_number, per_page=100, total_count=len(products))
+        for page_number, chunk in enumerate(
+            (products[index : index + 100] for index in range(0, len(products), 100)),
+            start=1,
+        )
+    ]
+    mirror.sync(FakeMirrorClient(pages), region_id=34, per_page=100)
+
+    first = mirror.search(intent(article="999999", query="клапан"), limit=1)
+    second = mirror.search(intent(article="999999", query="клапан"), limit=1)
+
+    assert first[0].product_item == "999999"
+    assert [item.product_item for item in first] == [item.product_item for item in second]

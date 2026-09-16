@@ -194,6 +194,53 @@ def test_configured_provider_without_mirror_is_not_reported_healthy(tmp_path):
     assert client.access_calls == 0
 
 
+def test_region_affinity_mismatch_blocks_health_and_search_before_auth(tmp_path):
+    provider, client, mirror = configured_provider(tmp_path)
+
+    class SyncClient(ProviderClient):
+        def get_products(self, **kwargs):
+            return LemanaProductsPage(products=(product(),), page=1, per_page=100, total_count=1)
+
+    mirror.sync(SyncClient(), region_id=34, environment="test")
+    provider.settings.region_id = 35
+
+    state = provider.stats()
+
+    assert state.configured is True
+    assert state.reachable is False
+    assert "окружения и региона" in state.error
+    assert client.access_calls == 0
+    with pytest.raises(SourcingProviderError, match="окружения и региона"):
+        provider.search(intent())
+    assert client.access_calls == 0
+
+
+def test_environment_affinity_mismatch_blocks_health_and_sync_restores_it(tmp_path):
+    provider, client, mirror = configured_provider(tmp_path)
+
+    class SyncClient(ProviderClient):
+        def get_products(self, **kwargs):
+            return LemanaProductsPage(products=(product(),), page=1, per_page=100, total_count=1)
+
+    mirror.sync(SyncClient(), region_id=34, environment="test")
+    provider.settings.environment = "prod"
+
+    state = provider.stats()
+
+    assert state.configured is True
+    assert state.reachable is False
+    assert "окружения и региона" in state.error
+    assert client.access_calls == 0
+
+    client.get_products = SyncClient().get_products
+    provider.sync()
+    restored = provider.stats()
+    assert restored.reachable is True
+    assert mirror.environment == "prod"
+    assert mirror.region_id == 34
+    assert client.access_calls == 1
+
+
 def test_project_continues_after_one_lemana_price_failure(tmp_path):
     class FailOnceClient(ProviderClient):
         def __init__(self):

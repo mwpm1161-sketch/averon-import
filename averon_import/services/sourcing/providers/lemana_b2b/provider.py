@@ -73,6 +73,17 @@ class LemanaB2BProvider:
                 catalog_version=revision,
                 error="Лемана ПРО B2B не настроен",
             )
+        if (
+            self.mirror.environment != self.settings.environment
+            or self.mirror.region_id != self.settings.region_id
+        ):
+            return SourcingProviderRuntimeState(
+                configured=True,
+                reachable=False,
+                item_count=item_count,
+                catalog_version=revision,
+                error="Зеркало нужно синхронизировать для текущего окружения и региона",
+            )
         if not self.mirror.has_content():
             return SourcingProviderRuntimeState(
                 configured=True,
@@ -112,11 +123,13 @@ class LemanaB2BProvider:
         return self.mirror.sync(
             self.client,
             region_id=self.settings.region_id,
+            environment=self.settings.environment,
             per_page=100,
         )
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
         self._ensure_configured()
+        self._ensure_affinity()
         if not self.mirror.has_content():
             raise SourcingProviderError(
                 "Локальное зеркало Лемана ПРО B2B ещё не синхронизировано",
@@ -140,6 +153,17 @@ class LemanaB2BProvider:
                 "Лемана ПРО B2B не настроен",
                 code="NOT_CONFIGURED",
                 category="not_configured",
+            )
+
+    def _ensure_affinity(self) -> None:
+        if (
+            self.mirror.environment != self.settings.environment
+            or self.mirror.region_id != self.settings.region_id
+        ):
+            raise SourcingProviderError(
+                "Зеркало нужно синхронизировать для текущего окружения и региона",
+                code="CATALOG_AFFINITY_MISMATCH",
+                category="health_error",
             )
         if self.settings.region_id is None:
             raise SourcingProviderError(
