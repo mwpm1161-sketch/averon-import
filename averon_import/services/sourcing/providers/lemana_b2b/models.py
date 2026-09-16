@@ -9,7 +9,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 class LemanaSupplierModel(BaseModel):
     """Bounded provider-side representation of an official supplier object."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
 class LemanaProductRecord(LemanaSupplierModel):
