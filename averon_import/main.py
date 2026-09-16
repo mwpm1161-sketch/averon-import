@@ -115,6 +115,17 @@ demo_store_provider = sourcing_runtime.providers["demo_store_http"]
 sourcing_service = sourcing_runtime.service
 human_review_service = HumanReviewService()
 
+
+def _rebuild_sourcing_runtime() -> None:
+    """Rebind sourcing dependencies after settings or secret changes."""
+
+    global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
+    sourcing_runtime = create_sourcing_runtime(DATA_DIR, app_settings_service, secret_store)
+    sourcing_repository = sourcing_runtime.repository
+    sourcing_provider = sourcing_runtime.providers["local_catalog"]
+    demo_store_provider = sourcing_runtime.providers["demo_store_http"]
+    sourcing_service = sourcing_runtime.service
+
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
@@ -305,11 +316,7 @@ def put_settings(request: SettingsUpdate):
     patch = {key: value for key, value in patch.items() if value is not None}
     try:
         app_settings_service.update(patch)
-        sourcing_runtime = create_sourcing_runtime(DATA_DIR, app_settings_service, secret_store)
-        sourcing_repository = sourcing_runtime.repository
-        sourcing_provider = sourcing_runtime.providers["local_catalog"]
-        demo_store_provider = sourcing_runtime.providers["demo_store_http"]
-        sourcing_service = sourcing_runtime.service
+        _rebuild_sourcing_runtime()
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {}
         location = ".".join(str(part) for part in first.get("loc", ()))
@@ -332,6 +339,7 @@ def delete_yandex_ai_api_key():
 @app.delete("/api/settings/lemana-client-secret")
 def delete_lemana_client_secret():
     secret_store.delete(LEMANA_B2B_CLIENT_SECRET)
+    _rebuild_sourcing_runtime()
     return {"deleted": True}
 
 

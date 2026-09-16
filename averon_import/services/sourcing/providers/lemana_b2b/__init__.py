@@ -3,6 +3,7 @@
 from .client import (
     LEMANA_API_URLS,
     LEMANA_AUTH_URL,
+    LEMANA_AUTH_URLS,
     LEMANA_PRICE_BATCH_PATH,
     LEMANA_PRICE_PATH,
     LEMANA_PRODUCTS_PATH,
@@ -23,6 +24,7 @@ from .provider import LemanaB2BProvider
 __all__ = [
     "LEMANA_API_URLS",
     "LEMANA_AUTH_URL",
+    "LEMANA_AUTH_URLS",
     "LEMANA_PRICE_BATCH_PATH",
     "LEMANA_PRICE_PATH",
     "LEMANA_PRODUCTS_PATH",

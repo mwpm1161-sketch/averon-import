@@ -224,11 +224,7 @@ class AppSettingsService:
 
     def update(self, patch: dict) -> AppSettings:
         current = json.loads(self.settings.model_dump_json())
-        for key, value in patch.items():
-            if isinstance(value, dict) and isinstance(current.get(key), dict):
-                current[key] = {**current[key], **value}
-            else:
-                current[key] = value
+        current = _deep_merge_settings(current, patch)
         candidate = AppSettings.model_validate(current)
         self.settings = candidate
         self.apply_env_overrides()
@@ -270,6 +266,17 @@ def _env_bool(value: str) -> bool | None:
     if normalized in {"0", "false", "no", "off", "нет"}:
         return False
     return None
+
+
+def _deep_merge_settings(current: object, patch: object) -> object:
+    """Recursively merge mappings while replacing lists and scalar values."""
+
+    if isinstance(current, dict) and isinstance(patch, dict):
+        merged = dict(current)
+        for key, value in patch.items():
+            merged[key] = _deep_merge_settings(merged[key], value) if key in merged else value
+        return merged
+    return patch
 
 
 def normalize_http_base_url(value: str) -> str:

@@ -11,6 +11,7 @@ from averon_import.services.sourcing.providers.base import SourcingProviderError
 from averon_import.services.sourcing.providers.lemana_b2b import (
     LEMANA_API_URLS,
     LEMANA_AUTH_URL,
+    LEMANA_AUTH_URLS,
     LEMANA_PRICE_BATCH_PATH,
     LEMANA_PRICE_PATH,
     LEMANA_PRODUCTS_PATH,
@@ -95,13 +96,14 @@ def test_constructor_does_not_call_network_and_selects_known_environment_url():
 
     assert transport.calls == []
     assert client.api_base_url == LEMANA_API_URLS["test"]
-    assert client.auth_url == LEMANA_AUTH_URL
+    assert client.auth_url == LEMANA_AUTH_URLS["test"]
     assert client.configured is True
 
     prod = LemanaB2BClient(
         _settings(environment="prod"), "secret-value", transport=FakeTransport([])
     )
     assert prod.api_base_url == LEMANA_API_URLS["prod"]
+    assert prod.auth_url == LEMANA_AUTH_URLS["prod"]
 
 
 def test_client_credentials_form_and_token_cache():
@@ -115,7 +117,7 @@ def test_client_credentials_form_and_token_cache():
     assert str(prices[0].price) == "796.14"
     assert len(transport.calls) == 3
     auth_method, auth_url, _, auth_body = transport.calls[0]
-    assert auth_method == "POST" and auth_url == LEMANA_AUTH_URL
+    assert auth_method == "POST" and auth_url == LEMANA_AUTH_URLS["test"]
     assert parse_qs((auth_body or b"").decode()) == {
         "grant_type": ["client_credentials"],
         "client_id": ["client-1"],

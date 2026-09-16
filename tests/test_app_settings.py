@@ -82,6 +82,30 @@ def test_demo_store_url_is_validated_and_persisted(tmp_path):
         service.update({"sourcing": {"demo_store_base_url": "ftp://store.example"}})
 
 
+def test_nested_sourcing_settings_update_preserves_untouched_lemana_fields(tmp_path):
+    service = AppSettingsService(tmp_path)
+    service.update({
+        "sourcing": {
+            "lemana_b2b": {
+                "enabled": True,
+                "environment": "prod",
+                "client_id": "abc",
+                "region_id": 34,
+                "request_timeout_s": 10,
+            }
+        }
+    })
+    service.update({"sourcing": {"lemana_b2b": {"request_timeout_s": 20}}})
+
+    assert service.settings.sourcing.lemana_b2b.model_dump() == {
+        "enabled": True,
+        "environment": "prod",
+        "client_id": "abc",
+        "region_id": 34,
+        "request_timeout_s": 20.0,
+    }
+
+
 def test_invalid_json_falls_back_to_defaults_with_warning(tmp_path):
     (tmp_path / "settings.json").write_text("{not valid json", encoding="utf-8")
     service = AppSettingsService(tmp_path)
@@ -330,6 +354,32 @@ def test_put_selects_demo_store_without_changing_vision_or_ai_credentials(api):
     assert payload["sourcing"]["demo_store_base_url"] == "http://demo.example"
 
 
+def test_settings_api_nested_lemana_update_preserves_other_fields(api):
+    app_module, _, service = api
+    app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            lemana_b2b=app_module.LemanaB2BSettingsUpdate(
+                enabled=True,
+                environment="prod",
+                client_id="abc",
+                region_id=34,
+                request_timeout_s=10,
+            )
+        )
+    ))
+    app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            lemana_b2b=app_module.LemanaB2BSettingsUpdate(request_timeout_s=20),
+        )
+    ))
+
+    assert service.settings.sourcing.lemana_b2b.enabled is True
+    assert service.settings.sourcing.lemana_b2b.environment == "prod"
+    assert service.settings.sourcing.lemana_b2b.client_id == "abc"
+    assert service.settings.sourcing.lemana_b2b.region_id == 34
+    assert service.settings.sourcing.lemana_b2b.request_timeout_s == 20
+
+
 def test_replace_and_delete_api_key_without_reading_it_back(api):
     app_module, store, _ = api
     app_module.put_settings(app_module.SettingsUpdate(api_key="first-key"))
@@ -355,6 +405,32 @@ def test_lemana_client_secret_is_write_only_and_not_persisted(api):
     assert "client_secret" not in (service.path.read_text(encoding="utf-8") if service.path.exists() else "")
     assert app_module.delete_lemana_client_secret() == {"deleted": True}
     assert store.get(LEMANA_B2B_CLIENT_SECRET) is None
+
+
+def test_lemana_secret_delete_rebuilds_runtime_and_public_state(api, monkeypatch):
+    app_module, store, _ = api
+    monkeypatch.delenv("AVERON_LEMANA_B2B_CLIENT_SECRET", raising=False)
+    app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            lemana_b2b=app_module.LemanaB2BSettingsUpdate(
+                enabled=True,
+                environment="test",
+                client_id="client-1",
+                region_id=34,
+            )
+        ),
+        lemana_client_secret="private-secret",
+    ))
+    before = app_module.sourcing_runtime.providers["lemana_b2b"]
+    assert before.configured is True
+
+    assert app_module.delete_lemana_client_secret() == {"deleted": True}
+    after = app_module.sourcing_runtime.providers["lemana_b2b"]
+    payload = app_module.get_settings()
+
+    assert store.get(LEMANA_B2B_CLIENT_SECRET) is None
+    assert after.configured is False
+    assert payload["sourcing"]["lemana_b2b"]["client_secret_configured"] is False
 
 
 def test_put_rejects_invalid_payload_values():

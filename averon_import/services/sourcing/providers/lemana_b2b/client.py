@@ -14,9 +14,18 @@ from averon_import.services.sourcing.providers.base import SourcingProviderError
 
 from .models import LemanaPriceRecord, LemanaProductsPage, parse_price_payload, parse_products_payload
 
-LEMANA_AUTH_URL = (
-    "https://customer.auth.lemanapro.ru/realms/b2b/protocol/openid-connect/token"
-)
+LEMANA_AUTH_URLS: dict[str, str] = {
+    "test": (
+        "https://internal-customer-preprod.auth.lmru.tech/realms/b2b"
+        "/protocol/openid-connect/token"
+    ),
+    "prod": (
+        "https://customer.auth.lemanapro.ru/realms/b2b"
+        "/protocol/openid-connect/token"
+    ),
+}
+# Compatibility alias for integrations that used the production constant.
+LEMANA_AUTH_URL = LEMANA_AUTH_URLS["prod"]
 LEMANA_API_URLS: dict[str, str] = {
     "test": "https://api-test.lemanapro.ru",
     "prod": "https://api.lemanapro.ru",
@@ -78,7 +87,7 @@ class LemanaB2BClient:
 
     @property
     def auth_url(self) -> str:
-        return LEMANA_AUTH_URL
+        return LEMANA_AUTH_URLS[self.settings.environment]
 
     @property
     def configured(self) -> bool:
