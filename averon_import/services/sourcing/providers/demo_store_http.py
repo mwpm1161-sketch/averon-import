@@ -22,7 +22,10 @@ from averon_import.services.sourcing.models import (
     ProductIntent,
     SourcingProviderCapabilities,
 )
-from averon_import.services.sourcing.providers.base import SourcingProviderError
+from averon_import.services.sourcing.providers.base import (
+    SourcingProviderCachePolicy,
+    SourcingProviderError,
+)
 
 
 class DemoStoreProviderError(SourcingProviderError):
@@ -91,6 +94,7 @@ def _retrieval_payload(intent: ProductIntent) -> dict[str, Any]:
 class DemoStoreHttpProvider:
     key = "demo_store_http"
     label = "Averon Demo Store"
+    cache_policy = SourcingProviderCachePolicy()
     capabilities = SourcingProviderCapabilities(
         supports_price=True,
         supports_availability=True,

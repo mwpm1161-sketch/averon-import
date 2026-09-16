@@ -17,7 +17,10 @@ from averon_import.services.sourcing.models import (
     SourcingProviderCapabilities,
     SourcingProviderRuntimeState,
 )
-from averon_import.services.sourcing.providers.base import SourcingProviderError
+from averon_import.services.sourcing.providers.base import (
+    SourcingProviderCachePolicy,
+    SourcingProviderError,
+)
 
 from .client import LemanaB2BClient
 from .mirror import LemanaCatalogMirror, LemanaMirrorSyncResult
@@ -26,6 +29,7 @@ from .mirror import LemanaCatalogMirror, LemanaMirrorSyncResult
 class LemanaB2BProvider:
     key = "lemana_b2b"
     label = "Лемана ПРО B2B"
+    cache_policy = SourcingProviderCachePolicy(cache_search_results=False)
     capabilities = SourcingProviderCapabilities(
         supports_price=True,
         supports_availability=True,
@@ -219,13 +223,11 @@ def _currency(value: Any) -> str:
 
 
 def _unit(value: Any) -> str:
-    if value is None:
-        return "шт."
     if isinstance(value, dict):
-        value = value.get("name") or value.get("unit") or value.get("code")
-    if isinstance(value, (dict, list)):
-        return "шт."
-    return str(value).strip() or "шт."
+        value = value.get("unitName") or value.get("name") or value.get("unit") or value.get("code")
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return str(value).strip()
 
 
 def _safe_url(value: Any) -> str:

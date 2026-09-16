@@ -218,12 +218,10 @@ class LemanaB2BClient:
         return value
 
     @staticmethod
-    def _json_product_item(value: str) -> int | str:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return value
-        return parsed if parsed >= 0 else value
+    def _json_product_item(value: str) -> str:
+        """Preserve the documented string identifier losslessly on the wire."""
+
+        return str(value)
 
     def _get_token(self, *, force: bool = False) -> str:
         if not self.settings.enabled or not self.settings.client_id.strip() or not self._client_secret:

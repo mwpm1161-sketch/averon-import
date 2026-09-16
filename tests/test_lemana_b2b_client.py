@@ -129,10 +129,21 @@ def test_client_credentials_form_and_token_cache():
     assert json.loads((transport.calls[2][3] or b"{}").decode()) == {
         "limit": 100,
         "offset": 0,
-        "productItem": [82331508],
+        "productItem": ["82331508"],
         "regionId": 34,
         "retailPrice": False,
     }
+
+
+def test_price_request_preserves_leading_zero_product_item_as_string():
+    item = "0000123"
+    transport = FakeTransport([_token(), _prices_response(item)])
+    client = LemanaB2BClient(_settings(), "secret", transport=transport)
+
+    prices = client.get_prices([item])
+
+    assert prices[0].product_item == item
+    assert json.loads((transport.calls[-1][3] or b"{}").decode())["productItem"] == [item]
 
 
 def test_token_expires_with_safety_margin_and_is_refreshed():

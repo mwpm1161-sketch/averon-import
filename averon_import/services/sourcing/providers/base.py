@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from averon_import.services.sourcing.models import (
@@ -35,6 +36,13 @@ class SourcingProviderError(ValueError):
         super().__init__(message)
 
 
+@dataclass(frozen=True)
+class SourcingProviderCachePolicy:
+    """Typed provider policy for persisted search-result reuse."""
+
+    cache_search_results: bool = True
+
+
 class SourcingProvider(Protocol):
     key: str
     label: str
@@ -62,6 +70,17 @@ def get_provider_capabilities(provider: object) -> SourcingProviderCapabilities:
         return SourcingProviderCapabilities.model_validate(payload)
     except Exception:
         return SourcingProviderCapabilities()
+
+
+def get_provider_cache_policy(provider: object) -> SourcingProviderCachePolicy:
+    """Return the provider cache policy, keeping legacy providers cacheable."""
+
+    raw = getattr(provider, "cache_policy", None)
+    if isinstance(raw, SourcingProviderCachePolicy):
+        return SourcingProviderCachePolicy(
+            cache_search_results=raw.cache_search_results is True,
+        )
+    return SourcingProviderCachePolicy()
 
 
 def _unavailable_provider_runtime_state() -> SourcingProviderRuntimeState:

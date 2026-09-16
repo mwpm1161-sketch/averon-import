@@ -25,6 +25,7 @@ def product(
     name: str = "Клапан шаровый",
     available: bool | None = True,
     url: str = "https://example.test/p/1",
+    unit_sale=None,
 ):
     return LemanaProductRecord(
         product_item=item,
@@ -36,7 +37,7 @@ def product(
         product_brand="Brand",
         product_barcode="4600000000000",
         product_params={"diameter": "100"},
-        product_unit_sale={"name": "шт."},
+        product_unit_sale={"name": "шт."} if unit_sale is None else unit_sale,
         categories=[{"id": 10}],
     )
 
@@ -294,35 +295,75 @@ def test_project_continues_after_one_lemana_price_failure(tmp_path):
     assert client.failed is True
 
 
-def test_sourcing_cache_key_uses_mirror_revision(tmp_path):
+def test_lemana_live_prices_bypass_search_cache_with_same_mirror_revision(tmp_path):
     price = LemanaPriceRecord("82331508", Decimal("10"), "Rub")
     provider, client, mirror = configured_provider(tmp_path, prices=[price])
 
     class SyncClient(ProviderClient):
-        def __init__(self, current_product):
-            super().__init__()
-            self.current_product = current_product
-
         def get_products(self, **kwargs):
             return LemanaProductsPage(
-                products=(self.current_product,), page=1, per_page=100, total_count=1
+                products=(product(),), page=1, per_page=100, total_count=1
             )
 
-    mirror.sync(SyncClient(product()), region_id=34)
+    mirror.sync(SyncClient(), region_id=34)
+    class TrackingCache(SourcingCache):
+        def __init__(self, path):
+            super().__init__(path)
+            self.get_calls = 0
+            self.set_calls = 0
+
+        def get(self, key):
+            self.get_calls += 1
+            return super().get(key)
+
+        def set(self, key, value):
+            self.set_calls += 1
+            return super().set(key, value)
+
+    cache = TrackingCache(tmp_path / "cache.json")
     service = SourcingService(
         {provider.key: provider},
         default_provider=provider.key,
-        cache=SourcingCache(tmp_path / "cache.json"),
+        cache=cache,
     )
 
     first = service.search_intent(intent(), ai_rerank=False)
+    revision = mirror.revision
+    client.prices = (LemanaPriceRecord("82331508", Decimal("20"), "Rub"),)
     second = service.search_intent(intent(), ai_rerank=False)
-    old_revision = mirror.revision
-    mirror.sync(SyncClient(product(name="Клапан обновлён")), region_id=34)
-    third = service.search_intent(intent(), ai_rerank=False)
 
     assert first.timings["search_cache_hit"] == 0.0
-    assert second.timings["search_cache_hit"] == 1.0
-    assert mirror.revision != old_revision
-    assert third.timings["search_cache_hit"] == 0.0
-    assert client.price_calls
+    assert second.timings["search_cache_hit"] == 0.0
+    assert mirror.revision == revision
+    assert first.offers[0].price == Decimal("10")
+    assert second.offers[0].price == Decimal("20")
+    assert client.price_calls == [(('82331508',), 34), (('82331508',), 34)]
+    assert cache.get_calls == 0
+    assert cache.set_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("unit_sale", "expected"),
+    [
+        ({"unitOkeiCode": 166, "unitName": "кг"}, "кг"),
+        ({"unitOkeiCode": 166}, ""),
+    ],
+)
+def test_supplier_unit_name_is_preserved_without_fabricating_unknown_unit(
+    tmp_path, unit_sale, expected
+):
+    price = LemanaPriceRecord("82331508", Decimal("10"), "Rub")
+    provider, _, mirror = configured_provider(tmp_path, prices=[price])
+
+    class SyncClient(ProviderClient):
+        def get_products(self, **kwargs):
+            return LemanaProductsPage(
+                products=(product(unit_sale=unit_sale),),
+                page=1,
+                per_page=100,
+                total_count=1,
+            )
+
+    mirror.sync(SyncClient(), region_id=34)
+
+    assert provider.search(intent())[0].price_unit == expected

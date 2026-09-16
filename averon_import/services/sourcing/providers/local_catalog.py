@@ -6,11 +6,13 @@ from averon_import.services.sourcing.models import (
     ProductIntent,
     SourcingProviderCapabilities,
 )
+from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy
 
 
 class LocalCatalogProvider:
     key = "local_catalog"
     label = "Локальный каталог"
+    cache_policy = SourcingProviderCachePolicy()
     capabilities = SourcingProviderCapabilities(
         supports_price=True,
         supports_availability=True,

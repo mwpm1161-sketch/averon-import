@@ -16,7 +16,10 @@ from averon_import.services.sourcing.models import (
 )
 from averon_import.services.app_settings import LemanaB2BSettings
 from averon_import.services.sourcing.product_understanding import SourcingAIService
-from averon_import.services.sourcing.providers.base import get_provider_capabilities
+from averon_import.services.sourcing.providers.base import (
+    get_provider_cache_policy,
+    get_provider_capabilities,
+)
 from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
 from averon_import.services.sourcing.providers.local_catalog import (
     LemanaB2BProvider,
@@ -83,6 +86,17 @@ def test_builtin_provider_capability_matrices(tmp_path):
     assert local.capabilities.supports_batch_search is False
     assert local.capabilities.supports_stock_quantity is False
     assert demo.capabilities is not local.capabilities
+
+
+def test_builtin_provider_search_cache_policies_are_explicit_and_legacy_default_is_true(tmp_path):
+    local = LocalCatalogProvider(tmp_path / "catalog.sqlite3")
+    demo = DemoStoreHttpProvider(transport=lambda *_args: None)
+    leman = LemanaB2BProvider(LemanaB2BSettings(), MemorySecretStore(), tmp_path)
+
+    assert get_provider_cache_policy(local).cache_search_results is True
+    assert get_provider_cache_policy(demo).cache_search_results is True
+    assert get_provider_cache_policy(leman).cache_search_results is False
+    assert get_provider_cache_policy(LegacyStubProvider()).cache_search_results is True
 
 
 class LegacyStubProvider:

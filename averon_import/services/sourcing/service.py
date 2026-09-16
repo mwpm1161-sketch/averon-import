@@ -31,6 +31,7 @@ from averon_import.services.sourcing.providers.base import (
     SourcingProvider,
     SourcingProviderError,
     get_provider_capabilities,
+    get_provider_cache_policy,
     normalize_provider_runtime_state,
 )
 
@@ -148,6 +149,7 @@ class SourcingService:
         catalog_version: str | None = None,
     ) -> SourcingResult:
         provider = self.provider(provider_key)
+        cache_policy = get_provider_cache_policy(provider)
         if catalog_version is None:
             try:
                 stats = provider.stats() if hasattr(provider, "stats") else {}
@@ -169,9 +171,10 @@ class SourcingService:
                     _as_provider_error(exc),
                 )
         cache_key = f"search:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            return self._compose_cached_result(cached, understanding, warnings, notices)
+        if cache_policy.cache_search_results:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return self._compose_cached_result(cached, understanding, warnings, notices)
         started = time.perf_counter()
         try:
             offers = provider.search(intent, limit=limit)
@@ -222,17 +225,18 @@ class SourcingService:
             },
             ai_mode=self._current_ai_mode(understanding),
         )
-        # Catalog offers and deterministic match facts are reusable. Audit
-        # Provenance, parser warnings and notices belong to the current response only.
-        self.cache.set(
-            cache_key,
-            result.model_copy(update={
-                "understanding": None,
-                "warnings": [],
-                "notices": [],
-                "ai_mode": "fallback",
-            }),
-        )
+        if cache_policy.cache_search_results:
+            # Catalog offers and deterministic match facts are reusable. Audit
+            # Provenance, parser warnings and notices belong to the current response only.
+            self.cache.set(
+                cache_key,
+                result.model_copy(update={
+                    "understanding": None,
+                    "warnings": [],
+                    "notices": [],
+                    "ai_mode": "fallback",
+                }),
+            )
         return result
 
     @staticmethod
