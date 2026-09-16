@@ -14,6 +14,7 @@ from averon_import.services.sourcing.models import (
     SourcingProviderCapabilities,
     SourcingProviderInfo,
 )
+from averon_import.services.app_settings import LemanaB2BSettings
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.providers.base import get_provider_capabilities
 from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
@@ -21,6 +22,7 @@ from averon_import.services.sourcing.providers.local_catalog import (
     LemanaB2BProvider,
     LocalCatalogProvider,
 )
+from averon_import.services.secrets import MemorySecretStore
 from averon_import.services.sourcing.service import SourcingService
 
 
@@ -72,11 +74,12 @@ def test_old_provider_info_payload_gets_empty_capability_default():
 def test_builtin_provider_capability_matrices(tmp_path):
     local = LocalCatalogProvider(tmp_path / "catalog.sqlite3")
     demo = DemoStoreHttpProvider(transport=lambda *_args: None)
-    leman = LemanaB2BProvider()
+    leman = LemanaB2BProvider(LemanaB2BSettings(), MemorySecretStore(), tmp_path)
 
     assert local.capabilities.model_dump() == EXPECTED_CATALOG_CAPABILITIES
     assert demo.capabilities.model_dump() == EXPECTED_CATALOG_CAPABILITIES
-    assert leman.capabilities == SourcingProviderCapabilities()
+    assert leman.key == "lemana_b2b"
+    assert leman.capabilities.model_dump() == EXPECTED_CATALOG_CAPABILITIES
     assert local.capabilities.supports_batch_search is False
     assert local.capabilities.supports_stock_quantity is False
     assert demo.capabilities is not local.capabilities

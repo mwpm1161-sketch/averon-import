@@ -12,6 +12,7 @@ from averon_import.services.sourcing.providers.lemana_b2b import (
     LEMANA_API_URLS,
     LEMANA_AUTH_URL,
     LEMANA_PRICE_BATCH_PATH,
+    LEMANA_PRICE_PATH,
     LEMANA_PRODUCTS_PATH,
     LemanaB2BClient,
     parse_price_payload,
@@ -123,6 +124,13 @@ def test_client_credentials_form_and_token_cache():
     assert transport.calls[1][1].startswith(f"{LEMANA_API_URLS['test']}{LEMANA_PRODUCTS_PATH}?")
     assert transport.calls[2][1] == f"{LEMANA_API_URLS['test']}{LEMANA_PRICE_BATCH_PATH}"
     assert transport.calls[1][2]["Authorization"] == "Bearer access-token"
+    assert json.loads((transport.calls[2][3] or b"{}").decode()) == {
+        "limit": 100,
+        "offset": 0,
+        "productItem": [82331508],
+        "regionId": 34,
+        "retailPrice": False,
+    }
 
 
 def test_token_expires_with_safety_margin_and_is_refreshed():
@@ -229,6 +237,18 @@ def test_products_request_uses_documented_query_and_not_modified_is_local_signal
     assert headers["if-modified-since"] == "Wed, 01 Jan 2025 00:00:00 GMT"
 
 
+def test_price_page_uses_documented_get_route_and_region():
+    transport = FakeTransport([_token(), _prices_response()])
+    client = LemanaB2BClient(_settings(), "secret", transport=transport)
+
+    prices = client.get_prices_page(page=2, per_page=50)
+
+    assert len(prices) == 1
+    assert transport.calls[-1][1].startswith(f"{LEMANA_API_URLS['test']}{LEMANA_PRICE_PATH}?")
+    query = parse_qs(transport.calls[-1][1].split("?", 1)[1])
+    assert query == {"regionId": ["34"], "page": ["2"], "perPage": ["50"]}
+
+
 def test_supplier_models_whitelist_official_product_fields_and_isolate_bad_rows():
     page = parse_products_payload(
         {
@@ -284,3 +304,15 @@ def test_price_parser_maps_official_batch_response_and_ignores_extra_fields():
     assert prices[0].product_item == "85087716"
     assert prices[0].currency == "Rub"
     assert str(prices[0].price) == "796.14"
+
+
+def test_price_parser_accepts_documented_get_response_plural_envelope():
+    prices = parse_price_payload(
+        {
+            "productsPrice": [
+                {"productItem": 85087716, "salesPrices": [{"salesPrice": 10, "currencyName": "Rub"}]}
+            ]
+        }
+    )
+
+    assert prices[0].product_item == "85087716"

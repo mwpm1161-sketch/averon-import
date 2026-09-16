@@ -53,6 +53,7 @@ from averon_import.services.review_decisions import (
 )
 from averon_import.services.review_policy import refresh_rows
 from averon_import.services.secrets import (
+    LEMANA_B2B_CLIENT_SECRET,
     YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
     create_secret_store,
@@ -205,11 +206,22 @@ class PipelineSettingsUpdate(BaseModel):
     min_confidence: float | None = None
 
 
+class LemanaB2BSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool | None = None
+    environment: Literal["test", "prod"] | None = None
+    client_id: str | None = None
+    region_id: int | None = None
+    request_timeout_s: float | None = None
+
+
 class SourcingSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str | None = None
     demo_store_base_url: str | None = None
+    lemana_b2b: LemanaB2BSettingsUpdate | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -224,8 +236,11 @@ class SettingsUpdate(BaseModel):
     sourcing: SourcingSettingsUpdate | None = None
     api_key: str | None = None
     ai_api_key: str | None = None
+    # Write-only: stored in SecretStore, never in settings.json or responses.
+    lemana_client_secret: str | None = None
     delete_yandex_api_key: bool = False
     delete_yandex_ai_api_key: bool = False
+    delete_lemana_client_secret: bool = False
 
 
 def _settings_public() -> dict:
@@ -245,6 +260,11 @@ def _settings_public() -> dict:
     payload["yandex"]["api_key_configured"] = vision_key_configured
     payload["yandex"]["vision_api_key_configured"] = vision_key_configured
     payload["yandex"]["ai_api_key_configured"] = ai_key_configured
+    payload["sourcing"]["lemana_b2b"]["client_secret_configured"] = resolve_secret(
+        os.environ.get("AVERON_LEMANA_B2B_CLIENT_SECRET"),
+        secret_store,
+        LEMANA_B2B_CLIENT_SECRET,
+    ) is not None
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
     return payload
@@ -263,17 +283,23 @@ def put_settings(request: SettingsUpdate):
         secret_store.set(YANDEX_API_KEY, request.api_key.strip())
     if request.ai_api_key is not None and request.ai_api_key.strip():
         secret_store.set(YANDEX_AI_API_KEY, request.ai_api_key.strip())
+    if request.lemana_client_secret is not None and request.lemana_client_secret.strip():
+        secret_store.set(LEMANA_B2B_CLIENT_SECRET, request.lemana_client_secret.strip())
     if request.delete_yandex_api_key:
         secret_store.delete(YANDEX_API_KEY)
     if request.delete_yandex_ai_api_key:
         secret_store.delete(YANDEX_AI_API_KEY)
+    if request.delete_lemana_client_secret:
+        secret_store.delete(LEMANA_B2B_CLIENT_SECRET)
     patch = request.model_dump(
         exclude_none=True,
         exclude={
             "api_key",
             "ai_api_key",
+            "lemana_client_secret",
             "delete_yandex_api_key",
             "delete_yandex_ai_api_key",
+            "delete_lemana_client_secret",
         },
     )
     patch = {key: value for key, value in patch.items() if value is not None}
@@ -300,6 +326,12 @@ def delete_yandex_api_key():
 @app.delete("/api/settings/yandex-ai-api-key")
 def delete_yandex_ai_api_key():
     secret_store.delete(YANDEX_AI_API_KEY)
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/lemana-client-secret")
+def delete_lemana_client_secret():
+    secret_store.delete(LEMANA_B2B_CLIENT_SECRET)
     return {"deleted": True}
 
 
@@ -572,6 +604,24 @@ def _sourcing_payload(value: Any) -> Any:
 @app.get("/api/sourcing/providers")
 def sourcing_providers():
     return sourcing_service.public_config()
+
+
+@app.post("/api/sourcing/providers/lemana_b2b/sync")
+def sync_lemana_b2b():
+    provider = sourcing_service.provider("lemana_b2b")
+    sync_method = getattr(provider, "sync", None)
+    if not callable(sync_method):
+        raise HTTPException(404, "Синхронизация Lemana PRO B2B недоступна")
+
+    def run(progress):
+        result = sync_method()
+        if hasattr(result, "__dataclass_fields__"):
+            from dataclasses import asdict
+
+            return asdict(result)
+        return _sourcing_payload(result)
+
+    return job_service.submit(run).public()
 
 
 @app.get("/api/sourcing/catalog/stats")

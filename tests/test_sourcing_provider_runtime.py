@@ -350,7 +350,7 @@ def test_runtime_factory_registers_only_current_providers_without_health_calls(t
 
     runtime = create_sourcing_runtime(tmp_path / "data", settings, MemorySecretStore())
 
-    assert set(runtime.providers) == {"local_catalog", "demo_store_http"}
+    assert set(runtime.providers) == {"local_catalog", "demo_store_http", "lemana_b2b"}
     assert "lemana" not in runtime.providers
     assert runtime.repository.path == tmp_path / "data" / "sourcing" / "catalog.sqlite3"
     assert runtime.service.providers is runtime.providers
@@ -363,9 +363,11 @@ def test_runtime_factory_preserves_provider_capabilities_and_normalizes_runtime_
 
     local = runtime.providers["local_catalog"]
     demo = runtime.providers["demo_store_http"]
+    lemana = runtime.providers["lemana_b2b"]
     local_state = normalize_provider_runtime_state(local.stats())
 
     assert local.capabilities == demo.capabilities
+    assert local.capabilities == lemana.capabilities
     assert local.capabilities.supports_price is True
     assert local.capabilities.supports_batch_search is False
     assert type(local_state) is SourcingProviderRuntimeState
@@ -378,6 +380,7 @@ def test_runtime_factory_preserves_provider_capabilities_and_normalizes_runtime_
     [
         ("local_catalog", "local_catalog"),
         ("demo_store_http", "demo_store_http"),
+        ("lemana_b2b", "lemana_b2b"),
         ("unknown-provider", "local_catalog"),
     ],
 )

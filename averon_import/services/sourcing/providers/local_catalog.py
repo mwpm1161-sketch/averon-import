@@ -33,15 +33,6 @@ class LocalCatalogProvider:
         return self.repository.stats()
 
 
-class LemanaB2BProvider:
-    """Future adapter boundary; network integration is intentionally absent."""
-
-    key = "lemana"
-    label = "Lemana B2B"
-    capabilities = SourcingProviderCapabilities()
-
-    def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
-        raise RuntimeError("Lemana B2B provider is not configured")
-
-    def stats(self) -> dict:
-        return {"item_count": 0, "catalog_version": "not_configured"}
+# Compatibility import for integrations that historically imported the
+# placeholder from this module.  The implementation is provider-owned.
+from averon_import.services.sourcing.providers.lemana_b2b.provider import LemanaB2BProvider

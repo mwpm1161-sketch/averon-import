@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 from averon_import.services.app_settings import LemanaB2BSettings
@@ -163,6 +163,32 @@ class LemanaB2BClient:
         except ValueError as exc:
             raise SourcingProviderError(
                 "Лемана ПРО B2B вернула некорректные цены",
+                category="invalid_response",
+            ) from exc
+
+    def get_prices_page(
+        self,
+        *,
+        region_id: int | None = None,
+        page: int = 1,
+        per_page: int = _DEFAULT_PAGE_SIZE,
+    ) -> tuple[LemanaPriceRecord, ...]:
+        """Read a bounded regional price page through the documented GET route."""
+
+        region = self._region(region_id)
+        query = urlencode(
+            {
+                "regionId": region,
+                "page": max(1, min(int(page), 100_000)),
+                "perPage": max(1, min(int(per_page), _DEFAULT_PAGE_SIZE)),
+            }
+        )
+        payload = self._request_json("GET", f"{LEMANA_PRICE_PATH}?{query}")
+        try:
+            return parse_price_payload(payload)
+        except ValueError as exc:
+            raise SourcingProviderError(
+                "Лемана ПРО B2B вернула некорректную страницу цен",
                 category="invalid_response",
             ) from exc
 
@@ -335,6 +361,8 @@ class LemanaB2BClient:
                 )
             return status, raw
         except urllib.error.HTTPError as exc:
+            if int(exc.code) == 304:
+                return 304, b""
             raise self._status_error(int(exc.code)) from exc
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", None)

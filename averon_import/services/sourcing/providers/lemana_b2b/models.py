@@ -162,6 +162,8 @@ def parse_price_payload(payload: Any) -> tuple[LemanaPriceRecord, ...]:
     if not isinstance(payload, dict):
         raise ValueError("price response must be an object")
     raw_prices = payload.get("productPrice")
+    if raw_prices is None:
+        raw_prices = payload.get("productsPrice")
     if not isinstance(raw_prices, list):
         raise ValueError("price response must contain productPrice list")
     records: list[LemanaPriceRecord] = []

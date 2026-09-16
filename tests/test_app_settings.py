@@ -13,6 +13,7 @@ from averon_import.services.app_settings import (
     AppSettingsService,
 )
 from averon_import.services.secrets import (
+    LEMANA_B2B_CLIENT_SECRET,
     YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
     InsecureFileSecretStore,
@@ -337,6 +338,23 @@ def test_replace_and_delete_api_key_without_reading_it_back(api):
     assert app_module.delete_yandex_api_key() == {"deleted": True}
     assert not store.has(YANDEX_API_KEY)
     app_module.delete_yandex_api_key()
+
+
+def test_lemana_client_secret_is_write_only_and_not_persisted(api):
+    app_module, store, service = api
+    secret = "lemana-client-secret-private"
+
+    payload = app_module.put_settings(
+        app_module.SettingsUpdate(lemana_client_secret=secret)
+    )
+
+    assert store.get(LEMANA_B2B_CLIENT_SECRET) == secret
+    assert payload["sourcing"]["lemana_b2b"]["client_secret_configured"] is True
+    encoded_payload = json.dumps(payload, ensure_ascii=False)
+    assert secret not in encoded_payload
+    assert "client_secret" not in (service.path.read_text(encoding="utf-8") if service.path.exists() else "")
+    assert app_module.delete_lemana_client_secret() == {"deleted": True}
+    assert store.get(LEMANA_B2B_CLIENT_SECRET) is None
 
 
 def test_put_rejects_invalid_payload_values():

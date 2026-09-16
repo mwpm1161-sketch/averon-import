@@ -18,6 +18,7 @@ from .models import (
     parse_products_payload,
 )
 from .mirror import LemanaCatalogMirror, LemanaMirrorSyncResult
+from .provider import LemanaB2BProvider
 
 __all__ = [
     "LEMANA_API_URLS",
@@ -35,4 +36,5 @@ __all__ = [
     "parse_products_payload",
     "LemanaCatalogMirror",
     "LemanaMirrorSyncResult",
+    "LemanaB2BProvider",
 ]

@@ -15,6 +15,7 @@ from averon_import.services.sourcing.catalog_repository import CatalogRepository
 from averon_import.services.sourcing.providers.base import SourcingProvider
 from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
+from averon_import.services.sourcing.providers.lemana_b2b import LemanaB2BProvider
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.secrets import YANDEX_AI_API_KEY, resolve_secret
@@ -92,9 +93,15 @@ def create_sourcing_runtime(
     demo_store_provider = DemoStoreHttpProvider(
         settings_service.settings.sourcing.demo_store_base_url,
     )
+    lemana_provider = LemanaB2BProvider(
+        settings_service.settings.sourcing.lemana_b2b,
+        secret_store,
+        data_root,
+    )
     providers: dict[str, SourcingProvider] = {
         local_provider.key: local_provider,
         demo_store_provider.key: demo_store_provider,
+        lemana_provider.key: lemana_provider,
     }
     configured_provider = str(settings_service.settings.sourcing.provider or "")
     default_provider = (
