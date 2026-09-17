@@ -246,6 +246,7 @@ class EtmIproSettingsUpdate(BaseModel):
     warehouse_codes: list[str] | str | None = None
     request_timeout_s: float | None = None
     base_url_override: str | None = None
+    max_live_candidates: int | None = None
 
 
 class SourcingSettingsUpdate(BaseModel):

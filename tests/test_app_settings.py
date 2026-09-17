@@ -112,11 +112,13 @@ def test_etm_ipro_settings_are_non_secret_and_warehouse_codes_are_normalized(tmp
     monkeypatch.setenv("AVERON_ETM_IPRO_ENABLED", "true")
     monkeypatch.setenv("AVERON_ETM_IPRO_ENVIRONMENT", "prod")
     monkeypatch.setenv("AVERON_ETM_IPRO_WAREHOUSE_CODES", "15, 22,15")
+    monkeypatch.setenv("AVERON_ETM_IPRO_MAX_LIVE_CANDIDATES", "7")
     service = AppSettingsService(tmp_path)
 
     assert service.settings.sourcing.etm_ipro.enabled is True
     assert service.settings.sourcing.etm_ipro.environment == "prod"
     assert service.settings.sourcing.etm_ipro.warehouse_codes == ["15", "22"]
+    assert service.settings.sourcing.etm_ipro.max_live_candidates == 7
     assert "password" not in (tmp_path / "settings.json").read_text(encoding="utf-8") if (tmp_path / "settings.json").exists() else True
 
 

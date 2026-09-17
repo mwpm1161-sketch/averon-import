@@ -88,6 +88,7 @@ class EtmIproSettings(BaseModel):
     warehouse_codes: list[str] = Field(default_factory=list)
     request_timeout_s: float = Field(default=20.0, gt=0, le=180.0)
     base_url_override: str = ""
+    max_live_candidates: int = Field(default=5, ge=1, le=10)
 
     @field_validator("warehouse_codes", mode="before")
     @classmethod
@@ -281,6 +282,13 @@ class AppSettingsService:
             except (TypeError, ValueError):
                 self.warnings.append(
                     "AVERON_ETM_IPRO_REQUEST_TIMEOUT_S имеет недопустимое значение; используется значение из settings.json."
+                )
+        if (value := _env_int("AVERON_ETM_IPRO_MAX_LIVE_CANDIDATES")) is not None:
+            try:
+                settings.sourcing.etm_ipro.max_live_candidates = value
+            except (TypeError, ValueError):
+                self.warnings.append(
+                    "AVERON_ETM_IPRO_MAX_LIVE_CANDIDATES имеет недопустимое значение; используется значение из settings.json."
                 )
 
     def update(self, patch: dict) -> AppSettings:

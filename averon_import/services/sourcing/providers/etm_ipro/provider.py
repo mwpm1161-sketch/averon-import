@@ -67,13 +67,13 @@ class EtmIproProvider:
                 catalog_version=self.mirror.revision,
                 error="ЭТМ iPRO не настроен: укажите логин и пароль",
             )
-        if not self.mirror.has_content():
+        if not self.mirror.has_content() and self.mirror.manufacturer_count() == 0:
             return SourcingProviderRuntimeState(
                 configured=True,
                 reachable=False,
                 item_count=0,
                 catalog_version=self.mirror.revision,
-                error="Локальное зеркало ЭТМ iPRO ещё не синхронизировано",
+                error="ЭТМ iPRO не готов: нет локального каталога или справочника производителей",
             )
         return SourcingProviderRuntimeState(
             configured=True,
@@ -118,13 +118,9 @@ class EtmIproProvider:
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
         self._ensure_configured()
-        if not self.mirror.has_content():
-            raise SourcingProviderError(
-                "Локальное зеркало ЭТМ iPRO ещё не синхронизировано",
-                code="CATALOG_NOT_SYNCED",
-                category="not_configured",
-            )
-        bounded_limit = max(1, min(int(limit), 100))
+        requested_limit = max(1, min(int(limit), 100))
+        live_limit = min(requested_limit, int(self.settings.max_live_candidates))
+        mirror_available = self.mirror.has_content()
         direct_goods: list[dict[str, Any]] = []
         manufacturer_code = None
         if intent.article and intent.manufacturer:
@@ -135,35 +131,45 @@ class EtmIproProvider:
                     lookup_type="mnf",
                     manufacturer_code=manufacturer_code,
                 )
-                direct_goods = _goods_rows(payload)[:bounded_limit]
-        records = self.mirror.search(
-            intent,
-            limit=bounded_limit,
-            manufacturer_code=manufacturer_code,
+                direct_goods = _goods_rows(payload)[:live_limit]
+        records = (
+            self.mirror.search(
+                intent,
+                limit=requested_limit,
+                manufacturer_code=manufacturer_code,
+            )
+            if mirror_available
+            else []
         )
         goods_by_id: dict[str, dict[str, Any]] = {}
         for raw in direct_goods:
-            if len(goods_by_id) >= bounded_limit:
+            if len(goods_by_id) >= live_limit:
                 break
             parsed = _goods_record(raw)
             if parsed is not None:
                 goods_by_id[parsed.source_item_id] = raw
         for record in records:
-            if len(goods_by_id) >= bounded_limit:
+            if len(goods_by_id) >= live_limit:
                 break
             goods_by_id.setdefault(record.source_item_id, {})
         if not goods_by_id:
+            if not mirror_available:
+                raise SourcingProviderError(
+                    "ЭТМ iPRO не может выполнить поиск: локальный каталог не синхронизирован",
+                    code="CATALOG_NOT_SYNCED",
+                    category="not_configured",
+                )
             return []
         details: list[tuple[str, dict[str, Any], EtmCatalogRecord | None]] = []
         record_by_id = {record.source_item_id: record for record in records}
         for source_item_id, raw in goods_by_id.items():
-            if not raw:
-                raw = self.client.get_goods(source_item_id)
             details.append((source_item_id, raw, record_by_id.get(source_item_id)))
         source_ids = [item[0] for item in details]
         prices = self.client.get_prices(source_ids)
         offers: list[Offer] = []
         for source_item_id, raw, catalog_record in details:
+            if not raw:
+                raw = self.client.get_goods(source_item_id)
             goods = _goods_record(raw)
             if goods is None:
                 goods = catalog_record
@@ -192,7 +198,13 @@ class EtmIproProvider:
         stock_records, availability, availability_text = _stock_summary(
             remains, self.settings.warehouse_codes
         )
-        price_text = "Цена уточняется индивидуально" if price is not None and price_value is None else ""
+        price_status = _price_status(price, price_value)
+        if price_status == "requires_individual_request":
+            price_text = "Цена уточняется индивидуально"
+        elif price_status == "unknown":
+            price_text = "Цена не получена"
+        else:
+            price_text = ""
         if price_text and availability_text:
             availability_text = f"{availability_text}; {price_text}"
         elif price_text:
@@ -228,7 +240,7 @@ class EtmIproProvider:
                 "catalog_version": self.mirror.revision,
                 "source_item_id": goods.source_item_id,
                 "price_field": "pricewnds" if price_value is not None else "",
-                "price_status": _price_status(price, price_value),
+                "price_status": price_status,
             },
         )
 
@@ -409,8 +421,18 @@ def _images(value: Any) -> list[Any]:
             result.append(value if value.startswith(("http://", "https://")) else "https://cdn.etm.ru/" + value.lstrip("/"))
         elif isinstance(item, dict):
             copied = dict(item)
+            for field_name in ("gdsImgSrc", "gdsImgRef"):
+                original = copied.get(field_name)
+                if isinstance(original, str) and original.strip():
+                    copied[f"source_{field_name}"] = original
+                    copied[field_name] = _cdn_url(original)
             raw_url = copied.get("url", copied.get("path", copied.get("src")))
             if isinstance(raw_url, str) and raw_url.strip() and not raw_url.startswith(("http://", "https://")):
-                copied["url"] = "https://cdn.etm.ru/" + raw_url.strip().lstrip("/")
+                copied["url"] = _cdn_url(raw_url)
             result.append(copied)
     return result
+
+
+def _cdn_url(value: str) -> str:
+    value = value.strip()
+    return value if value.startswith(("http://", "https://")) else "https://cdn.etm.ru/" + value.lstrip("/")

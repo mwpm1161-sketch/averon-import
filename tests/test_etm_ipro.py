@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -21,6 +21,7 @@ from averon_import.services.sourcing.providers.etm_ipro import (
 )
 from averon_import.services.sourcing.providers.etm_ipro.provider import (
     _goods_rows,
+    _images,
     _price_row,
     _stock_summary,
 )
@@ -47,12 +48,13 @@ class FakeClock:
         return self.value
 
 
-def settings(tmp_path, *, enabled=True):
+def settings(tmp_path, *, enabled=True, max_live_candidates=5):
     return EtmIproSettings(
         enabled=enabled,
         environment="test",
         warehouse_codes=["WH-1"],
         base_url_override="https://etm.example/api/v1",
+        max_live_candidates=max_live_candidates,
     )
 
 
@@ -144,7 +146,7 @@ class OfficialWireTransport:
                         "gdsChars": [{"name": "Ток", "value": "10 А"}],
                         "gdsClassTree": [{"name": "Автоматика"}],
                         "gdsPacks": [],
-                        "gdsImages": [],
+                        "gdsImages": [{"gdsImgSrc": "/images/a.jpg", "gdsImgRef": "refs/a.jpg"}],
                     }],
                     "records": 1,
                 },
@@ -183,6 +185,10 @@ def test_official_wire_contract_uses_query_session_and_rows_adapters(tmp_path):
     manufacturers = client.get_manufacturers()
     assert _goods_rows(goods_mnf)[0]["gdscode"] == 9536092
     assert _goods_rows(goods_etm)[0]["code"] == "ETM9536092"
+    image = _images(_goods_rows(goods_etm)[0]["gdsImages"])[0]
+    assert image["gdsImgSrc"] == "https://cdn.etm.ru/images/a.jpg"
+    assert image["gdsImgRef"] == "https://cdn.etm.ru/refs/a.jpg"
+    assert image["source_gdsImgSrc"] == "/images/a.jpg"
     assert _goods_rows({"status": {}, "data": {"records": 0}}) == []
     assert _price_row(price, "9536092")["pricewnds"] == "125.40"
     selected, availability, _ = _stock_summary(remains, ["WH-1"])
@@ -236,6 +242,49 @@ def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp
     assert offer.attributes["supplier_stores"] == [{"StoreCode": "SUP-1", "StoreQuantRem": "8"}]
     assert offer.attributes["forecast"] == {"days": 2}
     assert offer.attributes["delivery"] == "завтра"
+
+
+def test_direct_article_lookup_works_without_catalog_mirror_through_service(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    client = FakeEtmClient()
+    mirror.sync_manufacturers([EtmManufacturer("1", "Acme")])
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=client, mirror=mirror
+    )
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+
+    result = service.search_intent(intent(), ai_rerank=False)
+
+    assert result.offers
+    assert result.offers[0].source_item_id == "A-100"
+    assert provider.stats().reachable is True
+
+
+def test_name_only_search_without_catalog_returns_catalog_not_ready_notice(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_manufacturers([EtmManufacturer("1", "Acme")])
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=FakeEtmClient(), mirror=mirror
+    )
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+
+    result = service.search_intent(
+        intent(article="", manufacturer="", brand="", normalized_name="Клапан"),
+        ai_rerank=False,
+    )
+
+    assert result.offers == []
+    assert result.warnings
+    assert "каталог" in result.warnings[0].casefold()
+    assert result.notices[0].code == "PROVIDER_ERROR"
 
 
 @pytest.mark.parametrize(
@@ -371,6 +420,33 @@ class FakeEtmClient:
         return {"data": {"stores": [{"store_code": "WH-1", "store_name": "Основной", "store_type": "warehouse", "stock": "4", "supplier_stock": "2", "forecast": "завтра"}]}}
 
 
+class TimedWireTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, request, timeout):
+        self.requests.append(request)
+        path = urlsplit(request.full_url).path
+        if path.endswith("/user/login"):
+            return FakeResponse({"data": {"session": "timed-session"}})
+        if path.endswith("/price"):
+            encoded_ids = path.split("/goods/", 1)[1].rsplit("/price", 1)[0]
+            ids = unquote(encoded_ids).split(",")
+            return FakeResponse({
+                "data": [
+                    {"gdscode": source_id, "pricewnds": "10", "price": "0", "price_tarif": "0", "price_retail": "0"}
+                    for source_id in ids
+                ],
+            })
+        if path.endswith("/remains"):
+            source_id = unquote(path.split("/goods/", 1)[1].rsplit("/remains", 1)[0])
+            return FakeResponse({"data": {"InfoStores": [{"StoreCode": "WH-1", "StoreQuantRem": "1"}], "gdscode": source_id}})
+        if "/goods/" in path:
+            source_id = unquote(path.split("/goods/", 1)[1])
+            return FakeResponse({"data": {"rows": [{"gdscode": source_id, "name": f"Насос {source_id}", "art": source_id}]}})
+        raise AssertionError(f"unexpected timed wire path: {request.full_url}")
+
+
 def configured_provider(tmp_path, *, price_client=None):
     mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
     mirror.sync_snapshot({"data": [catalog_record()]})
@@ -380,6 +456,99 @@ def configured_provider(tmp_path, *, price_client=None):
         client=price_client or FakeEtmClient(), mirror=mirror,
     )
     return provider, mirror
+
+
+def test_etm_max_live_candidates_bounds_goods_remains_price_and_offers(tmp_path):
+    class CountingClient(FakeEtmClient):
+        def __init__(self):
+            self.goods_calls = []
+            self.remains_calls = []
+            self.price_batches = []
+
+        def get_goods(self, source_item_id, *, lookup_type="etm", manufacturer_code=None):
+            self.goods_calls.append(source_item_id)
+            return super().get_goods(source_item_id, lookup_type=lookup_type, manufacturer_code=manufacturer_code)
+
+        def get_prices(self, source_item_ids):
+            self.price_batches.append(list(source_item_ids))
+            return super().get_prices(source_item_ids)
+
+        def get_remains(self, source_item_id):
+            self.remains_calls.append(source_item_id)
+            return super().get_remains(source_item_id)
+
+    client = CountingClient()
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({
+        "data": [catalog_record(f"ITEM-{index}", name=f"Насос {index}", article="") for index in range(10)],
+    })
+    provider = EtmIproProvider(
+        settings(tmp_path, max_live_candidates=5), MemorySecretStore(), tmp_path, client=client, mirror=mirror
+    )
+    broad_intent = intent(article="", manufacturer="", brand="", model="Насос", normalized_name="Насос", search_queries=["Насос"])
+
+    offers = provider.search(broad_intent, limit=20)
+    assert len(offers) == 5
+    assert len(client.goods_calls) == 5
+    assert len(client.remains_calls) == 5
+    assert len(client.price_batches) == 1
+    assert len(client.price_batches[0]) == 5
+
+    client.goods_calls.clear()
+    client.remains_calls.clear()
+    client.price_batches.clear()
+    limited_offers = provider.search(broad_intent, limit=2)
+    assert len(limited_offers) == 2
+    assert len(client.goods_calls) <= 2
+    assert len(client.remains_calls) <= 2
+    assert len(client.price_batches) == 1
+    assert len(client.price_batches[0]) <= 2
+
+
+def test_etm_candidate_enrichment_interleaves_goods_and_remains_buckets(tmp_path):
+    clock = FakeClock()
+    sleeps = []
+
+    def sleeper(seconds):
+        sleeps.append(seconds)
+        clock.value += seconds
+
+    transport = TimedWireTransport()
+    client = EtmIproClient(
+        settings(tmp_path, max_live_candidates=5),
+        "login",
+        "password",
+        transport=transport,
+        clock=clock,
+        rate_limiter=EtmRateLimiter(interval_seconds=1, clock=clock, sleeper=sleeper),
+    )
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({
+        "data": [catalog_record(f"ITEM-{index}", name=f"Насос {index}", article="") for index in range(5)],
+    })
+    provider = EtmIproProvider(
+        settings(tmp_path, max_live_candidates=5), MemorySecretStore(), tmp_path, client=client, mirror=mirror
+    )
+    broad_intent = intent(article="", manufacturer="", brand="", model="Насос", normalized_name="Насос", search_queries=["Насос"])
+
+    assert len(provider.search(broad_intent, limit=20)) == 5
+    assert clock.value == 4.0
+    assert len(sleeps) == 4
+    paths = [urlsplit(request.full_url).path for request in transport.requests]
+    assert paths[1].endswith("/price")
+    assert paths[2].endswith("/goods/ITEM-0")
+    assert paths[3].endswith("/goods/ITEM-0/remains")
+
+
+@pytest.mark.parametrize("price_row", [{"pricewnds": "bad", "price": "99"}, {"price": "99"}])
+def test_unknown_etm_price_is_not_described_as_individual_pricing(tmp_path, price_row):
+    provider, _ = configured_provider(tmp_path)
+    offer = provider._offer(catalog_record(), price_row, {"data": {"stores": []}}, {})
+
+    assert offer.price is None
+    assert offer.data_provenance["price_status"] == "unknown"
+    assert "Цена не получена" in offer.availability_text
+    assert "индивидуально" not in offer.availability_text
 
 
 def test_provider_maps_goods_price_remains_and_preserves_detail_evidence(tmp_path):
