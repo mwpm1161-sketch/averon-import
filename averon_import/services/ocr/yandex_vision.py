@@ -31,6 +31,7 @@ from typing import Callable, Iterable
 
 import fitz
 
+from averon_import.core.normalizers import numeric_cell_metadata
 from averon_import.services.ocr.base import (
     OcrProviderError,
     OcrResult,
@@ -870,7 +871,13 @@ class YandexVisionProvider:
                 continue
             refs = row.metadata.get("physical_grid_cells") or {}
             for field in EXACT_CELL_FIELDS:
-                if str(row.values.get(field, "") or "").strip():
+                raw_value = str(row.values.get(field, "") or "")
+                shape_trigger = bool(
+                    field == "quantity"
+                    and raw_value.strip()
+                    and numeric_cell_metadata(raw_value).get("integer_like_decimal")
+                )
+                if raw_value.strip() and not shape_trigger:
                     continue
                 ref = refs.get(field)
                 if not isinstance(ref, dict):

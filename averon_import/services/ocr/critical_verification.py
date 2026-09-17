@@ -221,7 +221,14 @@ def attach_exact_cell_candidate(
     source: str = "yandex_exact_cell_2x",
 ) -> bool:
     """Attach an isolated-cell result as review evidence, never as a value."""
-    if field not in CRITICAL_FIELDS or str(row.values.get(field, "") or "").strip():
+    primary_raw = str(row.values.get(field, "") or "")
+    primary_value = normalize_cell(field, primary_raw)
+    primary_shape_trigger = bool(
+        field == "quantity"
+        and primary_value
+        and numeric_cell_metadata(primary_raw).get("integer_like_decimal")
+    )
+    if field not in CRITICAL_FIELDS or (primary_value and not primary_shape_trigger):
         return False
     value = _candidate_value(field, raw_value)
     if value is None:
@@ -238,6 +245,13 @@ def attach_exact_cell_candidate(
         "review_reason": "recovered_by_exact_cell_ocr",
         "auto_trusted": False,
     }
+    if primary_value:
+        agrees_with_primary = primary_value == value
+        evidence["agreement_with_primary"] = agrees_with_primary
+        if not agrees_with_primary:
+            evidence["review_reason"] = "numeric_shape_conflict"
+    else:
+        agrees_with_primary = False
     if isinstance(existing, dict):
         if existing.get("value_candidate") == value:
             sources = list(existing.get("evidence_sources") or [])
@@ -246,7 +260,9 @@ def attach_exact_cell_candidate(
                     sources.append(item)
             existing = dict(existing)
             existing["evidence_sources"] = sources
-            existing["auto_trusted"] = False
+            existing["agreement_with_primary"] = bool(
+                existing.get("agreement_with_primary") or agrees_with_primary
+            )
             candidates[field] = existing
         else:
             alternatives = list(metadata.get("alternative_value_candidates") or [])
@@ -255,16 +271,95 @@ def attach_exact_cell_candidate(
             reasons = list(metadata.get("review_reasons") or [])
             if "secondary_conflict" not in reasons:
                 reasons.append("secondary_conflict")
+            if "numeric_shape_conflict" not in reasons:
+                reasons.append("numeric_shape_conflict")
             metadata["review_reasons"] = reasons
             metadata["value_candidates"] = candidates
             return True
     else:
         candidates[field] = evidence
+    if primary_value and not agrees_with_primary:
+        alternatives = list(metadata.get("alternative_value_candidates") or [])
+        if not any(
+            isinstance(item, dict)
+            and item.get("field") == field
+            and item.get("value_candidate") == value
+            for item in alternatives
+        ):
+            alternatives.append({"field": field, **evidence})
+        metadata["alternative_value_candidates"] = alternatives
+        conflict_fields = set(metadata.get("secondary_conflict_fields") or ())
+        conflict_fields.add(field)
+        metadata["secondary_conflict_fields"] = sorted(conflict_fields)
+        reasons = list(metadata.get("review_reasons") or [])
+        for reason in ("secondary_conflict", "numeric_shape_conflict"):
+            if reason not in reasons:
+                reasons.append(reason)
+        metadata["review_reasons"] = reasons
+        metadata["value_candidates"] = candidates
+        return True
     metadata["value_candidates"] = candidates
     reasons = list(metadata.get("review_reasons") or [])
+    if primary_value and agrees_with_primary and resolve_numeric_shape_with_exact_cell_evidence(row, field):
+        return True
     if "recovered_by_exact_cell_ocr" not in reasons:
         reasons.append("recovered_by_exact_cell_ocr")
     metadata["review_reasons"] = reasons
+    return True
+
+
+def resolve_numeric_shape_with_exact_cell_evidence(row: OcrRow, field: str) -> bool:
+    """Resolve a quantity shape warning only after safe exact-cell agreement."""
+    if field != "quantity":
+        return False
+    metadata = row.metadata if isinstance(row.metadata, dict) else {}
+    primary = normalize_cell(field, row.values.get(field, ""))
+    if not primary or not numeric_cell_metadata(str(row.values.get(field) or "")).get(
+        "integer_like_decimal"
+    ):
+        return False
+    candidate = (metadata.get("value_candidates") or {}).get(field)
+    if not isinstance(candidate, dict):
+        return False
+    candidate_value = _candidate_value(field, str(candidate.get("raw_value") or ""))
+    if candidate_value != primary or not str(candidate.get("candidate_source") or "").startswith(
+        "yandex_exact_cell"
+    ):
+        return False
+    safety = (metadata.get("target_cell_structural_safety") or {}).get(field)
+    if not isinstance(safety, dict) or safety.get("safe") is not True:
+        return False
+    if field in set(metadata.get("secondary_conflict_fields") or ()):
+        return False
+    if any(
+        isinstance(item, dict) and str(item.get("field") or "") == field
+        for item in metadata.get("alternative_value_candidates") or ()
+    ):
+        return False
+    candidate = dict(candidate)
+    candidate.update({
+        "agreement_with_primary": True,
+        "auto_trusted": True,
+        "verified_by_exact_cell_ocr": True,
+        "review_reason": None,
+    })
+    metadata.setdefault("value_candidates", {})[field] = candidate
+    verified = set(metadata.get("numeric_shape_verified_fields") or ())
+    verified.add(field)
+    metadata["numeric_shape_verified_fields"] = sorted(verified)
+    metadata["review_reasons"] = [
+        reason
+        for reason in metadata.get("review_reasons") or ()
+        if reason != "numeric_shape_suspect"
+    ]
+    required = metadata.get("semantic_required_critical_fields") or ()
+    if required and all(
+        str(row.values.get(required_field, "") or "").strip()
+        for required_field in required
+    ) and not metadata["review_reasons"]:
+        metadata["semantic_review"] = False
+        metadata["semantic_state"] = "VERIFIED"
+        metadata["semantic_review_impact"] = "NONE"
     return True
 
 

@@ -489,12 +489,24 @@ function numericSuspectFields(row) {
     const details = normalization[key];
     const shapeSuspect = key === "quantity" && details?.integer_like_decimal;
     if (!details?.numeric_suspect && !shapeSuspect) return false;
+    if (shapeSuspect && numericShapeAgreed(row)) return false;
     if (!edited.has(key)) return true;
     if (shapeSuspect && key === "quantity") {
       return /^-?\d+[.,]0$/.test(String(row[key] ?? "").trim());
     }
     return !/^-?\d+(?:[.,]\d+)?$/.test(String(row[key] ?? "").trim());
   });
+}
+
+function numericShapeAgreed(row) {
+  const candidate = row?.value_candidates?.quantity
+    || row?.ocr_metadata?.value_candidates?.quantity;
+  const safety = row?.ocr_metadata?.target_cell_structural_safety?.quantity;
+  return candidate?.agreement_with_primary === true
+    && candidate?.verified_by_exact_cell_ocr === true
+    && String(candidate?.candidate_source || "").startsWith("yandex_exact_cell")
+    && safety?.safe === true
+    && String(row?.quantity ?? "").trim() === String(candidate?.value_candidate ?? "").trim();
 }
 
 function criticalBlockers(row) {
@@ -537,8 +549,12 @@ function refreshClientReview(row) {
   const conflicts = new Set(row.ocr_metadata?.secondary_conflict_fields || []);
   reasons.delete("critical_value_missing");
   reasons.delete("numeric_suspect");
+  reasons.delete("numeric_shape_suspect");
   if (missing.length) reasons.add("critical_value_missing");
   if (suspect.length) reasons.add("numeric_suspect");
+  if (numericSuspectFields(row).includes("quantity") && !numericShapeAgreed(row)) {
+    reasons.add("numeric_shape_suspect");
+  }
   if (!(conflicts.size && [...conflicts].some((field) => edited.has(field)))) {
     if (previousBlockers.has("secondary_conflict")) reasons.add("secondary_conflict");
   } else {

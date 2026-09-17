@@ -7,6 +7,7 @@ from averon_import.services.ocr.base import OcrRow
 from averon_import.services.ocr.critical_verification import (
     attach_exact_cell_candidate,
     promote_exact_cell_candidate,
+    resolve_numeric_shape_with_exact_cell_evidence,
 )
 from averon_import.services.ocr.semantics.semantic_projection import (
     StructuredReconstructionResult,
@@ -101,6 +102,63 @@ def test_exact_cell_does_not_promote_package_quantity_or_suspicious_decimal():
         assert "quantity" not in row.values
 
 
+def test_legitimate_integer_like_decimal_requires_and_accepts_exact_agreement():
+    row = _semantic_row(
+        {"name": "Насос", "unit": "шт.", "quantity": "4.0"},
+        review_reasons=["numeric_shape_suspect"],
+    )
+    row.metadata["target_cell_structural_safety"] = {
+        "quantity": {"safe": True, "reasons": []},
+    }
+    assert attach_exact_cell_candidate(row, "quantity", "4.0", bbox={})
+    assert resolve_numeric_shape_with_exact_cell_evidence(row, "quantity")
+    assert row.values["quantity"] == "4.0"
+    assert row.metadata["semantic_review"] is False
+    assert "numeric_shape_suspect" not in row.metadata["review_reasons"]
+    presented = SpecificationRowAssembler().build_semantic_row(1, row)
+    assert presented["status"] == "recognized"
+    assert critical_blockers_for_row(presented) == []
+
+
+def test_integer_like_decimal_conflict_keeps_primary_and_exposes_candidate():
+    row = _semantic_row(
+        {"name": "Трубы", "unit": "м", "quantity": "4.0"},
+        review_reasons=["numeric_shape_suspect"],
+    )
+    row.metadata["target_cell_structural_safety"] = {
+        "quantity": {"safe": True, "reasons": []},
+    }
+    assert attach_exact_cell_candidate(row, "quantity", "40", bbox={})
+    assert row.values["quantity"] == "4.0"
+    candidate = row.metadata["value_candidates"]["quantity"]
+    assert candidate["value_candidate"] == "40"
+    assert candidate["review_reason"] == "numeric_shape_conflict"
+    assert "secondary_conflict" in row.metadata["review_reasons"]
+    assert not resolve_numeric_shape_with_exact_cell_evidence(row, "quantity")
+    presented = SpecificationRowAssembler().build_semantic_row(1, row)
+    assert presented["status"] == "review"
+    assert "40" == presented["value_candidates"]["quantity"]["value_candidate"]
+    assert "numeric_shape_conflict" in critical_blockers_for_row(presented)
+
+
+def test_numeric_shape_trigger_does_not_reject_other_quantity_shapes():
+    for value in ("2.5", "3.4", "2.2", "8.2", "4.9", "3.46", "4.33", "40", ""):
+        assert numeric_cell_metadata(value)["integer_like_decimal"] is False
+
+
+def test_alphabetic_system_requires_section_topology():
+    for label in ("ГОСТ", "ООО", "КЖ", "ПС"):
+        _table, _context, graph, _relations, _semantic = _run({
+            1: {1: label},
+            2: {1: "Точка", 5: "шт", 6: "1"},
+        })
+        selected = graph.row_role_assessments[0]
+        assert not (
+            selected.selected_role == RowRole.CONTEXT
+            and selected.selected_qualifier == "SYSTEM"
+        )
+
+
 def test_package_components_keep_explicit_and_blank_quantity_without_swallowing_next_item():
     _table, context, graph, _relations, semantic = _run({
         1: {1: "Установка", 5: "компл."},
@@ -191,4 +249,5 @@ def test_semantic_rows_without_provider_confidence_expose_none():
 def test_static_ui_keeps_unavailable_confidence_distinct_from_zero():
     app_js = Path("averon_import/static/app.js").read_text(encoding="utf-8")
     assert "row.confidence === null" in app_js
+    assert "numericShapeAgreed" in app_js
     assert "—" in app_js

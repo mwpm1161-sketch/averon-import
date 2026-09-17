@@ -55,9 +55,13 @@ class EvidenceTier(str, Enum):
 
 _INTEGER_RE = re.compile(r"^\d+$")
 _NUMBER_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
-_SYSTEM_RE = re.compile(
-    r"^(?:(?:[А-ЯЁ]{2,4})|(?:[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?))\s*\*?"
-    r"(?:\s*,\s*(?:(?:[А-ЯЁ]{2,4})|(?:[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?))\s*\*?)*$",
+_SYSTEM_ALNUM_RE = re.compile(
+    r"^[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?\s*\*?"
+    r"(?:\s*,\s*[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?\s*\*?)*$",
+    re.IGNORECASE,
+)
+_SYSTEM_ALPHA_RE = re.compile(
+    r"^[А-ЯЁ]{2,4}\s*\*?(?:\s*,\s*[А-ЯЁ]{2,4}\s*\*?)*$",
     re.IGNORECASE,
 )
 _NOTE_RE = re.compile(
@@ -378,6 +382,8 @@ def _item_evidence(
 def _context_component_note_evidence(
     row: PhysicalRowIR,
     mapping: Mapping[int, tuple[str, ...]],
+    *,
+    allow_alphabetic_system: bool = False,
 ) -> tuple[RoleCandidate, ...]:
     occupied = _row_occupied(row)
     values = [_text(cell.raw_text) for cell in occupied]
@@ -390,7 +396,14 @@ def _context_component_note_evidence(
         for field in ("name", "type_mark", "code", "manufacturer")
     )
     candidates: list[RoleCandidate] = []
-    if len(values) == 1 and _SYSTEM_RE.fullmatch(combined):
+    system_shape = bool(
+        len(values) == 1
+        and (
+            _SYSTEM_ALNUM_RE.fullmatch(combined)
+            or allow_alphabetic_system and _SYSTEM_ALPHA_RE.fullmatch(combined)
+        )
+    )
+    if system_shape:
         candidates.append(
             _candidate(
                 RowRole.CONTEXT,
@@ -439,6 +452,8 @@ def _context_component_note_evidence(
 def _is_standalone_system_row(
     row: PhysicalRowIR,
     mapping: Mapping[int, tuple[str, ...]],
+    *,
+    allow_alphabetic: bool = False,
 ) -> bool:
     occupied = _row_occupied(row)
     if len(occupied) != 1:
@@ -449,7 +464,13 @@ def _is_standalone_system_row(
     combined = " ".join(
         _text(cell.raw_text) for cell in occupied if _text(cell.raw_text)
     )
-    return bool(combined and _SYSTEM_RE.fullmatch(combined))
+    return bool(
+        combined
+        and (
+            _SYSTEM_ALNUM_RE.fullmatch(combined)
+            or allow_alphabetic and _SYSTEM_ALPHA_RE.fullmatch(combined)
+        )
+    )
 
 
 def _section_before_system_candidate(
@@ -459,7 +480,9 @@ def _section_before_system_candidate(
 ) -> RoleCandidate | None:
     """Use adjacent heading/system topology as provider-neutral evidence."""
 
-    if next_row is None or not _is_standalone_system_row(next_row, mapping):
+    if next_row is None or not _is_standalone_system_row(
+        next_row, mapping, allow_alphabetic=True
+    ):
         return None
     occupied = _row_occupied(row)
     if not occupied or len(occupied) > 2:
@@ -746,6 +769,13 @@ class TableFunctionalAnalyzer:
             sorted(physical_table.rows, key=lambda value: value.ref.row_index)
         )
         for row_index, row in enumerate(physical_rows):
+            previous_assessment = assessments[-1] if assessments else None
+            previous_section_confirmed = bool(
+                previous_assessment is not None
+                and previous_assessment.selected_role == RowRole.CONTEXT
+                and previous_assessment.selected_qualifier == "SECTION"
+                and previous_assessment.state == RowRoleState.CONFIRMED
+            )
             candidates = list(_header_adjacency_evidence(row, header_rows))
             if row.ref.row_index not in header_rows:
                 numbering_candidates, numbering_diagnostics = _numbering_evidence(
@@ -764,7 +794,13 @@ class TableFunctionalAnalyzer:
                         anomalies.append({"row_ref": row.ref.as_dict(), **numbering_diagnostics})
                 candidates.extend(_item_evidence(row, mapping))
                 candidates.extend(_section_heading_evidence(row, mapping))
-                candidates.extend(_context_component_note_evidence(row, mapping))
+                candidates.extend(
+                    _context_component_note_evidence(
+                        row,
+                        mapping,
+                        allow_alphabetic_system=previous_section_confirmed,
+                    )
+                )
             next_row = (
                 physical_rows[row_index + 1]
                 if row_index + 1 < len(physical_rows)

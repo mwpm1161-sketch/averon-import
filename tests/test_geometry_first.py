@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import pytest
 
+from averon_import.core.normalizers import numeric_cell_metadata
 from averon_import.services.ocr.base import OcrProviderError, OcrRow
 from averon_import.services.ocr.critical_verification import (
     attach_exact_cell_candidate,
@@ -748,6 +749,47 @@ def test_benchmark_critical_cells_produce_29_of_29_review_candidates():
         for row in all_rows
     ] == expected
     assert all(row.values.get("quantity", "") == "" for row in all_rows)
+
+
+def test_exact_cell_verification_is_triggered_for_unresolved_integer_like_decimal():
+    raster, rows = _benchmark_raster(["4.0"])
+    row = rows[0]
+    row.values["quantity"] = "4.0"
+    row.metadata["normalization"] = {
+        "quantity": numeric_cell_metadata("4.0"),
+    }
+    row.metadata["review_reasons"] = ["numeric_shape_suspect"]
+    http = _ExactCellHttp(["4.0"])
+    secrets = MemorySecretStore()
+    secrets.set("yandex.api_key", "test-key")
+    provider = YandexVisionProvider(
+        _Settings(),
+        secrets,
+        cache_dir=None,
+        http=http,
+        sleep_fn=lambda _seconds: None,
+        reconstruction_mode="geometry",
+    )
+    stats = {
+        "exact_cell_checked": 0,
+        "exact_cell_requests": 0,
+        "exact_cell_candidates": 0,
+    }
+    provider._exact_cell_verify_page(
+        58,
+        raster,
+        rows,
+        provider._yandex_settings(),
+        "test-key",
+        None,
+        [],
+        stats,
+    )
+    assert len(http.calls) == 1
+    assert row.values["quantity"] == "4.0"
+    assert row.metadata["value_candidates"]["quantity"]["agreement_with_primary"] is True
+    assert row.metadata["value_candidates"]["quantity"]["verified_by_exact_cell_ocr"] is True
+    assert "numeric_shape_suspect" not in row.metadata["review_reasons"]
 
 
 def test_exact_cell_verification_does_not_swallow_cancel():

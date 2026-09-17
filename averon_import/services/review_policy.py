@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from averon_import.core.normalizers import numeric_cell_metadata
+from averon_import.core.normalizers import normalize_cell, numeric_cell_metadata
 
 CRITICAL_FIELDS = ("quantity", "unit", "mass")
 CRITICAL_REASONS = {
     "critical_value_missing",
     "numeric_suspect",
     "numeric_shape_suspect",
+    "numeric_shape_conflict",
     "ambiguous_columns",
     "ambiguous_table_schema",
     "secondary_conflict",
@@ -227,6 +228,28 @@ def _numeric_shape_suspect_fields(row: dict) -> set[str]:
         details = normalization.get("quantity")
         if isinstance(details, dict) and details.get("integer_like_decimal"):
             result.add("quantity")
+    candidate = (
+        metadata.get("value_candidates", {}).get("quantity")
+        if isinstance(metadata, dict) and isinstance(metadata.get("value_candidates"), dict)
+        else None
+    )
+    safety = (
+        metadata.get("target_cell_structural_safety", {}).get("quantity")
+        if isinstance(metadata, dict) and isinstance(metadata.get("target_cell_structural_safety"), dict)
+        else None
+    )
+    if (
+        "quantity" in result
+        and isinstance(candidate, dict)
+        and candidate.get("agreement_with_primary") is True
+        and candidate.get("verified_by_exact_cell_ocr") is True
+        and str(candidate.get("candidate_source") or "").startswith("yandex_exact_cell")
+        and isinstance(safety, dict)
+        and safety.get("safe") is True
+        and normalize_cell("quantity", row.get("quantity", ""))
+        == normalize_cell("quantity", candidate.get("value_candidate", ""))
+    ):
+        result.discard("quantity")
     edited_fields = set(_as_list(row.get("edited_fields")))
     if "quantity" in result and "quantity" in edited_fields:
         details = numeric_cell_metadata(row.get("quantity", ""))
@@ -246,6 +269,7 @@ def critical_blockers_for_row(row: dict) -> list[str]:
     for reason in (
         "numeric_suspect",
         "numeric_shape_suspect",
+        "numeric_shape_conflict",
         "ambiguous_columns",
         "ambiguous_table_schema",
         "secondary_conflict",
