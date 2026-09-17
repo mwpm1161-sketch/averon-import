@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import tempfile
@@ -72,6 +73,16 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
 
 
+def _static_asset_revision(filename: str) -> str:
+    return hashlib.sha256((PACKAGE_DIR / "static" / filename).read_bytes()).hexdigest()[:12]
+
+
+STATIC_ASSET_REVISIONS = {
+    "app": _static_asset_revision("app.js"),
+    "styles": _static_asset_revision("styles.css"),
+}
+
+
 def default_data_dir() -> Path:
     configured = os.environ.get("AVERON_DATA_DIR", "").strip()
     if configured:
@@ -140,6 +151,7 @@ def index(request: Request):
             "app_name": APP_NAME,
             "version": APP_VERSION,
             "developer": DEVELOPER,
+            "asset_revisions": STATIC_ASSET_REVISIONS,
         },
     )
 

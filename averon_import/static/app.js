@@ -1448,11 +1448,15 @@ function reviewExportFilename() {
 }
 
 async function downloadReviewExcel() {
-  const columns = selectedExportColumns();
-  if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
+  const button = $("#download-review-excel");
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = "Формируем Excel…";
   try {
-    const authoritative = await saveRows(false);
-    if (!authoritative) return;
+    if (!state.document) { toast("Сначала откройте документ", "error"); return; }
+    if (!state.rows.length) { toast("Нет строк для экспорта", "error"); return; }
+    const columns = selectedExportColumns();
+    if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
     const payload = {
       columns, rows:state.rows,
       include_headers:$("#export-headers").checked,
@@ -1470,6 +1474,10 @@ async function downloadReviewExcel() {
     link.href=url; link.click(); URL.revokeObjectURL(url);
     $("#export-modal").close(); toast("Проверочный Excel сформирован", "success");
   } catch (error) { toast(error.message,"error"); }
+  finally {
+    button.disabled = false;
+    button.textContent = "Экспорт для проверки";
+  }
 }
 
 function resetApp() {

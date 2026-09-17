@@ -172,7 +172,7 @@ button { cursor: pointer; }
 .ocr-verified { display:inline-block; margin:0 8px 7px; color:#64748b; font-size:10px; }
 .empty-table { position:absolute; inset:80px 0 auto; text-align:center; color:var(--muted); }
 .modal { border:0; padding:0; background:transparent; max-width:none; max-height:none; }
-.modal::backdrop { background:rgba(17,19,24,.42); backdrop-filter:blur(3px); }
+.modal::backdrop { background:rgba(17,19,24,.42); }
 .modal-card { width:min(900px,calc(100vw - 80px)); max-height:calc(100vh - 70px); overflow:auto; border-radius:20px; background:#fff; box-shadow:0 30px 80px rgba(0,0,0,.22); padding:27px; }
 .modal-header { display:flex; align-items:flex-start; gap:20px; border-bottom:1px solid var(--line); padding-bottom:20px; margin-bottom:22px; }
 .modal-header h2 { margin:7px 0 5px; }.modal-header p { margin:0; color:var(--muted); }

@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 import re
 
@@ -76,10 +77,49 @@ def test_review_export_is_explicit_and_not_gated_by_production_blockers():
     assert "Экспорт для проверки" in html
     assert "Проверочный файл может содержать строки, требующие проверки." in html
     assert "function downloadReviewExcel()" in app_js
-    assert "review_export:true" in app_js
-    assert "only_exportable:false" in app_js
-    assert "saveRows(false)" in app_js
+    review_export = app_js.split("async function downloadReviewExcel()", 1)[1].split("\nfunction resetApp()", 1)[0]
+    production_export = app_js.split("async function downloadExcel()", 1)[1].split("\nfunction reviewExportFilename()", 1)[0]
+    assert "review_export:true" in review_export
+    assert "only_exportable:false" in review_export
+    assert "rows:state.rows" in review_export
+    assert "saveRows(false)" not in review_export
+    assert "loadResult(" not in review_export
+    assert "state.dirty = false" not in review_export
+    assert "saveRows(false)" in production_export
+    assert "backendExportBlockers()" in production_export
+    assert "review_export:false" in production_export
     assert "function reviewExportFilename()" in app_js
+
+
+def test_review_export_button_has_busy_and_finally_recovery_semantics():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    review_export = app_js.split("async function downloadReviewExcel()", 1)[1].split("\nfunction resetApp()", 1)[0]
+
+    assert "if (button.disabled) return;" in review_export
+    assert "button.disabled = true;" in review_export
+    assert 'button.textContent = "Формируем Excel…";' in review_export
+    assert 'toast("Сначала откройте документ", "error")' in review_export
+    assert 'toast("Нет строк для экспорта", "error")' in review_export
+    assert "finally" in review_export
+    assert "button.disabled = false;" in review_export
+    assert 'button.textContent = "Экспорт для проверки";' in review_export
+
+
+def test_static_assets_use_deterministic_content_revisions_and_modal_has_no_blur():
+    app_path = ROOT / "averon_import" / "static" / "app.js"
+    styles_path = ROOT / "averon_import" / "static" / "styles.css"
+    html = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    css = styles_path.read_text(encoding="utf-8")
+
+    app_revision = hashlib.sha256(app_path.read_bytes()).hexdigest()[:12]
+    styles_revision = hashlib.sha256(styles_path.read_bytes()).hexdigest()[:12]
+    assert f"/static/app.js?v={{{{ asset_revisions.app }}}}" in html
+    assert f"/static/styles.css?v={{{{ asset_revisions.styles }}}}" in html
+    assert len(app_revision) == 12
+    assert len(styles_revision) == 12
+    modal_backdrop = re.search(r"\.modal::backdrop\s*\{([^}]*)\}", css)
+    assert modal_backdrop
+    assert "backdrop-filter" not in modal_backdrop.group(1)
 
 
 def test_export_safety_uses_backend_page_status_and_pdf_viewer_resets_cleanly():
