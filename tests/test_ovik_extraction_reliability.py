@@ -159,11 +159,34 @@ def test_alphabetic_system_requires_section_topology():
         )
 
 
+def test_alphabetic_adjacency_cannot_create_circular_section_system_context():
+    for first in ("Поставщик", "КЖ", "ПС", "ГОСТ"):
+        _table, _context, graph, _relations, _semantic = _run({
+            1: {1: first},
+            2: {1: "ООО"},
+            3: {1: "Насос", 5: "шт", 6: "1"},
+        })
+        selected = {
+            assessment.physical_row_ref.row_index: assessment
+            for assessment in graph.row_role_assessments
+        }
+        assert not (
+            selected[1].selected_role == RowRole.CONTEXT
+            and selected[1].selected_qualifier == "SECTION"
+            and selected[1].state == RowRoleState.CONFIRMED
+        )
+        assert not (
+            selected[2].selected_role == RowRole.CONTEXT
+            and selected[2].selected_qualifier == "SYSTEM"
+            and selected[2].state == RowRoleState.CONFIRMED
+        )
+
+
 def test_package_components_keep_explicit_and_blank_quantity_without_swallowing_next_item():
     _table, context, graph, _relations, semantic = _run({
         1: {1: "Установка", 5: "компл."},
-        2: {1: "- Компонент без количества"},
-        3: {1: "- Компонент", 6: "2"},
+        2: {1: "- Компонент", 6: "2"},
+        3: {1: "- Компонент без количества"},
         4: {1: "Отдельный насос", 5: "шт", 6: "1"},
     })
     roles = {
@@ -188,9 +211,21 @@ def test_package_components_keep_explicit_and_blank_quantity_without_swallowing_
         if row.metadata.get("semantic_role") == "COMPONENT"
     ]
     assert len(components) == 2
-    assert components[0].values.get("quantity", "") == ""
-    assert components[1].values["quantity"] == "2"
+    assert components[0].values["quantity"] == "2"
+    assert components[1].values.get("quantity", "") == ""
     assert all(not row.metadata.get("semantic_review") for row in components)
+    assert not attach_exact_cell_candidate(
+        components[1], "quantity", "1", bbox={}
+    )
+    assert components[1].metadata.get("semantic_required_critical_fields") == []
+    assert components[1].metadata.get("value_candidates") == {}
+    presented_components = [
+        SpecificationRowAssembler().build_semantic_row(1, row)
+        for row in components
+    ]
+    assert presented_components[0]["quantity"] == "2"
+    assert presented_components[1].get("quantity") is None
+    assert all(critical_blockers_for_row(row) == [] for row in presented_components)
     assert len(semantic.logical_items) == 2
     assert all(
         all(ref.row_index not in {2, 3} for ref in item.physical_row_refs)

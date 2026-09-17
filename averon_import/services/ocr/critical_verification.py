@@ -233,6 +233,16 @@ def attach_exact_cell_candidate(
     value = _candidate_value(field, raw_value)
     if value is None:
         return False
+    # A source-blank package component has no applicable quantity field.
+    # Exact-cell evidence must not turn that non-applicable blank into a
+    # required critical field (or a review blocker).  Explicit component
+    # quantities may still use exact-cell evidence for numeric-shape review.
+    if (
+        not primary_value
+        and isinstance(row.metadata, dict)
+        and row.metadata.get("semantic_role") == "COMPONENT"
+    ):
+        return False
     mark_semantic_field_required(row, field)
     metadata = row.metadata
     candidates = dict(metadata.get("value_candidates") or {})

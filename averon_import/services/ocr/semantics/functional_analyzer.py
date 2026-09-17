@@ -480,9 +480,13 @@ def _section_before_system_candidate(
 ) -> RoleCandidate | None:
     """Use adjacent heading/system topology as provider-neutral evidence."""
 
-    if next_row is None or not _is_standalone_system_row(
-        next_row, mapping, allow_alphabetic=True
-    ):
+    # A section candidate must not be manufactured from the same weak
+    # alphabetic token that it would then enable as a SYSTEM row.  Only an
+    # independently strong alphanumeric system shape may prove this sparse
+    # preceding row to be a section.  Alphabetic-only systems are admitted by
+    # the normal topology path only after a section has already been confirmed
+    # by its own evidence.
+    if next_row is None or not _is_standalone_system_row(next_row, mapping):
         return None
     occupied = _row_occupied(row)
     if not occupied or len(occupied) > 2:
