@@ -123,6 +123,38 @@ def _field_texts(row: PhysicalRowIR, mapping: Mapping[int, tuple[str, ...]]) -> 
     return result
 
 
+def _mapped_cells(
+    row: PhysicalRowIR,
+    mapping: Mapping[int, tuple[str, ...]],
+    field_name: str,
+) -> tuple[PhysicalCellIR, ...]:
+    return tuple(
+        cell
+        for cell in row.cells
+        if field_name in mapping.get(cell.ref.column_index, ())
+    )
+
+
+def _source_blank_proven(cell: PhysicalCellIR) -> bool:
+    """Return only explicit physical evidence that a mapped cell is blank.
+
+    An empty OCR string is intentionally insufficient: the provider may have
+    missed printed ink.  ``available`` is required for the raster shorthand so
+    that a missing raster observation cannot be treated as a blank source.
+    """
+    if cell.raw_text.strip() or cell.word_refs:
+        return False
+    evidence = dict(cell.raster_evidence)
+    provenance = dict(cell.provenance)
+    if evidence.get("source_blank") is True or provenance.get("source_blank") is True:
+        return True
+    if evidence.get("available") is True and evidence.get("raster_glyph") is False:
+        return True
+    if evidence.get("available") is True and evidence.get("glyph_count") == 0:
+        return True
+    return False
+
+
 def _has_letters(value: str) -> bool:
     return bool(re.search(r"[A-Za-zА-Яа-яЁё]", value))
 
@@ -661,6 +693,12 @@ def _hierarchical_group_candidate(
         for field in ("unit", "quantity", "mass", "type_mark", "code", "manufacturer")
     ):
         return None
+    if any(
+        len(cells := _mapped_cells(row, mapping, field)) != 1
+        or not _source_blank_proven(cells[0])
+        for field in ("unit", "quantity", "mass")
+    ):
+        return None
 
     root = positions[0]
     children: list[PhysicalRowIR] = []
@@ -701,7 +739,7 @@ def _hierarchical_group_candidate(
         evidence=(
             "hierarchical_root_position",
             "meaningful_group_name",
-            "group_parent_critical_fields_blank",
+            "group_parent_critical_fields_source_blank",
             "contiguous_child_positions",
             "multiple_child_item_anchors",
         ),

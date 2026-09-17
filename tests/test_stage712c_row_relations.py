@@ -48,6 +48,8 @@ def _table(
     detector_source: str = "raster",
     header_rows: tuple[int, ...] = (0,),
     structural_evidence: dict | None = None,
+    source_blank_cells: dict[int, tuple[int, ...]] | None = None,
+    cell_evidence: dict[int, dict[int, dict]] | None = None,
 ) -> tuple[PhysicalTableIR, TableAnalysisContext]:
     table_ref = PhysicalTableRef(
         page_number=page_number,
@@ -57,19 +59,30 @@ def _table(
     )
     row_indexes = (0, *sorted(body))
     max_row = max(row_indexes, default=0)
+    source_blank_cells = source_blank_cells or {}
+    cell_evidence = cell_evidence or {}
     rows: list[PhysicalRowIR] = []
     for row_index in row_indexes:
         values = _HEADER if row_index == 0 else body[row_index]
         row_ref = PhysicalRowRef(table_ref, row_index)
+        evidence_by_column = cell_evidence.get(row_index, {})
+        blank_columns = set(source_blank_cells.get(row_index, ()))
+        columns = set(values) | blank_columns | set(evidence_by_column)
         cells = tuple(
             PhysicalCellIR(
                 ref=PhysicalCellRef(row_ref, column_index, row_index * 100 + column_index),
                 bbox=(column_index * 100.0, row_index * 20.0,
                       column_index * 100.0 + 100.0, row_index * 20.0 + 20.0),
-                raw_text=text,
+                raw_text=values.get(column_index, ""),
+                raster_evidence={
+                    **({"source_blank": True} if column_index in blank_columns else {}),
+                    **dict(evidence_by_column.get(column_index, {})),
+                },
             )
-            for column_index, text in sorted(values.items())
-            if text
+            for column_index in sorted(columns)
+            if values.get(column_index, "")
+            or column_index in blank_columns
+            or column_index in evidence_by_column
         )
         rows.append(
             PhysicalRowIR(

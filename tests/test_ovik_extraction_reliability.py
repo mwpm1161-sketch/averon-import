@@ -303,7 +303,7 @@ def test_hierarchical_procurement_group_keeps_parent_non_output_and_children_ite
         2: {0: "8.1", 1: "Шпилька М16", 5: "шт", 6: "4"},
         3: {0: "8.2", 1: "Гайка М16", 5: "шт", 6: "8"},
         4: {0: "9", 1: "Насос", 5: "шт", 6: "1"},
-    })
+    }, source_blank_cells={1: (5, 6, 7)})
     selected = {
         assessment.physical_row_ref.row_index: assessment
         for assessment in graph.row_role_assessments
@@ -334,6 +334,65 @@ def test_hierarchical_procurement_group_keeps_parent_non_output_and_children_ite
     presented_group = SpecificationRowAssembler().build_semantic_row(1, group)
     assert presented_group["row_type"] == "note"
     assert presented_group["status"] == "recognized"
+
+
+def test_hierarchical_group_rejects_parent_when_quantity_glyph_was_missed():
+    _table, _context, graph, _relations, semantic = _run({
+        1: {0: "8", 1: "Parent equipment"},
+        2: {0: "8.1", 1: "Item A", 5: "шт", 6: "1"},
+        3: {0: "8.2", 1: "Item B", 5: "шт", 6: "2"},
+    }, cell_evidence={
+        1: {
+            5: {"source_blank": True},
+            6: {"available": True, "raster_glyph": True},
+            7: {"source_blank": True},
+        },
+    })
+    selected = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    assert selected[1].selected_role == RowRole.ITEM_ROOT
+    assert selected[1].selected_qualifier is None
+    assert [item.physical_row_refs[0].row_index for item in semantic.logical_items] == [1, 2, 3]
+
+
+def test_hierarchical_group_fails_closed_without_blank_evidence():
+    _table, _context, graph, _relations, semantic = _run({
+        1: {0: "8", 1: "Parent equipment"},
+        2: {0: "8.1", 1: "Item A", 5: "шт", 6: "1"},
+        3: {0: "8.2", 1: "Item B", 5: "шт", 6: "2"},
+    }, cell_evidence={1: {5: {}, 6: {}, 7: {}}})
+    selected = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    assert not (
+        selected[1].selected_role == RowRole.CONTEXT
+        and selected[1].selected_qualifier == "GROUP"
+        and selected[1].state == RowRoleState.CONFIRMED
+    )
+    assert [item.physical_row_refs[0].row_index for item in semantic.logical_items] == [1, 2, 3]
+
+
+def test_hierarchical_group_rejects_explicit_parent_value_and_keeps_ordinary_items():
+    _table, _context, graph, _relations, semantic = _run({
+        1: {0: "8", 1: "Parent equipment", 5: "компл.", 6: "1"},
+        2: {0: "8.1", 1: "Item A", 5: "шт", 6: "1"},
+        3: {0: "8.2", 1: "Item B", 5: "шт", 6: "2"},
+        4: {0: "1", 1: "Ordinary one", 5: "шт", 6: "1"},
+        5: {0: "2", 1: "Ordinary two", 5: "шт", 6: "2"},
+        6: {0: "3", 1: "Ordinary three", 5: "шт", 6: "3"},
+    })
+    selected = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    assert selected[1].selected_role == RowRole.ITEM_ROOT
+    assert selected[1].selected_qualifier is None
+    for row_index in (2, 3, 4, 5, 6):
+        assert selected[row_index].selected_role == RowRole.ITEM_ROOT
+    assert [item.physical_row_refs[0].row_index for item in semantic.logical_items] == [1, 2, 3, 4, 5, 6]
 
 
 def test_hierarchical_group_requires_two_contiguous_children():
