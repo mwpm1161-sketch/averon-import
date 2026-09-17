@@ -487,8 +487,12 @@ function numericSuspectFields(row) {
   return CRITICAL_FIELDS.filter((key) => {
     if (!["quantity", "mass"].includes(key)) return false;
     const details = normalization[key];
-    if (!details?.numeric_suspect) return false;
+    const shapeSuspect = key === "quantity" && details?.integer_like_decimal;
+    if (!details?.numeric_suspect && !shapeSuspect) return false;
     if (!edited.has(key)) return true;
+    if (shapeSuspect && key === "quantity") {
+      return /^-?\d+[.,]0$/.test(String(row[key] ?? "").trim());
+    }
     return !/^-?\d+(?:[.,]\d+)?$/.test(String(row[key] ?? "").trim());
   });
 }
@@ -1191,7 +1195,10 @@ function cellHtml(row, key) {
   if (key === "row_type") return `<td><select class="cell-select" data-id="${row.id}" data-key="row_type">${options(state.config.row_types,row.row_type)}</select></td>`;
   if (key === "status") return `<td><select class="cell-select" data-id="${row.id}" data-key="status">${options(state.config.statuses,row.status)}</select></td>`;
   if (key === "confidence") {
-    const value = Number(row.confidence || 0);
+    if (row.confidence === null || row.confidence === undefined || row.confidence === "") {
+      return `<td><div class="confidence"><span><i style="width:0%"></i></span>—</div></td>`;
+    }
+    const value = Number(row.confidence);
     return `<td><div class="confidence"><span><i style="width:${Math.max(0,Math.min(100,value))}%"></i></span>${value.toFixed(0)}%</div></td>`;
   }
   if (key === "page") return `<td><span class="status-pill">${escapeHtml(String(row.page ?? ""))}</span></td>`;
@@ -1218,6 +1225,8 @@ function cellHtml(row, key) {
     annotation = `<small class="human-verified">Проверено пользователем ✓</small>`;
   } else if (humanRejected) {
     annotation = `<small class="critical-warning">Кандидат отклонён пользователем · оставлено на проверке</small>`;
+  } else if (candidate?.auto_trusted) {
+    annotation = `<small class="human-verified">Проверено локальной ячейкой ✓</small>`;
   } else if (candidate?.value_candidate) {
     annotation = `<div class="secondary-candidate">Проверить · Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
       <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;

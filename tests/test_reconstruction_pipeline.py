@@ -370,7 +370,7 @@ def test_page30_fixture_maps_semantic_fields_and_splits_flexible_ducts():
     ]
     assert [row["unit"] for row in ducts] == ["м", "м", "м"]
     assert all(row["structured_table"] for row in assembled if row["row_type"] != "skip")
-    assert all(row["confidence"] == 0.0 for row in assembled)
+    assert all(row["confidence"] is None for row in assembled)
     assert all("no_confidence" in row["review_reasons"] for row in assembled)
 
 

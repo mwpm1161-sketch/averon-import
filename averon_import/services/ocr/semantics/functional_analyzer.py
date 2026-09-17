@@ -56,7 +56,8 @@ class EvidenceTier(str, Enum):
 _INTEGER_RE = re.compile(r"^\d+$")
 _NUMBER_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
 _SYSTEM_RE = re.compile(
-    r"^[A-ZА-ЯЁ]\s*\d{1,3}(?:[.,]\d+)?$",
+    r"^(?:(?:[А-ЯЁ]{2,4})|(?:[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?))\s*\*?"
+    r"(?:\s*,\s*(?:(?:[А-ЯЁ]{2,4})|(?:[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?))\s*\*?)*$",
     re.IGNORECASE,
 )
 _NOTE_RE = re.compile(
@@ -64,7 +65,7 @@ _NOTE_RE = re.compile(
     re.IGNORECASE,
 )
 _SECTION_HEADING_RE = re.compile(
-    r"^\s*(?:[IVXLCDM]+\s*[.)]|\d+(?:\.\d+)+\s*[.)]?)\s+\S",
+    r"^\s*(?:[IVXLCDM]+\s*[_.)-]?|\d+(?:\.\d+)+\s*[.)-]?)\s+\S",
     re.IGNORECASE,
 )
 
@@ -398,7 +399,14 @@ def _context_component_note_evidence(
                 evidence=("explicit_system_code_shape", "single_context_cell"),
             )
         )
-    elif len(values) == 1 and _has_letters(combined) and not has_item_anchor:
+    elif (
+        len(values) == 1
+        and _has_letters(combined)
+        and not has_item_anchor
+        and next(
+            (char for char in combined if char.isalpha()), ""
+        ).isupper()
+    ):
         candidates.append(
             _candidate(
                 RowRole.CONTEXT,
@@ -407,7 +415,7 @@ def _context_component_note_evidence(
                 evidence=("single_text_context_row", "no_independent_item_anchor"),
             )
         )
-    if combined.startswith(("-", "—", "•", "*")) or any(value.startswith(("-", "—", "•")) for value in values):
+    if combined.startswith(("-", "–", "—", "•", "*")) or any(value.startswith(("-", "–", "—", "•")) for value in values):
         candidates.append(
             _candidate(
                 RowRole.COMPONENT,
@@ -426,6 +434,122 @@ def _context_component_note_evidence(
             )
         )
     return tuple(candidates)
+
+
+def _is_standalone_system_row(
+    row: PhysicalRowIR,
+    mapping: Mapping[int, tuple[str, ...]],
+) -> bool:
+    occupied = _row_occupied(row)
+    if len(occupied) != 1:
+        return False
+    field_text = _field_texts(row, mapping)
+    if set(field_text) - {"name", "position"}:
+        return False
+    combined = " ".join(
+        _text(cell.raw_text) for cell in occupied if _text(cell.raw_text)
+    )
+    return bool(combined and _SYSTEM_RE.fullmatch(combined))
+
+
+def _section_before_system_candidate(
+    row: PhysicalRowIR,
+    next_row: PhysicalRowIR | None,
+    mapping: Mapping[int, tuple[str, ...]],
+) -> RoleCandidate | None:
+    """Use adjacent heading/system topology as provider-neutral evidence."""
+
+    if next_row is None or not _is_standalone_system_row(next_row, mapping):
+        return None
+    occupied = _row_occupied(row)
+    if not occupied or len(occupied) > 2:
+        return None
+    field_text = _field_texts(row, mapping)
+    if set(field_text) - {"name", "position"}:
+        return None
+    if any(field_text.get(field) for field in ("unit", "quantity", "mass")):
+        return None
+    if any(
+        any(_has_letters(value) for value in field_text.get(field, ()))
+        for field in ("type_mark", "code", "manufacturer")
+    ):
+        return None
+    combined = " ".join(
+        _text(cell.raw_text) for cell in occupied if _text(cell.raw_text)
+    )
+    if not combined or not _has_letters(combined):
+        return None
+    return _candidate(
+        RowRole.CONTEXT,
+        qualifier="SECTION",
+        tier=EvidenceTier.STRONG,
+        evidence=(
+            "section_precedes_standalone_system",
+            "sparse_heading_topology",
+            "no_independent_product_anchor",
+        ),
+    )
+
+
+def _is_package_host(
+    row: PhysicalRowIR,
+    mapping: Mapping[int, tuple[str, ...]],
+    assessment: RowRoleAssessment,
+) -> bool:
+    if (
+        assessment.selected_role != RowRole.ITEM_ROOT
+        or assessment.state != RowRoleState.CONFIRMED
+    ):
+        return False
+    field_text = _field_texts(row, mapping)
+    return any(
+        bool(re.fullmatch(r"\s*комп(?:л(?:\.|ект)?|лект)?\s*", value, re.IGNORECASE))
+        for value in field_text.get("unit", ())
+    )
+
+
+def _package_component_candidate(
+    row: PhysicalRowIR,
+    mapping: Mapping[int, tuple[str, ...]],
+) -> RoleCandidate | None:
+    field_text = _field_texts(row, mapping)
+    present = {
+        field for field, values in field_text.items()
+        if any(_text(value) for value in values)
+    }
+    if not present or "position" in present or "mass" in present:
+        return None
+    identity = {
+        field for field in ("name", "type_mark", "code", "manufacturer")
+        if any(_has_letters(value) for value in field_text.get(field, ()))
+    }
+    if not identity:
+        return None
+    combined = " ".join(
+        _text(value)
+        for values in field_text.values()
+        for value in values
+        if _text(value)
+    )
+    bullet = combined.lstrip().startswith(("-", "–", "—", "•", "*"))
+    # A component can have its own quantity/unit. A non-bulleted row with a
+    # unit is treated as a new item boundary; this prevents swallowing the
+    # unrelated item following a package block.
+    if "unit" in present and not bullet:
+        return None
+    if not bullet and "quantity" not in present:
+        return None
+    evidence = ["package_parent_context", "included_component_identity"]
+    if bullet:
+        evidence.append("bullet_component_marker")
+    if "quantity" in present:
+        evidence.append("explicit_component_quantity")
+    return _candidate(
+        RowRole.COMPONENT,
+        qualifier="INCLUDED",
+        tier=EvidenceTier.STRONG,
+        evidence=evidence,
+    )
 
 
 def _section_heading_evidence(
@@ -459,6 +583,11 @@ def _section_heading_evidence(
         return ()
     heading_shape = bool(_SECTION_HEADING_RE.match(combined))
     sparse_colon = len(occupied) <= 2 and combined.rstrip().endswith(":")
+    first_alpha = next((char for char in combined if char.isalpha()), "")
+    if sparse_colon and not heading_shape and first_alpha.islower():
+        # A lower-case terminal fragment is generic continuation evidence,
+        # not a new section heading (for example, a wrapped product phrase).
+        return ()
     if not heading_shape and not sparse_colon:
         return ()
     return (
@@ -513,7 +642,10 @@ def _assessment(
             for candidate in best
             if candidate.role == RowRole.CONTEXT
             and candidate.qualifier == "SECTION"
-            and "generic_section_heading_syntax" in candidate.evidence
+            and (
+                "generic_section_heading_syntax" in candidate.evidence
+                or "section_precedes_standalone_system" in candidate.evidence
+            )
         ),
         None,
     )
@@ -610,7 +742,10 @@ class TableFunctionalAnalyzer:
         assessments: list[RowRoleAssessment] = []
         numbering_rows: list[dict[str, Any]] = []
         anomalies: list[dict[str, Any]] = []
-        for row in physical_table.rows:
+        physical_rows = tuple(
+            sorted(physical_table.rows, key=lambda value: value.ref.row_index)
+        )
+        for row_index, row in enumerate(physical_rows):
             candidates = list(_header_adjacency_evidence(row, header_rows))
             if row.ref.row_index not in header_rows:
                 numbering_candidates, numbering_diagnostics = _numbering_evidence(
@@ -630,7 +765,61 @@ class TableFunctionalAnalyzer:
                 candidates.extend(_item_evidence(row, mapping))
                 candidates.extend(_section_heading_evidence(row, mapping))
                 candidates.extend(_context_component_note_evidence(row, mapping))
+            next_row = (
+                physical_rows[row_index + 1]
+                if row_index + 1 < len(physical_rows)
+                else None
+            )
+            section_before_system = _section_before_system_candidate(
+                row, next_row, mapping
+            )
+            if section_before_system is not None:
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if not (
+                        candidate.role == RowRole.CONTEXT
+                        and candidate.qualifier == "SECTION"
+                    )
+                ]
+                candidates.append(section_before_system)
             assessments.append(_assessment(row, candidates))
+
+        # Package rows introduce a bounded component block. This is based on
+        # the structured unit column and physical adjacency, not on product
+        # names or document-specific vocabulary.
+        normalized_assessments: list[RowRoleAssessment] = []
+        package_block_active = False
+        for row, assessment in zip(physical_rows, assessments):
+            if _is_package_host(row, mapping, assessment):
+                package_block_active = True
+                normalized_assessments.append(assessment)
+                continue
+            if package_block_active:
+                component = _package_component_candidate(row, mapping)
+                if component is not None:
+                    normalized_assessments.append(_assessment(row, [component]))
+                    continue
+                if (
+                    assessment.selected_role in {
+                        RowRole.CONTEXT,
+                        RowRole.HEADER,
+                        RowRole.SERVICE,
+                    }
+                    or assessment.state == RowRoleState.CONFIRMED
+                    and assessment.selected_role == RowRole.ITEM_ROOT
+                ):
+                    package_block_active = False
+                elif any(
+                    _text(value)
+                    for cell in row.cells
+                    for value in (_text(cell.raw_text),)
+                ):
+                    # A non-component physical row ends the package block;
+                    # it is still assessed by the normal evidence path.
+                    package_block_active = False
+            normalized_assessments.append(assessment)
+        assessments = normalized_assessments
 
         selected_roles = Counter(
             assessment.selected_role.value

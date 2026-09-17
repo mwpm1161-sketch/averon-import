@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from averon_import.core.normalizers import numeric_cell_metadata
+from averon_import.services.ocr.base import OcrRow
+from averon_import.services.ocr.critical_verification import (
+    attach_exact_cell_candidate,
+    promote_exact_cell_candidate,
+)
+from averon_import.services.ocr.semantics.semantic_projection import (
+    StructuredReconstructionResult,
+    project_semantic_table,
+)
+from averon_import.services.ocr.semantics.row_evidence import (
+    RowRole,
+    RowRoleState,
+)
+from averon_import.services.ocr.semantics.functional_analyzer import (
+    TableFunctionalAnalyzer,
+)
+from averon_import.services.row_assembler import SpecificationRowAssembler
+from averon_import.services.review_policy import (
+    critical_blockers_for_row,
+    critical_field_count,
+    refresh_review_state,
+)
+
+from tests.test_stage712c_row_relations import _run
+
+
+def _semantic_row(values: dict[str, str], *, review_reasons: list[str] | None = None) -> OcrRow:
+    return OcrRow(
+        source_row=1,
+        values=values,
+        confidences={},
+        sources={key: "yandex_vision" for key in values},
+        bbox={},
+        metadata={
+            "provider": "yandex_vision",
+            "structured_table": True,
+            "provider_has_explicit_rows": True,
+            "semantic_authoritative": True,
+            "semantic_resolved": True,
+            "semantic_role": "ITEM_ROOT",
+            "semantic_state": "REVIEW" if review_reasons else "VERIFIED",
+            "semantic_review": bool(review_reasons),
+            "semantic_required_critical_fields": ["quantity", "unit"],
+            "review_reasons": list(review_reasons or []),
+            "normalization": {},
+        },
+    )
+
+
+def test_integer_like_decimal_quantity_is_review_only_but_real_fraction_survives():
+    assert numeric_cell_metadata("40")["integer_like_decimal"] is False
+    assert numeric_cell_metadata("4.0")["integer_like_decimal"] is True
+    assert numeric_cell_metadata("2.5")["integer_like_decimal"] is False
+
+    row = SpecificationRowAssembler().build_semantic_row(
+        27,
+        _semantic_row(
+            {"name": "Трубы", "unit": "м", "quantity": "4.0"},
+            review_reasons=["numeric_shape_suspect"],
+        ),
+    )
+    row["ocr_metadata"]["normalization"]["quantity"] = numeric_cell_metadata("4.0")
+    refresh_review_state(row)
+    assert row["quantity"] == "4.0"
+    assert row["status"] == "review"
+    assert "numeric_shape_suspect" in critical_blockers_for_row(row)
+    assert critical_field_count(row) == 1
+
+
+def test_exact_cell_quantity_is_promoted_only_with_local_structural_proof():
+    row = _semantic_row({"name": "Насос", "unit": "шт."})
+    row.metadata.update({
+        "target_cell_structural_safety": {
+            "quantity": {"safe": True, "reasons": []},
+        },
+        "cell_bboxes": {"quantity": {"x": 0.7, "y": 0.2, "width": 0.05, "height": 0.02}},
+    })
+    assert attach_exact_cell_candidate(
+        row, "quantity", "1", bbox={"x": 0.7, "y": 0.2, "width": 0.05, "height": 0.02}
+    )
+    assert row.values.get("quantity", "") == ""
+    assert promote_exact_cell_candidate(row, "quantity")
+    assert row.values["quantity"] == "1"
+    assert row.metadata["value_candidates"]["quantity"]["auto_trusted"] is True
+    assert row.metadata["semantic_review"] is False
+
+
+def test_exact_cell_does_not_promote_package_quantity_or_suspicious_decimal():
+    for unit, raw in (("компл.", "1"), ("м", "4.0")):
+        row = _semantic_row({"name": "Комплект", "unit": unit})
+        row.metadata["target_cell_structural_safety"] = {
+            "quantity": {"safe": True, "reasons": []},
+        }
+        assert attach_exact_cell_candidate(row, "quantity", raw, bbox={})
+        assert not promote_exact_cell_candidate(row, "quantity")
+        assert "quantity" not in row.values
+
+
+def test_package_components_keep_explicit_and_blank_quantity_without_swallowing_next_item():
+    _table, context, graph, _relations, semantic = _run({
+        1: {1: "Установка", 5: "компл."},
+        2: {1: "- Компонент без количества"},
+        3: {1: "- Компонент", 6: "2"},
+        4: {1: "Отдельный насос", 5: "шт", 6: "1"},
+    })
+    roles = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    assert roles[2].selected_role == RowRole.COMPONENT
+    assert roles[2].state == RowRoleState.CONFIRMED
+    assert roles[3].selected_role == RowRole.COMPONENT
+    assert roles[4].selected_role == RowRole.ITEM_ROOT
+
+    projected = project_semantic_table(
+        StructuredReconstructionResult(
+            rows=[],
+            physical_table=_table,
+            semantic_table=semantic,
+            page_size=(900.0, 400.0),
+        )
+    )
+    components = [
+        row for row in projected
+        if row.metadata.get("semantic_role") == "COMPONENT"
+    ]
+    assert len(components) == 2
+    assert components[0].values.get("quantity", "") == ""
+    assert components[1].values["quantity"] == "2"
+    assert all(not row.metadata.get("semantic_review") for row in components)
+    assert len(semantic.logical_items) == 2
+    assert all(
+        all(ref.row_index not in {2, 3} for ref in item.physical_row_refs)
+        for item in semantic.logical_items
+    )
+
+
+def test_section_system_topology_and_system_lists_are_generic():
+    _table, _context, graph, _relations, semantic = _run({
+        1: {1: "II Дымоудаление"},
+        2: {1: "ДВЕ"},
+        3: {1: "Точка", 5: "шт", 6: "1"},
+        4: {1: "III Кондиционирование"},
+        5: {1: "K1,K2,K3"},
+        6: {1: "Точка 2", 5: "шт", 6: "1"},
+        7: {1: "IV _ Отопление"},
+        8: {1: "K4, K4*"},
+        9: {1: "Точка 3", 5: "шт", 6: "1"},
+    })
+    selected = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    for row_index in (1, 4, 7):
+        assert selected[row_index].selected_role == RowRole.CONTEXT
+        assert selected[row_index].selected_qualifier == "SECTION"
+        assert selected[row_index].state == RowRoleState.CONFIRMED
+    for row_index in (2, 5, 8):
+        assert selected[row_index].selected_role == RowRole.CONTEXT
+        assert selected[row_index].selected_qualifier == "SYSTEM"
+        assert selected[row_index].state == RowRoleState.CONFIRMED
+    assert [item.physical_row_refs[0].row_index for item in semantic.logical_items] == [3, 6, 9]
+
+
+def test_lowercase_terminal_fragment_is_not_a_new_section():
+    _table, _context, graph, _relations, _semantic = _run({
+        1: {1: "Насос", 5: "шт", 6: "1"},
+        2: {1: "сетка-SG60M) в компл.:"},
+    })
+    selected = graph.row_role_assessments[2]
+    assert not (
+        selected.selected_role == RowRole.CONTEXT
+        and selected.selected_qualifier == "SECTION"
+    )
+
+
+def test_semantic_rows_without_provider_confidence_expose_none():
+    row = SpecificationRowAssembler().build_semantic_row(
+        1,
+        _semantic_row({"name": "Насос", "unit": "шт.", "quantity": "1"}),
+    )
+    assert row["confidence"] is None
+    assert row["status"] == "recognized"
+
+
+def test_static_ui_keeps_unavailable_confidence_distinct_from_zero():
+    app_js = Path("averon_import/static/app.js").read_text(encoding="utf-8")
+    assert "row.confidence === null" in app_js
+    assert "—" in app_js

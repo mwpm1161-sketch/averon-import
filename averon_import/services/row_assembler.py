@@ -32,7 +32,13 @@ class SpecificationRowAssembler:
         "канализац",
         "оборудован",
     )
-    SYSTEM_RE = re.compile(r"^(?:[ПВКЕВBPK]{1,4}\s*\d+(?:[.,]\d+)?|К\d+(?:\.\d+)*)$", re.I)
+    # Legacy non-semantic rows keep the historical strict validation. The
+    # provider-neutral semantic path owns the broader structural system
+    # contract used for short labels and comma-separated labels.
+    SYSTEM_RE = re.compile(
+        r"^(?:[ПВКЕВBPK]{1,4}\s*\d+(?:[.,]\d+)?|К\d+(?:\.\d+)*)$",
+        re.I,
+    )
 
     def __init__(self):
         self.current_section = ""
@@ -135,7 +141,7 @@ class SpecificationRowAssembler:
         confidence = (
             round(sum(confidence_values) / len(confidence_values), 1)
             if confidence_values
-            else 0.0
+            else None
         )
         review_reasons = list(metadata.get("review_reasons") or [])
         if row_type == "item_candidate" and "physical_row_unresolved" not in review_reasons:
@@ -236,7 +242,7 @@ class SpecificationRowAssembler:
             for key, value in (payload.get("confidences") or {}).items()
             if values.get(key, "").strip()
         ]
-        confidence = round(sum(confidence_values) / len(confidence_values), 1) if confidence_values else 0.0
+        confidence = round(sum(confidence_values) / len(confidence_values), 1) if confidence_values else None
         section = self.current_section
         system = self.current_system
         if row_type == "section":
@@ -392,17 +398,18 @@ class SpecificationRowAssembler:
         return "skip"
 
     @staticmethod
-    def status_for(values: dict[str, str], confidence: float, row_type: str) -> str:
+    def status_for(values: dict[str, str], confidence: float | None, row_type: str) -> str:
+        score = confidence if confidence is not None else 0.0
         if row_type == "item_candidate":
             return "unrecognized"
         if row_type in {"section", "system", "note", "component"}:
-            return "recognized" if confidence >= 55 else "review"
+            return "recognized" if score >= 55 else "review"
         critical_present = bool(values.get("name")) and bool(
             values.get("quantity") or values.get("unit")
         )
         if not critical_present:
             return "review" if values.get("name") else "unrecognized"
-        return "recognized" if confidence >= 68 else "review"
+        return "recognized" if score >= 68 else "review"
 
     @staticmethod
     def summary(rows: list[dict], errors: list[dict]) -> dict:

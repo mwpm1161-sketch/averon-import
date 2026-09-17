@@ -115,7 +115,7 @@ def test_fully_empty_row_still_emitted_as_skip():
     rows = assembler.build_page(1, [mkrow(5, {}, confidences={})])
     assert len(rows) == 1
     assert rows[0]["row_type"] == "skip"
-    assert rows[0]["confidence"] == 0.0
+    assert rows[0]["confidence"] is None
     assert rows[0]["status"] == "unrecognized"
 
 
