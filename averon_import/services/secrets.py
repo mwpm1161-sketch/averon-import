@@ -19,6 +19,9 @@ YANDEX_API_KEY = "yandex.api_key"
 YANDEX_AI_API_KEY = "yandex.ai_api_key"
 # Lemana B2B client secret is owned by SecretStore, never settings.json.
 LEMANA_B2B_CLIENT_SECRET = "lemana_b2b.client_secret"
+# ETM iPRO owns two independent credentials; neither is part of settings.json.
+ETM_IPRO_LOGIN = "etm_ipro.login"
+ETM_IPRO_PASSWORD = "etm_ipro.password"
 
 
 class SecretStoreError(RuntimeError):

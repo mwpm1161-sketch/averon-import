@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Callable
+from urllib.parse import quote, urlencode, urlsplit
+
+from averon_import.services.app_settings import EtmIproSettings
+from averon_import.services.sourcing.providers.base import SourcingProviderError
+
+from .models import parse_manufacturers
+
+ETM_API_URLS = {
+    "prod": "https://ipro.etm.ru/api/v1",
+    "test": "https://itest2.etm.ru/api/v1",
+}
+ETM_LOGIN_PATH = "/user/login"
+ETM_MANUFACTURERS_PATH = "/info/search/r-manuf/"
+ETM_CATALOG_JOB_CREATE_PATH = "/job/create/40029846"
+_MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+_SESSION_LIFETIME_SECONDS = 8 * 60 * 60
+_SESSION_MARGIN_SECONDS = 5 * 60
+_LOGIN_INTERVAL_SECONDS = 120.0
+
+Transport = Callable[[urllib.request.Request, float], Any]
+
+
+def _default_transport(request: urllib.request.Request, timeout: float):
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+class EtmRateLimiter:
+    """Provider-owned monotonic limiter; callers never issue parallel ETM calls."""
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self._clock = clock
+        self._sleeper = sleeper
+        self._last_by_bucket: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, bucket: str) -> None:
+        with self._lock:
+            now = self._clock()
+            previous = self._last_by_bucket.get(str(bucket))
+            if previous is not None:
+                wait = self.interval_seconds - (now - previous)
+                if wait > 0:
+                    self._sleeper(wait)
+                    now = max(self._clock(), previous + self.interval_seconds)
+            self._last_by_bucket[str(bucket)] = now
+
+
+@dataclass(frozen=True)
+class _Session:
+    value: str
+    expires_at: float
+
+
+class EtmIproClient:
+    """Safe HTTP/session boundary for the documented ETM iPRO API."""
+
+    def __init__(
+        self,
+        settings: EtmIproSettings,
+        login: str | None,
+        password: str | None,
+        *,
+        transport: Transport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+        rate_limiter: EtmRateLimiter | None = None,
+    ) -> None:
+        self.settings = settings
+        self._login_value = str(login or "").strip()
+        self._password = str(password or "").strip()
+        self._transport = transport or _default_transport
+        self._clock = clock
+        self._session: _Session | None = None
+        self._last_login_at: float | None = None
+        self._session_lock = threading.Lock()
+        self.rate_limiter = rate_limiter or EtmRateLimiter(clock=clock, sleeper=sleeper)
+
+    @property
+    def api_base_url(self) -> str:
+        return (self.settings.base_url_override or ETM_API_URLS[self.settings.environment]).rstrip("/")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.settings.enabled and self._login_value and self._password)
+
+    def check_access(self) -> bool:
+        self._get_session()
+        return True
+
+    def get_goods(
+        self,
+        source_item_id: str,
+        *,
+        lookup_type: str = "etm",
+        manufacturer_code: str | None = None,
+    ) -> dict[str, Any]:
+        item = self._id(source_item_id)
+        params: dict[str, str] = {"type": lookup_type}
+        if manufacturer_code:
+            params["mnf"] = str(manufacturer_code).strip()
+        return self._request_json("GET", f"/goods/{quote(item, safe='')}", query=params, bucket="goods")
+
+    def get_prices(self, source_item_ids: list[str] | tuple[str, ...]) -> dict[str, Any]:
+        items = self._ids(source_item_ids, limit=50)
+        if not items:
+            return {"data": []}
+        joined = ",".join(quote(item, safe="") for item in items)
+        return self._request_json(
+            "GET", f"/goods/{joined}/price", query={"type": "etm"}, bucket="price"
+        )
+
+    def get_price(self, source_item_id: str) -> dict[str, Any]:
+        return self.get_prices([source_item_id])
+
+    def get_remains(self, source_item_id: str) -> dict[str, Any]:
+        item = self._id(source_item_id)
+        return self._request_json(
+            "GET", f"/goods/{quote(item, safe='')}/remains", query={"type": "etm"}, bucket="remains"
+        )
+
+    def get_manufacturers(self) -> tuple:
+        payload = self._request_json("GET", ETM_MANUFACTURERS_PATH, bucket="manufacturer")
+        try:
+            return parse_manufacturers(payload)
+        except ValueError as exc:
+            raise SourcingProviderError(
+                "ЭТМ iPRO вернул некорректный справочник производителей",
+                code="INVALID_RESPONSE",
+                category="invalid_response",
+            ) from exc
+
+    def create_catalog_job(self) -> str:
+        payload = self._request_json(
+            "POST", ETM_CATALOG_JOB_CREATE_PATH, query={"session-id": self._get_session()}
+        )
+        value = self._data_value(payload, "uuid")
+        if not value:
+            raise SourcingProviderError(
+                "ЭТМ iPRO не вернул идентификатор синхронизации каталога",
+                code="INVALID_RESPONSE",
+                category="invalid_response",
+            )
+        return str(value).strip()
+
+    def get_catalog_job(self, job_uuid: str) -> dict[str, Any]:
+        value = self._id(job_uuid)
+        return self._request_json(
+            "GET", f"/job/{quote(value, safe='')}", query={"session-id": self._get_session()}, bucket="catalog"
+        )
+
+    def download_snapshot(self, url: str) -> Any:
+        parsed = urlsplit(str(url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise SourcingProviderError(
+                "ЭТМ iPRO не вернул безопасный адрес каталога",
+                code="INVALID_RESPONSE",
+                category="invalid_response",
+            )
+        return self._request_json("GET", str(url), auth=False, bucket="catalog")
+
+    def _get_session(self, *, force: bool = False) -> str:
+        if not self.configured:
+            raise SourcingProviderError(
+                "ЭТМ iPRO не настроен: укажите логин и пароль",
+                code="NOT_CONFIGURED",
+                category="not_configured",
+            )
+        now = self._clock()
+        with self._session_lock:
+            if not force and self._session is not None and self._session.expires_at > now:
+                return self._session.value
+            if (
+                self._last_login_at is not None
+                and now - self._last_login_at < _LOGIN_INTERVAL_SECONDS
+            ):
+                raise SourcingProviderError(
+                    "ЭТМ iPRO временно ограничил обновление сессии; повторите позже",
+                    code="AUTH_RATE_LIMITED",
+                    category="rate_limit",
+                )
+            self.rate_limiter.acquire("auth")
+            query = urlencode({"log": self._login_value, "pwd": self._password})
+            payload = self._request_json("POST", f"{ETM_LOGIN_PATH}?{query}", auth=False, bucket="auth")
+            session = self._data_value(payload, "session")
+            if isinstance(session, (dict, list)) or not str(session or "").strip():
+                raise SourcingProviderError(
+                    "ЭТМ iPRO не вернул рабочую сессию",
+                    code="INVALID_RESPONSE",
+                    category="invalid_response",
+                )
+            self._last_login_at = now
+            self._session = _Session(
+                str(session).strip(),
+                now + _SESSION_LIFETIME_SECONDS - _SESSION_MARGIN_SECONDS,
+            )
+            return self._session.value
+
+    def _request_json(
+        self,
+        method: str,
+        path_or_url: str,
+        *,
+        query: dict[str, Any] | None = None,
+        auth: bool = True,
+        bucket: str = "general",
+    ) -> Any:
+        url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{self.api_base_url}{path_or_url}"
+        if query:
+            separator = "&" if "?" in url else "?"
+            url += separator + urlencode(query)
+        headers = {"Accept": "application/json"}
+        session: str | None = None
+        for attempt in range(2 if auth else 1):
+            if auth:
+                session = self._get_session(force=attempt == 1)
+                headers["X-Session-Id"] = session
+            try:
+                status, raw = self._request_raw(method, url, headers=headers, bucket=bucket)
+                if not 200 <= status < 300:
+                    raise self._status_error(status)
+                try:
+                    return json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise SourcingProviderError(
+                        "ЭТМ iPRO вернул некорректный JSON",
+                        code="INVALID_RESPONSE",
+                        category="invalid_response",
+                    ) from exc
+            except SourcingProviderError as exc:
+                if auth and attempt == 0 and exc.status_code == 403 and session:
+                    with self._session_lock:
+                        if self._session is not None and self._session.value == session:
+                            self._session = None
+                    continue
+                raise
+        raise SourcingProviderError("ЭТМ iPRO не вернул ответ", category="upstream_error")
+
+    def _request_raw(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        bucket: str,
+    ) -> tuple[int, bytes]:
+        request = urllib.request.Request(url, headers=headers, method=method)
+        if bucket not in {"auth", "general"}:
+            self.rate_limiter.acquire(bucket)
+        try:
+            response = self._transport(request, float(self.settings.request_timeout_s))
+            try:
+                status = getattr(response, "status", None) or getattr(response, "code", None)
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            if not isinstance(status, int):
+                raise SourcingProviderError("ЭТМ iPRO вернул ответ без HTTP-статуса", category="invalid_response")
+            if len(raw) > _MAX_RESPONSE_BYTES:
+                raise SourcingProviderError("Ответ ЭТМ iPRO превышает безопасный размер", category="invalid_response")
+            return status, raw
+        except urllib.error.HTTPError as exc:
+            raise self._status_error(int(exc.code)) from None
+        except SourcingProviderError:
+            raise
+        except (OSError, TimeoutError, ValueError) as exc:
+            raise SourcingProviderError(
+                "ЭТМ iPRO временно недоступен; повторите запрос позже",
+                code="UPSTREAM_UNAVAILABLE",
+                category="network",
+            ) from exc
+
+    @staticmethod
+    def _status_error(status: int) -> SourcingProviderError:
+        if status == 403:
+            message = "ЭТМ iPRO отклонил сессию; повторите запрос позже"
+            category = "auth"
+        elif 400 <= status < 500:
+            message, category = "ЭТМ iPRO отклонил запрос", "invalid_request"
+        else:
+            message, category = "ЭТМ iPRO временно недоступен", "upstream_error"
+        return SourcingProviderError(message, status_code=status, category=category)
+
+    @staticmethod
+    def _data_value(payload: Any, key: str) -> Any:
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        if isinstance(data, dict) and key in data:
+            return data[key]
+        return payload.get(key)
+
+    @staticmethod
+    def _id(value: Any) -> str:
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            raise SourcingProviderError("ЭТМ iPRO получил некорректный идентификатор", category="invalid_request")
+        normalized = str(value).strip()
+        if not normalized:
+            raise SourcingProviderError("ЭТМ iPRO получил пустой идентификатор", category="invalid_request")
+        return normalized
+
+    @classmethod
+    def _ids(cls, values, *, limit: int) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            normalized = cls._id(value)
+            if normalized not in result:
+                result.append(normalized)
+        if len(result) > limit:
+            raise SourcingProviderError(
+                f"ЭТМ iPRO принимает не более {limit} товаров за запрос",
+                category="invalid_request",
+            )
+        return result

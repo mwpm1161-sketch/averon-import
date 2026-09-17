@@ -28,6 +28,8 @@ _FORBIDDEN_FILE_KEYS = {
     "password",
     "token",
     "client_secret",
+    "etm_login",
+    "etm_password",
 }
 
 
@@ -76,12 +78,44 @@ class LemanaB2BSettings(BaseModel):
     request_timeout_s: float = Field(default=10.0, gt=0, le=120.0)
 
 
+class EtmIproSettings(BaseModel):
+    """Non-secret configuration for the ETM iPRO provider."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    environment: Literal["test", "prod"] = "test"
+    warehouse_codes: list[str] = Field(default_factory=list)
+    request_timeout_s: float = Field(default=20.0, gt=0, le=180.0)
+    base_url_override: str = ""
+
+    @field_validator("warehouse_codes", mode="before")
+    @classmethod
+    def _normalize_warehouse_codes(cls, value):
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            value = value.split(",")
+        if not isinstance(value, list):
+            raise ValueError("warehouse_codes must be a list or comma-separated string")
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+    @field_validator("base_url_override")
+    @classmethod
+    def _validate_base_url_override(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        return normalize_http_base_url(value)
+
+
 class SourcingSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str = "local_catalog"
     demo_store_base_url: str = "http://127.0.0.1:8877"
     lemana_b2b: LemanaB2BSettings = Field(default_factory=LemanaB2BSettings)
+    etm_ipro: EtmIproSettings = Field(default_factory=EtmIproSettings)
 
     @field_validator("demo_store_base_url")
     @classmethod
@@ -220,6 +254,33 @@ class AppSettingsService:
             except (TypeError, ValueError):
                 self.warnings.append(
                     "AVERON_LEMANA_B2B_REGION_ID имеет недопустимое значение; используется значение из settings.json."
+                )
+        if (value := _env_bool(os.environ.get("AVERON_ETM_IPRO_ENABLED", ""))) is not None:
+            settings.sourcing.etm_ipro.enabled = value
+        if value := os.environ.get("AVERON_ETM_IPRO_ENVIRONMENT", "").strip().lower():
+            if value in {"test", "prod"}:
+                settings.sourcing.etm_ipro.environment = value
+            else:
+                self.warnings.append(
+                    "AVERON_ETM_IPRO_ENVIRONMENT должен быть test или prod; используется значение из settings.json."
+                )
+        if value := os.environ.get("AVERON_ETM_IPRO_WAREHOUSE_CODES", "").strip():
+            settings.sourcing.etm_ipro.warehouse_codes = list(dict.fromkeys(
+                part.strip() for part in value.split(",") if part.strip()
+            ))
+        if value := os.environ.get("AVERON_ETM_IPRO_BASE_URL", "").strip():
+            try:
+                settings.sourcing.etm_ipro.base_url_override = normalize_http_base_url(value)
+            except ValueError:
+                self.warnings.append(
+                    "AVERON_ETM_IPRO_BASE_URL имеет недопустимый URL; используется значение из settings.json."
+                )
+        if (value := _env_float("AVERON_ETM_IPRO_REQUEST_TIMEOUT_S")) is not None:
+            try:
+                settings.sourcing.etm_ipro.request_timeout_s = value
+            except (TypeError, ValueError):
+                self.warnings.append(
+                    "AVERON_ETM_IPRO_REQUEST_TIMEOUT_S имеет недопустимое значение; используется значение из settings.json."
                 )
 
     def update(self, patch: dict) -> AppSettings:
