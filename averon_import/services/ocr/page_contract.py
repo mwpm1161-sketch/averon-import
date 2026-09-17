@@ -139,6 +139,8 @@ def page_status_from_diagnostics(
         status.add_blocker("critical_value_missing")
     if int(data.get("semantic_numeric_suspect_count") or 0) > 0:
         status.add_blocker("numeric_suspect")
+    if int(data.get("semantic_numeric_non_scalar_count") or 0) > 0:
+        status.add_blocker("numeric_non_scalar")
     if int(data.get("semantic_secondary_conflict_count") or 0) > 0:
         status.add_blocker("secondary_conflict")
     if data.get("semantic_resolution_error"):

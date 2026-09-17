@@ -278,6 +278,20 @@ def _source_safety_reasons(metadata: Mapping[str, Any]) -> list[str]:
                 )
             )
         ),
+        "numeric_non_scalar": bool(
+            any(
+                isinstance(details, Mapping)
+                and (
+                    details.get("non_scalar")
+                    or details.get("numeric_shape") == "NON_SCALAR_SLASH"
+                )
+                for details in (
+                    (metadata.get("normalization") or {}).values()
+                    if isinstance(metadata.get("normalization"), Mapping)
+                    else ()
+                )
+            )
+        ),
         "numeric_shape_suspect": bool(
             isinstance(metadata.get("normalization"), Mapping)
             and isinstance(metadata["normalization"].get("quantity"), Mapping)
@@ -457,21 +471,29 @@ def _item_row(
         canonical = str(field_value.canonical_text or "").strip()
         if not canonical:
             continue
+        numeric_details = (
+            numeric_cell_metadata(canonical)
+            if field_name in {"quantity", "mass"}
+            else None
+        )
         normalized = normalize_cell(field_name, canonical)
+        if field_name in {"quantity", "mass"} and numeric_details is not None:
+            normalization[field_name] = numeric_details
+            if numeric_details.get("non_scalar"):
+                raw_values[field_name] = canonical
+                review_reasons.append("numeric_non_scalar")
+            elif numeric_details.get("numeric_suspect"):
+                review_reasons.append("numeric_suspect")
+            if (
+                field_name == "quantity"
+                and numeric_details.get("integer_like_decimal")
+            ):
+                review_reasons.append("numeric_shape_suspect")
         if not normalized:
             continue
         values[field_name] = normalized
         raw_values[field_name] = canonical
         sources[field_name] = provider_key
-        if field_name in {"quantity", "mass"}:
-            normalization[field_name] = numeric_cell_metadata(canonical)
-            if normalization[field_name].get("numeric_suspect"):
-                review_reasons.append("numeric_suspect")
-            if (
-                field_name == "quantity"
-                and normalization[field_name].get("integer_like_decimal")
-            ):
-                review_reasons.append("numeric_shape_suspect")
 
     required_fields = _required_fields(item, mapping, metadata)
     if any(not str(values.get(field, "") or "").strip() for field in required_fields):

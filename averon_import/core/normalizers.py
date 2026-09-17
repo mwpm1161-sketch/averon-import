@@ -191,6 +191,11 @@ def normalize_cell(key: str, value: str | None) -> str:
         text = re.sub(r"(?i)(?<!\w)[гgr][оo0][сcs][тt](?=\s*\d)", "ГОСТ", text)
     if key in {"quantity", "mass"}:
         text = text.replace(" ", "").replace(",", ".")
+        # A slash-separated OCR cell is a composite/source expression, not a
+        # scalar quantity.  Do not collapse it into a fabricated number such
+        # as ``4/8/8`` -> ``488``; callers retain the raw value as evidence.
+        if "/" in text:
+            return ""
         text = re.sub(r"[^0-9.\-]", "", text)
         if text.count(".") > 1:
             first, *rest = text.split(".")
@@ -221,9 +226,17 @@ def numeric_cell_metadata(value: str | None) -> dict[str, object]:
     raw_value = "" if value is None else str(value)
     candidate = normalize_cell("quantity", raw_value)
     compact_raw = clean_text(raw_value).replace(" ", "")
-    numeric_suspect = bool(compact_raw) and not re.fullmatch(
-        r"-?\d+(?:[.,]\d+)?", compact_raw
-    )
+    if not compact_raw:
+        numeric_shape = "BLANK"
+    elif "/" in compact_raw:
+        numeric_shape = "NON_SCALAR_SLASH"
+    elif re.fullmatch(r"-?\d+(?:[.,]\d+)?", compact_raw):
+        numeric_shape = "SCALAR"
+    else:
+        numeric_shape = "CONTAMINATED"
+    # NON_SCALAR_SLASH has a dedicated safety reason.  It is intentionally
+    # not also classified as generic OCR contamination.
+    numeric_suspect = numeric_shape == "CONTAMINATED"
     # OCR may insert a decimal separator into an integer quantity (for
     # example, ``40`` -> ``4.0``). Preserve the display candidate, but expose
     # the shape separately so callers can fail closed without rejecting
@@ -233,6 +246,8 @@ def numeric_cell_metadata(value: str | None) -> dict[str, object]:
         "raw_value": raw_value,
         "normalized_candidate": candidate,
         "numeric_suspect": numeric_suspect,
+        "numeric_shape": numeric_shape,
+        "non_scalar": numeric_shape == "NON_SCALAR_SLASH",
         "integer_like_decimal": integer_like_decimal,
     }
 

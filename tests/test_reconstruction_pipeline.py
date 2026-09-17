@@ -639,6 +639,29 @@ def test_suspect_numeric_candidate_is_marked_for_review_without_changing_clean_v
     assert "numeric_suspect" in assembled["review_reasons"]
 
 
+def test_non_scalar_numeric_shape_is_preserved_as_review_evidence():
+    raw = "4/8/8"
+    details = numeric_cell_metadata(raw)
+    assert normalize_cell("quantity", raw) == ""
+    assert details["numeric_shape"] == "NON_SCALAR_SLASH"
+    assert details["non_scalar"] is True
+    assert details["numeric_suspect"] is False
+
+    rows = reconstruct_page_rows(_quantity_payload([raw]), "yandex_vision")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.values.get("quantity", "") == ""
+    assert row.metadata["raw_values"]["quantity"] == raw
+    assert row.metadata["normalization"]["quantity"] == details
+    assert "numeric_non_scalar" in row.metadata["review_reasons"]
+
+    assembled = SpecificationRowAssembler().build_page(1, rows)[0]
+    assert assembled.get("quantity") in (None, "")
+    assert "4/8/8" not in str(assembled.get("quantity", ""))
+    assert "numeric_non_scalar" in assembled["review_reasons"]
+    assert "numeric_non_scalar" in assembled["critical_blockers"]
+
+
 def test_ambiguous_table_fallback_has_review_reason_instead_of_a_guess():
     payload = {
         "page": {"width": 600, "height": 800},

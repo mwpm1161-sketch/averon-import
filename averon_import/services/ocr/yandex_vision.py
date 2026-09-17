@@ -1252,6 +1252,9 @@ class YandexVisionProvider:
                 bool({"numeric_suspect", "numeric_shape_suspect"}.intersection(reasons))
                 for reasons in review_reasons
             ),
+            "semantic_numeric_non_scalar_count": sum(
+                "numeric_non_scalar" in reasons for reasons in review_reasons
+            ),
             "semantic_secondary_conflict_count": sum(
                 "secondary_conflict" in reasons for reasons in review_reasons
             ),

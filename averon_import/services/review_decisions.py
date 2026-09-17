@@ -586,6 +586,10 @@ def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
             1 for row in output_rows
             if "numeric_suspect" in critical_blockers_for_row(row)
         )
+        numeric_non_scalar = sum(
+            1 for row in output_rows
+            if "numeric_non_scalar" in critical_blockers_for_row(row)
+        )
         secondary_conflict = sum(
             1 for row in output_rows
             if "secondary_conflict" in critical_blockers_for_row(row)
@@ -600,6 +604,7 @@ def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
             "unresolved_physical_row_count": len(review_rows),
             "semantic_relation_conflict_count": relation_conflicts,
             "semantic_numeric_suspect_count": numeric_suspect,
+            "semantic_numeric_non_scalar_count": numeric_non_scalar,
             "semantic_secondary_conflict_count": secondary_conflict,
             "logical_item_count": len([
                 row for row in page_rows
@@ -612,6 +617,7 @@ def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
             "critical_value_missing",
             "physical_row_semantics_unresolved",
             "numeric_suspect",
+            "numeric_non_scalar",
             "secondary_conflict",
         }
         preserved_blockers = [

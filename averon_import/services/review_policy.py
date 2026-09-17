@@ -10,6 +10,7 @@ CRITICAL_FIELDS = ("quantity", "unit", "mass")
 CRITICAL_REASONS = {
     "critical_value_missing",
     "numeric_suspect",
+    "numeric_non_scalar",
     "numeric_shape_suspect",
     "numeric_shape_conflict",
     "ambiguous_columns",
@@ -220,6 +221,26 @@ def _numeric_suspect_fields(row: dict) -> set[str]:
     return result
 
 
+def _numeric_non_scalar_fields(row: dict) -> set[str]:
+    metadata = row.get("ocr_metadata") or {}
+    normalization = metadata.get("normalization") if isinstance(metadata, dict) else {}
+    result: set[str] = set()
+    if isinstance(normalization, dict):
+        for key in ("quantity", "mass"):
+            details = normalization.get(key)
+            if isinstance(details, dict) and (
+                details.get("non_scalar")
+                or details.get("numeric_shape") == "NON_SCALAR_SLASH"
+            ):
+                result.add(key)
+    edited_fields = set(_as_list(row.get("edited_fields")))
+    for key in result & edited_fields:
+        details = numeric_cell_metadata(row.get(key, ""))
+        if not details.get("non_scalar"):
+            result.discard(key)
+    return result
+
+
 def _numeric_shape_suspect_fields(row: dict) -> set[str]:
     metadata = row.get("ocr_metadata") or {}
     normalization = metadata.get("normalization") if isinstance(metadata, dict) else {}
@@ -268,6 +289,7 @@ def critical_blockers_for_row(row: dict) -> list[str]:
         blockers.append("critical_value_missing")
     for reason in (
         "numeric_suspect",
+        "numeric_non_scalar",
         "numeric_shape_suspect",
         "numeric_shape_conflict",
         "ambiguous_columns",
@@ -300,11 +322,14 @@ def critical_field_count(row: dict) -> int:
     count = len(missing)
     suspect = (
         _numeric_suspect_fields(row)
+        | _numeric_non_scalar_fields(row)
         | _numeric_shape_suspect_fields(row)
     ) - missing
     blockers = critical_blockers_for_row(row)
     count += len(suspect)
     if "numeric_suspect" in blockers and not suspect:
+        count = max(count, 1)
+    if "numeric_non_scalar" in blockers and not suspect:
         count = max(count, 1)
     if "critical_value_missing" in blockers and not count:
         count = max(count, len(_as_list(row.get("critical_fields"))) or 1)
@@ -326,6 +351,7 @@ def critical_field_count(row: dict) -> int:
             "physical_row_loss_suspected",
             "identity_cell_missing",
             "numeric_shape_suspect",
+            "numeric_non_scalar",
         )
     ):
         count = 1
@@ -376,6 +402,7 @@ def refresh_review_state(row: dict) -> dict:
         if reason not in {
             "critical_value_missing",
             "numeric_suspect",
+            "numeric_non_scalar",
             "numeric_shape_suspect",
         }
     ]
@@ -384,6 +411,8 @@ def refresh_review_state(row: dict) -> dict:
         reasons.append("critical_value_missing")
     if _numeric_suspect_fields(row):
         reasons.append("numeric_suspect")
+    if _numeric_non_scalar_fields(row):
+        reasons.append("numeric_non_scalar")
     if _numeric_shape_suspect_fields(row):
         reasons.append("numeric_shape_suspect")
     for field, candidate in (row.get("value_candidates") or {}).items():
@@ -406,6 +435,7 @@ def refresh_review_state(row: dict) -> dict:
             reason for reason in reasons
             if reason not in {
                 "numeric_suspect",
+                "numeric_non_scalar",
                 "numeric_shape_suspect",
                 "ambiguous_columns",
                 "secondary_conflict",
@@ -419,6 +449,7 @@ def refresh_review_state(row: dict) -> dict:
     effective_blockers.difference_update({
         "critical_value_missing",
         "numeric_suspect",
+        "numeric_non_scalar",
         "numeric_shape_suspect",
     })
     if (
@@ -430,6 +461,7 @@ def refresh_review_state(row: dict) -> dict:
     if row.get("status") == "verified" and not missing:
         effective_blockers.difference_update({
             "numeric_suspect",
+            "numeric_non_scalar",
             "numeric_shape_suspect",
             "ambiguous_columns",
             "secondary_conflict",

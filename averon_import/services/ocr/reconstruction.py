@@ -1494,18 +1494,23 @@ def rows_from_tables(
                     if key == "note" and re.fullmatch(r"-?\d+(?:[.,]\d+)?", raw_text.strip()):
                         continue
                 candidate = normalize_cell(key, raw_text)
+                if key in {"quantity", "mass"}:
+                    details = numeric_cell_metadata(raw_text)
+                    normalization[key] = details
+                    if not candidate and details.get("numeric_shape") != "BLANK":
+                        raw_values[key] = raw_text
                 if not candidate:
                     continue
                 values[key] = candidate
                 raw_values[key] = raw_text
                 sources[key] = provider_key
-                if key in {"quantity", "mass"}:
-                    normalization[key] = numeric_cell_metadata(raw_text)
                 vertices.extend(_vertices_of(cell.bbox))
         review_reasons = list(table.review_reasons)
         if subrow.structural_ambiguity and "structural_ambiguity" not in review_reasons:
             review_reasons.append("structural_ambiguity")
         for field_name, details in normalization.items():
+            if details.get("non_scalar") and "numeric_non_scalar" not in review_reasons:
+                review_reasons.append("numeric_non_scalar")
             if details.get("numeric_suspect") and "numeric_suspect" not in review_reasons:
                 review_reasons.append("numeric_suspect")
             if (
@@ -1514,7 +1519,7 @@ def rows_from_tables(
                 and "numeric_shape_suspect" not in review_reasons
             ):
                 review_reasons.append("numeric_shape_suspect")
-        if not values and not subrow.structural_ambiguity:
+        if not values and not raw_values and not subrow.structural_ambiguity:
             _record_diagnostic(
                 diagnostics,
                 kind="row_dropped",
@@ -1727,14 +1732,16 @@ def _rows_from_geometry(
                 continue
             raw_text = " ".join(member["text"] for member in members)
             normalized = normalize_cell(key, raw_text)
-            if not normalized:
-                continue
-            values[key] = normalized
-            raw_values[key] = raw_text
-            sources[key] = provider_key
             if key in {"quantity", "mass"}:
                 details = numeric_cell_metadata(raw_text)
                 normalization[key] = details
+                if not normalized and details.get("numeric_shape") != "BLANK":
+                    raw_values[key] = raw_text
+                if (
+                    details.get("non_scalar")
+                    and "numeric_non_scalar" not in row_review_reasons
+                ):
+                    row_review_reasons.append("numeric_non_scalar")
                 if details.get("numeric_suspect") and "numeric_suspect" not in row_review_reasons:
                     row_review_reasons.append("numeric_suspect")
                 if (
@@ -1743,6 +1750,11 @@ def _rows_from_geometry(
                     and "numeric_shape_suspect" not in row_review_reasons
                 ):
                     row_review_reasons.append("numeric_shape_suspect")
+            if not normalized:
+                continue
+            values[key] = normalized
+            raw_values[key] = raw_text
+            sources[key] = provider_key
             for member in members:
                 vertices.extend(member["vertices"])
             if vertices:
@@ -1751,7 +1763,7 @@ def _rows_from_geometry(
                     denominator_x,
                     denominator_y,
                 )
-        if not values:
+        if not values and not raw_values:
             continue
         rows.append(
             OcrRow(
