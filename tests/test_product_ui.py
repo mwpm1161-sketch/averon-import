@@ -197,6 +197,20 @@ def test_settings_ui_exposes_separate_sourcing_provider_and_demo_store_url():
     assert "sourcing: {" in app_js
 
 
+def test_settings_ui_exposes_etm_ipro_without_exposing_credentials():
+    html = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'value="etm_ipro"' in html
+    assert 'id="settings-etm-environment"' in html
+    assert 'id="settings-etm-warehouses"' in html
+    assert 'id="settings-etm-login"' in html
+    assert 'id="settings-etm-password"' in html
+    assert "payload.etm_login = etmLogin" in app_js
+    assert "payload.etm_password = etmPassword" in app_js
+    assert "login_configured" in app_js
+    assert "password_configured" in app_js
+
+
 def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 

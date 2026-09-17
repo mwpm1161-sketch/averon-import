@@ -116,9 +116,15 @@ function initializeSettings(settings) {
   $("#settings-vision-model").value = settings?.yandex?.vision_model || "table";
   $("#settings-language-codes").value = (settings?.yandex?.language_codes || ["ru", "en"]).join(",");
   const sourcingProvider = settings?.sourcing?.provider;
-  $("#settings-sourcing-provider").value = ["local_catalog", "demo_store_http"].includes(sourcingProvider)
+  $("#settings-sourcing-provider").value = ["local_catalog", "demo_store_http", "etm_ipro"].includes(sourcingProvider)
     ? sourcingProvider : "local_catalog";
   $("#settings-demo-store-url").value = settings?.sourcing?.demo_store_base_url || "http://127.0.0.1:8877";
+  const etm = settings?.sourcing?.etm_ipro || {};
+  $("#settings-etm-environment").value = etm.environment || "test";
+  $("#settings-etm-warehouses").value = (etm.warehouse_codes || []).join(",");
+  $("#settings-etm-base-url").value = etm.base_url_override || "";
+  $("#settings-etm-login").value = "";
+  $("#settings-etm-password").value = "";
   updateSourcingProviderFields();
   const ready = Boolean(state.ocrHealth?.available);
   const visionKeyReady = Boolean(settings?.yandex?.vision_api_key_configured ?? settings?.yandex?.api_key_configured);
@@ -132,6 +138,13 @@ function initializeSettings(settings) {
   const aiKeyReady = Boolean(settings?.yandex?.ai_api_key_configured);
   $("#settings-ai-connection").textContent = `Qwen / AI Studio: ключ ${aiKeyReady ? "настроен" : "не настроен"}.`;
   $("#settings-ai-connection").className = aiKeyReady ? "mode-status ok" : "mode-status warning";
+  const etmLoginReady = Boolean(etm.login_configured);
+  const etmPasswordReady = Boolean(etm.password_configured);
+  const etmStatus = $("#settings-etm-connection");
+  if (etmStatus) {
+    etmStatus.textContent = "ЭТМ iPRO: " + (etmLoginReady && etmPasswordReady ? "учётные данные настроены." : "учётные данные не настроены.");
+    etmStatus.className = etmLoginReady && etmPasswordReady ? "mode-status ok" : "mode-status warning";
+  }
   updateSourcingStatus();
 }
 
@@ -140,6 +153,8 @@ function updateSourcingProviderFields() {
   const url = $("#settings-demo-store-url");
   if (!provider || !url) return;
   url.disabled = provider.value !== "demo_store_http";
+  ["#settings-etm-environment", "#settings-etm-warehouses", "#settings-etm-base-url", "#settings-etm-login", "#settings-etm-password"]
+    .forEach((selector) => { const element = $(selector); if (element) element.disabled = provider.value !== "etm_ipro"; });
 }
 
 function updateSourcingStatus() {
@@ -171,6 +186,10 @@ async function saveSettings() {
   if (!codes.length) { toast("Укажите хотя бы один язык OCR", "error"); return; }
   const apiKey = $("#settings-api-key").value.trim();
   const aiApiKey = $("#settings-ai-api-key").value.trim();
+  const etmLogin = $("#settings-etm-login").value.trim();
+  const etmPassword = $("#settings-etm-password").value.trim();
+  const etmWarehouses = $("#settings-etm-warehouses").value.split(",").map((value) => value.trim()).filter(Boolean);
+  const selectedProvider = $("#settings-sourcing-provider").value;
   const payload = {
     processing_mode: "cloud",
     yandex: {
@@ -180,12 +199,20 @@ async function saveSettings() {
       llm_model: $("#settings-llm-model").value.trim(),
     },
     sourcing: {
-      provider: $("#settings-sourcing-provider").value,
+      provider: selectedProvider,
       demo_store_base_url: $("#settings-demo-store-url").value.trim(),
+      etm_ipro: {
+        enabled: selectedProvider === "etm_ipro" || Boolean(state.settings?.sourcing?.etm_ipro?.enabled),
+        environment: $("#settings-etm-environment").value,
+        warehouse_codes: etmWarehouses,
+        base_url_override: $("#settings-etm-base-url").value.trim(),
+      },
     },
   };
   if (apiKey) payload.api_key = apiKey;
   if (aiApiKey) payload.ai_api_key = aiApiKey;
+  if (etmLogin) payload.etm_login = etmLogin;
+  if (etmPassword) payload.etm_password = etmPassword;
   try {
     state.settings = await api("/api/settings", {
       method: "PUT",
@@ -197,6 +224,8 @@ async function saveSettings() {
     state.sourcingHealth = health.sourcing || null;
     $("#settings-api-key").value = "";
     $("#settings-ai-api-key").value = "";
+    $("#settings-etm-login").value = "";
+    $("#settings-etm-password").value = "";
     initializeSettings(state.settings);
     updateCloudStatus();
     updateSourcingStatus();
@@ -917,6 +946,7 @@ function sourcingProviderLabel(offer) {
     averon_demo_store: "Averon Demo Store",
     demo_store_http: "Averon Demo Store",
     local_catalog: "Локальный каталог",
+    etm_ipro: "ЭТМ iPRO",
   }[source] || "Поставщик";
 }
 

@@ -13,6 +13,8 @@ from averon_import.services.app_settings import (
     AppSettingsService,
 )
 from averon_import.services.secrets import (
+    ETM_IPRO_LOGIN,
+    ETM_IPRO_PASSWORD,
     LEMANA_B2B_CLIENT_SECRET,
     YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
@@ -104,6 +106,18 @@ def test_nested_sourcing_settings_update_preserves_untouched_lemana_fields(tmp_p
         "region_id": 34,
         "request_timeout_s": 20.0,
     }
+
+
+def test_etm_ipro_settings_are_non_secret_and_warehouse_codes_are_normalized(tmp_path, monkeypatch):
+    monkeypatch.setenv("AVERON_ETM_IPRO_ENABLED", "true")
+    monkeypatch.setenv("AVERON_ETM_IPRO_ENVIRONMENT", "prod")
+    monkeypatch.setenv("AVERON_ETM_IPRO_WAREHOUSE_CODES", "15, 22,15")
+    service = AppSettingsService(tmp_path)
+
+    assert service.settings.sourcing.etm_ipro.enabled is True
+    assert service.settings.sourcing.etm_ipro.environment == "prod"
+    assert service.settings.sourcing.etm_ipro.warehouse_codes == ["15", "22"]
+    assert "password" not in (tmp_path / "settings.json").read_text(encoding="utf-8") if (tmp_path / "settings.json").exists() else True
 
 
 def test_invalid_json_falls_back_to_defaults_with_warning(tmp_path):
@@ -431,6 +445,36 @@ def test_lemana_secret_delete_rebuilds_runtime_and_public_state(api, monkeypatch
     assert store.get(LEMANA_B2B_CLIENT_SECRET) is None
     assert after.configured is False
     assert payload["sourcing"]["lemana_b2b"]["client_secret_configured"] is False
+
+
+def test_etm_credentials_are_write_only_and_runtime_rebuilds(api, monkeypatch):
+    app_module, store, service = api
+    monkeypatch.delenv("AVERON_ETM_IPRO_LOGIN", raising=False)
+    monkeypatch.delenv("AVERON_ETM_IPRO_PASSWORD", raising=False)
+    payload = app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            provider="etm_ipro",
+            etm_ipro=app_module.EtmIproSettingsUpdate(
+                enabled=True, environment="test", warehouse_codes=["WH-1"]
+            ),
+        ),
+        etm_login="etm-login-private",
+        etm_password="etm-password-private",
+    ))
+
+    assert store.get(ETM_IPRO_LOGIN) == "etm-login-private"
+    assert store.get(ETM_IPRO_PASSWORD) == "etm-password-private"
+    assert payload["sourcing"]["etm_ipro"]["login_configured"] is True
+    assert payload["sourcing"]["etm_ipro"]["password_configured"] is True
+    encoded = json.dumps(payload, ensure_ascii=False)
+    assert "etm-login-private" not in encoded
+    assert "etm-password-private" not in encoded
+    saved = service.path.read_text(encoding="utf-8")
+    assert "etm_password" not in saved
+    assert app_module.delete_etm_ipro_login() == {"deleted": True}
+    assert app_module.delete_etm_ipro_password() == {"deleted": True}
+    assert not store.has(ETM_IPRO_LOGIN)
+    assert not store.has(ETM_IPRO_PASSWORD)
 
 
 def test_put_rejects_invalid_payload_values():

@@ -239,14 +239,37 @@
         <div>
           <label class="field-label" for="settings-sourcing-provider">Провайдер предложений</label>
           <select class="select" id="settings-sourcing-provider">
-            <option value="local_catalog">Локальный каталог</option>
-            <option value="demo_store_http">Averon Demo Store</option>
+          <option value="local_catalog">Локальный каталог</option>
+          <option value="demo_store_http">Averon Demo Store</option>
+            <option value="etm_ipro">ЭТМ iPRO</option>
           </select>
         </div>
         <div>
           <label class="field-label" for="settings-demo-store-url">Demo Store URL</label>
           <input class="input" id="settings-demo-store-url" autocomplete="off" placeholder="http://127.0.0.1:8877">
           <p class="hint">Только http/https. Используется, когда выбран Averon Demo Store.</p>
+        </div>
+        <div class="etm-settings-field">
+          <label class="field-label" for="settings-etm-environment">ЭТМ iPRO окружение</label>
+          <select class="select" id="settings-etm-environment"><option value="test">Тестовое</option><option value="prod">Рабочее</option></select>
+        </div>
+        <div class="etm-settings-field">
+          <label class="field-label" for="settings-etm-warehouses">Коды складов ЭТМ</label>
+          <input class="input" id="settings-etm-warehouses" autocomplete="off" placeholder="через запятую, например WH-1,WH-2">
+          <p class="hint">Учитываются только выбранные склады; пусто — наличие не подтверждается.</p>
+        </div>
+        <div class="etm-settings-field">
+          <label class="field-label" for="settings-etm-login">Логин ЭТМ iPRO</label>
+          <input class="input" id="settings-etm-login" autocomplete="username" placeholder="Оставьте пустым, чтобы не менять">
+        </div>
+        <div class="etm-settings-field">
+          <label class="field-label" for="settings-etm-password">Пароль ЭТМ iPRO</label>
+          <input class="input" id="settings-etm-password" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
+          <p class="hint">Логин и пароль не сохраняются в settings.json и не показываются обратно.</p>
+        </div>
+        <div class="etm-settings-field">
+          <label class="field-label" for="settings-etm-base-url">Расширенный base URL (необязательно)</label>
+          <input class="input" id="settings-etm-base-url" autocomplete="off" placeholder="Оставьте пустым для URL окружения">
         </div>
         <div>
           <label class="field-label" for="settings-api-key">Yandex Vision API key</label>
@@ -265,6 +288,7 @@
       </div>
       <p class="mode-status" id="settings-connection"></p>
       <p class="mode-status" id="settings-ai-connection"></p>
+      <p class="mode-status" id="settings-etm-connection"></p>
       <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="save-settings">Сохранить</button></div>
     </form>
   </dialog>

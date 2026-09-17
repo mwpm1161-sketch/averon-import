@@ -31,10 +31,7 @@ from averon_import.core.constants import (
     STATUSES,
 )
 from averon_import.core.schemas import ExportRequest, RecognitionRequest, SaveRowsRequest
-from averon_import.services.app_settings import (
-    PROCESSING_MODES,
-    AppSettingsService,
-)
+from averon_import.services.app_settings import PROCESSING_MODES, AppSettingsService
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
@@ -54,6 +51,8 @@ from averon_import.services.review_decisions import (
 )
 from averon_import.services.review_policy import refresh_rows
 from averon_import.services.secrets import (
+    ETM_IPRO_LOGIN,
+    ETM_IPRO_PASSWORD,
     LEMANA_B2B_CLIENT_SECRET,
     YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
@@ -239,12 +238,23 @@ class LemanaB2BSettingsUpdate(BaseModel):
     request_timeout_s: float | None = None
 
 
+class EtmIproSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool | None = None
+    environment: Literal["test", "prod"] | None = None
+    warehouse_codes: list[str] | str | None = None
+    request_timeout_s: float | None = None
+    base_url_override: str | None = None
+
+
 class SourcingSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str | None = None
     demo_store_base_url: str | None = None
     lemana_b2b: LemanaB2BSettingsUpdate | None = None
+    etm_ipro: EtmIproSettingsUpdate | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -261,9 +271,13 @@ class SettingsUpdate(BaseModel):
     ai_api_key: str | None = None
     # Write-only: stored in SecretStore, never in settings.json or responses.
     lemana_client_secret: str | None = None
+    etm_login: str | None = None
+    etm_password: str | None = None
     delete_yandex_api_key: bool = False
     delete_yandex_ai_api_key: bool = False
     delete_lemana_client_secret: bool = False
+    delete_etm_login: bool = False
+    delete_etm_password: bool = False
 
 
 def _settings_public() -> dict:
@@ -288,6 +302,12 @@ def _settings_public() -> dict:
         secret_store,
         LEMANA_B2B_CLIENT_SECRET,
     ) is not None
+    payload["sourcing"]["etm_ipro"]["login_configured"] = resolve_secret(
+        os.environ.get("AVERON_ETM_IPRO_LOGIN"), secret_store, ETM_IPRO_LOGIN
+    ) is not None
+    payload["sourcing"]["etm_ipro"]["password_configured"] = resolve_secret(
+        os.environ.get("AVERON_ETM_IPRO_PASSWORD"), secret_store, ETM_IPRO_PASSWORD
+    ) is not None
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
     return payload
@@ -308,12 +328,20 @@ def put_settings(request: SettingsUpdate):
         secret_store.set(YANDEX_AI_API_KEY, request.ai_api_key.strip())
     if request.lemana_client_secret is not None and request.lemana_client_secret.strip():
         secret_store.set(LEMANA_B2B_CLIENT_SECRET, request.lemana_client_secret.strip())
+    if request.etm_login is not None and request.etm_login.strip():
+        secret_store.set(ETM_IPRO_LOGIN, request.etm_login.strip())
+    if request.etm_password is not None and request.etm_password.strip():
+        secret_store.set(ETM_IPRO_PASSWORD, request.etm_password.strip())
     if request.delete_yandex_api_key:
         secret_store.delete(YANDEX_API_KEY)
     if request.delete_yandex_ai_api_key:
         secret_store.delete(YANDEX_AI_API_KEY)
     if request.delete_lemana_client_secret:
         secret_store.delete(LEMANA_B2B_CLIENT_SECRET)
+    if request.delete_etm_login:
+        secret_store.delete(ETM_IPRO_LOGIN)
+    if request.delete_etm_password:
+        secret_store.delete(ETM_IPRO_PASSWORD)
     patch = request.model_dump(
         exclude_none=True,
         exclude={
@@ -323,6 +351,10 @@ def put_settings(request: SettingsUpdate):
             "delete_yandex_api_key",
             "delete_yandex_ai_api_key",
             "delete_lemana_client_secret",
+            "etm_login",
+            "etm_password",
+            "delete_etm_login",
+            "delete_etm_password",
         },
     )
     patch = {key: value for key, value in patch.items() if value is not None}
@@ -351,6 +383,20 @@ def delete_yandex_ai_api_key():
 @app.delete("/api/settings/lemana-client-secret")
 def delete_lemana_client_secret():
     secret_store.delete(LEMANA_B2B_CLIENT_SECRET)
+    _rebuild_sourcing_runtime()
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/etm-ipro-login")
+def delete_etm_ipro_login():
+    secret_store.delete(ETM_IPRO_LOGIN)
+    _rebuild_sourcing_runtime()
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/etm-ipro-password")
+def delete_etm_ipro_password():
+    secret_store.delete(ETM_IPRO_PASSWORD)
     _rebuild_sourcing_runtime()
     return {"deleted": True}
 
@@ -630,6 +676,10 @@ class SourcingProjectRequest(BaseModel):
 def _sourcing_payload(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
+    if hasattr(value, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        return asdict(value)
     return value
 
 
@@ -654,6 +704,51 @@ def sync_lemana_b2b():
         return _sourcing_payload(result)
 
     return job_service.submit(run).public()
+
+
+@app.get("/api/sourcing/providers/etm_ipro/health")
+def etm_ipro_health():
+    provider = sourcing_service.provider("etm_ipro")
+    health_method = getattr(provider, "health", None)
+    if not callable(health_method):
+        raise HTTPException(404, "Проверка ЭТМ iPRO недоступна")
+    return _sourcing_payload(health_method())
+
+
+@app.post("/api/sourcing/providers/etm_ipro/manufacturers/sync")
+def sync_etm_ipro_manufacturers():
+    provider = sourcing_service.provider("etm_ipro")
+    method = getattr(provider, "sync_manufacturers", None)
+    if not callable(method):
+        raise HTTPException(404, "Синхронизация производителей ЭТМ iPRO недоступна")
+    return job_service.submit(lambda progress: {"count": method()}).public()
+
+
+@app.get("/api/sourcing/providers/etm_ipro/manufacturers/status")
+def etm_ipro_manufacturer_status():
+    provider = sourcing_service.provider("etm_ipro")
+    method = getattr(provider, "manufacturer_status", None)
+    if not callable(method):
+        raise HTTPException(404, "Статус производителей ЭТМ iPRO недоступен")
+    return _sourcing_payload(method())
+
+
+@app.post("/api/sourcing/providers/etm_ipro/catalog/sync")
+def start_etm_ipro_catalog_sync():
+    provider = sourcing_service.provider("etm_ipro")
+    method = getattr(provider, "start_catalog_sync", None)
+    if not callable(method):
+        raise HTTPException(404, "Синхронизация каталога ЭТМ iPRO недоступна")
+    return job_service.submit(lambda progress: _sourcing_payload(method())).public()
+
+
+@app.get("/api/sourcing/providers/etm_ipro/catalog/status")
+def etm_ipro_catalog_status():
+    provider = sourcing_service.provider("etm_ipro")
+    method = getattr(provider, "catalog_sync_status", None)
+    if not callable(method):
+        raise HTTPException(404, "Статус каталога ЭТМ iPRO недоступен")
+    return _sourcing_payload(method())
 
 
 @app.get("/api/sourcing/catalog/stats")
