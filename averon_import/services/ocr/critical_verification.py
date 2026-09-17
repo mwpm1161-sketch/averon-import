@@ -233,18 +233,32 @@ def attach_exact_cell_candidate(
     value = _candidate_value(field, raw_value)
     if value is None:
         return False
-    # A source-blank package component has no applicable quantity field.
-    # Exact-cell evidence must not turn that non-applicable blank into a
-    # required critical field (or a review blocker).  Explicit component
-    # quantities may still use exact-cell evidence for numeric-shape review.
+    metadata = row.metadata if isinstance(row.metadata, dict) else {}
+    # A source-blank package component has no applicable quantity field unless
+    # the raster layer independently proved that the target cell contains a
+    # glyph, or an earlier stage explicitly declared the field applicable.
+    # Structural safety alone is not proof of a printed value and cached
+    # evidence must not manufacture that proof.
     if (
         not primary_value
-        and isinstance(row.metadata, dict)
-        and row.metadata.get("semantic_role") == "COMPONENT"
+        and metadata.get("semantic_role") == "COMPONENT"
     ):
-        return False
+        field_evidence_map = metadata.get("semantic_field_evidence")
+        field_evidence = (
+            field_evidence_map.get(field)
+            if isinstance(field_evidence_map, dict)
+            else None
+        )
+        required_fields = metadata.get("semantic_required_critical_fields") or ()
+        if not isinstance(required_fields, (list, tuple, set)):
+            required_fields = ()
+        raster_glyph_proven = (
+            isinstance(field_evidence, dict)
+            and field_evidence.get("raster_glyph") is True
+        )
+        if not raster_glyph_proven and field not in required_fields:
+            return False
     mark_semantic_field_required(row, field)
-    metadata = row.metadata
     candidates = dict(metadata.get("value_candidates") or {})
     existing = candidates.get(field)
     evidence = {

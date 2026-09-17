@@ -102,6 +102,43 @@ def test_exact_cell_does_not_promote_package_quantity_or_suspicious_decimal():
         assert "quantity" not in row.values
 
 
+def test_blank_component_rejects_exact_candidate_without_raster_glyph_proof():
+    row = _semantic_row({"name": "- Компонент", "unit": "шт."})
+    row.metadata["semantic_role"] = "COMPONENT"
+    row.metadata["semantic_required_critical_fields"] = []
+    row.metadata["target_cell_structural_safety"] = {
+        "quantity": {"safe": True, "reasons": []},
+    }
+
+    assert not attach_exact_cell_candidate(row, "quantity", "1", bbox={})
+    assert row.values.get("quantity", "") == ""
+    assert row.metadata.get("semantic_required_critical_fields") == []
+    assert (row.metadata.get("value_candidates") or {}) == {}
+    presented = SpecificationRowAssembler().build_semantic_row(1, row)
+    assert "critical_value_missing" not in critical_blockers_for_row(presented)
+
+
+def test_blank_component_keeps_glyph_proven_exact_candidate_for_review():
+    row = _semantic_row({"name": "- Компонент", "unit": "шт."})
+    row.metadata["semantic_role"] = "COMPONENT"
+    row.metadata["semantic_required_critical_fields"] = []
+    row.metadata["semantic_field_evidence"] = {
+        "quantity": {"raster_glyph": True},
+    }
+    row.metadata["target_cell_structural_safety"] = {
+        "quantity": {"safe": True, "reasons": []},
+    }
+
+    assert attach_exact_cell_candidate(row, "quantity", "2", bbox={})
+    assert row.values.get("quantity", "") == ""
+    assert row.metadata["semantic_required_critical_fields"] == ["quantity"]
+    assert row.metadata["value_candidates"]["quantity"]["value_candidate"] == "2"
+    assert not promote_exact_cell_candidate(row, "quantity")
+    presented = SpecificationRowAssembler().build_semantic_row(1, row)
+    assert presented["value_candidates"]["quantity"]["value_candidate"] == "2"
+    assert "critical_value_missing" in critical_blockers_for_row(presented)
+
+
 def test_legitimate_integer_like_decimal_requires_and_accepts_exact_agreement():
     row = _semantic_row(
         {"name": "Насос", "unit": "шт.", "quantity": "4.0"},
