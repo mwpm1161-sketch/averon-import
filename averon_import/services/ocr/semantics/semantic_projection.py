@@ -278,6 +278,11 @@ def _source_safety_reasons(metadata: Mapping[str, Any]) -> list[str]:
                 )
             )
         ),
+        "numeric_shape_suspect": bool(
+            isinstance(metadata.get("normalization"), Mapping)
+            and isinstance(metadata["normalization"].get("quantity"), Mapping)
+            and metadata["normalization"]["quantity"].get("integer_like_decimal")
+        ),
         "ambiguous_columns": bool(
             metadata.get("ambiguous_fields")
             or metadata.get("ambiguous_physical_cells")
@@ -462,6 +467,11 @@ def _item_row(
             normalization[field_name] = numeric_cell_metadata(canonical)
             if normalization[field_name].get("numeric_suspect"):
                 review_reasons.append("numeric_suspect")
+            if (
+                field_name == "quantity"
+                and normalization[field_name].get("integer_like_decimal")
+            ):
+                review_reasons.append("numeric_shape_suspect")
 
     required_fields = _required_fields(item, mapping, metadata)
     if any(not str(values.get(field, "") or "").strip() for field in required_fields):
@@ -638,7 +648,12 @@ def _resolved_context_row(
     if role == RowRole.CONTEXT and qualifier in {"SECTION", "SYSTEM"}:
         allowed = {"name", "position"}
     elif role == RowRole.COMPONENT:
-        allowed = {"name", "type_mark", "code", "manufacturer", "note"}
+        # Included components may carry an explicit quantity/unit, but remain
+        # non-output component rows and therefore cannot affect item totals.
+        allowed = {
+            "name", "type_mark", "code", "manufacturer", "unit",
+            "quantity", "mass", "note",
+        }
     else:
         allowed = {"name", "note"}
     values, sources, bboxes, raw_cells = _raw_row_values(

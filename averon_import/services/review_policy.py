@@ -10,6 +10,7 @@ CRITICAL_FIELDS = ("quantity", "unit", "mass")
 CRITICAL_REASONS = {
     "critical_value_missing",
     "numeric_suspect",
+    "numeric_shape_suspect",
     "ambiguous_columns",
     "ambiguous_table_schema",
     "secondary_conflict",
@@ -218,6 +219,22 @@ def _numeric_suspect_fields(row: dict) -> set[str]:
     return result
 
 
+def _numeric_shape_suspect_fields(row: dict) -> set[str]:
+    metadata = row.get("ocr_metadata") or {}
+    normalization = metadata.get("normalization") if isinstance(metadata, dict) else {}
+    result: set[str] = set()
+    if isinstance(normalization, dict):
+        details = normalization.get("quantity")
+        if isinstance(details, dict) and details.get("integer_like_decimal"):
+            result.add("quantity")
+    edited_fields = set(_as_list(row.get("edited_fields")))
+    if "quantity" in result and "quantity" in edited_fields:
+        details = numeric_cell_metadata(row.get("quantity", ""))
+        if not details.get("integer_like_decimal"):
+            result.discard("quantity")
+    return result
+
+
 def critical_blockers_for_row(row: dict) -> list[str]:
     """Return blocking reason codes; ``no_confidence`` is informational only."""
     missing = missing_critical_fields(row)
@@ -228,6 +245,7 @@ def critical_blockers_for_row(row: dict) -> list[str]:
         blockers.append("critical_value_missing")
     for reason in (
         "numeric_suspect",
+        "numeric_shape_suspect",
         "ambiguous_columns",
         "ambiguous_table_schema",
         "secondary_conflict",
@@ -256,7 +274,10 @@ def critical_blockers_for_row(row: dict) -> list[str]:
 def critical_field_count(row: dict) -> int:
     missing = set(missing_critical_fields(row))
     count = len(missing)
-    suspect = _numeric_suspect_fields(row) - missing
+    suspect = (
+        _numeric_suspect_fields(row)
+        | _numeric_shape_suspect_fields(row)
+    ) - missing
     blockers = critical_blockers_for_row(row)
     count += len(suspect)
     if "numeric_suspect" in blockers and not suspect:
@@ -280,6 +301,7 @@ def critical_field_count(row: dict) -> int:
             "structural_schema_ambiguous",
             "physical_row_loss_suspected",
             "identity_cell_missing",
+            "numeric_shape_suspect",
         )
     ):
         count = 1
@@ -327,13 +349,19 @@ def refresh_review_state(row: dict) -> dict:
         reasons = [reason for reason in reasons if reason != "secondary_conflict"]
     reasons = [
         reason for reason in reasons
-        if reason not in {"critical_value_missing", "numeric_suspect"}
+        if reason not in {
+            "critical_value_missing",
+            "numeric_suspect",
+            "numeric_shape_suspect",
+        }
     ]
     missing = missing_critical_fields(row)
     if missing:
         reasons.append("critical_value_missing")
     if _numeric_suspect_fields(row):
         reasons.append("numeric_suspect")
+    if _numeric_shape_suspect_fields(row):
+        reasons.append("numeric_shape_suspect")
     for field, candidate in (row.get("value_candidates") or {}).items():
         if isinstance(candidate, dict) and candidate.get("review_reason"):
             if field in human_verified_fields:
@@ -352,14 +380,23 @@ def refresh_review_state(row: dict) -> dict:
     if row.get("status") == "verified" and not missing:
         reasons = [
             reason for reason in reasons
-            if reason not in {"numeric_suspect", "ambiguous_columns", "secondary_conflict"}
+            if reason not in {
+                "numeric_suspect",
+                "numeric_shape_suspect",
+                "ambiguous_columns",
+                "secondary_conflict",
+            }
         ]
     unique_reasons = list(dict.fromkeys(reasons))
     row["critical_fields"] = missing
     row["review_reasons"] = unique_reasons
     row["review_reason"] = ", ".join(unique_reasons)
     effective_blockers = set(previous_blockers)
-    effective_blockers.difference_update({"critical_value_missing", "numeric_suspect"})
+    effective_blockers.difference_update({
+        "critical_value_missing",
+        "numeric_suspect",
+        "numeric_shape_suspect",
+    })
     if (
         "secondary_conflict" not in unique_reasons
         or "secondary_conflict" in edited_fields
@@ -367,7 +404,12 @@ def refresh_review_state(row: dict) -> dict:
     ):
         effective_blockers.discard("secondary_conflict")
     if row.get("status") == "verified" and not missing:
-        effective_blockers.difference_update({"numeric_suspect", "ambiguous_columns", "secondary_conflict"})
+        effective_blockers.difference_update({
+            "numeric_suspect",
+            "numeric_shape_suspect",
+            "ambiguous_columns",
+            "secondary_conflict",
+        })
     review_snapshot = dict(row)
     review_snapshot["critical_blockers"] = sorted(effective_blockers)
     row["critical_blockers"] = critical_blockers_for_row(review_snapshot)

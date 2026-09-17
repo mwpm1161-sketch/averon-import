@@ -1505,9 +1505,15 @@ def rows_from_tables(
         review_reasons = list(table.review_reasons)
         if subrow.structural_ambiguity and "structural_ambiguity" not in review_reasons:
             review_reasons.append("structural_ambiguity")
-        for details in normalization.values():
+        for field_name, details in normalization.items():
             if details.get("numeric_suspect") and "numeric_suspect" not in review_reasons:
                 review_reasons.append("numeric_suspect")
+            if (
+                field_name == "quantity"
+                and details.get("integer_like_decimal")
+                and "numeric_shape_suspect" not in review_reasons
+            ):
+                review_reasons.append("numeric_shape_suspect")
         if not values and not subrow.structural_ambiguity:
             _record_diagnostic(
                 diagnostics,
@@ -1731,6 +1737,12 @@ def _rows_from_geometry(
                 normalization[key] = details
                 if details.get("numeric_suspect") and "numeric_suspect" not in row_review_reasons:
                     row_review_reasons.append("numeric_suspect")
+                if (
+                    key == "quantity"
+                    and details.get("integer_like_decimal")
+                    and "numeric_shape_suspect" not in row_review_reasons
+                ):
+                    row_review_reasons.append("numeric_shape_suspect")
             for member in members:
                 vertices.extend(member["vertices"])
             if vertices:

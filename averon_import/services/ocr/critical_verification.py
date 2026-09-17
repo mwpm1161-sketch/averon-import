@@ -1,8 +1,8 @@
 """BBox-only secondary verification for critical Yandex OCR fields.
 
 Primary reconstructed values remain authoritative. Secondary table and exact
-cell results are manual-review candidates only; they never fill a missing
-value automatically.
+cell results are manual-review candidates unless an exact-cell candidate has
+independent structural proof and passes the explicit safe-promotion contract.
 """
 
 from __future__ import annotations
@@ -265,6 +265,84 @@ def attach_exact_cell_candidate(
     if "recovered_by_exact_cell_ocr" not in reasons:
         reasons.append("recovered_by_exact_cell_ocr")
     metadata["review_reasons"] = reasons
+    return True
+
+
+def promote_exact_cell_candidate(row: OcrRow, field: str) -> bool:
+    """Promote one locally safe exact-cell quantity to canonical output.
+
+    Exact-cell OCR is independent evidence only when the raster layer has
+    already proved the target cell safe and there is exactly one candidate.
+    Package-unit rows intentionally remain review-only: an absent package
+    quantity is not evidence that the quantity is one.
+    """
+
+    if field not in CRITICAL_FIELDS:
+        return False
+    metadata = row.metadata if isinstance(row.metadata, dict) else {}
+    if metadata.get("semantic_role") != "ITEM_ROOT":
+        return False
+    if str(row.values.get(field, "") or "").strip():
+        return False
+    candidate = (metadata.get("value_candidates") or {}).get(field)
+    if not isinstance(candidate, dict):
+        return False
+    source = str(candidate.get("candidate_source") or "")
+    if not source.startswith("yandex_exact_cell"):
+        return False
+    if field in set(metadata.get("secondary_conflict_fields") or ()):
+        return False
+    if any(
+        isinstance(item, dict) and str(item.get("field") or "") == field
+        for item in metadata.get("alternative_value_candidates") or ()
+    ):
+        return False
+    safety = (metadata.get("target_cell_structural_safety") or {}).get(field)
+    if not isinstance(safety, dict) or safety.get("safe") is not True:
+        return False
+    normalized = _candidate_value(field, str(candidate.get("raw_value") or ""))
+    if normalized is None:
+        return False
+    if field == "quantity":
+        details = numeric_cell_metadata(str(candidate.get("raw_value") or ""))
+        if details.get("integer_like_decimal"):
+            return False
+    unit = normalize_cell("unit", row.values.get("unit", ""))
+    if field == "quantity" and unit == "компл.":
+        return False
+
+    row.values[field] = normalized
+    row.sources[field] = source
+    metadata.setdefault("raw_values", {})[field] = str(
+        candidate.get("raw_value") or normalized
+    )
+    metadata.setdefault("normalization", {})[field] = numeric_cell_metadata(
+        str(candidate.get("raw_value") or normalized)
+    )
+    metadata.setdefault("semantic_field_evidence", {})[field] = {
+        **dict(metadata.get("semantic_field_evidence", {}).get(field) or {}),
+        "exact_cell_ocr": True,
+        "verified": True,
+        "bbox": dict(candidate.get("bbox") or {}),
+    }
+    promoted = dict(candidate)
+    promoted["auto_trusted"] = True
+    promoted["verified_by_exact_cell_ocr"] = True
+    promoted["review_reason"] = None
+    metadata.setdefault("value_candidates", {})[field] = promoted
+    metadata["review_reasons"] = [
+        reason
+        for reason in metadata.get("review_reasons") or ()
+        if reason not in {"recovered_by_exact_cell_ocr", "critical_value_missing"}
+    ]
+    required = metadata.get("semantic_required_critical_fields") or ()
+    if required and all(
+        str(row.values.get(required_field, "") or "").strip()
+        for required_field in required
+    ) and not metadata["review_reasons"]:
+        metadata["semantic_review"] = False
+        metadata["semantic_state"] = "VERIFIED"
+        metadata["semantic_review_impact"] = "NONE"
     return True
 
 

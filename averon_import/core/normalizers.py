@@ -224,10 +224,16 @@ def numeric_cell_metadata(value: str | None) -> dict[str, object]:
     numeric_suspect = bool(compact_raw) and not re.fullmatch(
         r"-?\d+(?:[.,]\d+)?", compact_raw
     )
+    # OCR may insert a decimal separator into an integer quantity (for
+    # example, ``40`` -> ``4.0``). Preserve the display candidate, but expose
+    # the shape separately so callers can fail closed without rejecting
+    # legitimate non-zero fractions such as ``2.5``.
+    integer_like_decimal = bool(re.fullmatch(r"-?\d+[.,]0", compact_raw))
     return {
         "raw_value": raw_value,
         "normalized_candidate": candidate,
         "numeric_suspect": numeric_suspect,
+        "integer_like_decimal": integer_like_decimal,
     }
 
 

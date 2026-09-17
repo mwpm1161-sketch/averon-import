@@ -55,6 +55,7 @@ from averon_import.services.ocr.semantics.semantic_projection import (
 from averon_import.services.ocr.critical_verification import (
     attach_exact_cell_candidate,
     attach_secondary_candidates,
+    promote_exact_cell_candidate,
 )
 from averon_import.services.ocr.physical_grid import (
     PhysicalGridDetection,
@@ -944,6 +945,8 @@ class YandexVisionProvider:
                         bbox=cell.as_bbox(),
                     ):
                         stats["exact_cell_candidates"] += 1
+                        if promote_exact_cell_candidate(row, field):
+                            stats["exact_cell_recovered"] += 1
                 except OcrProviderError as exc:
                     # Cancellation is a job-level decision, not a recoverable
                     # failure of one optional verification candidate.
@@ -1239,7 +1242,8 @@ class YandexVisionProvider:
                 for row in item_rows
             ),
             "semantic_numeric_suspect_count": sum(
-                "numeric_suspect" in reasons for reasons in review_reasons
+                bool({"numeric_suspect", "numeric_shape_suspect"}.intersection(reasons))
+                for reasons in review_reasons
             ),
             "semantic_secondary_conflict_count": sum(
                 "secondary_conflict" in reasons for reasons in review_reasons
@@ -1401,6 +1405,7 @@ class YandexVisionProvider:
             "exact_cell_checked": 0,
             "exact_cell_requests": 0,
             "exact_cell_candidates": 0,
+            "exact_cell_recovered": 0,
             "identity_cell_missing": 0,
             "unresolved_critical": 0,
             "semantic_authoritative_pages": 0,
