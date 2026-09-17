@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from averon_import.services.app_settings import EtmIproSettings
 from averon_import.services.sourcing.providers.base import SourcingProviderError
@@ -29,8 +30,16 @@ _LOGIN_INTERVAL_SECONDS = 120.0
 Transport = Callable[[urllib.request.Request, float], Any]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 def _default_transport(request: urllib.request.Request, timeout: float):
-    return urllib.request.urlopen(request, timeout=timeout)
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
 class EtmRateLimiter:
@@ -120,7 +129,7 @@ class EtmIproClient:
         items = self._ids(source_item_ids, limit=50)
         if not items:
             return {"data": []}
-        joined = ",".join(quote(item, safe="") for item in items)
+        joined = quote(",".join(items), safe="")
         return self._request_json(
             "GET", f"/goods/{joined}/price", query={"type": "etm"}, bucket="price"
         )
@@ -146,9 +155,7 @@ class EtmIproClient:
             ) from exc
 
     def create_catalog_job(self) -> str:
-        payload = self._request_json(
-            "POST", ETM_CATALOG_JOB_CREATE_PATH, query={"session-id": self._get_session()}
-        )
+        payload = self._request_json("POST", ETM_CATALOG_JOB_CREATE_PATH)
         value = self._data_value(payload, "uuid")
         if not value:
             raise SourcingProviderError(
@@ -160,13 +167,41 @@ class EtmIproClient:
 
     def get_catalog_job(self, job_uuid: str) -> dict[str, Any]:
         value = self._id(job_uuid)
-        return self._request_json(
-            "GET", f"/job/{quote(value, safe='')}", query={"session-id": self._get_session()}, bucket="catalog"
-        )
+        return self._request_json("GET", f"/job/{quote(value, safe='')}", bucket="catalog")
 
     def download_snapshot(self, url: str) -> Any:
         parsed = urlsplit(str(url or "").strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+            valid_port = False
+        else:
+            valid_port = port in {None, 443}
+        allowed_hosts = {
+            str(urlsplit(self.api_base_url).hostname or "").casefold(),
+            "ipro.etm.ru",
+        }
+        hostname = str(parsed.hostname or "").casefold()
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+        private_or_local = (
+            hostname in {"localhost", "localhost.localdomain"}
+            or address is not None
+            and (address.is_loopback or address.is_private or address.is_link_local or address.is_reserved or address.is_unspecified)
+        )
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.hostname
+            or hostname not in allowed_hosts
+            or private_or_local
+            or not valid_port
+        ):
             raise SourcingProviderError(
                 "ЭТМ iPRO не вернул безопасный адрес каталога",
                 code="INVALID_RESPONSE",
@@ -221,17 +256,16 @@ class EtmIproClient:
         bucket: str = "general",
     ) -> Any:
         url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{self.api_base_url}{path_or_url}"
-        if query:
-            separator = "&" if "?" in url else "?"
-            url += separator + urlencode(query)
         headers = {"Accept": "application/json"}
         session: str | None = None
         for attempt in range(2 if auth else 1):
+            request_query = dict(query or {})
             if auth:
                 session = self._get_session(force=attempt == 1)
-                headers["X-Session-Id"] = session
+                request_query["session-id"] = session
+            request_url = self._replace_query(url, request_query, authenticated=auth)
             try:
-                status, raw = self._request_raw(method, url, headers=headers, bucket=bucket)
+                status, raw = self._request_raw(method, request_url, headers=headers, bucket=bucket)
                 if not 200 <= status < 300:
                     raise self._status_error(status)
                 try:
@@ -250,6 +284,20 @@ class EtmIproClient:
                     continue
                 raise
         raise SourcingProviderError("ЭТМ iPRO не вернул ответ", category="upstream_error")
+
+    @staticmethod
+    def _replace_query(url: str, query: dict[str, Any], *, authenticated: bool) -> str:
+        parsed = urlsplit(url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if authenticated:
+            pairs = [(key, value) for key, value in pairs if key != "session-id"]
+        pairs.extend((str(key), str(value)) for key, value in query.items())
+        if authenticated:
+            session_values = [pair for pair in pairs if pair[0] == "session-id"]
+            pairs = [(key, value) for key, value in pairs if key != "session-id"]
+            if session_values:
+                pairs.append(session_values[-1])
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(pairs), parsed.fragment))
 
     def _request_raw(
         self,

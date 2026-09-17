@@ -331,11 +331,32 @@ class EtmCatalogMirror:
             data = payload.get("data", payload) if isinstance(payload, dict) else {}
             if not isinstance(data, dict):
                 raise ValueError("job data must be an object")
-            state = int(data.get("state", data.get("status")))
+            rows = data.get("rows")
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("job response contains no rows")
+            matching = [
+                row for row in rows
+                if isinstance(row, dict) and str(row.get("uuid", "")).strip() == value
+            ]
+            if len(matching) == 1:
+                row = matching[0]
+            elif not matching and len(rows) == 1 and isinstance(rows[0], dict):
+                row = rows[0]
+            else:
+                raise ValueError("job response contains ambiguous rows")
+            state = int(row.get("state"))
             if state not in _JOB_STATES:
                 raise ValueError("unknown job state")
-            url = str(data.get("url", data.get("file", data.get("download_url", ""))) or "").strip()
-            error = str(data.get("error", data.get("message", "")) or "").strip()
+            urls = row.get("urls")
+            url = ""
+            if isinstance(urls, list):
+                for candidate in urls:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_url = candidate.get("url")
+                    if isinstance(candidate_url, str) and candidate_url.strip():
+                        url = candidate_url.strip()
+                        break
         except SourcingProviderError:
             raise
         except (TypeError, ValueError) as exc:

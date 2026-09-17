@@ -124,6 +124,7 @@ class EtmIproProvider:
                 code="CATALOG_NOT_SYNCED",
                 category="not_configured",
             )
+        bounded_limit = max(1, min(int(limit), 100))
         direct_goods: list[dict[str, Any]] = []
         manufacturer_code = None
         if intent.article and intent.manufacturer:
@@ -134,18 +135,22 @@ class EtmIproProvider:
                     lookup_type="mnf",
                     manufacturer_code=manufacturer_code,
                 )
-                direct_goods = _goods_rows(payload)
+                direct_goods = _goods_rows(payload)[:bounded_limit]
         records = self.mirror.search(
             intent,
-            limit=max(1, min(int(limit), 100)),
+            limit=bounded_limit,
             manufacturer_code=manufacturer_code,
         )
         goods_by_id: dict[str, dict[str, Any]] = {}
         for raw in direct_goods:
+            if len(goods_by_id) >= bounded_limit:
+                break
             parsed = _goods_record(raw)
             if parsed is not None:
                 goods_by_id[parsed.source_item_id] = raw
         for record in records:
+            if len(goods_by_id) >= bounded_limit:
+                break
             goods_by_id.setdefault(record.source_item_id, {})
         if not goods_by_id:
             return []
@@ -214,13 +219,16 @@ class EtmIproProvider:
                 "packs": goods_source(raw_detail, "gdsPacks") or [],
                 "images": _images(goods_source(raw_detail, "gdsImages")),
                 "remains": stock_records,
+                "supplier_stores": _detail_value(remains, "InfoSuppStores", "supplier_stores"),
+                "forecast": _detail_value(remains, "InfoForecast", "forecast"),
+                "delivery": _detail_value(remains, "InforDeliveryTime", "delivery", "delivery_time"),
             },
             data_provenance={
                 "source": self.key,
                 "catalog_version": self.mirror.revision,
                 "source_item_id": goods.source_item_id,
                 "price_field": "pricewnds" if price_value is not None else "",
-                "price_status": "requires_individual_request" if price is not None and price_value is None else "",
+                "price_status": _price_status(price, price_value),
             },
         )
 
@@ -234,10 +242,11 @@ def _goods_rows(payload: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
     if isinstance(data, dict):
-        for key in ("goods", "items", "products"):
+        for key in ("rows", "goods", "items", "products"):
             if isinstance(data.get(key), list):
                 return [item for item in data[key] if isinstance(item, dict)]
-        return [data]
+        if any(key in data for key in ("gdscode", "id", "code", "source_item_id")):
+            return [data]
     return []
 
 
@@ -258,6 +267,18 @@ def goods_source(goods: Any, key: str) -> Any:
     return goods.get(key)
 
 
+def _detail_value(payload: Any, *keys: str) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data", payload)
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
 def _price_row(payload: Any, source_item_id: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
@@ -268,6 +289,8 @@ def _price_row(payload: Any, source_item_id: str) -> dict[str, Any] | None:
     elif isinstance(data, dict):
         rows = data.get("prices", data.get("goods", data.get("items", [data])))
     else:
+        rows = []
+    if not isinstance(rows, list):
         rows = []
     for row in rows:
         if not isinstance(row, dict):
@@ -294,12 +317,38 @@ def _commercial_price(row: dict[str, Any] | None) -> Decimal | None:
     return value if value.is_finite() and value > 0 else None
 
 
+def _price_status(row: dict[str, Any] | None, price: Decimal | None) -> str:
+    if not row:
+        return ""
+    raw = row.get("pricewnds")
+    try:
+        commercial = Decimal(str(raw).replace(",", "."))
+    except (InvalidOperation, TypeError, ValueError):
+        return "unknown"
+    if not commercial.is_finite():
+        return "unknown"
+    if price is not None:
+        return ""
+    if commercial == 0:
+        other_values = (row.get("price"), row.get("price_tarif"), row.get("price_retail"))
+        try:
+            parsed = [Decimal(str(value or "0").replace(",", ".")) for value in other_values]
+        except (InvalidOperation, TypeError, ValueError):
+            return "unknown"
+        if all(value == 0 for value in parsed):
+            return "requires_individual_request"
+    return "unknown"
+
+
 def _stock_summary(payload: Any, configured_codes: list[str]) -> tuple[list[dict[str, Any]], bool | None, str]:
     if not isinstance(payload, dict):
         return [], None, "Наличие уточняется"
     data = payload.get("data", payload)
     if isinstance(data, dict):
-        rows = data.get("stores", data.get("remains", data.get("items", [data])))
+        if "InfoStores" in data:
+            rows = data.get("InfoStores")
+        else:
+            rows = data.get("stores", data.get("remains", data.get("items", [data])))
     elif isinstance(data, list):
         rows = data
     else:
@@ -310,14 +359,17 @@ def _stock_summary(payload: Any, configured_codes: list[str]) -> tuple[list[dict
     for raw in rows:
         if not isinstance(raw, dict):
             continue
-        code = str(
-            raw.get("store_code", raw.get("storeCode", raw.get("code", raw.get("store", ""))))
-        ).strip()
+        code = str(raw.get("StoreCode", raw.get("store_code", raw.get("storeCode", raw.get("code", raw.get("store", "")))))).strip()
         is_open = raw.get("open", raw.get("is_open", raw.get("isOpen", True)))
         if is_open is False or (wanted and code not in wanted):
             continue
-        selected.append(dict(raw))
-        value = raw.get("stock", raw.get("quantity", raw.get("amount", raw.get("remain"))))
+        selected_row = dict(raw)
+        value = raw.get("StoreQuantRem", raw.get("stock", raw.get("quantity", raw.get("amount", raw.get("remain")))))
+        if code and "store_code" not in selected_row:
+            selected_row["store_code"] = code
+        if value is not None and "stock" not in selected_row:
+            selected_row["stock"] = value
+        selected.append(selected_row)
         try:
             number = Decimal(str(value).replace(",", "."))
             if number.is_finite():
@@ -325,6 +377,12 @@ def _stock_summary(payload: Any, configured_codes: list[str]) -> tuple[list[dict
         except (InvalidOperation, TypeError, ValueError):
             pass
     if not selected or not wanted:
+        return selected, None, "Наличие уточняется"
+    selected_codes = {
+        str(row.get("StoreCode", row.get("store_code", ""))).strip()
+        for row in selected
+    }
+    if not wanted.issubset(selected_codes):
         return selected, None, "Наличие уточняется"
     if any(value > 0 for value in known_values):
         return selected, True, "В наличии на выбранном складе"

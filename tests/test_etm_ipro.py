@@ -19,6 +19,11 @@ from averon_import.services.sourcing.providers.etm_ipro import (
     EtmIproProvider,
     EtmRateLimiter,
 )
+from averon_import.services.sourcing.providers.etm_ipro.provider import (
+    _goods_rows,
+    _price_row,
+    _stock_summary,
+)
 from averon_import.services.sourcing.providers.etm_ipro.models import EtmCatalogRecord, EtmManufacturer
 
 
@@ -86,6 +91,168 @@ def test_auth_success_uses_session_and_never_puts_credentials_in_errors(tmp_path
     assert parsed["log"] == ["login@example.com"]
     assert parsed["pwd"] == ["p&ss"]
     assert "session-private" not in str(result)
+
+
+class OfficialWireTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, request, timeout):
+        self.requests.append(request)
+        parsed = urlsplit(request.full_url)
+        path = parsed.path
+        if path.endswith("/user/login"):
+            return FakeResponse({"status": {"code": 200}, "data": {"session": "session-wire"}})
+        if path.endswith("/info/search/r-manuf/"):
+            return FakeResponse({
+                "status": {"code": 200},
+                "data": [{"id": "4263058", "value": "686", "label": "Реле и Автоматика"}],
+            })
+        if path.endswith("/price"):
+            return FakeResponse({
+                "status": {"code": 200},
+                "data": {"gdscode": 9536092, "price": 0, "pricewnds": "125.40", "price_tarif": 0, "price_retail": 0},
+            })
+        if path.endswith("/remains"):
+            return FakeResponse({
+                "status": {"code": 200},
+                "data": {
+                    "RequestStoreName": "Основной склад",
+                    "UnitName": "шт.",
+                    "gdscode": 9536092,
+                    "InfoStores": [
+                        {"StoreCode": "WH-1", "StoreType": "warehouse", "StoreName": "Основной", "StoreQuantRem": "4"},
+                        {"StoreCode": "WH-2", "StoreType": "warehouse", "StoreName": "Другой", "StoreQuantRem": "0"},
+                    ],
+                    "InfoForecast": {"days": 2},
+                    "InfoSuppStores": [{"StoreCode": "SUP-1", "StoreQuantRem": "8"}],
+                    "InforDeliveryTime": "завтра",
+                },
+            })
+        if "/goods/" in path and not path.endswith("/price") and not path.endswith("/remains"):
+            return FakeResponse({
+                "status": {"code": 200},
+                "data": {
+                    "rows": [{
+                        "code": "ETM9536092",
+                        "gdscode": 9536092,
+                        "art": "РВ-100",
+                        "mnf_name": "Реле и Автоматика",
+                        "mnf_code": 686,
+                        "edizm": "шт.",
+                        "min_cnt": "1",
+                        "gdsChars": [{"name": "Ток", "value": "10 А"}],
+                        "gdsClassTree": [{"name": "Автоматика"}],
+                        "gdsPacks": [],
+                        "gdsImages": [],
+                    }],
+                    "records": 1,
+                },
+            })
+        if path.endswith("/job/create/40029846"):
+            return FakeResponse({"status": {"code": 200}, "data": {"uuid": "job-wire"}})
+        if path.endswith("/job/job-wire"):
+            return FakeResponse({
+                "status": {"code": 200},
+                "data": {
+                    "page": 1,
+                    "rows": [{
+                        "state": 1,
+                        "state_desc": "Готово",
+                        "uuid": "job-wire",
+                        "urls": [{"type": "json", "url": "https://ipro.etm.ru/report/catalog.json"}],
+                    }],
+                    "total": 1,
+                    "records": 1,
+                    "userdata": {},
+                },
+            })
+        if path.endswith("/report/catalog.json"):
+            return FakeResponse({"status": {"code": 200}, "data": [{"gdscode": 9536092, "name": "Реле"}]})
+        raise AssertionError(f"unexpected wire path: {request.full_url}")
+
+
+def test_official_wire_contract_uses_query_session_and_rows_adapters(tmp_path):
+    transport = OfficialWireTransport()
+    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+
+    goods_mnf = client.get_goods("9536092", lookup_type="mnf", manufacturer_code="686")
+    goods_etm = client.get_goods("9536092", lookup_type="etm")
+    price = client.get_prices(["9536092", "9536093"])
+    remains = client.get_remains("9536092")
+    manufacturers = client.get_manufacturers()
+    assert _goods_rows(goods_mnf)[0]["gdscode"] == 9536092
+    assert _goods_rows(goods_etm)[0]["code"] == "ETM9536092"
+    assert _goods_rows({"status": {}, "data": {"records": 0}}) == []
+    assert _price_row(price, "9536092")["pricewnds"] == "125.40"
+    selected, availability, _ = _stock_summary(remains, ["WH-1"])
+    assert availability is True
+    assert selected[0]["StoreQuantRem"] == "4"
+    _, unavailable, _ = _stock_summary(remains, ["WH-1", "WH-MISSING"])
+    assert unavailable is None
+    assert manufacturers[0].code == "686"
+    assert manufacturers[0].label == "Реле и Автоматика"
+
+    assert client.create_catalog_job() == "job-wire"
+    assert client.get_catalog_job("job-wire")["data"]["rows"][0]["state"] == 1
+    assert client.download_snapshot("https://ipro.etm.ru/report/catalog.json")["data"][0]["gdscode"] == 9536092
+
+    authenticated = [
+        request for request in transport.requests
+        if "/user/login" not in request.full_url and "/report/" not in request.full_url
+    ]
+    assert authenticated
+    login_request = next(request for request in transport.requests if "/user/login" in request.full_url)
+    assert "session-id" not in parse_qs(urlsplit(login_request.full_url).query)
+    for request in authenticated:
+        assert parse_qs(urlsplit(request.full_url).query)["session-id"] == ["session-wire"]
+        assert "X-Session-Id" not in request.headers
+    price_request = next(request for request in transport.requests if request.full_url.endswith("/price?type=etm&session-id=session-wire"))
+    assert "%2C" in urlsplit(price_request.full_url).path
+    assert "session-wire" not in str(SourcingProviderError("Поставщик недоступен"))
+
+
+def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp_path):
+    transport = OfficialWireTransport()
+    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({
+        "data": [{
+            "gdscode": 9536092,
+            "name": "Реле и Автоматика РВ-100",
+            "art": "РВ-100",
+            "mnf_name": "Реле и Автоматика",
+            "mnf_code": 686,
+        }],
+    })
+    provider = EtmIproProvider(settings(tmp_path), MemorySecretStore(), tmp_path, client=client, mirror=mirror)
+    provider.sync_manufacturers()
+
+    offer = provider.search(intent(article="РВ-100", manufacturer="Реле и Автоматика", brand="Реле и Автоматика"))[0]
+    assert offer.source_item_id == "9536092"
+    assert offer.price == Decimal("125.40")
+    assert offer.availability is True
+    assert offer.attributes["remains"][0]["StoreQuantRem"] == "4"
+    assert offer.attributes["supplier_stores"] == [{"StoreCode": "SUP-1", "StoreQuantRem": "8"}]
+    assert offer.attributes["forecast"] == {"days": 2}
+    assert offer.attributes["delivery"] == "завтра"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://ipro.etm.ru/report/catalog.json",
+        "https://evil.example/report/catalog.json",
+        "https://localhost/report/catalog.json",
+        "https://127.0.0.1/report/catalog.json",
+        "https://10.0.0.1/report/catalog.json",
+        "https://user:password@ipro.etm.ru/report/catalog.json",
+    ],
+)
+def test_snapshot_download_rejects_unsafe_urls(tmp_path, url):
+    client = EtmIproClient(settings(tmp_path), "login", "password", transport=OfficialWireTransport())
+    with pytest.raises(SourcingProviderError, match="безопасный адрес"):
+        client.download_snapshot(url)
 
 
 def test_403_allows_one_reauth_retry_after_documented_login_cooldown(tmp_path):
@@ -277,6 +444,53 @@ def test_project_continues_after_one_etm_provider_row_failure(tmp_path):
     assert result.results[1].offers
 
 
+def test_provider_search_is_bounded_and_does_not_enrich_zero_evidence(tmp_path):
+    class CountingClient(FakeEtmClient):
+        def __init__(self):
+            self.goods_calls = []
+
+        def get_goods(self, source_item_id, *, lookup_type="etm", manufacturer_code=None):
+            self.goods_calls.append(source_item_id)
+            return super().get_goods(
+                source_item_id,
+                lookup_type=lookup_type,
+                manufacturer_code=manufacturer_code,
+            )
+
+    client = CountingClient()
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({
+        "data": [
+            catalog_record("A-100", name="Насос 1", article="" ).model_dump(),
+            catalog_record("B-200", name="Насос 2", article="" ).model_dump(),
+        ],
+    })
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=client, mirror=mirror
+    )
+    broad_intent = intent(
+        article="",
+        brand="",
+        manufacturer="",
+        model="Насос",
+        normalized_name="Насос",
+        search_queries=["Насос"],
+    )
+    assert len(provider.search(broad_intent, limit=1)) == 1
+    bounded_calls = len(client.goods_calls)
+
+    empty_intent = intent(
+        article="",
+        brand="",
+        manufacturer="",
+        model="",
+        normalized_name="нет такого товара",
+        search_queries=[],
+    )
+    assert provider.search(empty_intent, limit=20) == []
+    assert len(client.goods_calls) == bounded_calls
+
+
 def test_catalog_job_lifecycle_persists_uuid_and_imports_only_completed_snapshot(tmp_path):
     mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
 
@@ -288,7 +502,20 @@ def test_catalog_job_lifecycle_persists_uuid_and_imports_only_completed_snapshot
             return "job-1"
         def get_catalog_job(self, value):
             self.status_calls += 1
-            return {"data": {"state": 3 if self.status_calls == 1 else 1, "url": "https://etm.example/catalog.json"}}
+            return {
+                "data": {
+                    "page": 1,
+                    "rows": [{
+                        "state": 3 if self.status_calls == 1 else 1,
+                        "state_desc": "готово",
+                        "uuid": value,
+                        "urls": [{"type": "json", "url": "https://etm.example/catalog.json"}],
+                    }],
+                    "total": 1,
+                    "records": 1,
+                    "userdata": {},
+                },
+            }
         def download_snapshot(self, value):
             return {"data": [catalog_record("new").model_dump()]}
 
@@ -300,3 +527,22 @@ def test_catalog_job_lifecycle_persists_uuid_and_imports_only_completed_snapshot
     assert completed.state == 1
     assert mirror.search(intent(article="A-100"))[0].source_item_id == "new"
     assert mirror.count() == 1
+
+
+def test_catalog_job_status_fails_closed_without_unambiguous_official_row(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+
+    class JobClient:
+        def create_catalog_job(self):
+            return "job-ambiguous"
+
+        def get_catalog_job(self, value):
+            return {"data": {"rows": [
+                {"uuid": "other", "state": 1, "urls": [{"url": "https://ipro.etm.ru/a.json"}]},
+                {"uuid": "another", "state": 1, "urls": [{"url": "https://ipro.etm.ru/b.json"}]},
+            ]}}
+
+    client = JobClient()
+    mirror.create_job(client)
+    with pytest.raises(SourcingProviderError, match="некорректный статус"):
+        mirror.update_job(client)

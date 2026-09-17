@@ -12,7 +12,7 @@ class EtmCatalogRecord(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     source_item_id: str = Field(
-        validation_alias=AliasChoices("id", "gdscode", "source_item_id")
+        validation_alias=AliasChoices("gdscode", "id", "source_item_id", "code")
     )
     name: str = Field(default="", validation_alias=AliasChoices("name", "title"))
     brand: str = Field(default="", validation_alias=AliasChoices("brand", "mnf_name", "manufacturer"))
@@ -90,8 +90,8 @@ def parse_manufacturers(payload: Any) -> tuple[EtmManufacturer, ...]:
     for raw in rows:
         if not isinstance(raw, dict):
             continue
-        code = raw.get("code", raw.get("id", raw.get("mnf_code", raw.get("manufacturer_code"))))
-        label = raw.get("name", raw.get("label", raw.get("mnf_name", raw.get("manufacturer"))))
+        code = raw.get("value", raw.get("code", raw.get("mnf_code", raw.get("manufacturer_code", raw.get("id")))))
+        label = raw.get("label", raw.get("name", raw.get("mnf_name", raw.get("manufacturer"))))
         if code is None or label is None:
             continue
         code_text, label_text = str(code).strip(), str(label).strip()
