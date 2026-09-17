@@ -297,6 +297,63 @@ def test_section_system_topology_and_system_lists_are_generic():
     assert [item.physical_row_refs[0].row_index for item in semantic.logical_items] == [3, 6, 9]
 
 
+def test_hierarchical_procurement_group_keeps_parent_non_output_and_children_items():
+    _table, _context, graph, _relations, semantic = _run({
+        1: {0: "8", 1: "Колодец гашения напора К1.6"},
+        2: {0: "8.1", 1: "Шпилька М16", 5: "шт", 6: "4"},
+        3: {0: "8.2", 1: "Гайка М16", 5: "шт", 6: "8"},
+        4: {0: "9", 1: "Насос", 5: "шт", 6: "1"},
+    })
+    selected = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    assert selected[1].selected_role == RowRole.CONTEXT
+    assert selected[1].selected_qualifier == "GROUP"
+    assert selected[1].state == RowRoleState.CONFIRMED
+    for row_index in (2, 3, 4):
+        assert selected[row_index].selected_role == RowRole.ITEM_ROOT
+        assert selected[row_index].state == RowRoleState.CONFIRMED
+    assert [item.physical_row_refs[0].row_index for item in semantic.logical_items] == [2, 3, 4]
+
+    projected = project_semantic_table(
+        StructuredReconstructionResult(
+            rows=[],
+            physical_table=_table,
+            semantic_table=semantic,
+            page_size=(900.0, 400.0),
+        )
+    )
+    group = next(row for row in projected if row.source_row == 1)
+    assert group.metadata["semantic_role"] == "CONTEXT"
+    assert group.metadata["semantic_qualifier"] == "GROUP"
+    assert group.values["position"] == "8"
+    assert group.values["name"] == "Колодец гашения напора К1.6"
+    assert group.metadata["semantic_required_critical_fields"] == []
+    assert not group.metadata.get("semantic_review")
+    presented_group = SpecificationRowAssembler().build_semantic_row(1, group)
+    assert presented_group["row_type"] == "note"
+    assert presented_group["status"] == "recognized"
+
+
+def test_hierarchical_group_requires_two_contiguous_children():
+    _table, _context, graph, _relations, semantic = _run({
+        1: {0: "8", 1: "Один возможный раздел"},
+        2: {0: "8.1", 1: "Только один ребенок", 5: "шт", 6: "1"},
+        3: {0: "9", 1: "Насос", 5: "шт", 6: "1"},
+    })
+    selected = {
+        assessment.physical_row_ref.row_index: assessment
+        for assessment in graph.row_role_assessments
+    }
+    assert not (
+        selected[1].selected_role == RowRole.CONTEXT
+        and selected[1].selected_qualifier == "GROUP"
+        and selected[1].state == RowRoleState.CONFIRMED
+    )
+    assert semantic.logical_items
+
+
 def test_lowercase_terminal_fragment_is_not_a_new_section():
     _table, _context, graph, _relations, _semantic = _run({
         1: {1: "Насос", 5: "шт", 6: "1"},

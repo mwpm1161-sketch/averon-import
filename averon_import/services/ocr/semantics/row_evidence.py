@@ -33,6 +33,7 @@ class RowQualifier(str, Enum):
     TITLE_BLOCK = "TITLE_BLOCK"
     SECTION = "SECTION"
     SYSTEM = "SYSTEM"
+    GROUP = "GROUP"
     TITLE = "TITLE"
     SERVICE_TAIL = "SERVICE_TAIL"
     BULLET = "BULLET"

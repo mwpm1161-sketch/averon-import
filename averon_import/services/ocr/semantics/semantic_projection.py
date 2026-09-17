@@ -667,7 +667,7 @@ def _resolved_context_row(
 ) -> OcrRow:
     qualifier = str(getattr(disposition, "qualifier", "") or "")
     role = getattr(disposition, "role", RowRole.NOTE)
-    if role == RowRole.CONTEXT and qualifier in {"SECTION", "SYSTEM"}:
+    if role == RowRole.CONTEXT and qualifier in {"SECTION", "SYSTEM", "GROUP"}:
         allowed = {"name", "position"}
     elif role == RowRole.COMPONENT:
         # Included components may carry an explicit quantity/unit, but remain

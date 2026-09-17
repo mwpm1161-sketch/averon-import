@@ -54,6 +54,8 @@ class EvidenceTier(str, Enum):
 
 
 _INTEGER_RE = re.compile(r"^\d+$")
+_ROOT_POSITION_RE = re.compile(r"^\d+$")
+_DIRECT_CHILD_POSITION_RE = re.compile(r"^(?P<root>\d+)\.(?P<ordinal>\d+)$")
 _NUMBER_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
 _SYSTEM_ALNUM_RE = re.compile(
     r"^[A-ZА-ЯЁ]{1,4}\s*\d{1,3}(?:[.,]\d+)?\s*\*?"
@@ -633,6 +635,82 @@ def _section_heading_evidence(
     )
 
 
+def _hierarchical_group_candidate(
+    row: PhysicalRowIR,
+    following_rows: Iterable[PhysicalRowIR],
+    mapping: Mapping[int, tuple[str, ...]],
+) -> RoleCandidate | None:
+    """Recognize a structural procurement group parent.
+
+    The parent is confirmed only by its own root-position/name shape plus two
+    immediately contiguous, independently item-shaped children.  This keeps
+    group recognition generic and prevents a sparse numbered row from
+    swallowing an unrelated item or being treated as a product row merely to
+    remove review.
+    """
+
+    field_text = _field_texts(row, mapping)
+    positions = tuple(_text(value) for value in field_text.get("position", ()))
+    names = tuple(_text(value) for value in field_text.get("name", ()))
+    if len(positions) != 1 or not _ROOT_POSITION_RE.fullmatch(positions[0]):
+        return None
+    if not any(_has_letters(value) for value in names):
+        return None
+    if any(
+        any(_text(value) for value in field_text.get(field, ()))
+        for field in ("unit", "quantity", "mass", "type_mark", "code", "manufacturer")
+    ):
+        return None
+
+    root = positions[0]
+    children: list[PhysicalRowIR] = []
+    expected_ordinal = 1
+    parent_index = row.ref.row_index
+    for child in following_rows:
+        if child.ref.row_index != parent_index + len(children) + 1:
+            break
+        child_fields = _field_texts(child, mapping)
+        child_positions = tuple(
+            _text(value) for value in child_fields.get("position", ())
+        )
+        if len(child_positions) != 1:
+            break
+        match = _DIRECT_CHILD_POSITION_RE.fullmatch(child_positions[0])
+        if match is None or match.group("root") != root:
+            break
+        if int(match.group("ordinal")) != expected_ordinal:
+            break
+        item_candidates = _item_evidence(child, mapping)
+        if not any(
+            candidate.role == RowRole.ITEM_ROOT
+            and candidate.evidence_strength == EvidenceTier.STRONG.value
+            for candidate in item_candidates
+        ):
+            break
+        children.append(child)
+        expected_ordinal += 1
+        if len(children) >= 2:
+            break
+
+    if len(children) < 2:
+        return None
+    return _candidate(
+        RowRole.CONTEXT,
+        qualifier="GROUP",
+        tier=EvidenceTier.STRONG,
+        evidence=(
+            "hierarchical_root_position",
+            "meaningful_group_name",
+            "group_parent_critical_fields_blank",
+            "contiguous_child_positions",
+            "multiple_child_item_anchors",
+        ),
+        provenance={
+            "child_row_refs": [child.ref.as_dict() for child in children],
+        },
+    )
+
+
 def _assessment(
     row: PhysicalRowIR,
     candidates: Iterable[RoleCandidate],
@@ -681,6 +759,21 @@ def _assessment(
         # weak identity/position item hypothesis. Product anchors in critical
         # columns prevent the section candidate from being emitted earlier.
         selected = structural_section
+    structural_group = next(
+        (
+            candidate
+            for candidate in best
+            if candidate.role == RowRole.CONTEXT
+            and candidate.qualifier == "GROUP"
+            and "hierarchical_root_position" in candidate.evidence
+        ),
+        None,
+    )
+    if structural_group is not None:
+        # A group parent can also look like a position/name item.  The
+        # independent child-chain evidence is the stronger semantic decision
+        # and keeps the parent out of item totals.
+        selected = structural_group
     # Weak evidence is deliberately not a role decision.  In particular, a
     # lone position/number must remain unresolved rather than becoming an
     # item or a numbering row by proximity alone.
@@ -798,6 +891,13 @@ class TableFunctionalAnalyzer:
                         anomalies.append({"row_ref": row.ref.as_dict(), **numbering_diagnostics})
                 candidates.extend(_item_evidence(row, mapping))
                 candidates.extend(_section_heading_evidence(row, mapping))
+                group_candidate = _hierarchical_group_candidate(
+                    row,
+                    physical_rows[row_index + 1:],
+                    mapping,
+                )
+                if group_candidate is not None:
+                    candidates.append(group_candidate)
                 candidates.extend(
                     _context_component_note_evidence(
                         row,
