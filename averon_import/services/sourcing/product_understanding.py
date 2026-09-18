@@ -23,7 +23,7 @@ from averon_import.services.sourcing.models import (
 )
 
 
-PRODUCT_UNDERSTANDING_REVISION = "2"
+PRODUCT_UNDERSTANDING_REVISION = "3"
 
 AI_UNSUPPORTED_ATTRIBUTES_MESSAGE = (
     "AI предложил дополнительные характеристики, которые не используются при сопоставлении."
@@ -494,6 +494,29 @@ def _attribute_grounded(
     return False
 
 
+def _cross_field_identity_alias(field: str, proposed: str, fallback: ProductIntent) -> str:
+    """Return an audit reason when an identity value crosses model/article fields."""
+
+    normalized = _compact(proposed)
+    if not normalized:
+        return ""
+    if (
+        field == "article"
+        and fallback.model
+        and not fallback.article
+        and normalized == _compact(fallback.model)
+    ):
+        return "proposal_cross_field_identity_alias"
+    if (
+        field == "model"
+        and fallback.article
+        and not fallback.model
+        and normalized == _compact(fallback.article)
+    ):
+        return "proposal_cross_field_identity_alias"
+    return ""
+
+
 def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) -> ProductIntent:
     """Merge an AI proposal while keeping OCR-owned facts authoritative."""
 
@@ -514,6 +537,12 @@ def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) 
     for field in tuple(values):
         proposed = str(getattr(candidate, field) or "").strip()
         if values[field]:
+            continue
+        alias_reason = _cross_field_identity_alias(field, proposed, fallback)
+        if alias_reason:
+            uncertainties.append(
+                f"ai_cross_field_{field}_from_{'model' if field == 'article' else 'article'}"
+            )
             continue
         if proposed and _grounded(proposed, fallback.source_text, candidate_evidence, field):
             values[field] = proposed
@@ -596,6 +625,7 @@ def _audit_suggestions(
         proposed_value = getattr(proposal, field)
         if proposed_value == source_value:
             continue
+        alias_reason = _cross_field_identity_alias(field, str(proposed_value or ""), baseline)
         resolved_value = getattr(resolved, field)
         if field in always_locked or (field in explicitly_locked and source_value):
             resolution = SuggestionResolution.SOURCE_LOCKED
@@ -604,7 +634,7 @@ def _audit_suggestions(
         elif resolved_value != proposed_value:
             resolution = SuggestionResolution.REJECTED_UNGROUNDED
             grounded = False
-            reason = "proposal_not_mechanically_grounded_in_source"
+            reason = alias_reason or "proposal_not_mechanically_grounded_in_source"
         else:
             grounded = _phrase_grounded(str(proposed_value), baseline.source_text)
             resolution = (

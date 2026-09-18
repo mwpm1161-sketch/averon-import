@@ -531,8 +531,25 @@ class EtmCatalogMirror:
         ]:
             terms.extend(_tokens(value))
         terms = list(dict.fromkeys(terms))[:_MAX_FTS_TERMS]
-        excluded_fallback_terms = set(_tokens(intent.article)) | set(_tokens(intent.brand)) | set(_tokens(intent.manufacturer))
-        fallback_terms = [term for term in terms if term not in excluded_fallback_terms]
+        independent_terms: list[str] = []
+        for value in (intent.normalized_name, intent.model, intent.product_class):
+            independent_terms.extend(_tokens(value))
+        independent_terms = list(dict.fromkeys(independent_terms))
+        identity_terms = (
+            set(_tokens(intent.article))
+            | set(_tokens(intent.brand))
+            | set(_tokens(intent.manufacturer))
+        )
+        fallback_terms = list(independent_terms)
+        for query in intent.search_queries:
+            query_terms = _tokens(query)
+            if not query_terms or not any(term in independent_terms for term in query_terms):
+                continue
+            fallback_terms.extend(
+                term for term in query_terms
+                if term not in identity_terms or term in independent_terms
+            )
+        fallback_terms = list(dict.fromkeys(fallback_terms))[:_MAX_FTS_TERMS]
         if not terms and not article:
             return []
         requested_limit = max(1, int(limit))

@@ -952,6 +952,34 @@ def test_fts_relevance_can_beat_smaller_source_item_id(tmp_path):
     assert result[0].source_item_id == "9999"
 
 
+def test_fallback_search_preserves_model_evidence_when_article_aliases_model(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    distractors = [
+        catalog_record(f"GENERIC-{index}", name="Пост кнопочный", article=f"GENERIC-{index}")
+        for index in range(12)
+    ]
+    target = catalog_record(
+        "9536092",
+        name="Пост кнопочный ПКУ-15-21.121-54У2",
+        article="ET054487",
+        brand="Электротехник",
+    )
+    mirror.sync_snapshot({"data": [*distractors, target]})
+
+    model = "ПКУ-15-21.121-54У2"
+    result = mirror.search(intent(
+        article=model,
+        model=model,
+        manufacturer="",
+        brand="",
+        normalized_name="Пост кнопочный",
+        search_queries=[f"Пост кнопочный {model}"],
+    ), limit=5)
+
+    assert "9536092" in {row.source_item_id for row in result}
+    assert [row.source_item_id for row in result[:1]] == ["9536092"]
+
+
 def test_fts_prefers_and_then_controlled_or_and_bounds_pool(tmp_path, monkeypatch):
     mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
     mirror.sync_snapshot({"data": [

@@ -242,6 +242,60 @@ def test_p17_locked_proposal_is_visible_in_audit():
     assert suggestion.resolution == SuggestionResolution.SOURCE_LOCKED
 
 
+def test_cross_field_identity_alias_does_not_promote_model_as_article():
+    model = "ПКУ-15-21.121-54У2"
+    row = {
+        "id": "etm-live-smoke",
+        "source_text": f"Пост кнопочный {model} шт. 3",
+        "name": "Пост кнопочный",
+        "type_mark": model,
+        "code": "",
+        "manufacturer": "",
+        "quantity": "3",
+        "unit": "шт.",
+    }
+    result = understand(row, {
+        "normalized_name": "Пост кнопочный",
+        "model": model,
+        "article": model,
+    })
+
+    assert result.resolved_intent.model == model
+    assert result.resolved_intent.article == ""
+    assert result.resolved_intent.quantity == "3"
+    assert result.resolved_intent.unit == "шт."
+    assert "ai_cross_field_article_from_model" in result.resolved_intent.uncertainties
+    suggestion = next(item for item in result.suggestions if item.field == "article")
+    assert suggestion.reason == "proposal_cross_field_identity_alias"
+    assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
+
+
+def test_cross_field_identity_alias_does_not_promote_article_as_model():
+    article = "ET054487"
+    row = {
+        "id": "etm-article-row",
+        "source_text": f"Пост кнопочный {article} шт. 1",
+        "name": "Пост кнопочный",
+        "type_mark": "",
+        "code": article,
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }
+    result = understand(row, {
+        "normalized_name": "Пост кнопочный",
+        "model": article,
+        "article": article,
+    })
+
+    assert result.resolved_intent.article == article
+    assert result.resolved_intent.model == ""
+    assert "ai_cross_field_model_from_article" in result.resolved_intent.uncertainties
+    suggestion = next(item for item in result.suggestions if item.field == "model")
+    assert suggestion.reason == "proposal_cross_field_identity_alias"
+    assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
+
+
 def test_p18_product_intent_remains_frozen():
     intent = build_fallback_intent(source_row())
     with pytest.raises(ValidationError):
