@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from averon_import.services.app_settings import EtmIproSettings
 from averon_import.services.secrets import ETM_IPRO_LOGIN, ETM_IPRO_PASSWORD, SecretStore, resolve_secret
@@ -194,6 +197,7 @@ class EtmIproProvider:
         remains: Any,
         raw_detail: dict[str, Any],
     ) -> Offer:
+        detail = _goods_detail(raw_detail)
         price_value = _commercial_price(price)
         stock_records, availability, availability_text = _stock_summary(
             remains, self.settings.warehouse_codes
@@ -209,6 +213,26 @@ class EtmIproProvider:
             availability_text = f"{availability_text}; {price_text}"
         elif price_text:
             availability_text = price_text
+        attributes = {
+            "unit": _text(goods_source(raw_detail, "edizm")),
+            "min_cnt": goods_source(raw_detail, "min_cnt"),
+            "params_raw": detail["params_raw"],
+            "params": detail["params"],
+            "class_tree": detail["class_tree"],
+            "packs": detail["packs"],
+            "certificates": detail["certificates"],
+            "videos": detail["videos"],
+            "country": detail["country"],
+            "min_pack": detail["min_pack"],
+            "info_packs": detail["info_packs"],
+            "images_raw": detail["images_raw"],
+            "images": detail["images"],
+            "remains": stock_records,
+            "supplier_stores": _detail_value(remains, "InfoSuppStores", "supplier_stores"),
+            "forecast": _detail_value(remains, "InfoForecast", "forecast"),
+            "delivery": _detail_value(remains, "InforDeliveryTime", "delivery", "delivery_time"),
+        }
+        attributes.update(detail["canonical"])
         return Offer(
             offer_id=f"{self.key}:{goods.source_item_id}",
             provider=self.key,
@@ -223,18 +247,7 @@ class EtmIproProvider:
             availability=availability,
             availability_text=availability_text,
             url="",
-            attributes={
-                "unit": _text(goods_source(raw_detail, "edizm")),
-                "min_cnt": goods_source(raw_detail, "min_cnt"),
-                "params": goods_source(raw_detail, "gdsChars") or {},
-                "class_tree": goods_source(raw_detail, "gdsClassTree") or [],
-                "packs": goods_source(raw_detail, "gdsPacks") or [],
-                "images": _images(goods_source(raw_detail, "gdsImages")),
-                "remains": stock_records,
-                "supplier_stores": _detail_value(remains, "InfoSuppStores", "supplier_stores"),
-                "forecast": _detail_value(remains, "InfoForecast", "forecast"),
-                "delivery": _detail_value(remains, "InforDeliveryTime", "delivery", "delivery_time"),
-            },
+            attributes=attributes,
             data_provenance={
                 "source": self.key,
                 "catalog_version": self.mirror.revision,
@@ -243,6 +256,133 @@ class EtmIproProvider:
                 "price_status": price_status,
             },
         )
+
+
+def _goods_detail(raw_row: Any) -> dict[str, Any]:
+    row = raw_row if isinstance(raw_row, dict) else {}
+    card = row.get("add_info_card")
+    card = card if isinstance(card, dict) else {}
+
+    def field(name: str, default: Any) -> Any:
+        if name in card:
+            return deepcopy(card[name])
+        return deepcopy(row.get(name, default))
+
+    params_raw = field("gdsChars", {})
+    images_raw: list[Any] = []
+    if row.get("image") not in (None, ""):
+        images_raw.append(deepcopy(row["image"]))
+    nested_images = field("gdsImages", [])
+    if isinstance(nested_images, list):
+        images_raw.extend(nested_images)
+    return {
+        "params_raw": params_raw,
+        "params": _characteristic_map(params_raw),
+        "canonical": _canonical_characteristics(params_raw),
+        "class_tree": field("gdsClassTree", []),
+        "packs": field("gdsPacks", []),
+        "certificates": field("certificates", []),
+        "videos": field("gdsVideos", []),
+        "country": field("gdsNameCountry", ""),
+        "min_pack": field("minPack", ""),
+        "info_packs": field("gdsInfoPacks", ""),
+        "images_raw": images_raw,
+        "images": _images(images_raw),
+    }
+
+
+def _characteristic_entries(raw: Any) -> list[tuple[str, Any, dict[str, Any] | None]]:
+    if isinstance(raw, dict):
+        return [(str(name).strip(), value, None) for name, value in raw.items() if str(name).strip()]
+    if not isinstance(raw, list):
+        return []
+    result: list[tuple[str, Any, dict[str, Any] | None]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("gdsCharName", item.get("name", item.get("label", "")))
+        value = item.get("gdsCharVal", item.get("value", item.get("val")))
+        name_text = str(name or "").strip()
+        if name_text:
+            result.append((name_text, value, item))
+    return result
+
+
+def _characteristic_map(raw: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name, value, _item in _characteristic_entries(raw):
+        if name not in result:
+            result[name] = deepcopy(value)
+        elif isinstance(result[name], list):
+            result[name].append(deepcopy(value))
+        else:
+            result[name] = [result[name], deepcopy(value)]
+    return result
+
+
+def _canonical_characteristics(raw: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    conflicted: set[str] = set()
+
+    def put(key: str, value: Any) -> None:
+        if key in conflicted:
+            return
+        if key not in result:
+            result[key] = value
+        elif result[key] != value:
+            result.pop(key, None)
+            conflicted.add(key)
+
+    for name, value, item in _characteristic_entries(raw):
+        base_label, label_unit = _split_characteristic_label(name)
+        explicit_unit = ""
+        if item:
+            explicit_unit = _text(
+                item.get("gdsCharUnit", item.get("unit", item.get("measure", "")))
+            )
+        unit = _normalize_unit(explicit_unit or label_unit)
+        label = _normalize_label(base_label)
+        number = _numeric_value(value)
+        if label in {"напряжение", "voltage"} and unit in {"в", "v"} and number is not None:
+            put("voltage", number)
+        elif label in {"номинальныйток", "ток", "current"} and unit in {"а", "a"} and number is not None:
+            put("current", number)
+        elif label in {"степеньзащиты", "protectionclass"} and re.fullmatch(r"IP\s*\d+[A-ZА-ЯЁ0-9-]*", str(value or "").strip(), re.IGNORECASE):
+            put("protection_class", str(value).strip())
+        elif label in {"способмонтажа", "mountingmethod"} and _text(value):
+            put("mounting_type", _text(value))
+        elif label in {"мощность", "power"} and unit in {"вт", "w", "квт", "kw"} and number is not None:
+            put("power", number / 1000 if unit in {"вт", "w"} else number)
+        elif label in {"диаметр", "diameter"} and unit in {"мм", "mm"} and number is not None:
+            put("diameter", number)
+        elif label in {"материал", "material"} and _text(value):
+            put("material", _text(value))
+    return result
+
+
+def _split_characteristic_label(value: Any) -> tuple[str, str]:
+    text = _text(value)
+    if "," in text:
+        base, unit = text.split(",", 1)
+        return base.strip(), unit.strip()
+    match = re.match(r"^(.*?)[(]\s*([^()]+?)\s*[)]$", text)
+    return (match.group(1).strip(), match.group(2).strip()) if match else (text, "")
+
+
+def _normalize_label(value: Any) -> str:
+    return re.sub(r"[^a-zа-яё0-9]+", "", _text(value).casefold())
+
+
+def _normalize_unit(value: Any) -> str:
+    return _normalize_label(value).replace("ё", "е")
+
+
+def _numeric_value(value: Any) -> int | float | None:
+    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", _text(value))
+    if not match:
+        return None
+    number = float(match.group(0).replace(",", "."))
+    return int(number) if number.is_integer() else number
 
 
 def _goods_rows(payload: Any) -> list[dict[str, Any]]:
@@ -413,26 +553,52 @@ def _images(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     result: list[Any] = []
+    seen_urls: set[str] = set()
     for item in value:
         if isinstance(item, str):
             value = item.strip()
             if not value:
                 continue
-            result.append(value if value.startswith(("http://", "https://")) else "https://cdn.etm.ru/" + value.lstrip("/"))
+            normalized = _cdn_url(value)
+            if normalized and normalized not in seen_urls:
+                result.append(normalized)
+                seen_urls.add(normalized)
         elif isinstance(item, dict):
             copied = dict(item)
+            normalized_urls: list[str] = []
             for field_name in ("gdsImgSrc", "gdsImgRef"):
                 original = copied.get(field_name)
                 if isinstance(original, str) and original.strip():
                     copied[f"source_{field_name}"] = original
-                    copied[field_name] = _cdn_url(original)
+                    normalized = _cdn_url(original)
+                    if normalized:
+                        copied[field_name] = normalized
+                        normalized_urls.append(normalized)
+                    else:
+                        copied.pop(field_name, None)
             raw_url = copied.get("url", copied.get("path", copied.get("src")))
-            if isinstance(raw_url, str) and raw_url.strip() and not raw_url.startswith(("http://", "https://")):
-                copied["url"] = _cdn_url(raw_url)
+            if isinstance(raw_url, str) and raw_url.strip():
+                copied.setdefault("source_url", raw_url)
+                normalized = _cdn_url(raw_url)
+                if normalized:
+                    copied["url"] = normalized
+                    normalized_urls.append(normalized)
+                elif "url" in copied:
+                    copied.pop("url", None)
+            if not normalized_urls or any(url in seen_urls for url in normalized_urls):
+                continue
             result.append(copied)
+            seen_urls.update(normalized_urls)
     return result
 
 
 def _cdn_url(value: str) -> str:
     value = value.strip()
-    return value if value.startswith(("http://", "https://")) else "https://cdn.etm.ru/" + value.lstrip("/")
+    if not value or value.startswith("//"):
+        return ""
+    if value.startswith(("/", "ipro/")) or "://" not in value:
+        return "https://cdn.etm.ru/" + value.lstrip("/")
+    parsed = urlsplit(value)
+    if parsed.scheme == "https" and parsed.hostname and parsed.hostname.casefold() == "cdn.etm.ru":
+        return value
+    return ""

@@ -9,7 +9,8 @@ import pytest
 
 from averon_import.services.app_settings import EtmIproSettings
 from averon_import.services.secrets import MemorySecretStore
-from averon_import.services.sourcing.models import ProductIntent
+from averon_import.services.sourcing.matching import OfferMatcher
+from averon_import.services.sourcing.models import MatchDecision, ProductIntent
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.sourcing.providers.base import SourcingProviderError
@@ -20,6 +21,7 @@ from averon_import.services.sourcing.providers.etm_ipro import (
     EtmRateLimiter,
 )
 from averon_import.services.sourcing.providers.etm_ipro.provider import (
+    _goods_detail,
     _goods_rows,
     _images,
     _price_row,
@@ -141,12 +143,26 @@ class OfficialWireTransport:
                         "art": "РВ-100",
                         "mnf_name": "Реле и Автоматика",
                         "mnf_code": 686,
+                        "image": "/ipro/images/small_9536092.jpg",
                         "edizm": "шт.",
                         "min_cnt": "1",
-                        "gdsChars": [{"name": "Ток", "value": "10 А"}],
-                        "gdsClassTree": [{"name": "Автоматика"}],
-                        "gdsPacks": [],
-                        "gdsImages": [{"gdsImgSrc": "/images/a.jpg", "gdsImgRef": "refs/a.jpg"}],
+                        "add_info_card": {
+                            "gdsNameCountry": "Россия",
+                            "gdsInfoPacks": "Индивидуальная упаковка",
+                            "minPack": "1",
+                            "gdsClassTree": [{"name": "Автоматика"}],
+                            "gdsChars": [
+                                {"gdsCharName": "Степень защиты", "gdsCharVal": "IP54", "ConfigCharCode": "IP", "ConfigCharIdVal": 54},
+                                {"gdsCharName": "Напряжение, В", "gdsCharVal": "660", "ConfigCharCode": "U", "ConfigCharIdVal": 660},
+                                {"gdsCharName": "Номинальный ток, А", "gdsCharVal": "10", "ConfigCharCode": "I", "ConfigCharIdVal": 10},
+                                {"gdsCharName": "Способ монтажа", "gdsCharVal": "Монтажная плата", "ConfigCharCode": "MOUNT", "ConfigCharIdVal": 1},
+                                {"gdsCharName": "Масса, кг", "gdsCharVal": "0.71", "ConfigCharCode": "MASS", "ConfigCharIdVal": 71},
+                            ],
+                            "certificates": [{"type": "сертификат", "number": "CERT-1"}],
+                            "gdsPacks": [{"qty": "1"}],
+                            "gdsImages": [{"gdsImgSrc": "/images/a.jpg", "gdsImgRef": "refs/a.jpg"}],
+                            "gdsVideos": [{"url": "/video/a"}],
+                        },
                     }],
                     "records": 1,
                 },
@@ -185,10 +201,15 @@ def test_official_wire_contract_uses_query_session_and_rows_adapters(tmp_path):
     manufacturers = client.get_manufacturers()
     assert _goods_rows(goods_mnf)[0]["gdscode"] == 9536092
     assert _goods_rows(goods_etm)[0]["code"] == "ETM9536092"
-    image = _images(_goods_rows(goods_etm)[0]["gdsImages"])[0]
-    assert image["gdsImgSrc"] == "https://cdn.etm.ru/images/a.jpg"
-    assert image["gdsImgRef"] == "https://cdn.etm.ru/refs/a.jpg"
-    assert image["source_gdsImgSrc"] == "/images/a.jpg"
+    image = _images([
+        goods_etm["data"]["rows"][0]["image"],
+        *goods_etm["data"]["rows"][0]["add_info_card"]["gdsImages"],
+    ])[0]
+    assert image == "https://cdn.etm.ru/ipro/images/small_9536092.jpg"
+    nested_image = _images(goods_etm["data"]["rows"][0]["add_info_card"]["gdsImages"])[0]
+    assert nested_image["gdsImgSrc"] == "https://cdn.etm.ru/images/a.jpg"
+    assert nested_image["gdsImgRef"] == "https://cdn.etm.ru/refs/a.jpg"
+    assert nested_image["source_gdsImgSrc"] == "/images/a.jpg"
     assert _goods_rows({"status": {}, "data": {"records": 0}}) == []
     assert _price_row(price, "9536092")["pricewnds"] == "125.40"
     selected, availability, _ = _stock_summary(remains, ["WH-1"])
@@ -242,6 +263,92 @@ def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp
     assert offer.attributes["supplier_stores"] == [{"StoreCode": "SUP-1", "StoreQuantRem": "8"}]
     assert offer.attributes["forecast"] == {"days": 2}
     assert offer.attributes["delivery"] == "завтра"
+    assert offer.attributes["voltage"] == 660
+    assert offer.attributes["current"] == 10
+    assert offer.attributes["protection_class"] == "IP54"
+    assert offer.attributes["mounting_type"] == "Монтажная плата"
+    assert "Масса, кг" in offer.attributes["params"]
+    assert offer.attributes["params_raw"][0]["gdsCharVal"] == "IP54"
+    assert offer.attributes["country"] == "Россия"
+    assert offer.attributes["min_pack"] == "1"
+    assert offer.attributes["certificates"] == [{"type": "сертификат", "number": "CERT-1"}]
+    assert offer.attributes["videos"] == [{"url": "/video/a"}]
+    assert offer.url == ""
+
+
+def test_nested_official_details_feed_deterministic_validator_without_ai(tmp_path):
+    transport = OfficialWireTransport()
+    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [{
+        "gdscode": 9536092,
+        "name": "Реле и Автоматика РВ-100",
+        "art": "РВ-100",
+        "mnf_name": "Реле и Автоматика",
+        "mnf_code": 686,
+    }]})
+    mirror.sync_manufacturers([EtmManufacturer("686", "Реле и Автоматика")])
+    provider = EtmIproProvider(settings(tmp_path), MemorySecretStore(), tmp_path, client=client, mirror=mirror)
+    source_intent = intent(
+        article="РВ-100",
+        manufacturer="Реле и Автоматика",
+        model="",
+        required_attributes={"voltage": 660, "current": 10, "protection_class": "IP54"},
+    )
+    offer = provider.search(source_intent)[0]
+    match = OfferMatcher().match(source_intent, [offer])[0]
+
+    assert match.decision == MatchDecision.MATCH
+    assert match.missing_attributes == []
+    assert match.conflicting_attributes == []
+
+    conflict_intent = source_intent.model_copy(update={"required_attributes": {"voltage": 380}})
+    conflict = OfferMatcher().match(conflict_intent, [offer])[0]
+    assert conflict.decision == MatchDecision.REJECT
+    assert "voltage" in conflict.conflicting_attributes
+
+    class NoVoltageTransport(OfficialWireTransport):
+        def __call__(self, request, timeout):
+            response = super().__call__(request, timeout)
+            if "/goods/" in urlsplit(request.full_url).path and not urlsplit(request.full_url).path.endswith(("/price", "/remains")):
+                rows = response.payload.get("data", {}).get("rows", [])
+                if rows:
+                    rows[0]["add_info_card"]["gdsChars"] = [
+                        item for item in rows[0]["add_info_card"]["gdsChars"]
+                        if item["gdsCharName"] != "Напряжение, В"
+                    ]
+            return response
+
+    no_voltage_client = EtmIproClient(settings(tmp_path), "login", "password", transport=NoVoltageTransport())
+    no_voltage_provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=no_voltage_client, mirror=mirror
+    )
+    no_voltage_offer = no_voltage_provider.search(source_intent)[0]
+    missing = OfferMatcher().match(source_intent, [no_voltage_offer])[0]
+    assert missing.decision == MatchDecision.REVIEW
+    assert "voltage" in missing.missing_attributes
+
+
+def test_duplicate_etm_characteristics_remain_lossless_and_do_not_create_false_canonical_match(tmp_path):
+    provider, _ = configured_provider(tmp_path)
+    raw = {
+        "add_info_card": {
+            "gdsChars": [
+                {"gdsCharName": "Напряжение, В", "gdsCharVal": "660"},
+                {"gdsCharName": "Напряжение, В", "gdsCharVal": "380"},
+            ],
+        },
+    }
+    detail = _goods_detail(raw)
+    offer = provider._offer(catalog_record(), None, {"data": {"stores": []}}, raw)
+
+    assert detail["params"]["Напряжение, В"] == ["660", "380"]
+    assert offer.attributes["params_raw"] == detail["params_raw"]
+    assert "voltage" not in offer.attributes
+
+
+def test_external_image_hosts_are_not_trusted_as_etm_cdn_images():
+    assert _images(["https://evil.example/image.jpg", "//evil.example/image.jpg"]) == []
 
 
 def test_direct_article_lookup_works_without_catalog_mirror_through_service(tmp_path):
