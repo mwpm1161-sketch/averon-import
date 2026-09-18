@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import ipaddress
 import threading
@@ -7,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -23,6 +25,8 @@ ETM_LOGIN_PATH = "/user/login"
 ETM_MANUFACTURERS_PATH = "/info/search/r-manuf/"
 ETM_CATALOG_JOB_CREATE_PATH = "/job/create/40029846"
 _MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+_MAX_SNAPSHOT_BYTES = 1 * 1024 * 1024 * 1024
+_SNAPSHOT_CHUNK_BYTES = 1024 * 1024
 _SESSION_LIFETIME_SECONDS = 8 * 60 * 60
 _SESSION_MARGIN_SECONDS = 5 * 60
 _LOGIN_INTERVAL_SECONDS = 120.0
@@ -74,6 +78,15 @@ class EtmRateLimiter:
 class _Session:
     value: str
     expires_at: float
+
+
+@dataclass(frozen=True)
+class EtmSnapshotDownload:
+    path: Path
+    size_bytes: int
+    sha256: str
+    content_type: str
+    content_length: int | None
 
 
 class EtmIproClient:
@@ -170,7 +183,110 @@ class EtmIproClient:
         return self._request_json("GET", f"/job/{quote(value, safe='')}", bucket="catalog")
 
     def download_snapshot(self, url: str) -> Any:
-        parsed = urlsplit(str(url or "").strip())
+        safe_url = self._validate_snapshot_url(url)
+        return self._request_json("GET", safe_url, auth=False, bucket="catalog")
+
+    def download_snapshot_to_file(
+        self,
+        url: str,
+        destination: str | Path,
+        *,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> EtmSnapshotDownload:
+        """Stream a completed SgGds snapshot without buffering it in memory."""
+
+        safe_url = self._validate_snapshot_url(url)
+        output_path = Path(destination)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        response = None
+        try:
+            request = urllib.request.Request(
+                safe_url,
+                headers={"Accept": "application/json"},
+                method="GET",
+            )
+            self.rate_limiter.acquire("catalog")
+            try:
+                response = self._transport(request, float(self.settings.request_timeout_s))
+            except urllib.error.HTTPError as exc:
+                raise self._status_error(int(exc.code)) from None
+            status = getattr(response, "status", None) or getattr(response, "code", None)
+            if not isinstance(status, int):
+                raise SourcingProviderError(
+                    "ЭТМ iPRO вернул ответ без HTTP-статуса",
+                    category="invalid_response",
+                )
+            if not 200 <= status < 300:
+                raise self._status_error(status)
+            headers = getattr(response, "headers", {})
+            raw_content_length = headers.get("Content-Length")
+            content_length: int | None = None
+            if raw_content_length not in (None, ""):
+                try:
+                    content_length = int(raw_content_length)
+                except (TypeError, ValueError) as exc:
+                    raise SourcingProviderError(
+                        "ЭТМ iPRO вернул некорректный размер каталога",
+                        code="INVALID_RESPONSE",
+                        category="invalid_response",
+                    ) from exc
+                if content_length < 0:
+                    raise SourcingProviderError(
+                        "ЭТМ iPRO вернул некорректный размер каталога",
+                        code="INVALID_RESPONSE",
+                        category="invalid_response",
+                    )
+                if content_length > _MAX_SNAPSHOT_BYTES:
+                    raise SourcingProviderError(
+                        "Файл каталога ЭТМ iPRO превышает безопасный лимит",
+                        code="SNAPSHOT_TOO_LARGE",
+                        category="invalid_response",
+                    )
+            with output_path.open("wb") as output:
+                if progress is not None:
+                    progress(0, content_length or 0, "Загружаем каталог ЭТМ iPRO")
+                while True:
+                    chunk = response.read(_SNAPSHOT_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > _MAX_SNAPSHOT_BYTES:
+                        raise SourcingProviderError(
+                            "Файл каталога ЭТМ iPRO превышает безопасный лимит",
+                            code="SNAPSHOT_TOO_LARGE",
+                            category="invalid_response",
+                        )
+                    output.write(chunk)
+                    digest.update(chunk)
+                    if progress is not None:
+                        progress(size, content_length or 0, "Загружаем каталог ЭТМ iPRO")
+            return EtmSnapshotDownload(
+                path=output_path,
+                size_bytes=size,
+                sha256=digest.hexdigest(),
+                content_type=str(headers.get("Content-Type") or ""),
+                content_length=content_length,
+            )
+        except SourcingProviderError:
+            output_path.unlink(missing_ok=True)
+            raise
+        except (OSError, TimeoutError, ValueError) as exc:
+            output_path.unlink(missing_ok=True)
+            raise SourcingProviderError(
+                "ЭТМ iPRO временно недоступен; повторите запрос позже",
+                code="UPSTREAM_UNAVAILABLE",
+                category="network",
+            ) from exc
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
+    def _validate_snapshot_url(self, url: str) -> str:
+        safe_url = str(url or "").strip()
+        parsed = urlsplit(safe_url)
         try:
             port = parsed.port
         except ValueError:
@@ -207,7 +323,7 @@ class EtmIproClient:
                 code="INVALID_RESPONSE",
                 category="invalid_response",
             )
-        return self._request_json("GET", str(url), auth=False, bucket="catalog")
+        return safe_url
 
     def _get_session(self, *, force: bool = False) -> str:
         if not self.configured:

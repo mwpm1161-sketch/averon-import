@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from averon_import.services.app_settings import EtmIproSettings
@@ -118,6 +119,55 @@ class EtmIproProvider:
     def catalog_sync_status(self) -> EtmJobStatus:
         self._ensure_configured()
         return self.mirror.update_job(self.client)
+
+    def import_completed_catalog(
+        self,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> EtmCatalogSyncResult:
+        """Import the already-completed catalog without polling ETM again."""
+
+        self._ensure_configured()
+        if self.mirror.job_state != 1:
+            raise SourcingProviderError(
+                "Каталог ЭТМ iPRO ещё не готов к импорту",
+                code="CATALOG_NOT_READY",
+                category="invalid_request",
+            )
+        snapshot_url = self.mirror.job_url
+        if not snapshot_url:
+            raise SourcingProviderError(
+                "ЭТМ iPRO не вернул файл каталога",
+                code="INVALID_CATALOG",
+                category="invalid_response",
+            )
+        handle, temporary_path = tempfile.mkstemp(
+            prefix="etm-snapshot-",
+            suffix=".json",
+            dir=self.mirror.path.parent,
+        )
+        os.close(handle)
+        path = Path(temporary_path)
+        try:
+            download = self.client.download_snapshot_to_file(
+                snapshot_url,
+                path,
+                progress=progress,
+            )
+            return self.mirror.import_snapshot_file(
+                download.path,
+                snapshot_sha256=download.sha256,
+                progress=progress,
+            )
+        except SourcingProviderError:
+            raise
+        except Exception as exc:
+            raise SourcingProviderError(
+                "Локальный каталог ЭТМ iPRO не обновлён",
+                code="MIRROR_IMPORT_FAILED",
+                category="storage_error",
+            ) from exc
+        finally:
+            path.unlink(missing_ok=True)
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
         self._ensure_configured()

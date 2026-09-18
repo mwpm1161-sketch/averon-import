@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
 
@@ -48,6 +49,14 @@ class EtmManufacturer:
     label: str
 
 
+class CatalogSnapshotError(ValueError):
+    """A streamed SgGds snapshot cannot be safely imported."""
+
+
+class CatalogSnapshotLimitError(CatalogSnapshotError):
+    """A streamed SgGds snapshot exceeded its explicit item cap."""
+
+
 def _rows_from_payload(payload: Any) -> list[Any]:
     if isinstance(payload, list):
         return payload
@@ -82,6 +91,41 @@ def parse_catalog_snapshot(payload: Any) -> tuple[EtmCatalogRecord, ...]:
     for row in parsed:
         unique[row.source_item_id] = row
     return tuple(unique[key] for key in sorted(unique))
+
+
+def iter_catalog_snapshot_file(
+    path: str | Path,
+    *,
+    max_items: int,
+) -> Iterator[EtmCatalogRecord]:
+    """Yield validated records from a top-level JSON array incrementally."""
+
+    try:
+        import ijson
+    except ImportError as exc:  # pragma: no cover - dependency is declared
+        raise CatalogSnapshotError("Потоковый разбор каталога недоступен") from exc
+
+    count = 0
+    try:
+        with Path(path).open("rb") as stream:
+            for raw in ijson.items(stream, "item"):
+                count += 1
+                if count > max_items:
+                    raise CatalogSnapshotLimitError(
+                        "Файл каталога ЭТМ iPRO превышает безопасный лимит"
+                    )
+                if not isinstance(raw, dict):
+                    raise CatalogSnapshotError("Строка каталога ЭТМ iPRO должна быть объектом")
+                try:
+                    yield EtmCatalogRecord.model_validate(raw)
+                except Exception as exc:
+                    raise CatalogSnapshotError(
+                        "ЭТМ iPRO вернул некорректную строку каталога"
+                    ) from exc
+    except (CatalogSnapshotError, CatalogSnapshotLimitError):
+        raise
+    except Exception as exc:
+        raise CatalogSnapshotError("ЭТМ iPRO вернул некорректный файл каталога") from exc
 
 
 def parse_manufacturers(payload: Any) -> tuple[EtmManufacturer, ...]:

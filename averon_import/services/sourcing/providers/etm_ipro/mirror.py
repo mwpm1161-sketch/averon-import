@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,10 +13,44 @@ from averon_import.services.sourcing.catalog_repository import normalize_catalog
 from averon_import.services.sourcing.models import ProductIntent
 from averon_import.services.sourcing.providers.base import SourcingProviderError
 
-from .models import EtmCatalogRecord, EtmManufacturer, parse_catalog_snapshot
+from .models import (
+    CatalogSnapshotError,
+    CatalogSnapshotLimitError,
+    EtmCatalogRecord,
+    EtmManufacturer,
+    iter_catalog_snapshot_file,
+    parse_catalog_snapshot,
+)
 
-_MAX_CATALOG_ITEMS = 500_000
+_MAX_CATALOG_ITEMS = 2_000_000
+_IMPORT_BATCH_SIZE = 2_000
 _JOB_STATES = {0, 1, 2, 3}
+
+_UPSERT_CATALOG_SQL = """
+    INSERT INTO etm_catalog_products(
+        source_item_id,name,brand,article,brand_code,cli_code,
+        class_code,product_class,normalized_article,normalized_brand,
+        normalized_search
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(source_item_id) DO UPDATE SET
+        name=excluded.name,
+        brand=excluded.brand,
+        article=excluded.article,
+        brand_code=excluded.brand_code,
+        cli_code=excluded.cli_code,
+        class_code=excluded.class_code,
+        product_class=excluded.product_class,
+        normalized_article=excluded.normalized_article,
+        normalized_brand=excluded.normalized_brand,
+        normalized_search=excluded.normalized_search
+"""
+
+
+def _upsert_catalog_batch(
+    connection: sqlite3.Connection,
+    batch: list[tuple[str, ...]],
+) -> None:
+    connection.executemany(_UPSERT_CATALOG_SQL, batch)
 
 
 @dataclass(frozen=True)
@@ -202,6 +237,76 @@ class EtmCatalogMirror:
             self._set_meta(connection, "job_error", "")
         return EtmCatalogSyncResult(changed, len(products), revision, synced_at)
 
+    def import_snapshot_file(
+        self,
+        path: str | Path,
+        *,
+        snapshot_sha256: str,
+        progress: Callable[[int, int, str], None] | None = None,
+        now: datetime | None = None,
+    ) -> EtmCatalogSyncResult:
+        """Stream a snapshot into a transactional mirror replacement."""
+
+        revision = str(snapshot_sha256 or "").strip()
+        if not revision:
+            raise SourcingProviderError(
+                "ЭТМ iPRO не вернул контрольную сумму каталога",
+                code="INVALID_RESPONSE",
+                category="invalid_response",
+            )
+        previous_revision = self.revision
+        synced_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        processed = 0
+        batch: list[tuple[str, ...]] = []
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                connection.execute("DELETE FROM etm_catalog_products")
+                for product in iter_catalog_snapshot_file(path, max_items=_MAX_CATALOG_ITEMS):
+                    processed += 1
+                    batch.append(self._record(product))
+                    if len(batch) >= _IMPORT_BATCH_SIZE:
+                        _upsert_catalog_batch(connection, batch)
+                        batch.clear()
+                        if progress is not None:
+                            progress(processed, 0, "Импортируем каталог ЭТМ iPRO")
+                if batch:
+                    _upsert_catalog_batch(connection, batch)
+                if processed == 0:
+                    raise CatalogSnapshotError("ЭТМ catalog snapshot is empty")
+                item_count = int(
+                    connection.execute("SELECT COUNT(*) FROM etm_catalog_products").fetchone()[0]
+                )
+                self._set_meta(connection, "revision", revision)
+                self._set_meta(connection, "last_synced_at", synced_at)
+                self._set_meta(connection, "job_error", "")
+        except CatalogSnapshotLimitError as exc:
+            raise SourcingProviderError(
+                "Файл каталога ЭТМ iPRO превышает безопасный лимит",
+                code="CATALOG_TOO_LARGE",
+                category="invalid_response",
+            ) from exc
+        except CatalogSnapshotError as exc:
+            raise SourcingProviderError(
+                "ЭТМ iPRO вернул некорректный файл каталога",
+                code="INVALID_CATALOG",
+                category="invalid_response",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise SourcingProviderError(
+                "Локальный каталог ЭТМ iPRO не обновлён",
+                code="MIRROR_IMPORT_FAILED",
+                category="storage_error",
+            ) from exc
+        if progress is not None:
+            progress(processed, processed, "Каталог ЭТМ iPRO импортирован")
+        return EtmCatalogSyncResult(
+            previous_revision != revision,
+            item_count,
+            revision,
+            synced_at,
+        )
+
     def sync_manufacturers(self, manufacturers: tuple[EtmManufacturer, ...] | list[EtmManufacturer]) -> int:
         rows = {item.code: item for item in manufacturers if item.code and item.label}
         with self._connect() as connection:
@@ -368,10 +473,6 @@ class EtmCatalogMirror:
         if state == 1:
             if not url:
                 raise SourcingProviderError("ЭТМ iPRO не вернул файл каталога", code="INVALID_CATALOG", category="invalid_response")
-            result = self.sync_snapshot(client.download_snapshot(url), metadata={"job_uuid": value, "url": url})
-            with self._connect() as connection:
-                self._set_meta(connection, "job_error", "")
-            return EtmJobStatus(value, state, url, "", result.revision, result.item_count)
         return EtmJobStatus(
             value,
             state,

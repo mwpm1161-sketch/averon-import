@@ -749,7 +749,22 @@ def etm_ipro_catalog_status():
     method = getattr(provider, "catalog_sync_status", None)
     if not callable(method):
         raise HTTPException(404, "Статус каталога ЭТМ iPRO недоступен")
-    return _sourcing_payload(method())
+    payload = _sourcing_payload(method())
+    if isinstance(payload, dict):
+        payload["snapshot_ready"] = bool(payload.get("url"))
+        payload.pop("url", None)
+    return payload
+
+
+@app.post("/api/sourcing/providers/etm_ipro/catalog/import")
+def import_etm_ipro_catalog():
+    provider = sourcing_service.provider("etm_ipro")
+    method = getattr(provider, "import_completed_catalog", None)
+    if not callable(method):
+        raise HTTPException(404, "Импорт каталога ЭТМ iPRO недоступен")
+    return job_service.submit(
+        lambda progress: _sourcing_payload(method(progress))
+    ).public()
 
 
 @app.get("/api/sourcing/catalog/stats")

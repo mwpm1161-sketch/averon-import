@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,9 +17,18 @@ from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.sourcing.providers.base import SourcingProviderError
 from averon_import.services.sourcing.providers.etm_ipro import (
     EtmCatalogMirror,
+    EtmCatalogSyncResult,
     EtmIproClient,
     EtmIproProvider,
+    EtmJobStatus,
     EtmRateLimiter,
+    EtmSnapshotDownload,
+)
+from averon_import.services.sourcing.providers.etm_ipro import mirror as etm_mirror
+from averon_import.services.sourcing.providers.etm_ipro import client as etm_client
+from averon_import.services.sourcing.providers.etm_ipro.client import (
+    _MAX_RESPONSE_BYTES,
+    _MAX_SNAPSHOT_BYTES,
 )
 from averon_import.services.sourcing.providers.etm_ipro.provider import (
     _goods_detail,
@@ -28,7 +38,11 @@ from averon_import.services.sourcing.providers.etm_ipro.provider import (
     _price_row,
     _stock_summary,
 )
-from averon_import.services.sourcing.providers.etm_ipro.models import EtmCatalogRecord, EtmManufacturer
+from averon_import.services.sourcing.providers.etm_ipro.models import (
+    EtmCatalogRecord,
+    EtmManufacturer,
+    iter_catalog_snapshot_file,
+)
 
 
 @dataclass
@@ -38,6 +52,30 @@ class FakeResponse:
 
     def read(self, limit=-1):
         return json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
+
+    def close(self):
+        return None
+
+
+class StreamingResponse:
+    def __init__(self, payload: bytes, *, content_length: int | None = None, chunk_size: int = 3):
+        self.payload = payload
+        self.status = 200
+        self.headers = {"Content-Type": "application/json"}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+        self.chunk_size = chunk_size
+        self.offset = 0
+        self.read_calls = 0
+
+    def read(self, limit=-1):
+        self.read_calls += 1
+        if self.offset >= len(self.payload):
+            return b""
+        end = min(self.offset + min(self.chunk_size, limit), len(self.payload))
+        chunk = self.payload[self.offset:end]
+        self.offset = end
+        return chunk
 
     def close(self):
         return None
@@ -356,6 +394,253 @@ def test_live_price_rows_select_exact_product_and_preserve_price_semantics(tmp_p
         },
     }
     assert _price_row(multiple_payload, "9536092")["pricewnds"] == "125.40"
+
+
+def test_snapshot_download_streams_chunks_and_keeps_normal_response_limit(tmp_path):
+    assert _MAX_RESPONSE_BYTES == 25 * 1024 * 1024
+    assert _MAX_SNAPSHOT_BYTES == 1 * 1024 * 1024 * 1024
+    body = b"[" + (b"x" * 17) + b"]"
+    response = StreamingResponse(body, content_length=len(body), chunk_size=3)
+    requests = []
+
+    def transport(request, timeout):
+        requests.append(request)
+        return response
+
+    destination = tmp_path / "snapshot.json"
+    progress = []
+    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    result = client.download_snapshot_to_file(
+        "https://ipro.etm.ru/catalog.json?signature=private",
+        destination,
+        progress=lambda current, total, message: progress.append((current, total, message)),
+    )
+
+    assert result.path == destination
+    assert result.size_bytes == len(body)
+    assert result.sha256 == hashlib.sha256(body).hexdigest()
+    assert destination.read_bytes() == body
+    assert response.read_calls > 2
+    assert progress[-1][:2] == (len(body), len(body))
+    assert requests[0].full_url.endswith("catalog.json?signature=private")
+    assert "session-id" not in requests[0].full_url
+
+
+def test_snapshot_content_length_cap_fails_before_body_read(tmp_path):
+    response = StreamingResponse(b"ignored", content_length=_MAX_SNAPSHOT_BYTES + 1)
+    client = EtmIproClient(
+        settings(tmp_path), "login", "password", transport=lambda request, timeout: response
+    )
+    destination = tmp_path / "snapshot.json"
+
+    with pytest.raises(SourcingProviderError, match="безопасный лимит"):
+        client.download_snapshot_to_file("https://ipro.etm.ru/catalog.json", destination)
+
+    assert response.read_calls == 0
+    assert not destination.exists()
+
+
+def test_snapshot_actual_byte_cap_fails_without_content_length(tmp_path, monkeypatch):
+    monkeypatch.setattr(etm_client, "_MAX_SNAPSHOT_BYTES", 5)
+    response = StreamingResponse(b"123456", content_length=None, chunk_size=3)
+    client = EtmIproClient(
+        settings(tmp_path), "login", "password", transport=lambda request, timeout: response
+    )
+    destination = tmp_path / "snapshot.json"
+
+    with pytest.raises(SourcingProviderError, match="безопасный лимит"):
+        client.download_snapshot_to_file("https://ipro.etm.ru/catalog.json", destination)
+
+    assert not destination.exists()
+
+
+def test_streaming_catalog_parser_validates_observed_sggds_fields(tmp_path):
+    path = tmp_path / "snapshot.json"
+    path.write_text(json.dumps([{
+        "id": 9536092,
+        "name": "Реле",
+        "brand": "Электротехник",
+        "article": "ET054487",
+        "brand_code": 686,
+        "cli_code": "CLI",
+        "class_code": "CLASS",
+        "class": "Автоматика",
+    }], ensure_ascii=False), encoding="utf-8")
+
+    rows = list(iter_catalog_snapshot_file(path, max_items=2_000_000))
+
+    assert len(rows) == 1
+    assert rows[0].source_item_id == "9536092"
+    assert rows[0].brand_code == "686"
+    assert rows[0].product_class == "Автоматика"
+
+
+def test_streaming_import_uses_bounded_batches_and_snapshot_sha_revision(tmp_path, monkeypatch):
+    path = tmp_path / "snapshot.json"
+    payload = [
+        catalog_record("A-100").model_dump(),
+        catalog_record("B-200", name="Насос").model_dump(),
+        catalog_record("A-100", name="Последняя версия").model_dump(),
+        catalog_record("C-300").model_dump(),
+        catalog_record("D-400").model_dump(),
+    ]
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    path.write_bytes(body)
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    batches = []
+    original = etm_mirror._upsert_catalog_batch
+
+    def record_batch(connection, batch):
+        batches.append(len(batch))
+        original(connection, batch)
+
+    monkeypatch.setattr(etm_mirror, "_IMPORT_BATCH_SIZE", 2)
+    monkeypatch.setattr(etm_mirror, "_upsert_catalog_batch", record_batch)
+    result = mirror.import_snapshot_file(
+        path,
+        snapshot_sha256=hashlib.sha256(body).hexdigest(),
+    )
+
+    assert batches == [2, 2, 1]
+    assert result.item_count == 4
+    assert result.revision == hashlib.sha256(body).hexdigest()
+    exact_article = intent(
+        article="A-100",
+        manufacturer="",
+        brand="",
+        normalized_name="",
+        model="",
+        search_queries=[],
+    )
+    assert mirror.search(exact_article)[0].name == "Последняя версия"
+
+
+def test_streaming_import_failure_preserves_previous_mirror_and_empty_fails(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [catalog_record().model_dump()]})
+    old_revision = mirror.revision
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text(json.dumps([
+        catalog_record("new").model_dump(),
+        {"id": "broken", "name": {"private": "bad"}},
+    ], ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(SourcingProviderError, match="некорректн"):
+        mirror.import_snapshot_file(malformed, snapshot_sha256="malformed")
+    assert mirror.revision == old_revision
+    assert mirror.count() == 1
+    assert mirror.search(intent(article="A-100"))[0].source_item_id == "A-100"
+
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]", encoding="utf-8")
+    with pytest.raises(SourcingProviderError, match="некорректн"):
+        mirror.import_snapshot_file(empty, snapshot_sha256="empty")
+    assert mirror.revision == old_revision
+    assert mirror.count() == 1
+
+
+def test_streaming_catalog_cap_has_headroom_without_materializing_large_fixture(tmp_path, monkeypatch):
+    monkeypatch.setattr(etm_mirror, "_MAX_CATALOG_ITEMS", 2)
+    path = tmp_path / "over-cap.json"
+    path.write_text(json.dumps([
+        catalog_record("A-100").model_dump(),
+        catalog_record("B-200").model_dump(),
+        catalog_record("C-300").model_dump(),
+    ], ensure_ascii=False), encoding="utf-8")
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+
+    with pytest.raises(SourcingProviderError, match="безопасный лимит"):
+        mirror.import_snapshot_file(path, snapshot_sha256="over-cap")
+    assert mirror.count() == 0
+    assert etm_mirror._MAX_CATALOG_ITEMS == 2
+
+
+def test_streaming_import_uses_persisted_completed_job_without_polling_or_new_job(tmp_path):
+    path = tmp_path / "source.json"
+    body = json.dumps([catalog_record("new").model_dump()], ensure_ascii=False).encode("utf-8")
+    path.write_bytes(body)
+
+    class ImportClient(FakeEtmClient):
+        configured = True
+
+        def __init__(self):
+            self.create_calls = 0
+            self.status_calls = 0
+            self.download_calls = []
+
+        def create_catalog_job(self):
+            self.create_calls += 1
+            return "new-job"
+
+        def get_catalog_job(self, value):
+            self.status_calls += 1
+            raise AssertionError("background import must not poll ETM job")
+
+        def download_snapshot_to_file(self, url, destination, *, progress=None):
+            self.download_calls.append((url, destination))
+            destination.write_bytes(body)
+            return EtmSnapshotDownload(
+                path=destination,
+                size_bytes=len(body),
+                sha256=hashlib.sha256(body).hexdigest(),
+                content_type="application/json",
+                content_length=len(body),
+            )
+
+    client = ImportClient()
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.create_job(client)
+    with mirror._connect() as connection:
+        mirror._set_meta(connection, "job_state", 1)
+        mirror._set_meta(connection, "job_url", "https://ipro.etm.ru/catalog.json?signature=private")
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=client, mirror=mirror
+    )
+
+    result = provider.import_completed_catalog()
+
+    assert result.item_count == 1
+    assert client.create_calls == 1
+    assert client.status_calls == 0
+    assert len(client.download_calls) == 1
+    assert not client.download_calls[0][1].exists()
+    assert mirror.has_content() is True
+
+
+def test_background_import_removes_temp_snapshot_after_parse_failure(tmp_path):
+    body = json.dumps([{"id": "broken", "name": {"private": "bad"}}]).encode("utf-8")
+    captured_paths = []
+
+    class FailingImportClient:
+        configured = True
+
+        def download_snapshot_to_file(self, url, destination, *, progress=None):
+            captured_paths.append(destination)
+            destination.write_bytes(body)
+            return EtmSnapshotDownload(
+                path=destination,
+                size_bytes=len(body),
+                sha256=hashlib.sha256(body).hexdigest(),
+                content_type="application/json",
+                content_length=len(body),
+            )
+
+    client = FailingImportClient()
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    with mirror._connect() as connection:
+        mirror._set_meta(connection, "job_uuid", "completed-job")
+        mirror._set_meta(connection, "job_state", 1)
+        mirror._set_meta(connection, "job_url", "https://ipro.etm.ru/catalog.json")
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=client, mirror=mirror
+    )
+
+    with pytest.raises(SourcingProviderError, match="некорректн"):
+        provider.import_completed_catalog()
+
+    assert captured_paths
+    assert not captured_paths[0].exists()
+    assert mirror.count() == 0
 
 
 def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp_path):
@@ -886,7 +1171,7 @@ def test_provider_search_is_bounded_and_does_not_enrich_zero_evidence(tmp_path):
     assert len(client.goods_calls) == bounded_calls
 
 
-def test_catalog_job_lifecycle_persists_uuid_and_imports_only_completed_snapshot(tmp_path):
+def test_catalog_job_lifecycle_persists_uuid_and_defers_completed_snapshot_import(tmp_path):
     mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
 
     class JobClient:
@@ -911,17 +1196,60 @@ def test_catalog_job_lifecycle_persists_uuid_and_imports_only_completed_snapshot
                     "userdata": {},
                 },
             }
-        def download_snapshot(self, value):
-            return {"data": [catalog_record("new").model_dump()]}
-
     client = JobClient()
     first = mirror.create_job(client)
     assert first.uuid == "job-1" and first.state == 0
     assert mirror.update_job(client).state == 3
     completed = mirror.update_job(client)
     assert completed.state == 1
-    assert mirror.search(intent(article="A-100"))[0].source_item_id == "new"
-    assert mirror.count() == 1
+    assert mirror.job_state == 1
+    assert mirror.job_url == "https://etm.example/catalog.json"
+    assert mirror.count() == 0
+
+
+def test_catalog_status_is_ready_only_and_import_is_background_job(monkeypatch):
+    from averon_import import main as app_module
+
+    class Provider:
+        def catalog_sync_status(self):
+            return EtmJobStatus(
+                uuid="job-1",
+                state=1,
+                url="https://ipro.etm.ru/catalog.json?signature=private",
+                revision="old",
+                item_count=0,
+            )
+
+        def import_completed_catalog(self, progress):
+            progress(1, 1, "done")
+            return EtmCatalogSyncResult(True, 1, "sha", "now")
+
+    class FakeJob:
+        def public(self):
+            return {"id": "local-job", "status": "queued"}
+
+    class FakeJobService:
+        def __init__(self):
+            self.submitted = None
+
+        def submit(self, function):
+            self.submitted = function
+            return FakeJob()
+
+    provider = Provider()
+    jobs = FakeJobService()
+    monkeypatch.setattr(app_module.sourcing_service, "provider", lambda key: provider)
+    monkeypatch.setattr(app_module, "job_service", jobs)
+
+    status = app_module.etm_ipro_catalog_status()
+    queued = app_module.import_etm_ipro_catalog()
+
+    assert status["state"] == 1
+    assert status["snapshot_ready"] is True
+    assert "url" not in status
+    assert queued == {"id": "local-job", "status": "queued"}
+    assert jobs.submitted is not None
+    assert jobs.submitted(lambda current, total, message: None)["item_count"] == 1
 
 
 def test_catalog_job_status_fails_closed_without_unambiguous_official_row(tmp_path):
