@@ -8,7 +8,12 @@ from .client import (
     EtmIproClient,
     EtmRateLimiter,
 )
-from .mirror import EtmCatalogMirror, EtmCatalogSyncResult, EtmJobStatus
+from .mirror import (
+    EtmCatalogMirror,
+    EtmCatalogSyncResult,
+    EtmJobStatus,
+    EtmSearchIndexResult,
+)
 from .models import (
     CatalogSnapshotError,
     CatalogSnapshotLimitError,
@@ -29,6 +34,7 @@ __all__ = [
     "EtmCatalogMirror",
     "EtmCatalogSyncResult",
     "EtmJobStatus",
+    "EtmSearchIndexResult",
     "EtmCatalogRecord",
     "EtmManufacturer",
     "CatalogSnapshotError",

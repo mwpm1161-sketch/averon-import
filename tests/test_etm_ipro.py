@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -893,6 +894,217 @@ def test_mirror_search_is_deterministic_and_has_no_zero_evidence_fallback(tmp_pa
     mirror.sync_snapshot({"data": [catalog_record().model_dump(), catalog_record("B-200", name="Насос", article="B-200") ]})
     assert [row.source_item_id for row in mirror.search(intent(article="A-100"))] == ["A-100"]
     assert mirror.search(intent(article="", manufacturer="", model="", normalized_name="несуществующий", search_queries=["несуществующий"])) == []
+
+
+def test_fts_schema_is_external_content_and_readiness_tracks_revision(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    assert mirror.search_index_ready is False
+    with mirror._connect() as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='etm_catalog_fts'"
+        ).fetchone()
+    assert row is not None and "content='etm_catalog_products'" in row[0]
+
+    mirror.sync_snapshot({"data": [catalog_record().model_dump()]})
+
+    assert mirror.search_index_ready is True
+    assert mirror.search_index_revision == mirror.revision
+    assert mirror.stats()["search_index_ready"] is True
+
+
+def test_exact_article_lookup_bypasses_fts(tmp_path, monkeypatch):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [catalog_record().model_dump()]})
+
+    def fail_fts(*args, **kwargs):
+        raise AssertionError("exact article lookup must not use FTS")
+
+    monkeypatch.setattr(mirror, "_fts_candidates", fail_fts)
+    assert [row.source_item_id for row in mirror.search(
+        intent(article="A-100", manufacturer="", brand="")
+    )] == ["A-100"]
+
+
+def test_fts_relevance_can_beat_smaller_source_item_id(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [
+        catalog_record("0001", name="Пост кнопочный"),
+        catalog_record(
+            "9999",
+            name="Пост кнопочный ПКУ 15 21 121 54У2",
+            article="TARGET",
+        ),
+    ]})
+    query_terms = ["пост", "кнопочный", "пку", "15", "21", "121", "54у2"]
+    with mirror._connect() as connection:
+        candidates = mirror._fts_candidates(
+            connection, query_terms, operator="AND", limit=100
+        )
+
+    assert candidates and candidates[0]["source_item_id"] == "9999"
+    result = mirror.search(intent(
+        article="",
+        manufacturer="",
+        brand="",
+        normalized_name="Пост кнопочный ПКУ 15 21 121 54У2",
+        search_queries=["Пост кнопочный ПКУ 15 21 121 54У2"],
+    ), limit=1)
+    assert result[0].source_item_id == "9999"
+
+
+def test_fts_prefers_and_then_controlled_or_and_bounds_pool(tmp_path, monkeypatch):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [
+        catalog_record("0001", name="alpha"),
+        catalog_record("9999", name="alpha beta"),
+    ]})
+    calls = []
+    original = mirror._fts_candidates
+
+    def record_call(connection, terms, **kwargs):
+        calls.append((kwargs["operator"], kwargs["limit"]))
+        return original(connection, terms, **kwargs)
+
+    monkeypatch.setattr(mirror, "_fts_candidates", record_call)
+    rows = mirror.search(intent(
+        article="",
+        manufacturer="",
+        brand="",
+        normalized_name="alpha beta",
+        search_queries=["alpha beta"],
+    ), limit=20)
+
+    assert [operator for operator, _limit in calls[:2]] == ["AND", "OR"]
+    assert all(limit <= 500 for _operator, limit in calls)
+    assert {row.source_item_id for row in rows} == {"0001", "9999"}
+
+
+def test_fts_manufacturer_filter_is_preserved(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [
+        catalog_record("A-1", name="alpha beta", brand="One"),
+        EtmCatalogRecord(
+            source_item_id="B-2",
+            name="alpha beta",
+            article="B-2",
+            brand="Two",
+            brand_code="2",
+            cli_code="CLI-1",
+            class_code="C-1",
+            product_class="Арматура",
+        ).model_dump(),
+    ]})
+    result = mirror.search(intent(
+        article="",
+        manufacturer="",
+        brand="",
+        normalized_name="alpha beta",
+        search_queries=["alpha beta"],
+    ), limit=20, manufacturer_code="2")
+    assert [row.source_item_id for row in result] == ["B-2"]
+
+
+def test_fts_quotes_input_tokens_and_does_not_allow_match_operators(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [
+        catalog_record("A-1", name="Пост"),
+        catalog_record("B-2", name="Клапан"),
+    ]})
+    result = mirror.search(intent(
+        article="",
+        manufacturer="",
+        brand="",
+        normalized_name="пост OR *",
+        search_queries=["пост OR *"],
+    ), limit=20)
+    assert [row.source_item_id for row in result] == ["A-1"]
+
+
+def test_failed_fts_rebuild_preserves_previous_good_index_and_revision(tmp_path, monkeypatch):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [catalog_record().model_dump()]})
+    old_revision = mirror.revision
+    old_index_revision = mirror.search_index_revision
+
+    def fail_rebuild(*args, **kwargs):
+        raise sqlite3.OperationalError("simulated index failure")
+
+    monkeypatch.setattr(mirror, "_rebuild_search_index", fail_rebuild)
+    with pytest.raises(SourcingProviderError, match="индекс"):
+        mirror.rebuild_search_index()
+
+    assert mirror.revision == old_revision
+    assert mirror.search_index_revision == old_index_revision
+    assert mirror.search_index_ready is True
+    assert mirror.search(intent(article="A-100"))[0].source_item_id == "A-100"
+
+
+def test_search_index_revision_mismatch_is_not_ready(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [catalog_record().model_dump()]})
+    with mirror._connect() as connection:
+        mirror._set_meta(connection, "search_index_revision", "stale-revision")
+    assert mirror.search_index_ready is False
+    assert mirror.stats()["search_index_ready"] is False
+
+
+def test_snapshot_replacement_commits_catalog_and_fts_revision_together(tmp_path):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({"data": [catalog_record().model_dump()]})
+    path = tmp_path / "snapshot.json"
+    payload = json.dumps([
+        catalog_record("NEW-1", name="alpha beta").model_dump()
+    ], ensure_ascii=False).encode("utf-8")
+    path.write_bytes(payload)
+    revision = hashlib.sha256(payload).hexdigest()
+
+    result = mirror.import_snapshot_file(path, snapshot_sha256=revision)
+
+    assert result.revision == revision
+    assert mirror.revision == mirror.search_index_revision == revision
+    assert mirror.search_index_ready is True
+    assert mirror.search(intent(
+        article="", manufacturer="", brand="", normalized_name="alpha beta",
+        search_queries=["alpha beta"],
+    ))[0].source_item_id == "NEW-1"
+
+
+def test_local_reindex_endpoint_uses_job_service_without_etm(monkeypatch):
+    from averon_import import main as app_module
+
+    class Provider:
+        def rebuild_search_index(self, progress):
+            progress(0, 1, "index")
+            return {
+                "changed": True,
+                "item_count": 1,
+                "catalog_version": "revision",
+                "search_index_revision": "revision",
+                "search_index_ready": True,
+            }
+
+    class FakeJob:
+        def public(self):
+            return {"id": "local-reindex", "status": "queued"}
+
+    class FakeJobService:
+        def __init__(self):
+            self.submitted = None
+
+        def submit(self, function):
+            self.submitted = function
+            return FakeJob()
+
+    provider = Provider()
+    jobs = FakeJobService()
+    monkeypatch.setattr(app_module.sourcing_service, "provider", lambda key: provider)
+    monkeypatch.setattr(app_module, "job_service", jobs)
+
+    queued = app_module.reindex_etm_ipro_catalog()
+
+    assert queued == {"id": "local-reindex", "status": "queued"}
+    assert jobs.submitted is not None
+    assert jobs.submitted(lambda current, total, message: None)["search_index_ready"] is True
 
 
 def test_failed_new_snapshot_preserves_old_good_mirror(tmp_path):

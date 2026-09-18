@@ -24,6 +24,8 @@ from .models import (
 
 _MAX_CATALOG_ITEMS = 2_000_000
 _IMPORT_BATCH_SIZE = 2_000
+_MAX_FTS_TERMS = 32
+_MAX_FTS_CANDIDATES = 500
 _JOB_STATES = {0, 1, 2, 3}
 
 _UPSERT_CATALOG_SQL = """
@@ -63,6 +65,15 @@ class EtmCatalogSyncResult:
 
 
 @dataclass(frozen=True)
+class EtmSearchIndexResult:
+    changed: bool
+    item_count: int
+    catalog_version: str
+    search_index_revision: str
+    search_index_ready: bool
+
+
+@dataclass(frozen=True)
 class EtmJobStatus:
     uuid: str = ""
     state: int | None = None
@@ -70,6 +81,7 @@ class EtmJobStatus:
     error: str = ""
     revision: str = ""
     item_count: int = 0
+    search_index_ready: bool = False
 
 
 def _now_marker() -> str:
@@ -127,16 +139,43 @@ class EtmCatalogMirror:
                     ON etm_manufacturers(normalized_label);
                 """
             )
-            for key in ("revision", "last_synced_at", "job_uuid", "job_state", "job_url", "job_error"):
+            connection.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS etm_catalog_fts USING fts5(
+                    name,
+                    brand,
+                    article,
+                    product_class,
+                    cli_code,
+                    class_code,
+                    content='etm_catalog_products',
+                    content_rowid='rowid',
+                    tokenize='unicode61'
+                )"""
+            )
+            for key in (
+                "revision",
+                "search_index_revision",
+                "last_synced_at",
+                "job_uuid",
+                "job_state",
+                "job_url",
+                "job_error",
+            ):
                 connection.execute(
                     "INSERT OR IGNORE INTO etm_mirror_meta(key,value) VALUES (?,?)",
                     (key, ""),
                 )
 
+    @staticmethod
+    def _connection_meta(connection: sqlite3.Connection, key: str) -> str:
+        row = connection.execute(
+            "SELECT value FROM etm_mirror_meta WHERE key=?", (key,)
+        ).fetchone()
+        return str(row[0]) if row else ""
+
     def _meta(self, key: str) -> str:
         with self._connect() as connection:
-            row = connection.execute("SELECT value FROM etm_mirror_meta WHERE key=?", (key,)).fetchone()
-        return str(row[0]) if row else ""
+            return self._connection_meta(connection, key)
 
     @staticmethod
     def _set_meta(connection: sqlite3.Connection, key: str, value: Any) -> None:
@@ -149,6 +188,15 @@ class EtmCatalogMirror:
     @property
     def revision(self) -> str:
         return self._meta("revision") or "unknown"
+
+    @property
+    def search_index_revision(self) -> str:
+        return self._meta("search_index_revision")
+
+    @property
+    def search_index_ready(self) -> bool:
+        with self._connect() as connection:
+            return self._search_index_ready(connection)
 
     @property
     def last_synced_at(self) -> str:
@@ -185,6 +233,8 @@ class EtmCatalogMirror:
         return {
             "item_count": self.count(),
             "catalog_version": self.revision,
+            "search_index_revision": self.search_index_revision,
+            "search_index_ready": self.search_index_ready,
             "last_synced_at": self.last_synced_at,
             "job_uuid": self.job_uuid,
             "job_state": self.job_state,
@@ -221,6 +271,7 @@ class EtmCatalogMirror:
         synced_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         changed = revision != self.revision
         with self._connect() as connection:
+            index_revision = self._connection_meta(connection, "search_index_revision")
             if changed:
                 connection.execute("DELETE FROM etm_catalog_products")
                 for product in products:
@@ -232,6 +283,8 @@ class EtmCatalogMirror:
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                         self._record(product),
                     )
+            if changed or index_revision != revision:
+                self._rebuild_search_index(connection, revision=revision)
             self._set_meta(connection, "revision", revision)
             self._set_meta(connection, "last_synced_at", synced_at)
             self._set_meta(connection, "job_error", "")
@@ -277,6 +330,11 @@ class EtmCatalogMirror:
                 item_count = int(
                     connection.execute("SELECT COUNT(*) FROM etm_catalog_products").fetchone()[0]
                 )
+                self._rebuild_search_index(
+                    connection,
+                    revision=revision,
+                    progress=progress,
+                )
                 self._set_meta(connection, "revision", revision)
                 self._set_meta(connection, "last_synced_at", synced_at)
                 self._set_meta(connection, "job_error", "")
@@ -305,6 +363,45 @@ class EtmCatalogMirror:
             item_count,
             revision,
             synced_at,
+        )
+
+    def rebuild_search_index(
+        self,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> EtmSearchIndexResult:
+        """Rebuild the local FTS index without contacting ETM."""
+
+        revision = self.revision
+        if revision == "unknown":
+            raise SourcingProviderError(
+                "Локальный каталог ЭТМ iPRO не синхронизирован",
+                code="CATALOG_NOT_SYNCED",
+                category="not_configured",
+            )
+        previous_revision = self.search_index_revision
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                item_count = int(
+                    connection.execute("SELECT COUNT(*) FROM etm_catalog_products").fetchone()[0]
+                )
+                self._rebuild_search_index(
+                    connection,
+                    revision=revision,
+                    progress=progress,
+                )
+        except sqlite3.Error as exc:
+            raise SourcingProviderError(
+                "Локальный индекс ЭТМ iPRO не обновлён",
+                code="SEARCH_INDEX_REBUILD_FAILED",
+                category="storage_error",
+            ) from exc
+        return EtmSearchIndexResult(
+            previous_revision != revision,
+            item_count,
+            revision,
+            revision,
+            True,
         )
 
     def sync_manufacturers(self, manufacturers: tuple[EtmManufacturer, ...] | list[EtmManufacturer]) -> int:
@@ -341,6 +438,78 @@ class EtmCatalogMirror:
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
+    def _search_index_ready(self, connection: sqlite3.Connection) -> bool:
+        revision = self._connection_meta(connection, "revision") or "unknown"
+        index_revision = self._connection_meta(connection, "search_index_revision")
+        return revision != "unknown" and bool(index_revision) and index_revision == revision
+
+    def _rebuild_search_index(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        revision: str,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> None:
+        item_count = int(
+            connection.execute("SELECT COUNT(*) FROM etm_catalog_products").fetchone()[0]
+        )
+        if progress is not None:
+            progress(0, item_count, "Строим FTS-индекс ЭТМ iPRO")
+        connection.execute(
+            "INSERT INTO etm_catalog_fts(etm_catalog_fts) VALUES ('rebuild')"
+        )
+        self._set_meta(connection, "search_index_revision", revision)
+        if progress is not None:
+            progress(item_count, item_count, "FTS-индекс ЭТМ iPRO готов")
+
+    @staticmethod
+    def _fts_token(term: str) -> str:
+        return '"' + str(term).replace('"', '""') + '"'
+
+    def _fts_candidates(
+        self,
+        connection: sqlite3.Connection,
+        terms: list[str],
+        *,
+        operator: str,
+        limit: int,
+        manufacturer_code: str | None = None,
+    ) -> list[sqlite3.Row]:
+        match_expression = f" {operator} ".join(
+            self._fts_token(term) for term in terms
+        )
+        query = (
+            "SELECT products.* "
+            "FROM etm_catalog_fts "
+            "JOIN etm_catalog_products AS products ON products.rowid=etm_catalog_fts.rowid "
+            "WHERE etm_catalog_fts MATCH ?"
+        )
+        params: list[Any] = [match_expression]
+        if manufacturer_code:
+            query += " AND products.brand_code=?"
+            params.append(manufacturer_code)
+        query += " ORDER BY bm25(etm_catalog_fts), products.source_item_id LIMIT ?"
+        params.append(int(limit))
+        return connection.execute(query, params).fetchall()
+
+    def _like_candidates(
+        self,
+        connection: sqlite3.Connection,
+        terms: list[str],
+        *,
+        limit: int,
+        manufacturer_code: str | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses = " OR ".join("normalized_search LIKE ?" for _ in terms)
+        params: list[Any] = [f"%{term}%" for term in terms]
+        query = f"SELECT * FROM etm_catalog_products WHERE ({clauses})"
+        if manufacturer_code:
+            query += " AND brand_code=?"
+            params.append(manufacturer_code)
+        query += " ORDER BY source_item_id LIMIT ?"
+        params.append(int(limit))
+        return connection.execute(query, params).fetchall()
+
     def search(
         self,
         intent: ProductIntent,
@@ -361,12 +530,14 @@ class EtmCatalogMirror:
             intent.manufacturer,
         ]:
             terms.extend(_tokens(value))
-        terms = list(dict.fromkeys(terms))[:32]
+        terms = list(dict.fromkeys(terms))[:_MAX_FTS_TERMS]
         excluded_fallback_terms = set(_tokens(intent.article)) | set(_tokens(intent.brand)) | set(_tokens(intent.manufacturer))
         fallback_terms = [term for term in terms if term not in excluded_fallback_terms]
         if not terms and not article:
             return []
-        candidate_limit = min(max(1, int(limit)) * 10, 500)
+        requested_limit = max(1, int(limit))
+        candidate_limit = min(requested_limit * 10, _MAX_FTS_CANDIDATES)
+        candidate_pool = min(max(requested_limit * 20, 100), _MAX_FTS_CANDIDATES)
         with self._connect() as connection:
             rows: list[sqlite3.Row] = []
             if article:
@@ -381,15 +552,38 @@ class EtmCatalogMirror:
             # An article is a strong identifier.  A failed article lookup may
             # use independent name/model evidence, but never brand-only terms.
             if fallback_terms and not rows:
-                clauses = " OR ".join("normalized_search LIKE ?" for _ in fallback_terms)
-                params = [f"%{term}%" for term in fallback_terms]
-                query = f"SELECT * FROM etm_catalog_products WHERE ({clauses})"
-                if manufacturer_code:
-                    query += " AND brand_code=?"
-                    params.append(manufacturer_code)
-                query += " ORDER BY source_item_id LIMIT ?"
-                params.append(candidate_limit)
-                rows.extend(connection.execute(query, params).fetchall())
+                if self._search_index_ready(connection):
+                    and_rows = self._fts_candidates(
+                        connection,
+                        fallback_terms,
+                        operator="AND",
+                        limit=candidate_pool,
+                        manufacturer_code=manufacturer_code,
+                    )
+                    rows.extend(and_rows)
+                    if len(rows) < candidate_pool:
+                        or_rows = self._fts_candidates(
+                            connection,
+                            fallback_terms,
+                            operator="OR",
+                            limit=candidate_pool,
+                            manufacturer_code=manufacturer_code,
+                        )
+                        unique_rows = {row["source_item_id"] for row in rows}
+                        rows.extend(
+                            row for row in or_rows
+                            if row["source_item_id"] not in unique_rows
+                        )
+                        rows = rows[:candidate_pool]
+                else:
+                    rows.extend(
+                        self._like_candidates(
+                            connection,
+                            fallback_terms,
+                            limit=candidate_limit,
+                            manufacturer_code=manufacturer_code,
+                        )
+                    )
         unique: dict[str, EtmCatalogRecord] = {}
         for row in rows:
             unique[row["source_item_id"]] = EtmCatalogRecord(
@@ -409,7 +603,7 @@ class EtmCatalogMirror:
                 score_value += 100
             score_value += sum(1 for term in terms if term in normalize_catalog_text(product.name + " " + product.product_class))
             return (-score_value, product.source_item_id)
-        return [unique[key] for key in sorted(unique, key=lambda value: score(unique[value]))[: max(1, int(limit))]]
+        return [unique[key] for key in sorted(unique, key=lambda value: score(unique[value]))[:requested_limit]]
 
     def create_job(self, client: Any) -> EtmJobStatus:
         try:
@@ -425,12 +619,22 @@ class EtmCatalogMirror:
             self._set_meta(connection, "job_state", 0)
             self._set_meta(connection, "job_url", "")
             self._set_meta(connection, "job_error", "")
-        return EtmJobStatus(uuid=value, state=0, revision=self.revision, item_count=self.count())
+        return EtmJobStatus(
+            uuid=value,
+            state=0,
+            revision=self.revision,
+            item_count=self.count(),
+            search_index_ready=self.search_index_ready,
+        )
 
     def update_job(self, client: Any) -> EtmJobStatus:
         value = self.job_uuid
         if not value:
-            return EtmJobStatus(revision=self.revision, item_count=self.count())
+            return EtmJobStatus(
+                revision=self.revision,
+                item_count=self.count(),
+                search_index_ready=self.search_index_ready,
+            )
         try:
             payload = client.get_catalog_job(value)
             data = payload.get("data", payload) if isinstance(payload, dict) else {}
@@ -480,6 +684,7 @@ class EtmCatalogMirror:
             "Каталог ЭТМ iPRO недоступен для синхронизации" if state == 2 else "",
             self.revision,
             self.count(),
+            self.search_index_ready,
         )
 
     @staticmethod

@@ -20,7 +20,12 @@ from averon_import.services.sourcing.models import (
 from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy, SourcingProviderError
 
 from .client import EtmIproClient
-from .mirror import EtmCatalogMirror, EtmCatalogSyncResult, EtmJobStatus
+from .mirror import (
+    EtmCatalogMirror,
+    EtmCatalogSyncResult,
+    EtmJobStatus,
+    EtmSearchIndexResult,
+)
 from .models import EtmCatalogRecord
 
 
@@ -88,7 +93,12 @@ class EtmIproProvider:
 
     def health(self) -> dict[str, Any]:
         if not self.configured:
-            return {"configured": False, "reachable": False, "catalog_version": self.mirror.revision}
+            return {
+                "configured": False,
+                "reachable": False,
+                "catalog_version": self.mirror.revision,
+                "search_index_ready": self.mirror.search_index_ready,
+            }
         try:
             self.client.check_access()
         except SourcingProviderError as exc:
@@ -96,6 +106,7 @@ class EtmIproProvider:
                 "configured": True,
                 "reachable": False,
                 "catalog_version": self.mirror.revision,
+                "search_index_ready": self.mirror.search_index_ready,
                 "error": exc.public_message,
             }
         return {
@@ -103,6 +114,7 @@ class EtmIproProvider:
             "reachable": True,
             "catalog_version": self.mirror.revision,
             "item_count": self.mirror.count(),
+            "search_index_ready": self.mirror.search_index_ready,
         }
 
     def sync_manufacturers(self) -> int:
@@ -168,6 +180,14 @@ class EtmIproProvider:
             ) from exc
         finally:
             path.unlink(missing_ok=True)
+
+    def rebuild_search_index(
+        self,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> EtmSearchIndexResult:
+        """Rebuild only the local ETM search index; no upstream calls."""
+
+        return self.mirror.rebuild_search_index(progress=progress)
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
         self._ensure_configured()

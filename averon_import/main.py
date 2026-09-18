@@ -767,6 +767,17 @@ def import_etm_ipro_catalog():
     ).public()
 
 
+@app.post("/api/sourcing/providers/etm_ipro/catalog/reindex")
+def reindex_etm_ipro_catalog():
+    provider = sourcing_service.provider("etm_ipro")
+    method = getattr(provider, "rebuild_search_index", None)
+    if not callable(method):
+        raise HTTPException(404, "Переиндексация каталога ЭТМ iPRO недоступна")
+    return job_service.submit(
+        lambda progress: _sourcing_payload(method(progress))
+    ).public()
+
+
 @app.get("/api/sourcing/catalog/stats")
 def sourcing_catalog_stats():
     return sourcing_repository.stats()
