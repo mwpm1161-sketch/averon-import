@@ -300,6 +300,64 @@ def test_live_single_goods_object_is_normalized_without_sggds_mirror(tmp_path):
     assert offer.url == ""
 
 
+def test_live_price_rows_select_exact_product_and_preserve_price_semantics(tmp_path):
+    provider, _ = configured_provider(tmp_path)
+    positive_payload = {
+        "status": {"code": 200},
+        "data": {
+            "rows": [{
+                "gdscode": "9536092",
+                "price": "0",
+                "price_retail": "0",
+                "price_tarif": "0",
+                "pricewnds": "125.40",
+            }],
+        },
+    }
+    selected = _price_row(positive_payload, "9536092")
+    assert selected is not None
+    assert selected["gdscode"] == "9536092"
+    offer = provider._offer(catalog_record(), selected, {"data": {"stores": []}}, {})
+    assert offer.price == Decimal("125.40")
+    assert offer.currency == "RUB"
+    assert offer.data_provenance["price_field"] == "pricewnds"
+    assert offer.data_provenance["price_status"] == ""
+
+    zero_payload = {
+        "status": {"code": 200},
+        "data": {
+            "rows": [{
+                "gdscode": "9536092",
+                "price": "0",
+                "price_retail": "0",
+                "price_tarif": "0",
+                "pricewnds": "0",
+            }],
+        },
+    }
+    zero_row = _price_row(zero_payload, "9536092")
+    zero_offer = provider._offer(catalog_record(), zero_row, {"data": {"stores": []}}, {})
+    assert zero_offer.price is None
+    assert zero_offer.data_provenance["price_status"] == "requires_individual_request"
+
+    wrong_only_payload = {
+        "status": {"code": 200},
+        "data": {"rows": [{"gdscode": "other", "pricewnds": "99"}]},
+    }
+    assert _price_row(wrong_only_payload, "9536092") is None
+
+    multiple_payload = {
+        "status": {"code": 200},
+        "data": {
+            "rows": [
+                {"gdscode": "other", "pricewnds": "99"},
+                {"gdscode": "9536092", "pricewnds": "125.40"},
+            ],
+        },
+    }
+    assert _price_row(multiple_payload, "9536092")["pricewnds"] == "125.40"
+
+
 def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp_path):
     transport = OfficialWireTransport()
     client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)

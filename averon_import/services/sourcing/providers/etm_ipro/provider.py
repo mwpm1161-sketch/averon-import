@@ -494,17 +494,29 @@ def _price_row(payload: Any, source_item_id: str) -> dict[str, Any] | None:
     if isinstance(data, list):
         rows = data
     elif isinstance(data, dict):
-        rows = data.get("prices", data.get("goods", data.get("items", [data])))
+        rows = data.get("rows")
+        if not isinstance(rows, list):
+            rows = data.get("prices", data.get("goods", data.get("items", [data])))
     else:
         rows = []
     if not isinstance(rows, list):
         rows = []
+    rows = [row for row in rows if isinstance(row, dict)]
+    target_id = str(source_item_id).strip()
+    unidentifiable_rows: list[dict[str, Any]] = []
     for row in rows:
-        if not isinstance(row, dict):
+        identifiers = {
+            str(row[key]).strip()
+            for key in ("gdscode", "id", "code")
+            if row.get(key) not in (None, "")
+        }
+        if not identifiers:
+            unidentifiable_rows.append(row)
             continue
-        identifier = str(row.get("gdscode", row.get("id", row.get("code", source_item_id)))).strip()
-        if identifier == source_item_id or len(rows) == 1:
+        if identifiers == {target_id}:
             return row
+    if len(rows) == 1 and len(unidentifiable_rows) == 1:
+        return unidentifiable_rows[0]
     return None
 
 
