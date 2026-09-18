@@ -22,6 +22,7 @@ from averon_import.services.sourcing.providers.etm_ipro import (
 )
 from averon_import.services.sourcing.providers.etm_ipro.provider import (
     _goods_detail,
+    _goods_record,
     _goods_rows,
     _images,
     _price_row,
@@ -237,6 +238,66 @@ def test_official_wire_contract_uses_query_session_and_rows_adapters(tmp_path):
     price_request = next(request for request in transport.requests if request.full_url.endswith("/price?type=etm&session-id=session-wire"))
     assert "%2C" in urlsplit(price_request.full_url).path
     assert "session-wire" not in str(SourcingProviderError("Поставщик недоступен"))
+
+
+def test_live_single_goods_object_is_normalized_without_sggds_mirror(tmp_path):
+    payload = {
+        "status": {"code": 200},
+        "data": {
+            "gdsCode": "9536092",
+            "gdsNameTitle": "ETM live product title",
+            "gdsNameInMnf": "ETM manufacturer product name",
+            "gdsNameCountry": "Россия",
+            "gdsMnfName": "Электротехник",
+            "gdsMnfCode": "sanitized-mnf-code",
+            "gdsArt": "ET054487",
+            "gdsUnitName": "шт.",
+            "gdsChars": [
+                {"gdsCharName": "Характеристика", "gdsCharVal": "placeholder"},
+            ],
+            "gdsImages": ["https://cdn.etm.ru/live-placeholder.jpg"],
+            "gdsPacks": [{"qty": "1"}],
+            "gdsVideos": [{"url": "/live-placeholder"}],
+        },
+    }
+
+    rows = _goods_rows(payload)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["gdscode"] == "9536092"
+    assert row["name"] == "ETM live product title"
+    assert row["art"] == "ET054487"
+    assert row["mnf_name"] == "Электротехник"
+    assert row["mnf_code"] == "sanitized-mnf-code"
+    assert row["edizm"] == "шт."
+    assert row["gdsChars"] == payload["data"]["gdsChars"]
+    assert row["gdsImages"] == payload["data"]["gdsImages"]
+
+    fallback_payload = {"status": payload["status"], "data": dict(payload["data"])}
+    fallback_payload["data"]["gdsNameTitle"] = ""
+    assert _goods_rows(fallback_payload)[0]["name"] == "ETM manufacturer product name"
+
+    goods = _goods_record(row)
+    assert goods is not None
+    assert goods.source_item_id == "9536092"
+    assert goods.article == "ET054487"
+    assert goods.brand == "Электротехник"
+
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path, client=FakeEtmClient(), mirror=mirror
+    )
+    offer = provider._offer(goods, None, {"data": {"stores": []}}, row)
+    assert offer.source_item_id == "9536092"
+    assert offer.title == "ETM live product title"
+    assert offer.article == "ET054487"
+    assert offer.manufacturer == "Электротехник"
+    assert offer.brand == "Электротехник"
+    assert offer.price_unit == "шт."
+    assert len(offer.attributes["params_raw"]) == 1
+    assert offer.attributes["country"] == "Россия"
+    assert len(offer.attributes["images"]) == 1
+    assert offer.url == ""
 
 
 def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp_path):

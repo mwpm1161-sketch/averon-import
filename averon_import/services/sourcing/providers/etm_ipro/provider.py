@@ -387,28 +387,83 @@ def _numeric_value(value: Any) -> int | float | None:
 
 def _goods_rows(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        return _normalize_goods_rows(payload)
     if not isinstance(payload, dict):
         return []
     data = payload.get("data", payload)
     if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
+        return _normalize_goods_rows(data)
     if isinstance(data, dict):
         for key in ("rows", "goods", "items", "products"):
             if isinstance(data.get(key), list):
-                return [item for item in data[key] if isinstance(item, dict)]
-        if any(key in data for key in ("gdscode", "id", "code", "source_item_id")):
-            return [data]
+                return _normalize_goods_rows(data[key])
+        if _has_goods_identity(data):
+            normalized = _normalize_goods_row(data)
+            return [normalized] if normalized is not None else []
     return []
+
+
+def _normalize_goods_rows(rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw in rows:
+        row = _normalize_goods_row(raw)
+        if row is not None:
+            normalized.append(row)
+    return normalized
+
+
+def _has_goods_identity(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    return any(raw.get(key) not in (None, "") for key in (
+        "gdsCode", "gdscode", "code", "source_item_id", "id"
+    ))
+
+
+def _normalize_goods_row(raw: Any) -> dict[str, Any] | None:
+    if not _has_goods_identity(raw):
+        return None
+    row = deepcopy(raw)
+
+    def first_value(*keys: str) -> Any:
+        for key in keys:
+            value = raw.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    aliases = {
+        "gdscode": ("gdsCode", "gdscode", "code", "source_item_id", "id"),
+        "name": ("gdsNameTitle", "name", "title", "gdsNameInMnf"),
+        "mnf_name": ("gdsMnfName", "mnf_name", "brand", "manufacturer"),
+        "mnf_code": ("gdsMnfCode", "mnf_code", "brand_code", "mnf"),
+        "art": ("gdsArt", "art", "article"),
+        "edizm": ("gdsUnitName", "edizm", "unit"),
+    }
+    for canonical, keys in aliases.items():
+        value = first_value(*keys)
+        if value is not None:
+            row[canonical] = value
+
+    if (
+        raw.get("gdsNameTitle") in (None, "")
+        and first_value("name", "title") is None
+        and raw.get("gdsNameInMnf") not in (None, "")
+    ):
+        row["name"] = raw["gdsNameInMnf"]
+    return row
 
 
 def _goods_record(raw: Any) -> EtmCatalogRecord | None:
     if isinstance(raw, EtmCatalogRecord):
         return raw
-    if not isinstance(raw, dict):
+    normalized = _normalize_goods_row(raw)
+    if normalized is None:
         return None
     try:
-        return EtmCatalogRecord.model_validate(raw)
+        return EtmCatalogRecord.model_validate(normalized)
     except Exception:
         return None
 
