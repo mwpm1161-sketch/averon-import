@@ -311,20 +311,22 @@ def test_representative_p58_subset_uses_provider_prices(demo_repository, tmp_pat
     result = service.search_project(rows)
     assert result.positions_total == result.positions_processed == 5
     assert result.positions_matched == 3
-    assert result.positions_alternatives == 2
-    assert result.positions_review == result.positions_without_offers == 0
+    assert result.positions_alternatives == 0
+    assert result.positions_review == 2
+    assert result.positions_without_offers == 0
     assert result.estimated_total == Decimal("208800")
     assert result.confirmed_total == Decimal("208800")
-    assert result.alternative_total == Decimal("148380")
+    assert result.alternative_total is None
     assert result.confirmed_totals == {"RUB": Decimal("208800")}
-    assert result.alternative_totals == {"RUB": Decimal("148380")}
+    assert result.alternative_totals == {}
     assert result.currency == "RUB"
     assert [
-        item.recommended_offer.offer_id for item in result.results
+        item.recommended_offer.offer_id if item.recommended_offer else None
+        for item in result.results
     ] == [
         "demo-nobo-nfk4n-07",
         "demo-nobo-nfk4n-10",
-        "demo-cable-brim17-20",
-        "demo-regulator-devireg130",
+        None,
+        None,
         "demo-aircurtain-kev-9p2012e",
     ]

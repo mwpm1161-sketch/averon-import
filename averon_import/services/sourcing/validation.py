@@ -17,9 +17,11 @@ _CYRILLIC_IDENTIFIER_TRANSLATION = str.maketrans({
 @dataclass(frozen=True)
 class ValidationResult:
     matched: tuple[str, ...] = ()
+    supporting_matches: tuple[str, ...] = ()
     conflicts: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
     preferred_differences: tuple[str, ...] = ()
+    model_evidence_source: str = ""
 
 
 def _norm(value: object) -> str:
@@ -72,9 +74,11 @@ def _attribute_origin(intent: ProductIntent, key: str) -> str:
 
 def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
     matched: list[str] = []
+    supporting: list[str] = []
     conflicts: list[str] = []
     missing: list[str] = []
     preferred: list[str] = []
+    model_evidence_source = ""
     offer_attrs = {str(key): value for key, value in offer.attributes.items()}
     if intent.article:
         if not offer.article:
@@ -84,11 +88,26 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
         else:
             conflicts.append("article")
     if intent.model:
-        offer_model = offer_attrs.get("model") or offer.article
-        if offer_model and _same_identity(intent.model, offer_model):
-            matched.append("model")
-        elif offer_model:
-            preferred.append("model")
+        explicit_model = offer_attrs.get("model")
+        if explicit_model is not None and str(explicit_model).strip():
+            model_evidence_source = "explicit_model"
+            if _same_identity(intent.model, explicit_model):
+                matched.append("model")
+            else:
+                preferred.append("model")
+        elif _same_identity(intent.model, offer.title):
+            model_evidence_source = "title"
+            supporting.append("model")
+        elif _same_identity(intent.model, offer.article):
+            model_evidence_source = "article"
+            supporting.append("model")
+        else:
+            missing.append("model")
+    elif intent.normalized_name and _same_identity(intent.normalized_name, offer.title):
+        # A name-only intent still has deterministic product evidence.  Keep
+        # this separate from model evidence so a missing requested model can
+        # never be hidden by a generic title match.
+        supporting.append("normalized_name")
     for key, expected in intent.required_attributes.items():
         if _attribute_origin(intent, key) == "ai_inferred":
             continue
@@ -123,9 +142,11 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
             preferred.append(key)
     return ValidationResult(
         matched=tuple(dict.fromkeys(matched)),
+        supporting_matches=tuple(dict.fromkeys(supporting)),
         conflicts=tuple(dict.fromkeys(conflicts)),
         missing=tuple(dict.fromkeys(missing)),
         preferred_differences=tuple(dict.fromkeys(preferred)),
+        model_evidence_source=model_evidence_source,
     )
 
 
@@ -133,6 +154,9 @@ def explanation_for(result: ValidationResult) -> str:
     parts: list[str] = []
     if result.matched:
         parts.append("Совпало: " + ", ".join(result.matched))
+    if result.supporting_matches:
+        source = f" по {result.model_evidence_source}" if result.model_evidence_source else ""
+        parts.append("Поддерживается" + source + ": " + ", ".join(result.supporting_matches))
     if result.preferred_differences:
         parts.append("Отличается: " + ", ".join(result.preferred_differences))
     if result.missing:

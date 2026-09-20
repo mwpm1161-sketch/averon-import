@@ -224,6 +224,7 @@ class MatchResult(SourcingModel):
     decision: MatchDecision
     rank: int = Field(ge=1)
     matched_attributes: list[str] = Field(default_factory=list)
+    supporting_attributes: list[str] = Field(default_factory=list)
     conflicting_attributes: list[str] = Field(default_factory=list)
     missing_attributes: list[str] = Field(default_factory=list)
     explanation: str = ""

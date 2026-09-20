@@ -15,7 +15,7 @@ from averon_import.services.secrets import (
 )
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.catalog_repository import CatalogRepository
-from averon_import.services.sourcing.matching import OfferMatcher
+from averon_import.services.sourcing.matching import OfferMatcher, recommended_offer
 from averon_import.services.sourcing.models import (
     MatchDecision,
     MatchResult,
@@ -448,6 +448,160 @@ def test_q22_cyrillic_latin_product_identifier_is_equivalent():
     assert set(result.matched_attributes) >= {"article", "model", "manufacturer"}
 
 
+def test_model_evidence_uses_explicit_model_then_title_then_article():
+    intent = make_intent(
+        model="Model-1",
+        normalized_name="Устройство",
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+
+    explicit = OfferMatcher().match(
+        intent,
+        [make_offer(offer_id="explicit", attributes={"model": "Model-1"})],
+    )[0]
+    assert explicit.decision == MatchDecision.MATCH
+    assert explicit.matched_attributes == ["model"]
+    assert explicit.supporting_attributes == []
+    assert explicit.deterministic_evidence["model_evidence_source"] == "explicit_model"
+
+    title = OfferMatcher().match(
+        intent,
+        [make_offer(offer_id="title", title="Устройство Model-1", article="ET-1", attributes={})],
+    )[0]
+    assert title.decision == MatchDecision.LIKELY_MATCH
+    assert title.matched_attributes == []
+    assert title.supporting_attributes == ["model"]
+    assert title.deterministic_evidence["model_evidence_source"] == "title"
+
+    article = OfferMatcher().match(
+        intent,
+        [make_offer(offer_id="article", title="Устройство", article="Model-1", attributes={})],
+    )[0]
+    assert article.decision == MatchDecision.LIKELY_MATCH
+    assert article.supporting_attributes == ["model"]
+    assert article.deterministic_evidence["model_evidence_source"] == "article"
+
+    different = OfferMatcher().match(
+        intent,
+        [make_offer(offer_id="different", title="Устройство", article="OTHER", attributes={})],
+    )[0]
+    assert different.decision == MatchDecision.REVIEW
+    assert different.missing_attributes == ["model"]
+    assert different.deterministic_evidence["preferred_differences"] == []
+
+
+def test_model_title_support_does_not_hide_ambiguity():
+    model = "ПКУ-15-21.121-54У2"
+    intent = make_intent(
+        source_row_id="etm-row",
+        source_text="Пост кнопочный ПКУ-15-21.121-54У2",
+        normalized_name="Пост кнопочный",
+        model=model,
+        manufacturer="",
+        article="",
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    offers = [
+        make_offer(
+            offer_id=offer_id,
+            title=f"Пост кнопочный {model}",
+            article=article,
+            manufacturer="",
+            attributes={},
+        )
+        for offer_id, article in (
+            ("2667167", "A-1"),
+            ("3394481", "A-2"),
+            ("9396002", "A-3"),
+            ("9536092", "ET054487"),
+            ("1327846", "A-5"),
+        )
+    ]
+
+    matches = OfferMatcher().match(intent, offers)
+
+    assert all(item.decision == MatchDecision.LIKELY_MATCH for item in matches)
+    assert all(item.supporting_attributes == ["model"] for item in matches)
+    assert all(item.deterministic_evidence["model_evidence_source"] == "title" for item in matches)
+    assert recommended_offer(matches) is None
+
+
+def test_unique_explicit_model_evidence_beats_supporting_title_evidence():
+    intent = make_intent(
+        model="Model-1",
+        normalized_name="Устройство",
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    supporting = make_offer(offer_id="supporting", title="Устройство Model-1", attributes={})
+    explicit = make_offer(offer_id="explicit", title="Устройство", attributes={"model": "Model-1"})
+
+    matches = OfferMatcher().match(intent, [supporting, explicit])
+
+    assert matches[0].offer.offer_id == "explicit"
+    assert matches[0].decision == MatchDecision.MATCH
+    assert recommended_offer(matches).offer_id == "explicit"
+
+
+def test_zero_deterministic_evidence_is_review_not_likely():
+    intent = make_intent(
+        model="",
+        normalized_name="",
+        manufacturer="",
+        article="",
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    matches = OfferMatcher().match(
+        intent,
+        [make_offer(title="Неподтвержденное предложение", attributes={})],
+    )
+
+    assert matches[0].decision == MatchDecision.REVIEW
+    assert recommended_offer(matches) is None
+
+
+def test_project_ambiguous_model_titles_remain_review_and_unresolved(tmp_path):
+    model = "ПКУ-15-21.121-54У2"
+    offers = [
+        make_offer(
+            offer_id=offer_id,
+            title=f"Пост кнопочный {model}",
+            article=article,
+            attributes={},
+        )
+        for offer_id, article in (("2667167", "A-1"), ("9536092", "ET054487"))
+    ]
+    provider = RowOffersProvider({"etm-row": offers})
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+
+    result = service.search_project([{
+        "id": "etm-row",
+        "row_type": "item",
+        "name": "Пост кнопочный",
+        "type_mark": model,
+        "quantity": "1",
+    }])
+
+    assert result.positions_total == result.positions_processed == 1
+    assert result.positions_matched == 0
+    assert result.positions_review == 1
+    assert result.unresolved_count == 1
+    assert result.confirmed_totals == {}
+    assert result.results[0].recommended_offer is None
+
+
 def test_q23_same_alternative_class_prefers_more_supported_candidate():
     intent = make_intent(
         model="Model 10",
@@ -459,6 +613,7 @@ def test_q23_same_alternative_class_prefers_more_supported_candidate():
     weaker = make_offer(
         offer_id="adax-10",
         manufacturer="ADAX",
+        title="Клапан фланцевый Model 10",
         attributes={"power": 1},
     )
     stronger = make_offer(
@@ -566,7 +721,7 @@ def test_project_totals_separate_confirmed_alternative_and_unpriced(tmp_path):
     provider = RowOffersProvider({
         "confirmed": [make_offer(offer_id="confirmed", price=Decimal("10"))],
         "alternative": [make_offer(offer_id="alternative", manufacturer="Other", price=Decimal("5"))],
-        "unpriced": [make_offer(offer_id="unpriced", price=None)],
+        "unpriced": [make_offer(offer_id="unpriced", title="Насос", price=None)],
         "untrusted": [make_offer(offer_id="untrusted", price=Decimal("20"))],
     })
     service = SourcingService(
@@ -579,7 +734,7 @@ def test_project_totals_separate_confirmed_alternative_and_unpriced(tmp_path):
         {"id": "confirmed", "row_type": "item", "name": "Клапан", "quantity": "2"},
         {"id": "alternative", "row_type": "item", "name": "Клапан", "manufacturer": "Preferred", "quantity": "3"},
         {"id": "unpriced", "row_type": "item", "name": "Насос", "quantity": "1"},
-        {"id": "untrusted", "row_type": "item", "name": "Фильтр", "quantity": "2", "status": "review"},
+        {"id": "untrusted", "row_type": "item", "name": "Клапан", "quantity": "2", "status": "review"},
     ]
 
     result = service.search_project(rows)
@@ -602,11 +757,12 @@ def test_review_identity_candidate_is_separate_from_weak_alternative(tmp_path):
             make_offer(
                 offer_id="identity-review",
                 manufacturer="",
-                attributes={"model": "M-1"},
+                attributes={"model": "Model-1"},
             ),
             make_offer(
                 offer_id="weak-alternative",
                 manufacturer="Other",
+                title="Клапан фланцевый Model-1",
                 attributes={"power": 1},
             ),
         ],
@@ -619,7 +775,7 @@ def test_review_identity_candidate_is_separate_from_weak_alternative(tmp_path):
     )
     intent = make_intent(
         source_row_id="identity",
-        model="M-1",
+        model="Model-1",
         manufacturer="Maker",
         attributes={"power": 1},
         required_attributes={"power": 1},

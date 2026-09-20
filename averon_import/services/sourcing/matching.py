@@ -29,19 +29,24 @@ class OfferMatcher:
                 decision = MatchDecision.ALTERNATIVE
             elif evidence.matched:
                 decision = MatchDecision.MATCH
-            else:
+            elif evidence.supporting_matches:
                 decision = MatchDecision.LIKELY_MATCH
+            else:
+                decision = MatchDecision.REVIEW
             result = MatchResult(
                 offer=offer,
                 decision=decision,
                 rank=1,
                 matched_attributes=list(evidence.matched),
+                supporting_attributes=list(evidence.supporting_matches),
                 conflicting_attributes=list(evidence.conflicts),
                 missing_attributes=list(evidence.missing),
                 explanation=explanation_for(evidence),
                 ai_evidence={},
                 deterministic_evidence={
                     "hard_contradiction": bool(evidence.conflicts),
+                    "supporting_matches": list(evidence.supporting_matches),
+                    "model_evidence_source": evidence.model_evidence_source,
                     "preferred_differences": list(evidence.preferred_differences),
                 },
             )
@@ -52,6 +57,7 @@ class OfferMatcher:
                     len(evidence.missing),
                     len(evidence.preferred_differences),
                     -len(evidence.matched),
+                    -len(evidence.supporting_matches),
                     result.offer.offer_id,
                 ),
                 result,
@@ -66,10 +72,30 @@ def recommended_offer(results: list[MatchResult]) -> Offer | None:
         MatchDecision.LIKELY_MATCH,
         MatchDecision.ALTERNATIVE,
     ):
-        for result in results:
-            if result.decision == decision:
-                return result.offer
+        candidates = [result for result in results if result.decision == decision]
+        if not candidates:
+            continue
+        first = candidates[0]
+        signature = _deterministic_evidence_signature(first)
+        if sum(_deterministic_evidence_signature(item) == signature for item in candidates) > 1:
+            return None
+        return first.offer
     return None
+
+
+def _deterministic_evidence_signature(result: MatchResult) -> tuple[object, ...]:
+    evidence = result.deterministic_evidence
+    supporting = evidence.get("supporting_matches", result.supporting_attributes)
+    if not isinstance(supporting, (list, tuple, set)):
+        supporting = result.supporting_attributes
+    return (
+        result.decision.value,
+        tuple(sorted(str(value) for value in result.matched_attributes)),
+        tuple(sorted(str(value) for value in supporting)),
+        tuple(sorted(str(value) for value in result.conflicting_attributes)),
+        tuple(sorted(str(value) for value in result.missing_attributes)),
+        tuple(sorted(str(value) for value in evidence.get("preferred_differences", []))),
+    )
 
 
 _IDENTITY_FIELDS = frozenset({"article", "model", "manufacturer", "brand"})
