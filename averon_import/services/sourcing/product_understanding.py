@@ -23,7 +23,7 @@ from averon_import.services.sourcing.models import (
 )
 
 
-PRODUCT_UNDERSTANDING_REVISION = "3"
+PRODUCT_UNDERSTANDING_REVISION = "4"
 
 AI_UNSUPPORTED_ATTRIBUTES_MESSAGE = (
     "AI предложил дополнительные характеристики, которые не используются при сопоставлении."
@@ -494,24 +494,36 @@ def _attribute_grounded(
     return False
 
 
+_MIN_CROSS_FIELD_IDENTITY_LENGTH = 4
+
+
+def _meaningful_identity_containment(left: str, right: str) -> bool:
+    """Return whether two identities meaningfully contain one another."""
+
+    left_compact = _compact(left)
+    right_compact = _compact(right)
+    if min(len(left_compact), len(right_compact)) < _MIN_CROSS_FIELD_IDENTITY_LENGTH:
+        return False
+    return left_compact in right_compact or right_compact in left_compact
+
+
 def _cross_field_identity_alias(field: str, proposed: str, fallback: ProductIntent) -> str:
     """Return an audit reason when an identity value crosses model/article fields."""
 
-    normalized = _compact(proposed)
-    if not normalized:
+    if not proposed:
         return ""
     if (
         field == "article"
         and fallback.model
         and not fallback.article
-        and normalized == _compact(fallback.model)
+        and _meaningful_identity_containment(proposed, fallback.model)
     ):
         return "proposal_cross_field_identity_alias"
     if (
         field == "model"
         and fallback.article
         and not fallback.model
-        and normalized == _compact(fallback.article)
+        and _meaningful_identity_containment(proposed, fallback.article)
     ):
         return "proposal_cross_field_identity_alias"
     return ""

@@ -270,6 +270,38 @@ def test_cross_field_identity_alias_does_not_promote_model_as_article():
     assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
 
 
+@pytest.mark.parametrize(
+    ("model", "article"),
+    [
+        ("SOLARIS Life ST 100 /G.1", "ST 100 /G.1"),
+        ("ВКВЭ.110.260.6ТР L=3000мм", "ВКВЭ.110.260.6ТР"),
+    ],
+)
+def test_cross_field_identity_partial_alias_does_not_promote_model_as_article(model, article):
+    row = {
+        "id": "partial-model-alias-row",
+        "source_text": f"Оборудование {model} шт. 1",
+        "name": "Оборудование",
+        "type_mark": model,
+        "code": "",
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }
+    result = understand(row, {
+        "normalized_name": "Оборудование",
+        "model": model,
+        "article": article,
+    })
+
+    assert result.resolved_intent.model == model
+    assert result.resolved_intent.article == ""
+    assert "ai_cross_field_article_from_model" in result.resolved_intent.uncertainties
+    suggestion = next(item for item in result.suggestions if item.field == "article")
+    assert suggestion.reason == "proposal_cross_field_identity_alias"
+    assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
+
+
 def test_cross_field_identity_alias_does_not_promote_article_as_model():
     article = "ET054487"
     row = {
