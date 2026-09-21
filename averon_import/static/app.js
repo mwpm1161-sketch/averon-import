@@ -20,10 +20,13 @@ const state = {
   sourcing: {row: null, result: null, projectFilter: "all"},
   sourcingHealth: null,
   recentDocuments: [],
+  manual: {active: false, rows: []},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
 const CRITICAL_LABELS = {quantity:"Количество", unit:"Единица", mass:"Масса"};
+const MANUAL_DRAFT_KEY = "averonManualTenderDraft";
+const MANUAL_FIELDS = ["name", "type_mark", "manufacturer", "code", "quantity", "unit"];
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -53,6 +56,7 @@ async function api(url, options = {}) {
 function setView(name) {
   $$(".view").forEach((view) => view.classList.remove("visible"));
   $(`#${name}-view`).classList.add("visible");
+  document.body.classList.toggle("manual-mode", name === "manual");
   const stepMap = {upload:"upload", pages:"pages", processing:"recognition", review:"review"};
   const step = stepMap[name] || name;
   $$(".step").forEach((button) => button.classList.toggle("active", button.dataset.step === step));
@@ -61,6 +65,7 @@ function setView(name) {
     pages: ["Выбор страниц", "Укажите, какие таблицы необходимо распознать"],
     processing: ["Распознавание документа", "Определение строк, столбцов и текста"],
     review: ["Проверка данных", "Сравните результат с PDF и подготовьте экспорт"],
+    manual: ["Тендер без спецификации", "Введите позиции и подберите предложения в общем sourcing-процессе"],
   };
   const [title, subtitle] = titles[name] || titles.upload;
   $("#page-title").textContent = title;
@@ -89,8 +94,10 @@ async function boot() {
     initializeSettings(settings);
     populateFilters();
     initializeExportColumns();
+    loadManualDraft();
     try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
     await resumeLastDocument();
+    if (state.manual.active) openManualWorkspace();
   } catch (error) {
     toast(error.message, "error");
   }
@@ -258,6 +265,232 @@ function saveExportPreferences() {
     order: state.exportOrder,
     selected: [...state.exportSelected],
   }));
+}
+
+function newManualRowId() {
+  if (globalThis.crypto?.randomUUID) return `manual-${globalThis.crypto.randomUUID()}`;
+  return `manual-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function manualRow(values = {}) {
+  const row = {id: String(values.id || newManualRowId()), row_type: "item", source_origin: "manual", selected: values.selected !== false};
+  MANUAL_FIELDS.forEach((key) => { row[key] = String(values[key] ?? ""); });
+  return row;
+}
+
+function manualDraftPayload() {
+  return {
+    active: Boolean(state.manual.active),
+    rows: state.manual.rows.map((row) => ({
+      id: row.id,
+      selected: row.selected !== false,
+      ...Object.fromEntries(MANUAL_FIELDS.map((key) => [key, String(row[key] ?? "")])),
+    })),
+  };
+}
+
+function saveManualDraft() {
+  try { sessionStorage.setItem(MANUAL_DRAFT_KEY, JSON.stringify(manualDraftPayload())); } catch (_) {}
+}
+
+function loadManualDraft() {
+  try {
+    const payload = JSON.parse(sessionStorage.getItem(MANUAL_DRAFT_KEY) || "null");
+    if (!payload || !Array.isArray(payload.rows)) return;
+    state.manual.active = Boolean(payload.active);
+    state.manual.rows = payload.rows.map((row) => manualRow(row));
+  } catch (_) {
+    state.manual = {active: false, rows: []};
+  }
+}
+
+function manualRowById(id) {
+  return state.manual.rows.find((row) => row.id === id);
+}
+
+function manualRowValidation(row) {
+  const errors = [];
+  const warnings = [];
+  const identity = ["name", "type_mark", "code"].some((key) => String(row[key] || "").trim());
+  if (!identity) errors.push("Укажите наименование, модель или артикул.");
+  const quantity = String(row.quantity || "").trim();
+  const unit = String(row.unit || "").trim();
+  let quantityValid = true;
+  if (quantity) {
+    quantityValid = /^\d+(?:[.,]\d+)?$/.test(quantity) && Number(quantity.replace(",", ".")) > 0;
+    if (!quantityValid) errors.push("Количество должно быть числом больше нуля.");
+    else if (!unit) warnings.push("Для расчёта итоговой стоимости укажите количество и единицу.");
+  }
+  return {valid: !errors.length, errors, warnings, quantityTrusted: Boolean(quantity && quantityValid && unit)};
+}
+
+function manualFeedbackHtml(validation) {
+  return [...validation.errors.map((message) => `<span class="manual-error">${escapeHtml(message)}</span>`), ...validation.warnings.map((message) => `<span class="manual-warning">${escapeHtml(message)}</span>`)].join("");
+}
+
+function updateManualRowFeedback(row) {
+  const node = document.querySelector(`#manual-body tr[data-manual-id="${CSS.escape(row.id)}"]`);
+  if (!node) return;
+  const validation = manualRowValidation(row);
+  node.classList.toggle("manual-invalid", !validation.valid);
+  const feedback = node.querySelector(".manual-row-feedback");
+  if (feedback) feedback.innerHTML = manualFeedbackHtml(validation);
+  updateManualSummary();
+}
+
+function updateManualSummary() {
+  const selected = state.manual.rows.filter((row) => row.selected !== false).length;
+  const badge = $("#manual-selected-count");
+  if (badge) badge.textContent = `Выбрано: ${selected}`;
+  const selectAll = $("#manual-select-all");
+  if (selectAll) {
+    selectAll.checked = Boolean(state.manual.rows.length) && state.manual.rows.every((row) => row.selected !== false);
+    selectAll.indeterminate = state.manual.rows.some((row) => row.selected !== false) && !selectAll.checked;
+  }
+}
+
+function renderManualRows() {
+  const body = $("#manual-body");
+  if (!body) return;
+  body.innerHTML = state.manual.rows.map((row, index) => {
+    const validation = manualRowValidation(row);
+    const input = (key, label, placeholder = "") => `<input class="manual-cell-input" data-manual-id="${escapeHtml(row.id)}" data-key="${key}" aria-label="${escapeHtml(label)}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(row[key])}">`;
+    return `<tr data-manual-id="${escapeHtml(row.id)}" class="${validation.valid ? "" : "manual-invalid"}">
+      <td class="manual-selector"><input class="manual-row-select" data-manual-id="${escapeHtml(row.id)}" type="checkbox" ${row.selected !== false ? "checked" : ""} aria-label="Выбрать строку ${index + 1}"></td>
+      <td class="manual-number">${index + 1}</td>
+      <td>${input("name", "Наименование или описание", "Например: насос циркуляционный")}</td>
+      <td>${input("type_mark", "Модель или тип", "Модель / тип")}</td>
+      <td>${input("manufacturer", "Производитель", "Производитель")}</td>
+      <td>${input("code", "Артикул или код", "Артикул / код")}</td>
+      <td>${input("quantity", "Количество", "2 или 2,5")}</td>
+      <td><input class="manual-cell-input" list="manual-unit-suggestions" data-manual-id="${escapeHtml(row.id)}" data-key="unit" aria-label="Единица измерения" placeholder="шт." value="${escapeHtml(row.unit)}"></td>
+      <td class="manual-actions"><div><button class="button text manual-understand" type="button" data-manual-id="${escapeHtml(row.id)}">Разобрать</button><button class="button text manual-delete" type="button" data-manual-id="${escapeHtml(row.id)}" aria-label="Удалить строку ${index + 1}">Удалить</button></div><div class="manual-row-feedback">${manualFeedbackHtml(validation)}</div></td>
+    </tr>`;
+  }).join("");
+  $("#manual-empty").hidden = state.manual.rows.length > 0;
+  body.querySelectorAll(".manual-cell-input").forEach((input) => {
+    input.addEventListener("input", () => {
+      const row = manualRowById(input.dataset.manualId);
+      if (!row) return;
+      row[input.dataset.key] = input.value;
+      saveManualDraft();
+      updateManualRowFeedback(row);
+    });
+    input.addEventListener("focus", () => { const row = manualRowById(input.dataset.manualId); if (row) input.closest("tr")?.classList.add("manual-focused"); });
+    input.addEventListener("blur", () => input.closest("tr")?.classList.remove("manual-focused"));
+  });
+  body.querySelectorAll(".manual-row-select").forEach((input) => input.addEventListener("change", () => {
+    const row = manualRowById(input.dataset.manualId);
+    if (!row) return;
+    row.selected = input.checked;
+    saveManualDraft();
+    updateManualSummary();
+  }));
+  body.querySelectorAll(".manual-delete").forEach((button) => button.addEventListener("click", () => {
+    state.manual.rows = state.manual.rows.filter((row) => row.id !== button.dataset.manualId);
+    saveManualDraft();
+    renderManualRows();
+  }));
+  body.querySelectorAll(".manual-understand").forEach((button) => button.addEventListener("click", () => {
+    const row = manualRowById(button.dataset.manualId);
+    if (row) openManualUnderstanding(row);
+  }));
+  updateManualSummary();
+}
+
+function addManualRow(values = {}) {
+  state.manual.rows.push(manualRow(values));
+  saveManualDraft();
+  renderManualRows();
+  const last = state.manual.rows[state.manual.rows.length - 1];
+  requestAnimationFrame(() => document.querySelector(`.manual-cell-input[data-manual-id="${CSS.escape(last.id)}"][data-key="name"]`)?.focus());
+}
+
+function openManualWorkspace() {
+  state.manual.active = true;
+  if (!state.manual.rows.length) state.manual.rows.push(manualRow());
+  saveManualDraft();
+  renderManualRows();
+  setView("manual");
+}
+
+function returnToStartFromManual() {
+  state.manual.active = false;
+  saveManualDraft();
+  setView("upload");
+}
+
+function parseManualPaste(text) {
+  const lines = String(text || "").split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) return [];
+  const tsv = lines.some((line) => line.includes("\t"));
+  return lines.map((line) => {
+    if (!tsv) return manualRow({name: line.trim()});
+    const cells = line.split("\t").map((cell) => cell.trim());
+    if (cells.length > MANUAL_FIELDS.length) throw new Error("TSV должен содержать не более шести столбцов в фиксированном порядке");
+    return manualRow(Object.fromEntries(MANUAL_FIELDS.map((key, index) => [key, cells[index] || ""])));
+  });
+}
+
+function applyManualPaste() {
+  try {
+    const rows = parseManualPaste($("#manual-paste-input").value);
+    if (!rows.length) { toast("Вставьте хотя бы одну непустую строку", "error"); return; }
+    state.manual.rows.push(...rows);
+    saveManualDraft();
+    renderManualRows();
+    $("#manual-paste-modal").close();
+    $("#manual-paste-input").value = "";
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function clearManualDraft() {
+  if (!state.manual.rows.length) return;
+  if (!confirm("Очистить все введённые позиции?")) return;
+  state.manual.rows = [];
+  saveManualDraft();
+  renderManualRows();
+}
+
+function manualRowsForSourcing() {
+  return state.manual.rows.filter((row) => row.selected !== false).map((row) => {
+    const validation = manualRowValidation(row);
+    return {
+      id: row.id,
+      row_type: "item",
+      selected: true,
+      name: row.name,
+      type_mark: row.type_mark,
+      manufacturer: row.manufacturer,
+      code: row.code,
+      quantity: row.quantity,
+      unit: row.unit,
+      quantity_trusted: validation.quantityTrusted,
+      status: "recognized",
+      source_origin: "manual",
+    };
+  });
+}
+
+function renderManualUnderstandingWarnings(warnings) {
+  const values = (warnings || []).filter((warning) => String(warning || "").trim());
+  return values.length ? `<div class="manual-diagnostic-warnings"><b>Диагностические сообщения</b>${values.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>` : "";
+}
+
+async function openManualUnderstanding(row) {
+  state.sourcing.row = row;
+  state.sourcing.result = null;
+  $("#sourcing-subtitle").textContent = "Разбираем ручную позицию…";
+  $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Product Understanding</b><small>Исходные поля останутся без изменений</small></div>`;
+  $("#sourcing-modal").showModal();
+  try {
+    const response = await api("/api/sourcing/understand", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({row})});
+    $("#sourcing-subtitle").textContent = "Разбор ручной позиции завершён";
+    $("#sourcing-content").innerHTML = `${renderSourcingNotices(response.notices)}${renderManualUnderstandingWarnings(response.warnings)}${renderProductUnderstanding(response.understanding)}`;
+  } catch (error) {
+    $("#sourcing-subtitle").textContent = "Разбор не выполнен";
+    $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
+  }
 }
 
 async function resumeLastDocument() {
@@ -1201,21 +1434,39 @@ async function openSourcingForRow(row) {
   }
 }
 
-async function openProjectSourcing() {
-  const rows = state.rows.filter((row) => row.selected && sourcingEligible(row));
+async function runProjectSourcing(rows, documentId = null) {
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
   state.sourcing.projectFilter = "all";
   $("#sourcing-subtitle").textContent = "Подбираем предложения для выбранных позиций…";
   $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Анализируем выбранные позиции</b><small>Позиции обрабатываются последовательно; после анализа выполняется поиск в выбранном каталоге.</small></div>`;
   $("#sourcing-modal").showModal();
   try {
-    const url = state.document ? `/api/documents/${state.document.document_id}/sourcing/search-all` : "/api/sourcing/search-all";
+    const url = documentId ? `/api/documents/${documentId}/sourcing/search-all` : "/api/sourcing/search-all";
     const job = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows, limit:20})});
     await pollSourcingJob(job.id, rows.length);
   } catch (error) {
     $("#sourcing-subtitle").textContent = "Подбор не выполнен";
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
   }
+}
+
+async function openProjectSourcing() {
+  const rows = state.rows.filter((row) => row.selected && sourcingEligible(row));
+  await runProjectSourcing(rows, state.document?.document_id || null);
+}
+
+async function openManualProjectSourcing() {
+  const selected = state.manual.rows.filter((row) => row.selected !== false);
+  if (!selected.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
+  const invalid = selected.filter((row) => !manualRowValidation(row).valid);
+  renderManualRows();
+  if (invalid.length) {
+    toast("Исправьте ошибки в выбранных позициях перед подбором", "error");
+    const first = invalid[0];
+    requestAnimationFrame(() => document.querySelector(`.manual-cell-input[data-manual-id="${CSS.escape(first.id)}"]`)?.focus());
+    return;
+  }
+  await runProjectSourcing(manualRowsForSourcing(), null);
 }
 
 async function pollSourcingJob(jobId, expectedTotal) {
@@ -1544,6 +1795,18 @@ function resetApp() {
 
 function setupEvents() {
   $("#pdf-file").addEventListener("change", (event) => uploadFile(event.target.files[0]));
+  $("#open-manual-entry").addEventListener("click", openManualWorkspace);
+  $("#manual-back-to-start").addEventListener("click", returnToStartFromManual);
+  $("#manual-add-row").addEventListener("click", () => addManualRow());
+  $("#manual-paste-list").addEventListener("click", () => $("#manual-paste-modal").showModal());
+  $("#manual-paste-apply").addEventListener("click", applyManualPaste);
+  $("#manual-clear-draft").addEventListener("click", clearManualDraft);
+  $("#manual-project-sourcing-button").addEventListener("click", () => openManualProjectSourcing().catch((error) => toast(error.message, "error")));
+  $("#manual-select-all").addEventListener("change", (event) => {
+    state.manual.rows.forEach((row) => { row.selected = event.target.checked; });
+    saveManualDraft();
+    renderManualRows();
+  });
   const drop=$("#drop-zone");
   ["dragenter","dragover"].forEach((name)=>drop.addEventListener(name,(e)=>{e.preventDefault();drop.classList.add("drag");}));
   ["dragleave","drop"].forEach((name)=>drop.addEventListener(name,(e)=>{e.preventDefault();drop.classList.remove("drag");}));

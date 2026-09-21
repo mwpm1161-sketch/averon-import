@@ -65,6 +65,14 @@
             <small>До 250 МБ · исходный PDF хранится локально</small>
           </label>
         </div>
+        <section class="manual-entry-prompt" aria-labelledby="manual-entry-title">
+          <div>
+            <span class="eyebrow">Альтернативный источник</span>
+            <h3 id="manual-entry-title">Тендер без спецификации</h3>
+            <p>Введите или вставьте список позиций, если отдельной PDF-спецификации нет.</p>
+          </div>
+          <button class="button secondary" type="button" id="open-manual-entry">Ввести позиции вручную</button>
+        </section>
         <section class="panel recent-documents" id="recent-documents-panel" hidden>
           <div class="panel-heading">
             <div><h3>Недавние документы</h3><p>Откройте сохранённый workspace без повторного распознавания.</p></div>
@@ -72,6 +80,51 @@
           </div>
           <div id="recent-documents-list" class="recent-documents-list"></div>
         </section>
+      </section>
+
+      <section id="manual-view" class="view manual-view">
+        <div class="document-strip">
+          <div class="file-icon manual-file-icon">TXT</div>
+          <div class="document-info"><b>Тендер без спецификации</b><small>Ручной ввод позиций · данные сохраняются только в текущей вкладке</small></div>
+          <div class="spacer"></div>
+          <button class="button ghost" type="button" id="manual-back-to-start">К старту</button>
+        </div>
+
+        <div class="manual-workspace panel">
+          <div class="panel-heading manual-heading">
+            <div><h3>Позиции тендера</h3><p>Заполните хотя бы наименование, модель/тип или артикул/код.</p></div>
+            <span class="badge" id="manual-selected-count">Выбрано: 0</span>
+          </div>
+          <div class="manual-toolbar">
+            <div class="manual-toolbar-actions">
+              <button class="button secondary" type="button" id="manual-add-row">+ Добавить строку</button>
+              <button class="button ghost" type="button" id="manual-paste-list">Вставить список</button>
+              <button class="button text" type="button" id="manual-clear-draft">Очистить</button>
+            </div>
+            <div class="spacer"></div>
+            <button class="button primary" type="button" id="manual-project-sourcing-button">Подобрать предложения</button>
+          </div>
+          <p class="manual-trust-note">Количество с единицей участвует в итоговой стоимости. Если единица не указана, позиция останется доступной для подбора, но её сумма не будет подтверждена.</p>
+          <div class="manual-table-wrap">
+            <table class="manual-table" id="manual-table">
+              <thead>
+                <tr>
+                  <th class="manual-selector"><input type="checkbox" id="manual-select-all" title="Выбрать все позиции"></th>
+                  <th class="manual-number">№</th>
+                  <th>Наименование / описание</th>
+                  <th>Модель / тип</th>
+                  <th>Производитель</th>
+                  <th>Артикул / код</th>
+                  <th>Кол-во</th>
+                  <th>Ед. изм.</th>
+                  <th>Действия</th>
+                </tr>
+              </thead>
+              <tbody id="manual-body"></tbody>
+            </table>
+            <div class="manual-empty" id="manual-empty" hidden>Пока нет строк. Добавьте строку или вставьте список позиций.</div>
+          </div>
+        </div>
       </section>
 
       <section id="pages-view" class="view">
@@ -218,6 +271,19 @@
       <div id="sourcing-content" class="sourcing-content"><p class="hint">Выберите позицию, чтобы начать поиск.</p></div>
     </div>
   </dialog>
+
+  <dialog class="modal" id="manual-paste-modal">
+    <form method="dialog" class="modal-card manual-paste-card" id="manual-paste-form">
+      <div class="modal-header"><div><span class="eyebrow">Быстрый ввод</span><h2>Вставить список</h2><p>Одна непустая строка — одна позиция. Табличная вставка использует порядок: описание, модель, производитель, артикул, количество, единица.</p></div><button class="icon-button" value="cancel" aria-label="Закрыть">×</button></div>
+      <label class="field-label" for="manual-paste-input">Список позиций</label>
+      <textarea class="input manual-paste-input" id="manual-paste-input" rows="10" placeholder="Насос Grundfos MAGNA3 32-80\nКабель ВВГнг-LS 5х6"></textarea>
+      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="manual-paste-apply">Добавить позиции</button></div>
+    </form>
+  </dialog>
+
+  <datalist id="manual-unit-suggestions">
+    <option value="шт."></option><option value="м"></option><option value="м²"></option><option value="м³"></option><option value="кг"></option><option value="т"></option><option value="компл."></option><option value="упак."></option><option value="л"></option>
+  </datalist>
 
   <dialog class="modal" id="settings-modal">
     <form method="dialog" class="modal-card settings-card" id="settings-form">
