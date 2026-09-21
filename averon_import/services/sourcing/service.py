@@ -36,6 +36,54 @@ from averon_import.services.sourcing.providers.base import (
 )
 
 
+_PRICE_UNIT_FAMILIES = {
+    "шт": "piece",
+    "штука": "piece",
+    "штуки": "piece",
+    "штук": "piece",
+    "м": "meter",
+    "m": "meter",
+    "м2": "square_meter",
+    "m2": "square_meter",
+    "м3": "cubic_meter",
+    "m3": "cubic_meter",
+    "кг": "kilogram",
+    "kg": "kilogram",
+    "т": "tonne",
+    "ton": "tonne",
+    "tonne": "tonne",
+    "тонна": "tonne",
+    "тонны": "tonne",
+    "тонн": "tonne",
+    "компл": "set",
+    "комплект": "set",
+    "упак": "pack",
+    "упаковка": "pack",
+    "л": "litre",
+    "l": "litre",
+    "litre": "litre",
+    "литр": "litre",
+    "литра": "litre",
+    "литров": "litre",
+}
+
+
+def _price_unit_family(value: Any) -> str | None:
+    normalized = " ".join(str(value or "").casefold().split())
+    if not normalized:
+        return None
+    normalized = normalized.replace("²", "2").replace("³", "3").rstrip(".")
+    return _PRICE_UNIT_FAMILIES.get(normalized)
+
+
+def _units_compatible(source_unit: Any, price_unit: Any) -> bool:
+    """Return true only for an explicit, known unit family match."""
+
+    source_family = _price_unit_family(source_unit)
+    price_family = _price_unit_family(price_unit)
+    return source_family is not None and source_family == price_family
+
+
 class SourcingService:
     """Coordinates understanding, provider retrieval, matching and safe totals."""
 
@@ -321,7 +369,7 @@ class SourcingService:
         confirmed_totals: dict[str, Decimal] = {}
         alternative_totals: dict[str, Decimal] = {}
         matched = alternatives = review = without = 0
-        matched_unpriced = alternative_unpriced = unresolved = 0
+        matched_unpriced = alternative_unpriced = unit_confirmation = unresolved = 0
         understanding_time = retrieval_time = matching_time = ranking_time = 0.0
         understanding_cache_hits = search_cache_hits = 0
         for index, row in enumerate(eligible):
@@ -400,7 +448,14 @@ class SourcingService:
                         else None
                     )
                     if target is not None:
-                        target[best.currency] = target.get(best.currency, Decimal("0")) + best.price * quantity
+                        if _units_compatible(row.get("unit"), best.price_unit):
+                            target[best.currency] = target.get(best.currency, Decimal("0")) + best.price * quantity
+                        else:
+                            unit_confirmation += 1
+                            notices.append(SourcingNotice(
+                                code="PRICE_UNIT_REQUIRES_CONFIRMATION",
+                                message="Для одной или нескольких позиций требуется проверить единицу цены поставщика.",
+                            ))
                 elif decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
                     matched_unpriced += 1
                 elif decision_match == MatchDecision.ALTERNATIVE:
@@ -450,6 +505,7 @@ class SourcingService:
             alternative_currency=(alternative_currencies[0] if len(alternative_currencies) == 1 else None),
             matched_unpriced_count=matched_unpriced,
             alternative_unpriced_count=alternative_unpriced,
+            unit_confirmation_count=unit_confirmation,
             unresolved_count=unresolved,
             # Compatibility: estimated_total is the confirmed subtotal only.
             estimated_total=confirmed_total,

@@ -1196,10 +1196,32 @@ function sourcingProviderLabel(offer) {
   }[source] || "Поставщик";
 }
 
+const PRICE_UNIT_FAMILIES = {
+  "шт": "piece", "штука": "piece", "штуки": "piece", "штук": "piece",
+  "м": "meter", "m": "meter", "м2": "square_meter", "m2": "square_meter",
+  "м3": "cubic_meter", "m3": "cubic_meter", "кг": "kilogram", "kg": "kilogram",
+  "т": "tonne", "ton": "tonne", "tonne": "tonne", "тонна": "tonne", "тонны": "tonne", "тонн": "tonne",
+  "компл": "set", "комплект": "set", "упак": "pack", "упаковка": "pack",
+  "л": "litre", "l": "litre", "litre": "litre", "литр": "litre", "литра": "litre", "литров": "litre",
+};
+
+function priceUnitFamily(value) {
+  let normalized = String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) return null;
+  normalized = normalized.replaceAll("²", "2").replaceAll("³", "3").replace(/\.$/, "");
+  return PRICE_UNIT_FAMILIES[normalized] || null;
+}
+
+function priceUnitsCompatible(sourceUnit, priceUnit) {
+  const sourceFamily = priceUnitFamily(sourceUnit);
+  const priceFamily = priceUnitFamily(priceUnit);
+  return sourceFamily !== null && sourceFamily === priceFamily;
+}
+
 function estimatedOfferTotal(offer, intent) {
   const quantity = nonNegativeSourcingNumber(intent?.quantity);
   const price = nonNegativeSourcingNumber(offer?.price);
-  if (quantity === null || price === null) return null;
+  if (quantity === null || price === null || !priceUnitsCompatible(intent?.unit, offer?.price_unit)) return null;
   return (quantity * price).toFixed(2);
 }
 
@@ -1236,9 +1258,9 @@ function renderOfferCard(result, compact = false, intent = null) {
   const conflicts = (result.conflicting_attributes || []).map((key) => `<span class="conflict">Конфликт: ${escapeHtml(key)}</span>`).join("");
   return `<article class="offer-card ${compact ? "compact" : "recommended"}">
     <div class="offer-card-heading">${renderSourcingDecision(decision)}<b>${offerTitleHtml(offer)}</b></div>
-    <div class="offer-price">${formatMoney(offer.price, offer.currency)} <small>/ ${escapeHtml(offer.price_unit || "шт.")}</small></div>
+    <div class="offer-price">${formatMoney(offer.price, offer.currency)} <small>${offer.price_unit ? `/ ${escapeHtml(offer.price_unit)}` : "Единица цены не указана"}</small></div>
     <div class="offer-meta"><span>Поставщик: ${escapeHtml(supplier)}</span><span>${escapeHtml(offer.manufacturer || offer.brand || "Производитель не указан")}</span><span>${escapeHtml(offer.article || "Артикул не указан")}</span><span>${escapeHtml(offer.availability_text || (offer.availability === true ? "В наличии" : "Наличие уточняется"))}</span></div>
-    ${intent?.quantity ? `<div class="offer-total"><span>Количество: <b>${escapeHtml(String(intent.quantity))} ${escapeHtml(intent.unit || "")}</b></span><span>Расчётная стоимость: <b>${total === null ? "требует проверки" : formatMoney(total, offer.currency)}</b></span></div>` : ""}
+    ${intent?.quantity ? `<div class="offer-total"><span>Количество: <b>${escapeHtml(String(intent.quantity))} ${escapeHtml(intent.unit || "")}</b></span><span>Расчётная стоимость: <b>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</b></span></div>` : ""}
     ${matched || conflicts ? `<div class="offer-evidence">${matched}${conflicts}</div>` : ""}
     ${explanation ? `<p class="offer-explanation">${escapeHtml(explanation)}</p>` : ""}
     ${offerUrl ? `<a class="button text" target="_blank" rel="noopener noreferrer" href="${escapeHtml(offerUrl)}">Открыть предложение</a>` : ""}
@@ -1406,16 +1428,20 @@ function renderSourcingResult(result, row = null) {
     const alternativeCurrency = result.alternative_currency || "";
     const matchedUnpriced = sourcingCount(result.matched_unpriced_count);
     const alternativeUnpriced = sourcingCount(result.alternative_unpriced_count);
+    const unitConfirmation = sourcingCount(result.unit_confirmation_count);
     const unresolved = Number(result.unresolved_count ?? ((result.positions_review || 0) + (result.positions_without_offers || 0)));
-    const confirmedIncomplete = matchedUnpriced > 0 || unresolved > 0;
+    const confirmedIncomplete = matchedUnpriced > 0 || unitConfirmation > 0 || unresolved > 0;
     const confirmedLabel = confirmedIncomplete
       ? "Подтверждённая стоимость по позициям с ценой"
       : "Подтверждённая стоимость";
     const unpricedCard = matchedUnpriced || alternativeUnpriced
       ? `<div><small>Без цены</small><b>${escapeHtml(formatUnpricedSummary(matchedUnpriced, alternativeUnpriced))}</b></div>`
       : "";
+    const unitConfirmationCard = unitConfirmation
+      ? `<div><small>Проверить единицу цены</small><b>${unitConfirmation}</b></div>`
+      : "";
     const runMeta = result.run_id ? `<div class="sourcing-run-meta"><span>Поставщик: <b>${escapeHtml(result.provider_label || "Поставщик")}</b></span><span>Версия каталога: <b>${escapeHtml(result.catalog_version || "—")}</b></span><span>Запуск: <b>${escapeHtml(String(result.run_id).slice(0, 10))}</b></span><span>Время: <b>${escapeHtml(formatRecentTimestamp(result.run_completed_at || result.run_created_at))}</b></span></div>` : "";
-     content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${renderProjectSourcingList(result)}`;
+     content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}${unitConfirmationCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${renderProjectSourcingList(result)}`;
     bindSourcingFilters(result);
     return;
   }

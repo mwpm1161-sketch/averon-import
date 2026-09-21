@@ -283,6 +283,7 @@ class ProjectSourcingResult(SourcingModel):
     alternative_currency: str | None = None
     matched_unpriced_count: int = 0
     alternative_unpriced_count: int = 0
+    unit_confirmation_count: int = 0
     unresolved_count: int = 0
     estimated_total: Decimal | None = None
     currency: str | None = None

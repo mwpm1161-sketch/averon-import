@@ -264,6 +264,19 @@ def test_project_sourcing_ui_marks_partial_totals_and_hides_provider_keys():
     assert "sourcingProviderLabel(offer)" in app_js
 
 
+def test_project_sourcing_ui_guards_price_units_in_row_and_summary_totals():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "const PRICE_UNIT_FAMILIES" in app_js
+    assert "function priceUnitsCompatible(sourceUnit, priceUnit)" in app_js
+    assert "!priceUnitsCompatible(intent?.unit, offer?.price_unit)" in app_js
+    assert 'total === null ? "Требует проверки"' in app_js
+    assert 'offer.price_unit ? `/ ${escapeHtml(offer.price_unit)}` : "Единица цены не указана"' in app_js
+    assert "unit_confirmation_count" in app_js
+    assert "Проверить единицу цены" in app_js
+    assert "matchedUnpriced > 0 || unitConfirmation > 0 || unresolved > 0" in app_js
+
+
 def test_project_sourcing_ui_surfaces_review_candidate_before_weak_alternative():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
 

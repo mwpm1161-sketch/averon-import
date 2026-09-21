@@ -34,7 +34,7 @@ from averon_import.services.sourcing.product_understanding import (
 from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
 from averon_import.services.sourcing.providers.base import SourcingProvider
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
-from averon_import.services.sourcing.service import SourcingService
+from averon_import.services.sourcing.service import SourcingService, _units_compatible
 
 
 def make_intent(**updates) -> ProductIntent:
@@ -637,6 +637,130 @@ def test_s15_quantity_times_price_is_calculated_without_mutating_row(tmp_path):
     assert row["quantity"] == "3"
 
 
+@pytest.mark.parametrize(
+    ("source_unit", "price_unit"),
+    [
+        ("шт.", "шт"),
+        ("штуки", "шт."),
+        ("м", "m"),
+        ("м²", "m2"),
+        ("м3", "м³"),
+        ("кг", "kg"),
+        ("т.", "tonne"),
+        ("комплект", "компл."),
+        ("упаковка", "упак"),
+        ("л", "litre"),
+    ],
+)
+def test_price_unit_compatibility_accepts_only_explicit_equivalent_families(source_unit, price_unit):
+    assert _units_compatible(source_unit, price_unit) is True
+
+
+@pytest.mark.parametrize(
+    ("source_unit", "price_unit"),
+    [
+        ("шт.", "упак."),
+        ("шт.", "компл."),
+        ("м", "м²"),
+        ("м²", "м³"),
+        ("кг", "т"),
+        ("неизвестно", "шт."),
+        ("шт.", ""),
+    ],
+)
+def test_price_unit_compatibility_rejects_mismatch_unknown_and_missing(source_unit, price_unit):
+    assert _units_compatible(source_unit, price_unit) is False
+
+
+def test_project_total_with_incompatible_units_is_withheld_without_changing_match(tmp_path):
+    service = service_for(tmp_path, [make_offer(price=Decimal("100"), price_unit="шт.")])
+    result = service.search_project([{
+        "id": "pack-row",
+        "row_type": "item",
+        "name": "Клапан",
+        "quantity": "10",
+        "unit": "упак.",
+    }])
+
+    assert result.positions_matched == 1
+    assert result.results[0].match_results[0].decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
+    assert result.confirmed_totals == {}
+    assert result.confirmed_total is None
+    assert result.unit_confirmation_count == 1
+    assert [notice.code for notice in result.notices].count("PRICE_UNIT_REQUIRES_CONFIRMATION") == 1
+
+
+def test_project_totals_accept_meter_equivalence_and_reject_square_meter(tmp_path):
+    service = SourcingService(
+        {RowOffersProvider.key: RowOffersProvider({
+            "meter": [make_offer(offer_id="meter", price=Decimal("50"), price_unit="м")],
+            "area": [make_offer(offer_id="area", price=Decimal("50"), price_unit="м²")],
+        })},
+        default_provider=RowOffersProvider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(tmp_path / "cache.json"),
+    )
+    result = service.search_project([
+        {"id": "meter", "row_type": "item", "name": "Клапан", "quantity": "100", "unit": "m"},
+        {"id": "area", "row_type": "item", "name": "Клапан", "quantity": "100", "unit": "м"},
+    ])
+
+    assert result.confirmed_totals == {"RUB": Decimal("5000")}
+    assert result.unit_confirmation_count == 1
+
+
+def test_project_total_with_missing_price_unit_requires_confirmation(tmp_path):
+    service = service_for(tmp_path, [make_offer(price=Decimal("100"), price_unit="")])
+    result = service.search_project([{
+        "id": "missing-price-unit",
+        "row_type": "item",
+        "name": "Клапан",
+        "quantity": "10",
+        "unit": "шт.",
+    }])
+
+    assert result.confirmed_totals == {}
+    assert result.unit_confirmation_count == 1
+    assert result.matched_unpriced_count == 0
+
+
+def test_alternative_total_with_incompatible_units_is_withheld(tmp_path):
+    service = service_for(tmp_path, [make_offer(
+        manufacturer="Other",
+        price=Decimal("100"),
+        price_unit="шт.",
+    )])
+    result = service.search_project([{
+        "id": "alternative-pack",
+        "row_type": "item",
+        "name": "Клапан",
+        "manufacturer": "Preferred",
+        "quantity": "10",
+        "unit": "упак.",
+    }])
+
+    assert result.positions_alternatives == 1
+    assert result.alternative_totals == {}
+    assert result.alternative_total is None
+    assert result.unit_confirmation_count == 1
+
+
+def test_untrusted_quantity_is_not_double_counted_as_unit_confirmation(tmp_path):
+    service = service_for(tmp_path, [make_offer(price=Decimal("100"), price_unit="шт.")])
+    result = service.search_project([{
+        "id": "untrusted-quantity",
+        "row_type": "item",
+        "name": "Клапан",
+        "quantity": "10",
+        "unit": "упак.",
+        "quantity_trusted": False,
+    }])
+
+    assert result.confirmed_totals == {}
+    assert result.unit_confirmation_count == 0
+    assert result.matched_unpriced_count == 0
+
+
 def test_s16_unresolved_quantity_never_creates_trusted_total(tmp_path):
     service = service_for(tmp_path, [make_offer(price=Decimal("10"))])
     row = {"id": "q2", "row_type": "item", "name": "Клапан", "quantity": "", "status": "review"}
@@ -652,8 +776,8 @@ def test_s17_multiple_currencies_are_not_summed(tmp_path):
     eur = make_offer(offer_id="eur", title="Насос EUR", price=Decimal("20"), currency="EUR")
     service = service_for(tmp_path, [rub, eur])
     rows = [
-        {"id": "r", "row_type": "item", "name": "Клапан", "quantity": "1"},
-        {"id": "e", "row_type": "item", "name": "Насос", "quantity": "1"},
+        {"id": "r", "row_type": "item", "name": "Клапан", "quantity": "1", "unit": "шт."},
+        {"id": "e", "row_type": "item", "name": "Насос", "quantity": "1", "unit": "шт."},
     ]
     result = service.search_project(rows)
     assert result.estimated_total is None
@@ -731,10 +855,10 @@ def test_project_totals_separate_confirmed_alternative_and_unpriced(tmp_path):
         cache=SourcingCache(tmp_path / "cache.json"),
     )
     rows = [
-        {"id": "confirmed", "row_type": "item", "name": "Клапан", "quantity": "2"},
-        {"id": "alternative", "row_type": "item", "name": "Клапан", "manufacturer": "Preferred", "quantity": "3"},
-        {"id": "unpriced", "row_type": "item", "name": "Насос", "quantity": "1"},
-        {"id": "untrusted", "row_type": "item", "name": "Клапан", "quantity": "2", "status": "review"},
+        {"id": "confirmed", "row_type": "item", "name": "Клапан", "quantity": "2", "unit": "шт."},
+        {"id": "alternative", "row_type": "item", "name": "Клапан", "manufacturer": "Preferred", "quantity": "3", "unit": "шт."},
+        {"id": "unpriced", "row_type": "item", "name": "Насос", "quantity": "1", "unit": "шт."},
+        {"id": "untrusted", "row_type": "item", "name": "Клапан", "quantity": "2", "unit": "шт.", "status": "review"},
     ]
 
     result = service.search_project(rows)
@@ -837,8 +961,8 @@ def test_s20_project_sourcing_aggregates_positions(tmp_path):
     second = make_offer(offer_id="second", title="Насос", price=Decimal("20"))
     service = service_for(tmp_path, [first, second])
     rows = [
-        {"id": "1", "row_type": "item", "name": "Клапан", "quantity": "2"},
-        {"id": "2", "row_type": "item", "name": "Насос", "quantity": "3"},
+        {"id": "1", "row_type": "item", "name": "Клапан", "quantity": "2", "unit": "шт."},
+        {"id": "2", "row_type": "item", "name": "Насос", "quantity": "3", "unit": "шт."},
         {"id": "3", "row_type": "note", "name": "Примечание", "quantity": "1"},
     ]
     result = service.search_project(rows)
