@@ -172,6 +172,36 @@ def test_manual_explicit_source_fields_are_locked_and_row_is_immutable():
     assert resolved.unit == "шт."
 
 
+def test_manual_free_text_never_duplicates_grounded_model_into_article():
+    model = "ПКУ-15-21.121-54У2"
+    row = manual_row(
+        id="manual-free-text-pku",
+        name=f"Пост кнопочный {model}",
+        type_mark="",
+        code="",
+        manufacturer="",
+        quantity="1",
+        unit="шт.",
+    )
+    ai = SourcingAIService(FakeAIService(FakeAIProvider(qwen_payload(
+        row,
+        normalized_name="Пост кнопочный",
+        model=model,
+        article=model,
+    ))))
+
+    result = ai.understand_with_audit(row, build_fallback_intent(row))
+
+    assert result.resolved_intent.model == model
+    assert result.resolved_intent.article == ""
+    assert result.resolved_intent.quantity == "1"
+    assert result.resolved_intent.unit == "шт."
+    assert "ai_cross_field_article_from_model" in result.resolved_intent.uncertainties
+    article_suggestion = next(item for item in result.suggestions if item.field == "article")
+    assert article_suggestion.reason == "proposal_cross_field_identity_alias"
+    assert article_suggestion.resolution.value == "REJECTED_UNGROUNDED"
+
+
 def service_for_manual(tmp_path, offers, ai=None):
     provider = ManualProvider(offers)
     return SourcingService(

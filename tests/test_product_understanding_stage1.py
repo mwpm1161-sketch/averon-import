@@ -270,6 +270,32 @@ def test_cross_field_identity_alias_does_not_promote_model_as_article():
     assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
 
 
+def test_candidate_identity_alias_is_rejected_when_both_source_fields_are_empty():
+    model = "ПКУ-15-21.121-54У2"
+    row = {
+        "id": "manual-free-text-pku",
+        "row_type": "item",
+        "name": f"Пост кнопочный {model}",
+        "type_mark": "",
+        "code": "",
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }
+    result = understand(row, {
+        "normalized_name": "Пост кнопочный",
+        "model": model,
+        "article": model,
+    })
+
+    assert result.resolved_intent.model == model
+    assert result.resolved_intent.article == ""
+    assert "ai_cross_field_article_from_model" in result.resolved_intent.uncertainties
+    suggestion = next(item for item in result.suggestions if item.field == "article")
+    assert suggestion.reason == "proposal_cross_field_identity_alias"
+    assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
+
+
 @pytest.mark.parametrize(
     ("model", "article"),
     [
@@ -326,6 +352,86 @@ def test_cross_field_identity_alias_does_not_promote_article_as_model():
     suggestion = next(item for item in result.suggestions if item.field == "model")
     assert suggestion.reason == "proposal_cross_field_identity_alias"
     assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
+
+
+@pytest.mark.parametrize(
+    ("model", "article"),
+    [
+        ("SOLARIS Life ST 100 /G.1", "ST 100 /G.1"),
+        ("ВКВЭ.110.260.6ТР L=3000мм", "ВКВЭ.110.260.6ТР"),
+    ],
+)
+def test_candidate_identity_partial_alias_is_rejected_without_source_identity(model, article):
+    result = understand({
+        "id": "candidate-partial-alias",
+        "row_type": "item",
+        "name": model,
+        "type_mark": "",
+        "code": "",
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }, {
+        "normalized_name": "Оборудование",
+        "model": model,
+        "article": article,
+    })
+
+    assert result.resolved_intent.model == model
+    assert result.resolved_intent.article == ""
+    assert "ai_cross_field_article_from_model" in result.resolved_intent.uncertainties
+    suggestion = next(item for item in result.suggestions if item.field == "article")
+    assert suggestion.reason == "proposal_cross_field_identity_alias"
+    assert suggestion.resolution == SuggestionResolution.REJECTED_UNGROUNDED
+
+
+def test_distinct_candidate_model_and_article_are_not_rejected_as_alias():
+    result = understand({
+        "id": "candidate-distinct-identities",
+        "row_type": "item",
+        "name": "Оборудование MTR-500 ABC-98765",
+        "type_mark": "",
+        "code": "",
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }, {
+        "normalized_name": "Оборудование",
+        "model": "MTR-500",
+        "article": "ABC-98765",
+    })
+
+    assert result.resolved_intent.model == "MTR-500"
+    assert result.resolved_intent.article == "ABC-98765"
+    assert "ai_cross_field_article_from_model" not in result.resolved_intent.uncertainties
+
+
+def test_single_candidate_model_or_article_remains_eligible_when_source_identity_is_empty():
+    model_result = understand({
+        "id": "candidate-model-only",
+        "row_type": "item",
+        "name": "Оборудование MTR-500",
+        "type_mark": "",
+        "code": "",
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }, {"normalized_name": "Оборудование", "model": "MTR-500", "article": ""})
+    article_result = understand({
+        "id": "candidate-article-only",
+        "row_type": "item",
+        "name": "Оборудование ABC-98765",
+        "type_mark": "",
+        "code": "",
+        "manufacturer": "",
+        "quantity": "1",
+        "unit": "шт.",
+    }, {"normalized_name": "Оборудование", "model": "", "article": "ABC-98765"})
+
+    assert model_result.resolved_intent.model == "MTR-500"
+    assert model_result.resolved_intent.article == ""
+    assert article_result.resolved_intent.model == ""
+    assert article_result.resolved_intent.article == "ABC-98765"
 
 
 def test_p18_product_intent_remains_frozen():

@@ -23,7 +23,7 @@ from averon_import.services.sourcing.models import (
 )
 
 
-PRODUCT_UNDERSTANDING_REVISION = "4"
+PRODUCT_UNDERSTANDING_REVISION = "5"
 
 AI_UNSUPPORTED_ATTRIBUTES_MESSAGE = (
     "AI предложил дополнительные характеристики, которые не используются при сопоставлении."
@@ -507,7 +507,13 @@ def _meaningful_identity_containment(left: str, right: str) -> bool:
     return left_compact in right_compact or right_compact in left_compact
 
 
-def _cross_field_identity_alias(field: str, proposed: str, fallback: ProductIntent) -> str:
+def _cross_field_identity_alias(
+    field: str,
+    proposed: str,
+    fallback: ProductIntent,
+    *,
+    candidate_model: str = "",
+) -> str:
     """Return an audit reason when an identity value crosses model/article fields."""
 
     if not proposed:
@@ -524,6 +530,14 @@ def _cross_field_identity_alias(field: str, proposed: str, fallback: ProductInte
         and fallback.article
         and not fallback.model
         and _meaningful_identity_containment(proposed, fallback.article)
+    ):
+        return "proposal_cross_field_identity_alias"
+    if (
+        field == "article"
+        and not fallback.article
+        and not fallback.model
+        and candidate_model
+        and _meaningful_identity_containment(proposed, candidate_model)
     ):
         return "proposal_cross_field_identity_alias"
     return ""
@@ -550,7 +564,12 @@ def merge_intent_with_source(candidate: ProductIntent, fallback: ProductIntent) 
         proposed = str(getattr(candidate, field) or "").strip()
         if values[field]:
             continue
-        alias_reason = _cross_field_identity_alias(field, proposed, fallback)
+        alias_reason = _cross_field_identity_alias(
+            field,
+            proposed,
+            fallback,
+            candidate_model=str(candidate.model or ""),
+        )
         if alias_reason:
             uncertainties.append(
                 f"ai_cross_field_{field}_from_{'model' if field == 'article' else 'article'}"
@@ -637,7 +656,12 @@ def _audit_suggestions(
         proposed_value = getattr(proposal, field)
         if proposed_value == source_value:
             continue
-        alias_reason = _cross_field_identity_alias(field, str(proposed_value or ""), baseline)
+        alias_reason = _cross_field_identity_alias(
+            field,
+            str(proposed_value or ""),
+            baseline,
+            candidate_model=str(proposal.model or ""),
+        )
         resolved_value = getattr(resolved, field)
         if field in always_locked or (field in explicitly_locked and source_value):
             resolution = SuggestionResolution.SOURCE_LOCKED
