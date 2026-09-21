@@ -32,6 +32,7 @@ from averon_import.services.sourcing.providers.etm_ipro.client import (
     _MAX_SNAPSHOT_BYTES,
 )
 from averon_import.services.sourcing.providers.etm_ipro.provider import (
+    _etm_product_url,
     _goods_detail,
     _goods_record,
     _goods_rows,
@@ -336,7 +337,16 @@ def test_live_single_goods_object_is_normalized_without_sggds_mirror(tmp_path):
     assert len(offer.attributes["params_raw"]) == 1
     assert offer.attributes["country"] == "Россия"
     assert len(offer.attributes["images"]) == 1
-    assert offer.url == ""
+    assert offer.url == "https://www.etm.ru/cat/nn/9536092"
+
+
+@pytest.mark.parametrize("source_item_id", ["../../../evil", "ETM9536092", "", "  "])
+def test_etm_product_url_rejects_non_numeric_source_ids(source_item_id):
+    assert _etm_product_url(source_item_id) == ""
+
+
+def test_etm_product_url_trims_numeric_gds_id():
+    assert _etm_product_url(" 9536092 ") == "https://www.etm.ru/cat/nn/9536092"
 
 
 class MirrorEnrichmentGoodsClient:
@@ -441,6 +451,7 @@ def test_mirror_enrichment_normalizes_goods_before_offer(
     assert offer.attributes["country"] == "Россия"
     assert offer.attributes["params"]["Диаметр"] == "10 мм"
     assert len(offer.attributes["images"]) == 1
+    assert offer.url == "https://www.etm.ru/cat/nn/9536092"
 
 
 def test_mirror_enrichment_rejects_wrong_goods_identity_and_uses_safe_fallback(tmp_path):
@@ -814,7 +825,7 @@ def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp
     assert offer.attributes["min_pack"] == "1"
     assert offer.attributes["certificates"] == [{"type": "сертификат", "number": "CERT-1"}]
     assert offer.attributes["videos"] == [{"url": "/video/a"}]
-    assert offer.url == ""
+    assert offer.url == "https://www.etm.ru/cat/nn/9536092"
 
 
 def test_nested_official_details_feed_deterministic_validator_without_ai(tmp_path):

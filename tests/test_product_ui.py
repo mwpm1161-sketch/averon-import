@@ -220,7 +220,10 @@ def test_sourcing_offer_cards_show_provider_evidence_and_safe_external_link():
     assert "Совпало:" in app_js
     assert "Конфликт:" in app_js
     assert 'target="_blank" rel="noopener noreferrer"' in app_js
-    assert "Открыть предложение" in app_js
+    assert "Открыть у поставщика ↗" in app_js
+    assert "safeOfferUrl(offer?.url)" in app_js
+    assert "target=\"_blank\" rel=\"noopener noreferrer\"" in app_js
+    assert 'provider === "etm_ipro"' not in app_js
     assert "pollSourcingJob" in app_js
     assert "job.current" in app_js
     assert "job.message" in app_js
@@ -300,6 +303,15 @@ def test_project_review_rows_expose_existing_candidates_without_network_actions(
     assert "renderOfferCard(candidate, true, intent)" in app_js
     assert "renderProductUnderstanding(item.understanding)" in app_js
     assert "function renderProjectItemDetails(projectResult, item)" in app_js
+
+
+def test_project_review_candidate_cards_reuse_generic_offer_renderer():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    detail = app_js.split("function renderProjectItemDetails", 1)[1].split("function bindSourcingFilters", 1)[0]
+
+    assert "candidates.map((candidate) => renderOfferCard(candidate, true, intent))" in detail
+    assert "Открыть у поставщика ↗" not in detail
+    assert "provider === \"etm_ipro\"" not in detail
 
 
 def test_project_review_detail_is_local_and_preserves_project_context():

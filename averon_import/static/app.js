@@ -1263,7 +1263,7 @@ function renderOfferCard(result, compact = false, intent = null) {
     ${intent?.quantity ? `<div class="offer-total"><span>Количество: <b>${escapeHtml(String(intent.quantity))} ${escapeHtml(intent.unit || "")}</b></span><span>Расчётная стоимость: <b>${total === null ? "Требует проверки" : formatMoney(total, offer.currency)}</b></span></div>` : ""}
     ${matched || conflicts ? `<div class="offer-evidence">${matched}${conflicts}</div>` : ""}
     ${explanation ? `<p class="offer-explanation">${escapeHtml(explanation)}</p>` : ""}
-    ${offerUrl ? `<a class="button text" target="_blank" rel="noopener noreferrer" href="${escapeHtml(offerUrl)}">Открыть предложение</a>` : ""}
+    ${offerUrl ? `<a class="button text" target="_blank" rel="noopener noreferrer" href="${escapeHtml(offerUrl)}">Открыть у поставщика ↗</a>` : ""}
   </article>`;
 }
 

@@ -29,6 +29,13 @@ from .mirror import (
 from .models import EtmCatalogRecord
 
 
+def _etm_product_url(source_item_id: Any) -> str:
+    value = "" if source_item_id is None else str(source_item_id).strip()
+    if not value or re.fullmatch(r"[0-9]+", value) is None:
+        return ""
+    return f"https://www.etm.ru/cat/nn/{value}"
+
+
 class EtmIproProvider:
     key = "etm_ipro"
     label = "ЭТМ iPRO"
@@ -319,7 +326,7 @@ class EtmIproProvider:
             price_unit=_text(goods_source(raw_detail, "edizm")),
             availability=availability,
             availability_text=availability_text,
-            url="",
+            url=_etm_product_url(goods.source_item_id),
             attributes=attributes,
             data_provenance={
                 "source": self.key,
