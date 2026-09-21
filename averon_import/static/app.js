@@ -1373,17 +1373,42 @@ function projectResultView(item) {
   return {item, offer, decision, total, reason: projectReason(item)};
 }
 
-function renderProjectResultRow(view) {
+function projectReviewCandidates(item) {
+  const candidates = [];
+  const seenOfferIds = new Set();
+  const add = (candidate) => {
+    if (!candidate || candidate.decision === "REJECT" || !candidate.offer) return;
+    const offerId = String(candidate.offer.offer_id || "").trim();
+    if (offerId && seenOfferIds.has(offerId)) return;
+    if (offerId) seenOfferIds.add(offerId);
+    candidates.push(candidate);
+  };
+  add(item.review_candidate);
+  (item.match_results || [])
+    .slice()
+    .sort((left, right) => Number(left.rank ?? Number.MAX_SAFE_INTEGER) - Number(right.rank ?? Number.MAX_SAFE_INTEGER))
+    .forEach(add);
+  return candidates.slice(0, 5);
+}
+
+function projectHasReviewCandidates(item) {
+  return projectDecision(item) === "REVIEW" && projectReviewCandidates(item).length > 0;
+}
+
+function renderProjectResultRow(view, itemIndex) {
   const {item, offer, decision, total, reason} = view;
   const alternative = item.review_candidate
     && item.recommended_offer
     && item.recommended_offer.offer_id !== offer?.offer_id
     ? `<small class="project-result-secondary">Альтернатива: ${offerTitleHtml(item.recommended_offer)}</small>`
     : "";
+  const inspectCandidates = projectHasReviewCandidates(item)
+    ? `<button type="button" class="button text project-review-candidates" data-project-item-index="${itemIndex}">Посмотреть варианты</button>`
+    : "";
   return `<div class="project-result-row" role="row">
     <span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span>
     <span>${escapeHtml(item.intent.quantity || "—")}</span>
-    <span>${offer ? offerTitleHtml(offer) : "Нет подтверждённого предложения"}${alternative}</span>
+    <span>${offer ? offerTitleHtml(offer) : "Нет подтверждённого предложения"}${alternative}${inspectCandidates}</span>
     <span>${offer ? formatMoney(offer.price, offer.currency) : "—"}</span>
     <span>${total === null ? (offer ? "Требует проверки" : "—") : formatMoney(total, offer.currency)}</span>
     <span>${renderSourcingDecision(decision, reason)}</span>
@@ -1396,21 +1421,44 @@ function renderProjectSourcingList(result) {
     ? state.sourcing.projectFilter
     : "all";
   state.sourcing.projectFilter = activeFilter;
-  const views = (result.results || []).map(projectResultView);
+  const views = (result.results || []).map((item, itemIndex) => ({...projectResultView(item), itemIndex}));
   const visible = views.filter((view) => sourcingFilterMatches(view.decision, activeFilter));
   const header = ["Позиция", "Кол-во", "Предложение", "Цена", "Сумма", "Статус", "Поставщик"]
     .map((label) => `<span>${label}</span>`)
     .join("");
   const body = visible.length
-    ? visible.map(renderProjectResultRow).join("")
+    ? visible.map((view) => renderProjectResultRow(view, view.itemIndex)).join("")
     : `<div class="project-result-empty">В этой категории позиций нет.</div>`;
   return `${renderSourcingFilters(activeFilter)}<div class="sourcing-project-list" role="table"><div class="project-result-grid"><div class="project-result-header" role="row">${header}</div>${body}</div></div>`;
+}
+
+function renderProjectItemDetails(projectResult, item) {
+  const content = $("#sourcing-content");
+  const intent = item.intent || {};
+  const candidates = projectReviewCandidates(item);
+  const sourceLabel = intent.normalized_name || intent.source_text || "Позиция без исходного текста";
+  $("#sourcing-subtitle").textContent = "Проверка позиции";
+  content.innerHTML = `<button type="button" class="button text project-results-back">← К результатам подбора</button>
+    <h3>Проверка позиции</h3>
+    <p class="project-item-source">${escapeHtml(sourceLabel)}</p>
+    ${renderProductUnderstanding(item.understanding)}
+    <h3>Варианты для проверки</h3>
+    <div class="offer-grid">${candidates.map((candidate) => renderOfferCard(candidate, true, intent)).join("")}</div>`;
+  $(".project-results-back").addEventListener("click", () => renderSourcingResult(projectResult));
 }
 
 function bindSourcingFilters(result) {
   $("#sourcing-content").querySelectorAll(".sourcing-filter").forEach((button) => button.addEventListener("click", () => {
     state.sourcing.projectFilter = button.dataset.filter || "all";
     renderSourcingResult(result);
+  }));
+}
+
+function bindProjectCandidateActions(result) {
+  $("#sourcing-content").querySelectorAll(".project-review-candidates").forEach((button) => button.addEventListener("click", () => {
+    const itemIndex = Number(button.dataset.projectItemIndex);
+    const item = result.results?.[itemIndex];
+    if (item) renderProjectItemDetails(result, item);
   }));
 }
 
@@ -1441,8 +1489,9 @@ function renderSourcingResult(result, row = null) {
       ? `<div><small>Проверить единицу цены</small><b>${unitConfirmation}</b></div>`
       : "";
     const runMeta = result.run_id ? `<div class="sourcing-run-meta"><span>Поставщик: <b>${escapeHtml(result.provider_label || "Поставщик")}</b></span><span>Версия каталога: <b>${escapeHtml(result.catalog_version || "—")}</b></span><span>Запуск: <b>${escapeHtml(String(result.run_id).slice(0, 10))}</b></span><span>Время: <b>${escapeHtml(formatRecentTimestamp(result.run_completed_at || result.run_created_at))}</b></span></div>` : "";
-     content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}${unitConfirmationCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${renderProjectSourcingList(result)}`;
+    content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>Стоимость альтернатив</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}${unitConfirmationCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${renderProjectSourcingList(result)}`;
     bindSourcingFilters(result);
+    bindProjectCandidateActions(result);
     return;
   }
   const intent = result.intent || {};

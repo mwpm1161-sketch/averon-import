@@ -284,3 +284,57 @@ def test_project_sourcing_ui_surfaces_review_candidate_before_weak_alternative()
     assert "if (item.review_candidate) return item.review_candidate;" in app_js
     assert "result.review_candidate || recommended" in app_js
     assert "Альтернатива:" in app_js
+
+
+def test_project_review_rows_expose_existing_candidates_without_network_actions():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "function projectReviewCandidates(item)" in app_js
+    assert 'projectDecision(item) === "REVIEW"' in app_js
+    assert 'candidate.decision === "REJECT"' in app_js
+    assert "Посмотреть варианты" in app_js
+    assert "data-project-item-index" in app_js
+    assert "item.review_candidate" in app_js
+    assert "item.match_results" in app_js
+    assert "slice(0, 5)" in app_js
+    assert "renderOfferCard(candidate, true, intent)" in app_js
+    assert "renderProductUnderstanding(item.understanding)" in app_js
+    assert "function renderProjectItemDetails(projectResult, item)" in app_js
+
+
+def test_project_review_detail_is_local_and_preserves_project_context():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    detail = app_js.split("function renderProjectItemDetails", 1)[1].split("function bindSourcingFilters", 1)[0]
+
+    assert "project-results-back" in detail
+    assert "← К результатам подбора" in detail
+    assert "renderSourcingResult(projectResult)" in detail
+    assert "api(" not in detail
+    assert "/api/sourcing/search" not in detail
+    assert "/api/sourcing/understand" not in detail
+    assert "recommended_offer" not in detail
+    assert "Рекомендуемое предложение" not in detail
+
+
+def test_project_review_without_candidates_has_no_inspection_action():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    row = app_js.split("function renderProjectResultRow", 1)[1].split("function renderProjectSourcingList", 1)[0]
+
+    assert "projectHasReviewCandidates(item)" in row
+    assert 'class="button text project-review-candidates"' in row
+    assert "projectReviewCandidates(item).length > 0" in app_js
+
+
+def test_project_result_filters_and_totals_remain_on_project_render_path():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+
+    project_render = app_js.split("function renderSourcingResult", 1)[1].split("async function openSourcingForRow", 1)[0]
+    project_list = app_js.split("function renderProjectSourcingList", 1)[1].split("function renderProjectItemDetails", 1)[0]
+    assert "state.sourcing.result = result" in project_render
+    assert "state.sourcing.projectFilter" in project_list
+    assert "renderSourcingFilters(activeFilter)" in project_list
+    assert "renderSourcingNotices(result.notices)" in project_render
+    assert "confirmedTotals" in project_render
+    assert "unitConfirmation" in project_render
+    assert "bindSourcingFilters(result)" in project_render
+    assert "bindProjectCandidateActions(result)" in project_render
