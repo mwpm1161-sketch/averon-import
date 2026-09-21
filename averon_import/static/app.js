@@ -324,6 +324,10 @@ function manualRowValidation(row) {
   return {valid: !errors.length, errors, warnings, quantityTrusted: Boolean(quantity && quantityValid && unit)};
 }
 
+function isBlankManualPlaceholder(row) {
+  return MANUAL_FIELDS.every((key) => !String(row[key] || "").trim());
+}
+
 function manualFeedbackHtml(validation) {
   return [...validation.errors.map((message) => `<span class="manual-error">${escapeHtml(message)}</span>`), ...validation.warnings.map((message) => `<span class="manual-warning">${escapeHtml(message)}</span>`)].join("");
 }
@@ -436,7 +440,8 @@ function applyManualPaste() {
   try {
     const rows = parseManualPaste($("#manual-paste-input").value);
     if (!rows.length) { toast("Вставьте хотя бы одну непустую строку", "error"); return; }
-    state.manual.rows.push(...rows);
+    if (state.manual.rows.length === 1 && isBlankManualPlaceholder(state.manual.rows[0])) state.manual.rows = rows;
+    else state.manual.rows.push(...rows);
     saveManualDraft();
     renderManualRows();
     $("#manual-paste-modal").close();
@@ -478,6 +483,14 @@ function renderManualUnderstandingWarnings(warnings) {
 }
 
 async function openManualUnderstanding(row) {
+  const validation = manualRowValidation(row);
+  if (!validation.valid) {
+    updateManualRowFeedback(row);
+    toast(validation.errors[0], "error");
+    const focusKey = !["name", "type_mark", "code"].some((key) => String(row[key] || "").trim()) ? "name" : "quantity";
+    requestAnimationFrame(() => document.querySelector(`.manual-cell-input[data-manual-id="${CSS.escape(row.id)}"][data-key="${focusKey}"]`)?.focus());
+    return;
+  }
   state.sourcing.row = row;
   state.sourcing.result = null;
   $("#sourcing-subtitle").textContent = "Разбираем ручную позицию…";

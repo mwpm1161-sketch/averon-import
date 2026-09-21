@@ -315,3 +315,27 @@ def test_manual_frontend_has_separate_draft_and_reuses_project_pipeline():
 
     mapping = app.split("function manualRowsForSourcing()", 1)[1].split("function renderManualUnderstandingWarnings", 1)[0]
     assert "source_text" not in mapping
+
+
+def test_manual_frontend_replaces_only_blank_placeholder_on_paste():
+    app = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    paste = app.split("function applyManualPaste()", 1)[1].split("function clearManualDraft", 1)[0]
+
+    assert "function isBlankManualPlaceholder(row)" in app
+    assert "MANUAL_FIELDS.every((key) => !String(row[key] || \"\").trim())" in app
+    assert "state.manual.rows.length === 1 && isBlankManualPlaceholder(state.manual.rows[0])" in paste
+    assert "state.manual.rows = rows" in paste
+    assert "state.manual.rows.push(...rows)" in paste
+
+
+def test_manual_understanding_validates_before_api_and_allows_warning_only_rows():
+    app = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    understanding = app.split("async function openManualUnderstanding(row)", 1)[1].split("async function resumeLastDocument", 1)[0]
+
+    assert "const validation = manualRowValidation(row)" in understanding
+    assert "if (!validation.valid)" in understanding
+    assert "updateManualRowFeedback(row)" in understanding
+    assert 'toast(validation.errors[0], "error")' in understanding
+    assert 'api("/api/sourcing/understand"' in understanding
+    assert understanding.index("if (!validation.valid)") < understanding.index('api("/api/sourcing/understand"')
+    assert "else if (!unit) warnings.push" in app
