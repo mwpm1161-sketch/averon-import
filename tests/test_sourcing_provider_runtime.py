@@ -370,7 +370,7 @@ def test_runtime_factory_preserves_provider_capabilities_and_normalizes_runtime_
     assert local.capabilities == demo.capabilities
     assert local.capabilities == lemana.capabilities
     assert local.capabilities.supports_product_url is True
-    assert etm.capabilities.supports_product_url is False
+    assert etm.capabilities.supports_product_url is True
     assert etm.capabilities.supports_stock_quantity is True
     assert local.capabilities.supports_price is True
     assert local.capabilities.supports_batch_search is False

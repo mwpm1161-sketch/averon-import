@@ -43,7 +43,7 @@ class EtmIproProvider:
     capabilities = SourcingProviderCapabilities(
         supports_price=True,
         supports_availability=True,
-        supports_product_url=False,
+        supports_product_url=True,
         supports_article_search=True,
         supports_model_search=True,
         supports_batch_search=False,
