@@ -242,7 +242,10 @@ class EtmIproProvider:
         offers: list[Offer] = []
         for source_item_id, raw, catalog_record in details:
             if not raw:
-                raw = self.client.get_goods(source_item_id)
+                raw = _goods_row_for_source_item(
+                    self.client.get_goods(source_item_id),
+                    source_item_id,
+                ) or {}
             goods = _goods_record(raw)
             if goods is None:
                 goods = catalog_record
@@ -471,6 +474,16 @@ def _goods_rows(payload: Any) -> list[dict[str, Any]]:
             normalized = _normalize_goods_row(data)
             return [normalized] if normalized is not None else []
     return []
+
+
+def _goods_row_for_source_item(payload: Any, source_item_id: str) -> dict[str, Any] | None:
+    requested = str(source_item_id or "").strip()
+    if not requested:
+        return None
+    for row in _goods_rows(payload):
+        if str(row.get("gdscode") or "").strip() == requested:
+            return row
+    return None
 
 
 def _normalize_goods_rows(rows: Any) -> list[dict[str, Any]]:

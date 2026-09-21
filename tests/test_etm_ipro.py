@@ -339,6 +339,142 @@ def test_live_single_goods_object_is_normalized_without_sggds_mirror(tmp_path):
     assert offer.url == ""
 
 
+class MirrorEnrichmentGoodsClient:
+    configured = True
+
+    def __init__(self, goods_payload):
+        self.goods_payload = goods_payload
+
+    def get_goods(self, source_item_id, *, lookup_type="etm", manufacturer_code=None):
+        return self.goods_payload
+
+    def get_prices(self, source_item_ids):
+        return {
+            "data": [
+                {
+                    "gdscode": source_id,
+                    "pricewnds": "12.50",
+                    "price": "0",
+                    "price_tarif": "0",
+                    "price_retail": "0",
+                }
+                for source_id in source_item_ids
+            ],
+        }
+
+    def get_remains(self, source_item_id):
+        return {"data": {"stores": []}}
+
+
+def mirror_enrichment_provider(tmp_path, goods_payload):
+    mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
+    mirror.sync_snapshot({
+        "data": [catalog_record(
+            "9536092",
+            name="Пост кнопочный из зеркала",
+            article="ET054487",
+            brand="Электротехник",
+        ).model_dump()],
+    })
+    provider = EtmIproProvider(
+        settings(tmp_path), MemorySecretStore(), tmp_path,
+        client=MirrorEnrichmentGoodsClient(goods_payload), mirror=mirror,
+    )
+    return provider
+
+
+@pytest.mark.parametrize(
+    "goods_payload",
+    [
+        {
+            "status": {"code": 200},
+            "data": {
+                "gdsCode": "9536092",
+                "gdsNameTitle": "Пост кнопочный live",
+                "gdsMnfName": "Электротехник",
+                "gdsArt": "ET054487",
+                "gdsUnitName": "шт.",
+                "gdsNameCountry": "Россия",
+                "gdsChars": [{"gdsCharName": "Диаметр", "gdsCharVal": "10 мм"}],
+                "gdsImages": [{"gdsImgSrc": "/images/live.jpg"}],
+            },
+        },
+        {
+            "status": {"code": 200},
+            "data": {
+                "rows": [{
+                    "gdscode": "9536092",
+                    "name": "Пост кнопочный rows",
+                    "mnf_name": "Электротехник",
+                    "art": "ET054487",
+                    "edizm": "шт.",
+                    "gdsNameCountry": "Россия",
+                    "gdsChars": [{"gdsCharName": "Диаметр", "gdsCharVal": "10 мм"}],
+                    "gdsImages": [{"gdsImgSrc": "/images/rows.jpg"}],
+                }],
+            },
+        },
+    ],
+    ids=["single_object", "documented_rows"],
+)
+def test_mirror_enrichment_normalizes_goods_before_offer(
+    tmp_path,
+    goods_payload,
+):
+    provider = mirror_enrichment_provider(tmp_path, goods_payload)
+    offers = provider.search(intent(
+        article="ET054487",
+        manufacturer="",
+        brand="",
+        model="",
+        normalized_name="",
+        search_queries=[],
+    ), limit=1)
+
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer.source_item_id == "9536092"
+    assert offer.article == "ET054487"
+    assert offer.manufacturer == "Электротехник"
+    assert offer.price_unit == "шт."
+    assert offer.attributes["unit"] == "шт."
+    assert offer.attributes["country"] == "Россия"
+    assert offer.attributes["params"]["Диаметр"] == "10 мм"
+    assert len(offer.attributes["images"]) == 1
+
+
+def test_mirror_enrichment_rejects_wrong_goods_identity_and_uses_safe_fallback(tmp_path):
+    provider = mirror_enrichment_provider(tmp_path, {
+        "status": {"code": 200},
+        "data": {
+            "gdsCode": "different-product",
+            "gdsNameTitle": "Wrong product",
+            "gdsMnfName": "Wrong manufacturer",
+            "gdsArt": "WRONG-ARTICLE",
+            "gdsUnitName": "упак.",
+            "gdsChars": [{"gdsCharName": "Private", "gdsCharVal": "wrong"}],
+        },
+    })
+
+    offers = provider.search(intent(
+        article="ET054487",
+        manufacturer="",
+        brand="",
+        model="",
+        normalized_name="",
+        search_queries=[],
+    ), limit=1)
+
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer.source_item_id == "9536092"
+    assert offer.article == "ET054487"
+    assert offer.manufacturer == "Электротехник"
+    assert offer.price_unit == ""
+    assert offer.attributes["unit"] == ""
+    assert offer.attributes["params_raw"] == {}
+
+
 def test_live_price_rows_select_exact_product_and_preserve_price_semantics(tmp_path):
     provider, _ = configured_provider(tmp_path)
     positive_payload = {
