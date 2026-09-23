@@ -75,8 +75,7 @@ def auth_config() -> AuthConfig:
 
 
 def _auth_error(status_code: int, detail: str) -> HTTPException:
-    headers = {"WWW-Authenticate": "Basic"} if status_code == 401 else None
-    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 def _valid_username(value: str) -> bool:
@@ -119,7 +118,22 @@ def _local_dev_user(request: Request, config: AuthConfig) -> CurrentUser:
     if not _valid_username(config.dev_user):
         raise _auth_error(503, "Локальный режим аутентификации не настроен")
     client_host = request.client.host if request.client else ""
-    if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise _auth_error(401, "Требуется аутентификация")
+    host_header = request.headers.get("host", "").strip().casefold()
+    if host_header.startswith("["):
+        closing = host_header.find("]")
+        hostname = host_header[1:closing] if closing >= 0 else ""
+        port = host_header[closing + 1:] if closing >= 0 else "invalid"
+        if port and (not port.startswith(":") or not port[1:].isdigit()):
+            hostname = ""
+    elif host_header.count(":") == 1:
+        hostname, port = host_header.rsplit(":", 1)
+        if not port.isdigit():
+            hostname = ""
+    else:
+        hostname = host_header
+    if hostname.rstrip(".") not in {"localhost", "127.0.0.1", "::1"}:
         raise _auth_error(401, "Требуется аутентификация")
     return CurrentUser(username=config.dev_user, role=Role.ADMIN)
 

@@ -727,7 +727,7 @@ def sync_lemana_b2b():
     return job_service.submit(run).public()
 
 
-@app.get("/api/sourcing/providers/etm_ipro/health", dependencies=[Depends(require_authenticated)])
+@app.get("/api/sourcing/providers/etm_ipro/health", dependencies=[Depends(require_admin)])
 def etm_ipro_health():
     provider = sourcing_service.provider("etm_ipro")
     health_method = getattr(provider, "health", None)
@@ -763,7 +763,7 @@ def start_etm_ipro_catalog_sync():
     return job_service.submit(lambda progress: _sourcing_payload(method())).public()
 
 
-@app.get("/api/sourcing/providers/etm_ipro/catalog/status", dependencies=[Depends(require_authenticated)])
+@app.get("/api/sourcing/providers/etm_ipro/catalog/status", dependencies=[Depends(require_admin)])
 def etm_ipro_catalog_status():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "catalog_sync_status", None)

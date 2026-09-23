@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from fastapi.routing import APIRoute
 
 
 PROXY_SECRET = "proxy-secret-for-tests"
@@ -119,6 +120,7 @@ def test_invalid_proxy_assertion_is_unauthorized(auth_client):
     )
 
     assert response.status_code == 401
+    assert "www-authenticate" not in response.headers
 
 
 def test_valid_user_and_admin_identity(auth_client):
@@ -161,7 +163,9 @@ def test_client_role_header_is_ignored(auth_client):
         ("delete", "/api/settings/etm-ipro-login", {}),
         ("delete", "/api/settings/etm-ipro-password", {}),
         ("post", "/api/sourcing/providers/etm_ipro/manufacturers/sync", {}),
+        ("get", "/api/sourcing/providers/etm_ipro/health", {}),
         ("post", "/api/sourcing/providers/etm_ipro/catalog/sync", {}),
+        ("get", "/api/sourcing/providers/etm_ipro/catalog/status", {}),
         ("post", "/api/sourcing/providers/etm_ipro/catalog/import", {}),
         ("post", "/api/sourcing/providers/etm_ipro/catalog/reindex", {}),
         ("post", "/api/sourcing/providers/lemana_b2b/sync", {}),
@@ -190,7 +194,13 @@ def test_admin_provider_maintenance_endpoints_remain_available(auth_client, monk
         def sync_manufacturers(self):
             return 1
 
+        def health(self):
+            return {"available": True}
+
         def start_catalog_sync(self):
+            return {"state": 0}
+
+        def catalog_sync_status(self):
             return {"state": 0}
 
         def import_completed_catalog(self, progress):
@@ -213,7 +223,9 @@ def test_admin_provider_maintenance_endpoints_remain_available(auth_client, monk
     checks = [
         ("/api/sourcing/providers/lemana_b2b/sync", "post"),
         ("/api/sourcing/providers/etm_ipro/manufacturers/sync", "post"),
+        ("/api/sourcing/providers/etm_ipro/health", "get"),
         ("/api/sourcing/providers/etm_ipro/catalog/sync", "post"),
+        ("/api/sourcing/providers/etm_ipro/catalog/status", "get"),
         ("/api/sourcing/providers/etm_ipro/catalog/import", "post"),
         ("/api/sourcing/providers/etm_ipro/catalog/reindex", "post"),
     ]
@@ -328,13 +340,66 @@ def test_explicit_local_dev_mode_is_the_only_synthetic_admin_path(monkeypatch):
     monkeypatch.setenv("AVERON_DEV_USER", "desktop-admin")
     scope = {
         "type": "http",
-        "headers": [],
+        "headers": [(b"host", b"localhost:8765")],
         "client": ("127.0.0.1", 8765),
     }
     user = resolve_current_user(Request(scope))
 
     assert user.username == "desktop-admin"
     assert user.role is Role.ADMIN
+
+
+@pytest.mark.parametrize("host", ["localhost:8765", "127.0.0.1:8765", "[::1]:8765"])
+def test_local_dev_accepts_loopback_hostnames(monkeypatch, host):
+    from averon_import.services.auth import Role, resolve_current_user
+    from starlette.requests import Request
+
+    monkeypatch.setenv("AVERON_AUTH_MODE", "local_dev")
+    scope = {
+        "type": "http",
+        "headers": [(b"host", host.encode("ascii"))],
+        "client": ("127.0.0.1", 8765),
+    }
+
+    user = resolve_current_user(Request(scope))
+
+    assert user.role is Role.ADMIN
+
+
+def test_local_dev_rejects_public_host_from_loopback_client(monkeypatch):
+    from averon_import.services.auth import resolve_current_user
+    from starlette.requests import Request
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("AVERON_AUTH_MODE", "local_dev")
+    scope = {
+        "type": "http",
+        "headers": [(b"host", b"averon.nvss-home-new.ru")],
+        "client": ("127.0.0.1", 8765),
+    }
+
+    with pytest.raises(HTTPException) as error:
+        resolve_current_user(Request(scope))
+
+    assert error.value.status_code == 401
+
+
+def test_local_dev_rejects_remote_client_even_with_loopback_host(monkeypatch):
+    from averon_import.services.auth import resolve_current_user
+    from starlette.requests import Request
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("AVERON_AUTH_MODE", "local_dev")
+    scope = {
+        "type": "http",
+        "headers": [(b"host", b"localhost:8765")],
+        "client": ("192.0.2.10", 8765),
+    }
+
+    with pytest.raises(HTTPException) as error:
+        resolve_current_user(Request(scope))
+
+    assert error.value.status_code == 401
 
 
 def test_trusted_proxy_without_server_secret_fails_closed(auth_client, monkeypatch):
@@ -346,3 +411,23 @@ def test_trusted_proxy_without_server_secret_fails_closed(auth_client, monkeypat
     )
 
     assert response.status_code == 503
+
+
+def test_every_api_route_requires_application_authentication(auth_client):
+    from averon_import import main
+    from averon_import.services.auth import require_admin, require_authenticated
+
+    def has_auth_dependency(dependant):
+        if dependant.call in {require_authenticated, require_admin}:
+            return True
+        return any(has_auth_dependency(child) for child in dependant.dependencies)
+
+    unauthenticated = [
+        route.path
+        for route in main.app.routes
+        if isinstance(route, APIRoute)
+        and route.path.startswith("/api/")
+        and not has_auth_dependency(route.dependant)
+    ]
+
+    assert unauthenticated == []
