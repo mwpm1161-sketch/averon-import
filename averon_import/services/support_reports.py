@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -28,6 +29,7 @@ _FORBIDDEN_KEY_MARKERS = (
 )
 _ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
 _OMIT = object()
+logger = logging.getLogger(__name__)
 
 
 class SupportError(Exception):
@@ -89,6 +91,13 @@ def _safe_snapshot_value(value: Any, key: str = "") -> Any:
             return "[REDACTED_PATH]"
         return value
     return str(value)
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Unable to clean up support snapshot artifact")
 
 
 class SupportRepository:
@@ -266,8 +275,8 @@ class SupportRepository:
             }
         except Exception:
             if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-            snapshot_path.unlink(missing_ok=True)
+                _best_effort_unlink(temporary_path)
+            _best_effort_unlink(snapshot_path)
             raise
 
     def get_incident(self, incident_id: str) -> dict[str, Any]:

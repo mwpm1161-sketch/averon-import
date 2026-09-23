@@ -680,6 +680,13 @@ def _safe_export_validation_message(error: ValueError) -> str:
     return message
 
 
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Unable to clean up temporary export artifact")
+
+
 def _export_error_response(
     *,
     status_code: int,
@@ -823,7 +830,7 @@ def export(
         )
     finally:
         if temporary_output is not None:
-            temporary_output.unlink(missing_ok=True)
+            _best_effort_unlink(temporary_output)
     return FileResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

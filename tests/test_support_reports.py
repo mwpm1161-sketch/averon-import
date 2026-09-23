@@ -191,6 +191,12 @@ def test_success_export_keeps_file_behavior_and_creates_no_incident(support_cont
 
     assert response.status_code == 200
     assert response.content[:2] == b"PK"
+    with repository._connect() as connection:
+        incident_count = connection.execute("SELECT COUNT(*) FROM export_incidents").fetchone()[0]
+        report_count = connection.execute("SELECT COUNT(*) FROM support_reports").fetchone()[0]
+    assert incident_count == 0
+    assert list(repository.incidents_dir.glob("*.json")) == []
+    assert report_count == 0
     assert repository.list_reports(limit=100, offset=0) == []
     assert (workspace.exports_dir / "success.xlsx").is_file()
 
@@ -251,6 +257,38 @@ def test_unexpected_export_error_is_generic_and_snapshot_has_no_raw_error(suppor
     assert "private" not in snapshot_text
 
 
+def test_export_cleanup_failure_does_not_mask_safe_error(support_context, monkeypatch):
+    client, main, repository, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+
+    def fail_export(*args, **kwargs):
+        raise ValueError("Не удалось проверить экспорт")
+
+    original_unlink = Path.unlink
+
+    def fail_temp_unlink(path, missing_ok=False):
+        if path.name.startswith(".averon-export-"):
+            raise PermissionError("diagnostic cleanup failure")
+        return original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(main.export_service, "export", fail_export)
+    monkeypatch.setattr(Path, "unlink", fail_temp_unlink)
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("colleague"),
+        json=_export_payload(),
+    )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["detail"] == "Не удалось проверить экспорт"
+    assert payload["error"]["code"] == "EXPORT_VALIDATION_FAILED"
+    assert payload["error"]["incident_id"]
+    assert payload["error"]["reportable"] is True
+    assert "diagnostic cleanup failure" not in response.text
+    assert repository.get_incident(payload["error"]["incident_id"])["error_code"] == "EXPORT_VALIDATION_FAILED"
+
+
 def test_support_persistence_failure_does_not_mask_export_error(support_context, monkeypatch):
     client, main, _, workspace_service, _ = support_context
     workspace = _make_workspace(workspace_service)
@@ -304,6 +342,9 @@ def test_failed_export_preserves_previous_file_and_removes_temp_file(support_con
 def test_snapshot_is_immutable_and_hash_matches(support_context, monkeypatch):
     client, main, repository, workspace_service, _ = support_context
     workspace = _make_workspace(workspace_service)
+    source_pdf = workspace.root / "source.pdf"
+    source_pdf.write_bytes(b"%PDF-test-source")
+    source_pdf_before = source_pdf.read_bytes()
 
     monkeypatch.setattr(main.export_service, "export", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("bad export")))
     request_payload = _export_payload()
@@ -323,7 +364,96 @@ def test_snapshot_is_immutable_and_hash_matches(support_context, monkeypatch):
     snapshot = json.loads(after.decode("utf-8"))
     assert snapshot["export_request"] == request_payload
     assert snapshot["page_statuses"]["1"]["output_status"] == "USABLE"
-    assert not (workspace.root / "source.pdf").exists()
+    assert source_pdf.exists()
+    assert source_pdf.read_bytes() == source_pdf_before
+    assert len(list(repository.incidents_dir.glob("*.json"))) == 1
+    assert list(repository.support_dir.rglob("*.pdf")) == []
+
+
+def test_snapshot_sanitizes_nested_secrets_and_paths_without_losing_rows(support_context):
+    _, _, repository, _, _ = support_context
+    incident = repository.create_export_incident(
+        document_id="d" * 32,
+        username="colleague",
+        role="user",
+        app_version="test-version",
+        export_kind="production",
+        requested_filename="failed.xlsx",
+        row_count=1,
+        document={"filename": "specification.pdf", "page_count": 1, "size": 10},
+        export_request={
+            "columns": ["name", "quantity", "unit"],
+            "rows": [{
+                "name": "Насос",
+                "quantity": "2",
+                "unit": "шт",
+                "nested": {
+                    "api_key": "api-secret",
+                    "password": "password-secret",
+                    "proxy_token": "proxy-secret",
+                    "authorization": "Bearer secret",
+                    "windows_path": "C:\\private\\source.pdf",
+                    "linux_path": "/var/lib/averon/source.pdf",
+                },
+            }],
+        },
+        page_statuses={},
+        result_summary={},
+        resolved_filename="failed.xlsx",
+        error_code="EXPORT_FAILED",
+        public_message="Не удалось сформировать Excel.",
+        http_status=500,
+    )
+
+    snapshot_path = repository.incidents_dir / f"{incident['incident_id']}.json"
+    snapshot_text = snapshot_path.read_text(encoding="utf-8")
+    snapshot = json.loads(snapshot_text)
+    row = snapshot["export_request"]["rows"][0]
+    assert row["name"] == "Насос"
+    assert row["quantity"] == "2"
+    assert row["unit"] == "шт"
+    assert "api_key" not in snapshot_text
+    assert "password" not in snapshot_text
+    assert "proxy-secret" not in snapshot_text
+    assert "Bearer secret" not in snapshot_text
+    assert "C:\\private\\source.pdf" not in snapshot_text
+    assert "/var/lib/averon/source.pdf" not in snapshot_text
+    assert "[REDACTED_PATH]" in snapshot_text
+
+
+def test_snapshot_cleanup_failure_does_not_mask_persistence_error(support_context, monkeypatch):
+    _, _, repository, _, _ = support_context
+
+    def fail_connect():
+        raise RuntimeError("primary persistence failure")
+
+    def fail_unlink(path, missing_ok=False):
+        raise PermissionError("diagnostic snapshot cleanup failure")
+
+    monkeypatch.setattr(repository, "_connect", fail_connect)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(RuntimeError, match="primary persistence failure"):
+        repository.create_export_incident(
+            document_id="d" * 32,
+            username="colleague",
+            role="user",
+            app_version="test-version",
+            export_kind="production",
+            requested_filename="failed.xlsx",
+            row_count=1,
+            document={"filename": "specification.pdf"},
+            export_request=_export_payload(),
+            page_statuses={},
+            result_summary={},
+            resolved_filename="failed.xlsx",
+            error_code="EXPORT_FAILED",
+            public_message="Не удалось сформировать Excel.",
+            http_status=500,
+        )
+
+    monkeypatch.undo()
+    with repository._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM export_incidents").fetchone()[0] == 0
 
 
 def test_support_report_validates_ownership_duplicate_and_restart(support_context):
