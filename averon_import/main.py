@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import re
 import tempfile
@@ -11,13 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from starlette.requests import Request
 from typing import Any, Literal
 
@@ -62,6 +63,16 @@ from averon_import.services.secrets import (
     create_secret_store,
     resolve_secret,
 )
+from averon_import.services.support_reports import (
+    DuplicateReport,
+    IncidentNotFound,
+    REPORT_STATUSES,
+    ReportForbidden,
+    ReportNotFound,
+    SnapshotUnavailable,
+    StaleReport,
+    SupportRepository,
+)
 from averon_import.services.sourcing.demo_catalog import (
     DEMO_CATALOG_NOTICE,
     DEMO_CATALOG_SOURCE,
@@ -73,6 +84,7 @@ from averon_import.services.workspace import WorkspaceService
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
+logger = logging.getLogger(__name__)
 
 
 def _static_asset_revision(filename: str) -> str:
@@ -98,6 +110,7 @@ def default_data_dir() -> Path:
 
 DATA_DIR = default_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+support_repository = SupportRepository(DATA_DIR / "support")
 
 pdf_service = PdfService()
 workspace_service = WorkspaceService(DATA_DIR)
@@ -635,8 +648,100 @@ def review_export_filename(value: str) -> str:
     return safe_filename(f"{path.stem}_review.xlsx")
 
 
+def _safe_document_snapshot_metadata(workspace) -> dict[str, Any]:
+    try:
+        metadata = workspace_service.read_json(workspace.metadata_path, default={})
+    except (OSError, ValueError, TypeError):
+        metadata = {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    filename = Path(str(metadata.get("filename") or "document.pdf")).name
+    if not filename.lower().endswith(".pdf"):
+        filename = "document.pdf"
+    try:
+        page_count = max(0, int(metadata.get("page_count") or 0))
+    except (TypeError, ValueError):
+        page_count = 0
+    try:
+        size = max(0, int(metadata.get("size") or 0))
+    except (TypeError, ValueError):
+        size = 0
+    return {
+        "filename": filename,
+        "title": str(metadata.get("title") or Path(filename).stem)[:500],
+        "page_count": page_count,
+        "size": size,
+    }
+
+
+def _safe_export_validation_message(error: ValueError) -> str:
+    message = str(error).strip()
+    if not message or len(message) > 500 or re.search(r"(?:[A-Za-z]:[\\/]|\\\\|/)", message):
+        return "Не удалось выполнить проверку экспорта."
+    return message
+
+
+def _export_error_response(
+    *,
+    status_code: int,
+    error_code: str,
+    message: str,
+    incident_id: str | None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": message,
+            "error": {
+                "code": error_code,
+                "incident_id": incident_id,
+                "reportable": incident_id is not None,
+            },
+        },
+    )
+
+
+def _record_export_incident(
+    *,
+    document_id: str,
+    user: CurrentUser,
+    request: ExportRequest,
+    workspace,
+    stored_result: dict[str, Any],
+    resolved_filename: str,
+    error_code: str,
+    public_message: str,
+    http_status: int,
+) -> str | None:
+    try:
+        incident = support_repository.create_export_incident(
+            document_id=document_id,
+            username=user.username,
+            role=user.role.value,
+            app_version=APP_VERSION,
+            export_kind="review" if request.review_export else "production",
+            requested_filename=safe_filename(request.filename),
+            row_count=len(request.rows),
+            document=_safe_document_snapshot_metadata(workspace),
+            export_request=request.model_dump(mode="json"),
+            page_statuses=stored_result.get("page_statuses") or {},
+            result_summary=stored_result.get("summary") or {},
+            resolved_filename=resolved_filename,
+            error_code=error_code,
+            public_message=public_message,
+            http_status=http_status,
+        )
+        return str(incident["incident_id"])
+    except Exception:
+        logger.exception("Unable to persist export failure incident for document %s", document_id)
+        return None
+
+
 @app.post("/api/documents/{document_id}/export", dependencies=[Depends(require_authenticated)])
-def export(document_id: str, request: ExportRequest):
+def export(
+    document_id: str,
+    request: ExportRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
     try:
         workspace = workspace_service.get(document_id)
     except FileNotFoundError as exc:
@@ -647,13 +752,27 @@ def export(document_id: str, request: ExportRequest):
         if request.review_export
         else safe_filename(request.filename)
     )
-    output = workspace.exports_dir / filename
+    output: Path | None = None
+    temporary_output: Path | None = None
+    stored_result: dict[str, Any] = {}
     try:
-        stored_result = workspace_service.read_json(workspace.result_path, default={})
+        try:
+            stored_result = workspace_service.read_json(workspace.result_path, default={})
+        except Exception as exc:
+            raise RuntimeError("Не удалось прочитать состояние экспорта") from exc
+        stored_result = stored_result if isinstance(stored_result, dict) else {}
+        output = workspace.exports_dir / filename
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".averon-export-",
+            suffix=".tmp",
+            dir=workspace.exports_dir,
+        )
+        os.close(file_descriptor)
+        temporary_output = Path(temporary_name)
         export_service.export(
             rows=request.rows,
             columns=request.columns,
-            output_path=output,
+            output_path=temporary_output,
             sheet_name=request.sheet_name,
             include_headers=request.include_headers,
             only_exportable=request.only_exportable,
@@ -661,13 +780,226 @@ def export(document_id: str, request: ExportRequest):
             review_export=request.review_export,
             enforce_safety=not request.review_export,
         )
+        os.replace(temporary_output, output)
+        temporary_output = None
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        public_message = _safe_export_validation_message(exc)
+        incident_id = _record_export_incident(
+            document_id=document_id,
+            user=user,
+            request=request,
+            workspace=workspace,
+            stored_result=stored_result,
+            resolved_filename=filename,
+            error_code="EXPORT_VALIDATION_FAILED",
+            public_message=public_message,
+            http_status=400,
+        )
+        return _export_error_response(
+            status_code=400,
+            error_code="EXPORT_VALIDATION_FAILED",
+            message=public_message,
+            incident_id=incident_id,
+        )
+    except Exception:
+        logger.exception("Unexpected export failure for document %s", document_id)
+        public_message = "Не удалось сформировать Excel."
+        incident_id = _record_export_incident(
+            document_id=document_id,
+            user=user,
+            request=request,
+            workspace=workspace,
+            stored_result=stored_result,
+            resolved_filename=filename,
+            error_code="EXPORT_FAILED",
+            public_message=public_message,
+            http_status=500,
+        )
+        return _export_error_response(
+            status_code=500,
+            error_code="EXPORT_FAILED",
+            message=public_message,
+            incident_id=incident_id,
+        )
+    finally:
+        if temporary_output is not None:
+            temporary_output.unlink(missing_ok=True)
     return FileResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename,
     )
+
+
+class SupportReportCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str = Field(min_length=1, max_length=128)
+    reporter_fio: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=5000)
+
+    @model_validator(mode="after")
+    def normalize_text(self):
+        self.incident_id = self.incident_id.strip()
+        self.reporter_fio = self.reporter_fio.strip()
+        self.description = self.description.strip()
+        if len(self.reporter_fio) < 3:
+            raise ValueError("ФИО должно содержать не менее 3 символов")
+        if len(self.description) < 20:
+            raise ValueError("Описание должно содержать не менее 20 символов")
+        return self
+
+
+class SupportReportStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["OPEN", "IN_PROGRESS", "RESOLVED"]
+    version: int = Field(ge=1)
+
+
+def _document_available(document_id: str) -> bool:
+    try:
+        return workspace_service.get(document_id).root.is_dir()
+    except FileNotFoundError:
+        return False
+
+
+def _public_support_report(report: dict[str, Any]) -> dict[str, Any]:
+    incident_id = str(report["incident_id"])
+    incident = {
+        "incident_id": incident_id,
+        "document_id": report["document_id"],
+        "created_at": report["incident_created_at"],
+        "username": report["username"],
+        "role": report["role"],
+        "stage": report["stage"],
+        "error_code": report["error_code"],
+        "public_message": report["public_message"],
+        "http_status": report["http_status"],
+        "app_version": report["app_version"],
+        "export_kind": report["export_kind"],
+        "requested_filename": report["requested_filename"],
+        "row_count": report["row_count"],
+        "snapshot_sha256": report["snapshot_sha256"],
+        "document_available": _document_available(str(report["document_id"])),
+    }
+    return {
+        "report_id": report["report_id"],
+        "incident_id": incident_id,
+        "reporter_fio": report["reporter_fio"],
+        "description": report.get("description"),
+        "status": report["status"],
+        "created_at": report["created_at"],
+        "updated_at": report["updated_at"],
+        "version": report["version"],
+        "incident": incident,
+    }
+
+
+def _public_support_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "report_id": report["report_id"],
+        "incident_id": report["incident_id"],
+        "reporter_fio": report["reporter_fio"],
+        "status": report["status"],
+        "created_at": report["created_at"],
+        "updated_at": report["updated_at"],
+        "version": report["version"],
+        "document_id": report["document_id"],
+        "username": report["username"],
+        "error_code": report["error_code"],
+        "public_message": report["public_message"],
+        "row_count": report["row_count"],
+    }
+
+
+@app.post("/api/support/reports", dependencies=[Depends(require_authenticated)])
+def create_support_report(
+    request: SupportReportCreateRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    try:
+        report = support_repository.create_report(
+            incident_id=request.incident_id,
+            reporter_fio=request.reporter_fio,
+            description=request.description,
+            username=user.username,
+        )
+    except IncidentNotFound as exc:
+        raise HTTPException(404, "Инцидент не найден") from exc
+    except ReportForbidden as exc:
+        raise HTTPException(403, "Недостаточно прав для этого инцидента") from exc
+    except DuplicateReport as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Отчёт по этому инциденту уже существует",
+                "error": {"code": "SUPPORT_REPORT_EXISTS", "report_id": exc.report_id},
+            },
+        )
+    return _public_support_report(report)
+
+
+@app.get("/api/admin/support/reports", dependencies=[Depends(require_admin)])
+def list_support_reports(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    status: str | None = Query(default=None),
+):
+    if status is not None and status not in REPORT_STATUSES:
+        raise HTTPException(400, "Недопустимый статус отчёта")
+    reports = support_repository.list_reports(limit=limit, offset=offset, status=status)
+    return {
+        "reports": [_public_support_summary(report) for report in reports],
+        "limit": limit,
+        "offset": offset,
+        "status": status,
+    }
+
+
+@app.get("/api/admin/support/reports/{report_id}", dependencies=[Depends(require_admin)])
+def get_support_report(report_id: str):
+    try:
+        return _public_support_report(support_repository.get_report(report_id))
+    except ReportNotFound as exc:
+        raise HTTPException(404, "Отчёт не найден") from exc
+
+
+@app.get("/api/admin/support/reports/{report_id}/snapshot", dependencies=[Depends(require_admin)])
+def get_support_snapshot(report_id: str):
+    try:
+        return support_repository.snapshot_for_report(report_id)
+    except ReportNotFound as exc:
+        raise HTTPException(404, "Отчёт не найден") from exc
+    except SnapshotUnavailable as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Снимок инцидента недоступен",
+                "error": {"code": "SNAPSHOT_UNAVAILABLE"},
+            },
+        )
+
+
+@app.patch("/api/admin/support/reports/{report_id}", dependencies=[Depends(require_admin)])
+def update_support_report(report_id: str, request: SupportReportStatusRequest):
+    try:
+        report = support_repository.update_report_status(
+            report_id=report_id,
+            status=request.status,
+            version=request.version,
+        )
+    except ReportNotFound as exc:
+        raise HTTPException(404, "Отчёт не найден") from exc
+    except StaleReport as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "Версия отчёта устарела",
+                "error": {"code": "STALE_REPORT_VERSION"},
+            },
+        )
+    return _public_support_report(report)
 
 
 class SourcingRowRequest(BaseModel):
