@@ -19,6 +19,7 @@ const state = {
   settings: null,
   sourcing: {row: null, result: null, projectFilter: "all"},
   sourcingHealth: null,
+  currentUser: null,
   recentDocuments: [],
   manual: {active: false, rows: []},
 };
@@ -80,18 +81,25 @@ function bytes(value) {
 
 async function boot() {
   try {
-    const [config, health, settings] = await Promise.all([
+    const currentUser = await api("/api/me");
+    state.currentUser = currentUser;
+    const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
+    $("#settings-button").hidden = !isAdmin;
+    const [config, health] = await Promise.all([
       api("/api/config"),
       api("/api/health"),
-      api("/api/settings"),
     ]);
     state.config = config;
-    state.settings = settings;
     state.sourcingHealth = health.sourcing || null;
     const ocr = health.cloud_ocr;
     state.ocrHealth = ocr;
     updateCloudStatus();
-    initializeSettings(settings);
+    if (isAdmin) {
+      state.settings = await api("/api/settings");
+      initializeSettings(state.settings);
+    } else {
+      state.settings = null;
+    }
     populateFilters();
     initializeExportColumns();
     loadManualDraft();
@@ -1919,6 +1927,7 @@ function setupEvents() {
   $("#recognize-button").addEventListener("click",startRecognition);
   $("#new-document-button").addEventListener("click",resetApp);
   $("#settings-button").addEventListener("click",()=>{
+    if (String(state.currentUser?.role || "").toLowerCase() !== "admin") return;
     initializeSettings(state.settings || {});
     $("#settings-modal").showModal();
   });

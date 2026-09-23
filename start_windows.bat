@@ -6,6 +6,10 @@ title Averon Import
 set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
 set "RUN_FILE=%CD%\run.py"
 
+rem Explicit developer-only auth mode; production must use trusted_proxy.
+set "AVERON_AUTH_MODE=local_dev"
+set "AVERON_DEV_USER=local-admin"
+
 if not exist "%PYTHON_EXE%" goto :missing_python
 if not exist "%RUN_FILE%" goto :missing_run
 

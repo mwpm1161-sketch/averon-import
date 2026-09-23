@@ -64,6 +64,11 @@ install_accurate_ocr_models.bat
 
 Несмотря на браузерный интерфейс, PDF, OCR и Excel обрабатываются локально.
 
+`start_windows.bat` явно включает только локальный developer auth mode с
+синтетическим ADMIN-пользователем. В production этот режим не использовать:
+по умолчанию приложение ожидает trusted proxy headers от Caddy, а
+`AVERON_ADMIN_USERS` задаёт список ADMIN-пользователей.
+
 ## Хранение данных
 
 В Windows рабочие данные находятся в:

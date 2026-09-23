@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -32,6 +34,7 @@ from averon_import.core.constants import (
 )
 from averon_import.core.schemas import ExportRequest, RecognitionRequest, SaveRowsRequest
 from averon_import.services.app_settings import PROCESSING_MODES, AppSettingsService
+from averon_import.services.auth import CurrentUser, require_admin, require_authenticated
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
@@ -136,12 +139,18 @@ def _rebuild_sourcing_runtime() -> None:
     demo_store_provider = sourcing_runtime.providers["demo_store_http"]
     sourcing_service = sourcing_runtime.service
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url="/api/docs")
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_authenticated)])
 def index(request: Request):
     return templates.TemplateResponse(
         request=request,
@@ -155,7 +164,7 @@ def index(request: Request):
     )
 
 
-@app.get("/api/health")
+@app.get("/api/health", dependencies=[Depends(require_authenticated)])
 def health():
     return {
         "app": APP_NAME,
@@ -164,16 +173,27 @@ def health():
         "cloud_ocr": yandex_vision_provider.health(),
         "ai": ai_service.health(),
         "sourcing": sourcing_service.health(),
-        "data_dir": str(DATA_DIR),
-        "settings": {
-            "warnings": app_settings_service.warnings_snapshot(),
-            "secret_backend": secret_store.backend_name,
-            "secret_insecure": secret_store.is_insecure,
-        },
     }
 
 
-@app.get("/api/config")
+@app.get("/api/admin/health", dependencies=[Depends(require_admin)])
+def admin_health():
+    payload = health()
+    payload["data_dir"] = str(DATA_DIR)
+    payload["settings"] = {
+        "warnings": app_settings_service.warnings_snapshot(),
+        "secret_backend": secret_store.backend_name,
+        "secret_insecure": secret_store.is_insecure,
+    }
+    return payload
+
+
+@app.get("/api/me")
+def me(user: CurrentUser = Depends(require_authenticated)):
+    return user.public()
+
+
+@app.get("/api/config", dependencies=[Depends(require_authenticated)])
 def config():
     return {
         "columns": ALL_COLUMNS,
@@ -314,12 +334,12 @@ def _settings_public() -> dict:
     return payload
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", dependencies=[Depends(require_admin)])
 def get_settings():
     return _settings_public()
 
 
-@app.put("/api/settings")
+@app.put("/api/settings", dependencies=[Depends(require_admin)])
 def put_settings(request: SettingsUpdate):
     global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
 
@@ -369,40 +389,40 @@ def put_settings(request: SettingsUpdate):
     return _settings_public()
 
 
-@app.delete("/api/settings/yandex-api-key")
+@app.delete("/api/settings/yandex-api-key", dependencies=[Depends(require_admin)])
 def delete_yandex_api_key():
     secret_store.delete(YANDEX_API_KEY)
     return {"deleted": True}
 
 
-@app.delete("/api/settings/yandex-ai-api-key")
+@app.delete("/api/settings/yandex-ai-api-key", dependencies=[Depends(require_admin)])
 def delete_yandex_ai_api_key():
     secret_store.delete(YANDEX_AI_API_KEY)
     return {"deleted": True}
 
 
-@app.delete("/api/settings/lemana-client-secret")
+@app.delete("/api/settings/lemana-client-secret", dependencies=[Depends(require_admin)])
 def delete_lemana_client_secret():
     secret_store.delete(LEMANA_B2B_CLIENT_SECRET)
     _rebuild_sourcing_runtime()
     return {"deleted": True}
 
 
-@app.delete("/api/settings/etm-ipro-login")
+@app.delete("/api/settings/etm-ipro-login", dependencies=[Depends(require_admin)])
 def delete_etm_ipro_login():
     secret_store.delete(ETM_IPRO_LOGIN)
     _rebuild_sourcing_runtime()
     return {"deleted": True}
 
 
-@app.delete("/api/settings/etm-ipro-password")
+@app.delete("/api/settings/etm-ipro-password", dependencies=[Depends(require_admin)])
 def delete_etm_ipro_password():
     secret_store.delete(ETM_IPRO_PASSWORD)
     _rebuild_sourcing_runtime()
     return {"deleted": True}
 
 
-@app.post("/api/documents")
+@app.post("/api/documents", dependencies=[Depends(require_authenticated)])
 async def upload_document(file: UploadFile = File(...)):
     filename = file.filename or "document.pdf"
     if not filename.lower().endswith(".pdf"):
@@ -444,12 +464,12 @@ async def upload_document(file: UploadFile = File(...)):
         temp_path.unlink(missing_ok=True)
 
 
-@app.get("/api/documents")
+@app.get("/api/documents", dependencies=[Depends(require_authenticated)])
 def list_documents(limit: int = 50):
     return {"documents": workspace_service.list_recent(limit)}
 
 
-@app.get("/api/documents/{document_id}")
+@app.get("/api/documents/{document_id}", dependencies=[Depends(require_authenticated)])
 def get_document(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -464,7 +484,7 @@ def get_document(document_id: str):
         raise HTTPException(404, "Документ не найден") from exc
 
 
-@app.get("/api/documents/{document_id}/page/{page_number}")
+@app.get("/api/documents/{document_id}/page/{page_number}", dependencies=[Depends(require_authenticated)])
 def page_image(document_id: str, page_number: int, dpi: int = 110):
     try:
         workspace = workspace_service.get(document_id)
@@ -482,7 +502,7 @@ def page_image(document_id: str, page_number: int, dpi: int = 110):
         raise HTTPException(404, "Документ не найден") from exc
 
 
-@app.post("/api/documents/{document_id}/suggest-pages")
+@app.post("/api/documents/{document_id}/suggest-pages", dependencies=[Depends(require_authenticated)])
 def suggest_pages(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -498,7 +518,7 @@ def suggest_pages(document_id: str):
     return job_service.submit(run).public()
 
 
-@app.post("/api/documents/{document_id}/recognize")
+@app.post("/api/documents/{document_id}/recognize", dependencies=[Depends(require_authenticated)])
 def recognize(document_id: str, request: RecognitionRequest):
     try:
         workspace = workspace_service.get(document_id)
@@ -551,7 +571,7 @@ def recognize(document_id: str, request: RecognitionRequest):
     return job.public()
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_authenticated)])
 def get_job(job_id: str):
     try:
         return job_service.get(job_id).public()
@@ -559,7 +579,7 @@ def get_job(job_id: str):
         raise HTTPException(404, "Задание не найдено") from exc
 
 
-@app.get("/api/documents/{document_id}/results")
+@app.get("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
 def get_results(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -577,7 +597,7 @@ def get_results(document_id: str):
         raise HTTPException(404, "Документ не найден") from exc
 
 
-@app.put("/api/documents/{document_id}/results")
+@app.put("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
 def save_results(document_id: str, request: SaveRowsRequest):
     try:
         workspace = workspace_service.get(document_id)
@@ -615,7 +635,7 @@ def review_export_filename(value: str) -> str:
     return safe_filename(f"{path.stem}_review.xlsx")
 
 
-@app.post("/api/documents/{document_id}/export")
+@app.post("/api/documents/{document_id}/export", dependencies=[Depends(require_authenticated)])
 def export(document_id: str, request: ExportRequest):
     try:
         workspace = workspace_service.get(document_id)
@@ -684,12 +704,12 @@ def _sourcing_payload(value: Any) -> Any:
     return value
 
 
-@app.get("/api/sourcing/providers")
+@app.get("/api/sourcing/providers", dependencies=[Depends(require_authenticated)])
 def sourcing_providers():
     return sourcing_service.public_config()
 
 
-@app.post("/api/sourcing/providers/lemana_b2b/sync")
+@app.post("/api/sourcing/providers/lemana_b2b/sync", dependencies=[Depends(require_admin)])
 def sync_lemana_b2b():
     provider = sourcing_service.provider("lemana_b2b")
     sync_method = getattr(provider, "sync", None)
@@ -707,7 +727,7 @@ def sync_lemana_b2b():
     return job_service.submit(run).public()
 
 
-@app.get("/api/sourcing/providers/etm_ipro/health")
+@app.get("/api/sourcing/providers/etm_ipro/health", dependencies=[Depends(require_authenticated)])
 def etm_ipro_health():
     provider = sourcing_service.provider("etm_ipro")
     health_method = getattr(provider, "health", None)
@@ -716,7 +736,7 @@ def etm_ipro_health():
     return _sourcing_payload(health_method())
 
 
-@app.post("/api/sourcing/providers/etm_ipro/manufacturers/sync")
+@app.post("/api/sourcing/providers/etm_ipro/manufacturers/sync", dependencies=[Depends(require_admin)])
 def sync_etm_ipro_manufacturers():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "sync_manufacturers", None)
@@ -725,7 +745,7 @@ def sync_etm_ipro_manufacturers():
     return job_service.submit(lambda progress: {"count": method()}).public()
 
 
-@app.get("/api/sourcing/providers/etm_ipro/manufacturers/status")
+@app.get("/api/sourcing/providers/etm_ipro/manufacturers/status", dependencies=[Depends(require_authenticated)])
 def etm_ipro_manufacturer_status():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "manufacturer_status", None)
@@ -734,7 +754,7 @@ def etm_ipro_manufacturer_status():
     return _sourcing_payload(method())
 
 
-@app.post("/api/sourcing/providers/etm_ipro/catalog/sync")
+@app.post("/api/sourcing/providers/etm_ipro/catalog/sync", dependencies=[Depends(require_admin)])
 def start_etm_ipro_catalog_sync():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "start_catalog_sync", None)
@@ -743,7 +763,7 @@ def start_etm_ipro_catalog_sync():
     return job_service.submit(lambda progress: _sourcing_payload(method())).public()
 
 
-@app.get("/api/sourcing/providers/etm_ipro/catalog/status")
+@app.get("/api/sourcing/providers/etm_ipro/catalog/status", dependencies=[Depends(require_authenticated)])
 def etm_ipro_catalog_status():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "catalog_sync_status", None)
@@ -756,7 +776,7 @@ def etm_ipro_catalog_status():
     return payload
 
 
-@app.post("/api/sourcing/providers/etm_ipro/catalog/import")
+@app.post("/api/sourcing/providers/etm_ipro/catalog/import", dependencies=[Depends(require_admin)])
 def import_etm_ipro_catalog():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "import_completed_catalog", None)
@@ -767,7 +787,7 @@ def import_etm_ipro_catalog():
     ).public()
 
 
-@app.post("/api/sourcing/providers/etm_ipro/catalog/reindex")
+@app.post("/api/sourcing/providers/etm_ipro/catalog/reindex", dependencies=[Depends(require_admin)])
 def reindex_etm_ipro_catalog():
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "rebuild_search_index", None)
@@ -778,12 +798,33 @@ def reindex_etm_ipro_catalog():
     ).public()
 
 
-@app.get("/api/sourcing/catalog/stats")
+@app.get("/api/sourcing/catalog/stats", dependencies=[Depends(require_authenticated)])
 def sourcing_catalog_stats():
     return sourcing_repository.stats()
 
 
-@app.get("/demo-catalog", response_class=HTMLResponse)
+@app.get("/api/admin/openapi.json", dependencies=[Depends(require_admin)])
+def admin_openapi():
+    return get_openapi(title=APP_NAME, version=APP_VERSION, routes=app.routes)
+
+
+@app.get("/api/admin/docs", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
+def admin_docs():
+    return get_swagger_ui_html(
+        openapi_url="/api/admin/openapi.json",
+        title=f"{APP_NAME} API docs",
+    )
+
+
+@app.get("/api/admin/redoc", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
+def admin_redoc():
+    return get_redoc_html(
+        openapi_url="/api/admin/openapi.json",
+        title=f"{APP_NAME} API reference",
+    )
+
+
+@app.get("/demo-catalog", response_class=HTMLResponse, dependencies=[Depends(require_authenticated)])
 def demo_catalog(request: Request):
     offers = sourcing_repository.list_by_source(DEMO_CATALOG_SOURCE, limit=500)
     return templates.TemplateResponse(
@@ -793,7 +834,7 @@ def demo_catalog(request: Request):
     )
 
 
-@app.get("/demo-catalog/products/{offer_id}", response_class=HTMLResponse)
+@app.get("/demo-catalog/products/{offer_id}", response_class=HTMLResponse, dependencies=[Depends(require_authenticated)])
 def demo_catalog_product(request: Request, offer_id: str):
     offer = sourcing_repository.get_by_id(offer_id)
     if offer is None or offer.data_provenance.get("source") != DEMO_CATALOG_SOURCE:
@@ -805,7 +846,7 @@ def demo_catalog_product(request: Request, offer_id: str):
     )
 
 
-@app.post("/api/sourcing/understand")
+@app.post("/api/sourcing/understand", dependencies=[Depends(require_authenticated)])
 def sourcing_understand(request: SourcingRowRequest):
     understanding = sourcing_service.understand_row_result(request.row)
     return {
@@ -816,7 +857,7 @@ def sourcing_understand(request: SourcingRowRequest):
     }
 
 
-@app.post("/api/sourcing/search")
+@app.post("/api/sourcing/search", dependencies=[Depends(require_authenticated)])
 def sourcing_search(request: SourcingRowRequest):
     try:
         result = sourcing_service.search_row(
@@ -829,7 +870,7 @@ def sourcing_search(request: SourcingRowRequest):
     return _sourcing_payload(result)
 
 
-@app.post("/api/sourcing/search-intent")
+@app.post("/api/sourcing/search-intent", dependencies=[Depends(require_authenticated)])
 def sourcing_search_intent(request: SourcingIntentRequest):
     try:
         result = sourcing_service.search_intent(
@@ -921,7 +962,7 @@ def _submit_sourcing_project_job(
     return job_service.submit(run).public()
 
 
-@app.post("/api/sourcing/search-all")
+@app.post("/api/sourcing/search-all", dependencies=[Depends(require_authenticated)])
 def sourcing_search_all(request: SourcingProjectRequest):
     rows = [dict(row) for row in request.rows]
     provider_key = request.provider
@@ -948,7 +989,7 @@ class ReviewDecisionRequest(BaseModel):
     target: dict[str, Any] = Field(default_factory=dict)
 
 
-@app.get("/api/documents/{document_id}/review")
+@app.get("/api/documents/{document_id}/review", dependencies=[Depends(require_authenticated)])
 def get_review_decisions(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -962,7 +1003,7 @@ def get_review_decisions(document_id: str):
         raise HTTPException(404, "Документ не найден") from exc
 
 
-@app.post("/api/documents/{document_id}/review/decision")
+@app.post("/api/documents/{document_id}/review/decision", dependencies=[Depends(require_authenticated)])
 def save_review_decision(document_id: str, request: ReviewDecisionRequest):
     try:
         workspace = workspace_service.get(document_id)
@@ -996,13 +1037,13 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
         raise HTTPException(400, str(exc)) from exc
 
 
-@app.post("/api/documents/{document_id}/sourcing/search")
+@app.post("/api/documents/{document_id}/sourcing/search", dependencies=[Depends(require_authenticated)])
 def document_sourcing_search(document_id: str, request: SourcingRowRequest):
     _ensure_document(document_id)
     return sourcing_search(request)
 
 
-@app.post("/api/documents/{document_id}/sourcing/search-all")
+@app.post("/api/documents/{document_id}/sourcing/search-all", dependencies=[Depends(require_authenticated)])
 def document_sourcing_search_all(document_id: str, request: SourcingProjectRequest):
     _ensure_document(document_id)
     # The client sends the current selected/exportable rows, including any
@@ -1016,14 +1057,14 @@ def document_sourcing_search_all(document_id: str, request: SourcingProjectReque
     )
 
 
-@app.get("/api/documents/{document_id}/sourcing/runs")
+@app.get("/api/documents/{document_id}/sourcing/runs", dependencies=[Depends(require_authenticated)])
 def list_sourcing_runs(document_id: str):
     _ensure_document(document_id)
     workspace = workspace_service.get(document_id)
     return {"runs": SourcingRunHistory(workspace.sourcing_runs_dir).list_public()}
 
 
-@app.get("/api/documents/{document_id}/sourcing/runs/{run_id}")
+@app.get("/api/documents/{document_id}/sourcing/runs/{run_id}", dependencies=[Depends(require_authenticated)])
 def get_sourcing_run(document_id: str, run_id: str):
     _ensure_document(document_id)
     workspace = workspace_service.get(document_id)
