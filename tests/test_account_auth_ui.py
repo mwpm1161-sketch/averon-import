@@ -76,7 +76,8 @@ def test_login_and_logout_use_session_endpoints_without_persisting_credentials()
     assert 'api("/api/auth/login"' in login
     assert 'body: JSON.stringify({username, password})' in login
     assert 'await boot()' in login
-    assert 'error.status)) authLoginStatus("Неверный логин или пароль.")' in login
+    assert 'error.status === 401) authLoginStatus("Неверный логин или пароль.")' in login
+    assert 'error.status === 429) authLoginStatus("Слишком много попыток входа. Попробуйте немного позже.")' in login
     assert 'error.status === 503' in login and "Сервис авторизации временно недоступен" in login
     assert 'state.authMode !== "session"' in logout
     assert 'api("/api/auth/logout", {method:"POST"})' in logout
@@ -85,6 +86,38 @@ def test_login_and_logout_use_session_endpoints_without_persisting_credentials()
     assert "localStorage" not in login + logout
     assert "sessionStorage" not in login + logout
     assert "username" in HTML and 'autocomplete="current-password"' in HTML
+
+
+def test_auth_login_rate_limit_has_a_distinct_safe_message():
+    login = _function("submitAuthLogin", "logoutSession")
+    assert 'error.status === 401) authLoginStatus("Неверный логин или пароль.")' in login
+    assert 'error.status === 429) authLoginStatus("Слишком много попыток входа. Попробуйте немного позже.")' in login
+    assert 'error.status === 503) authLoginStatus("Сервис авторизации временно недоступен. Попробуйте позже.")' in login
+    assert "account" not in login.lower()
+
+
+def test_password_dialog_close_lifecycle_scrubs_secrets_even_for_native_close():
+    create_cleanup = _function("scrubUserCreateDialogSecrets", "scrubResetUserPasswordDialogSecrets")
+    reset_cleanup = _function("scrubResetUserPasswordDialogSecrets", "accountTimestampLabel")
+    events = _function("setupEvents", "setZoom")
+
+    assert '$("#new-user-password").value = ""' in create_cleanup
+    assert '$("#new-user-password-confirm").value = ""' in create_cleanup
+    assert '$("#user-create-status").textContent = ""' in create_cleanup
+    assert '$("#user-create-status").hidden = true' in create_cleanup
+    assert '.close(' not in create_cleanup
+
+    assert '$("#reset-user-password").value = ""' in reset_cleanup
+    assert '$("#reset-user-password-confirm").value = ""' in reset_cleanup
+    assert '$("#reset-user-password-status").textContent = ""' in reset_cleanup
+    assert '$("#reset-user-password-status").hidden = true' in reset_cleanup
+    assert 'state.users.selectedUser = null' in reset_cleanup
+    assert '.close(' not in reset_cleanup
+
+    assert '$("#users-modal").addEventListener("close", scrubUserCreateDialogSecrets)' in events
+    assert '$("#reset-user-password-modal").addEventListener("close", scrubResetUserPasswordDialogSecrets)' in events
+    assert 'const closePasswordReset = () => $("#reset-user-password-modal").close()' in events
+    assert not re.search(r'(?:localStorage|sessionStorage)\.setItem\([^\n]*password', APP_JS, re.I)
 
 
 def test_users_and_support_controls_use_independent_capabilities_and_users_are_lazy():

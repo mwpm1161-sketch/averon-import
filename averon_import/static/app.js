@@ -300,7 +300,8 @@ async function submitAuthLogin(event) {
     await boot();
   } catch (error) {
     $("#auth-login-password").value = "";
-    if (error instanceof ApiError && [401, 429].includes(error.status)) authLoginStatus("Неверный логин или пароль.");
+    if (error instanceof ApiError && error.status === 401) authLoginStatus("Неверный логин или пароль.");
+    else if (error instanceof ApiError && error.status === 429) authLoginStatus("Слишком много попыток входа. Попробуйте немного позже.");
     else if (error instanceof ApiError && error.status === 503) authLoginStatus("Сервис авторизации временно недоступен. Попробуйте позже.");
     else authLoginStatus("Не удалось выполнить вход. Повторите попытку.");
   } finally {
@@ -339,6 +340,21 @@ function accountErrorMessage(error) {
   if (error?.status === 503) return "Сервис авторизации временно недоступен.";
   if (error?.status === 422) return "Проверьте логин и пароль: формат или длина не подходят требованиям.";
   return "Не удалось выполнить действие. Проверьте данные и повторите попытку.";
+}
+
+function scrubUserCreateDialogSecrets() {
+  $("#new-user-password").value = "";
+  $("#new-user-password-confirm").value = "";
+  $("#user-create-status").textContent = "";
+  $("#user-create-status").hidden = true;
+}
+
+function scrubResetUserPasswordDialogSecrets() {
+  $("#reset-user-password").value = "";
+  $("#reset-user-password-confirm").value = "";
+  $("#reset-user-password-status").textContent = "";
+  $("#reset-user-password-status").hidden = true;
+  state.users.selectedUser = null;
 }
 
 function accountTimestampLabel(value) {
@@ -3008,16 +3024,13 @@ function setupEvents() {
   $("#logout-button").addEventListener("click", logoutSession);
   $("#users-button").addEventListener("click", openAdminUsers);
   $("#close-users").addEventListener("click", () => $("#users-modal").close());
+  $("#users-modal").addEventListener("close", scrubUserCreateDialogSecrets);
   $("#user-create-form").addEventListener("submit", createAccountUser);
   $("#users-previous").addEventListener("click", () => changeAdminUsersPage(-1));
   $("#users-next").addEventListener("click", () => changeAdminUsersPage(1));
   $("#reset-user-password-form").addEventListener("submit", submitAccountPasswordReset);
-  const closePasswordReset = () => {
-    $("#reset-user-password").value = "";
-    $("#reset-user-password-confirm").value = "";
-    state.users.selectedUser = null;
-    $("#reset-user-password-modal").close();
-  };
+  const closePasswordReset = () => $("#reset-user-password-modal").close();
+  $("#reset-user-password-modal").addEventListener("close", scrubResetUserPasswordDialogSecrets);
   $("#close-reset-user-password").addEventListener("click", closePasswordReset);
   $("#cancel-reset-user-password").addEventListener("click", closePasswordReset);
   $("#pdf-file").addEventListener("change", (event) => uploadFile(event.target.files[0]));
