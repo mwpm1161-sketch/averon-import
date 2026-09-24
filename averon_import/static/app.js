@@ -2312,7 +2312,7 @@ function renderAdminSupportSnapshot(snapshot) {
 
 async function openReportDocument(documentId) {
   if (state.currentUser?.capabilities?.admin_reports !== true) return;
-  if (state.document?.document_id !== documentId && state.dirty && !confirm("Несохранённые правки будут потеряны. Открыть документ обращения?")) return;
+  if (state.dirty && !confirm("Несохранённые правки будут потеряны. Открыть документ обращения?")) return;
   try {
     await openExistingDocument(documentId);
     $("#admin-reports-modal").close();

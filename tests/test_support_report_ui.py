@@ -105,7 +105,10 @@ def test_admin_detail_snapshot_status_and_document_actions_are_lazy_and_versione
     assert "STALE_REPORT_VERSION" in update
     assert "Обращение уже было изменено. Данные обновлены." in update
     assert "loadAdminSupportReport(report.report_id), loadAdminSupportReports()" in update
-    assert "state.dirty && !confirm" in open_document
+    dirty_confirmation = 'if (state.dirty && !confirm("Несохранённые правки будут потеряны. Открыть документ обращения?")) return;'
+    assert dirty_confirmation in open_document
+    assert "state.document?.document_id !== documentId" not in open_document
+    assert open_document.index(dirty_confirmation) < open_document.index("await openExistingDocument(documentId)")
     assert "openExistingDocument(documentId)" in open_document
     assert '"#admin-reports-modal").close()' in open_document
 

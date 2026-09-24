@@ -376,7 +376,7 @@ button { cursor: pointer; }
 .support-snapshot { margin-top:12px; border:1px solid var(--line); border-radius:10px; background:#fafbfc; }
 .support-snapshot > summary { padding:11px 12px; cursor:pointer; color:#353b43; font-size:12px; font-weight:700; }
 .support-snapshot > .support-muted,.support-snapshot > p { padding:0 12px 10px; }
-#support-snapshot-content { padding:0 12px 12px; }
+.support-snapshot [data-support-snapshot-content] { padding:0 12px 12px; }
 .support-snapshot h4 { margin:15px 0 8px; font-size:11px; }
 .support-snapshot-options { margin-top:12px; }
 .support-page-statuses { display:flex; flex-wrap:wrap; gap:6px; }
