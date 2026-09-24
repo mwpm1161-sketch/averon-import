@@ -37,6 +37,7 @@ const state = {
   },
   support: {
     pendingIncident: null,
+    contextualPendingIncident: null,
     reportMode: null,
     sending: false,
     submissionGeneration: 0,
@@ -152,6 +153,7 @@ function clearProtectedMemory() {
   state.bootComplete = false;
   state.users = {items: [], limit: 25, offset: 0, hasNext: false, listRequest: 0, loading: false, mutating: false, selectedUser: null};
   state.support.pendingIncident = null;
+  state.support.contextualPendingIncident = null;
   state.support.reportMode = null;
   state.support.sending = false;
   state.support.submissionGeneration += 1;
@@ -2517,7 +2519,6 @@ function openSupportReportModal(mode = "export_failure") {
   if (mode === "user_reported" && !state.document?.document_id) return;
   if (!["export_failure", "user_reported"].includes(mode)) return;
   state.support.reportMode = mode;
-  if (mode === "user_reported") state.support.pendingIncident = null;
   $("#support-report-form").reset();
   $("#support-report-title").textContent = "Сообщить о проблеме";
   $("#support-report-intro").textContent = mode === "user_reported"
@@ -2534,7 +2535,7 @@ function openSupportReportModal(mode = "export_failure") {
 function clearSupportReportState() {
   const previousMode = state.support.reportMode;
   state.support.submissionGeneration += 1;
-  state.support.pendingIncident = null;
+  if (previousMode === "user_reported") state.support.contextualPendingIncident = null;
   state.support.reportMode = null;
   state.support.sending = false;
   const form = $("#support-report-form");
@@ -2549,7 +2550,6 @@ function clearSupportReportState() {
     submit.disabled = false;
     submit.textContent = "Отправить";
   }
-  if (previousMode === "export_failure") $("#export-reportable-error").hidden = true;
 }
 
 async function submitSupportReport(event) {
@@ -2584,7 +2584,7 @@ async function submitSupportReport(event) {
   submit.textContent = "Отправляем…";
   message.hidden = true;
   try {
-    if (mode === "user_reported" && !state.support.pendingIncident?.incidentId) {
+    if (mode === "user_reported" && !state.support.contextualPendingIncident?.incidentId) {
       const incident = await api("/api/support/incidents", {
         method:"POST",
         headers:{"Content-Type":"application/json"},
@@ -2594,9 +2594,11 @@ async function submitSupportReport(event) {
       if (typeof incident?.incident_id !== "string" || !incident.incident_id) {
         throw new Error("Не удалось подготовить обращение.");
       }
-      state.support.pendingIncident = {incidentId:incident.incident_id};
+      state.support.contextualPendingIncident = {incidentId:incident.incident_id};
     }
-    const incidentId = state.support.pendingIncident?.incidentId;
+    const incidentId = mode === "user_reported"
+      ? state.support.contextualPendingIncident?.incidentId
+      : state.support.pendingIncident?.incidentId;
     if (!incidentId) return;
     await api("/api/support/reports", {
       method:"POST",
@@ -2604,11 +2606,15 @@ async function submitSupportReport(event) {
       body:JSON.stringify({incident_id:incidentId, reporter_fio:reporterFio, description}),
     });
     if (!isCurrentSubmission()) return;
+    if (mode === "export_failure") clearExportError();
+    else state.support.contextualPendingIncident = null;
     $("#support-report-modal").close();
     toast("Обращение отправлено", "success");
   } catch (error) {
     if (!isCurrentSubmission()) return;
     if (error instanceof ApiError && error.status === 409 && error.code === "SUPPORT_REPORT_EXISTS") {
+      if (mode === "export_failure") clearExportError();
+      else state.support.contextualPendingIncident = null;
       $("#support-report-modal").close();
       toast("Обращение уже отправлено.", "success");
     } else if (error instanceof ApiError && error.status === 422) {

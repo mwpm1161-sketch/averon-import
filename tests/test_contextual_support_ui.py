@@ -55,7 +55,8 @@ def test_manual_submission_validates_then_creates_one_minimal_incident_and_reuse
     assert submit.index('api("/api/support/incidents"') < submit.index('api("/api/support/reports"')
     assert "state.support.sending) return" in submit
     assert "state.support.pendingIncident?.incidentId" in submit
-    assert "mode === \"user_reported\" && !state.support.pendingIncident?.incidentId" in submit
+    assert "state.support.contextualPendingIncident?.incidentId" in submit
+    assert 'mode === "user_reported" && !state.support.contextualPendingIncident?.incidentId' in submit
     assert "JSON.stringify({document_id:documentId, stage:currentSupportStage()})" in submit
     assert "JSON.stringify({incident_id:incidentId, reporter_fio:reporterFio, description})" in submit
     assert "incident.incident_id" in submit
@@ -76,22 +77,64 @@ def test_stage_mapping_is_stable_and_falls_back_to_document():
     assert 'return stageByView[activeView?.id] || "document";' in stage
 
 
-def test_report_mode_lifecycle_clears_transient_state_and_export_uses_its_existing_incident():
+def test_export_and_contextual_incident_state_are_isolated_and_auth_cleanup_clears_both():
+    opener = _function("openSupportReportModal", "clearSupportReportState")
     clear = _function("clearSupportReportState", "submitSupportReport")
+    protected_memory = _function("clearProtectedMemory", "clearProtectedUi")
     events = _function("setupEvents", "setZoom")
     submit = _function("submitSupportReport", "SUPPORT_STATUS_LABELS")
     export_failure = _function("showExportFailure", "exportExcelFile")
-    assert "state.support.pendingIncident = null" in clear
+    assert "state.support.pendingIncident = {incidentId}" in export_failure
+    assert 'const panel = $("#export-reportable-error");' in export_failure
+    assert "if (panel) panel.hidden = false;" in export_failure
+    assert 'mode === "user_reported"' in opener
+    assert "pendingIncident = null" not in opener
+    assert "pendingIncident =" not in opener
+    assert "export-reportable-error" not in opener
+    assert 'state.support.contextualPendingIncident = null' in clear
+    assert 'if (previousMode === "user_reported") state.support.contextualPendingIncident = null;' in clear
+    assert "state.support.pendingIncident" not in clear
+    assert '$("#export-reportable-error")' not in clear
     assert "state.support.reportMode = null" in clear
     assert "state.support.sending = false" in clear
     assert 'supportReportModal.addEventListener("close",clearSupportReportState)' in events
     assert ".close(" not in clear
-    assert 'mode === "user_reported"' in submit
+    assert "state.support.pendingIncident = null" in protected_memory
+    assert "state.support.contextualPendingIncident = null" in protected_memory
+    assert "state.support.reportMode = null" in protected_memory
+    assert "state.support.sending = false" in protected_memory
     assert 'mode === "export_failure" && !state.support.pendingIncident?.incidentId' in submit
-    assert "state.support.pendingIncident = {incidentId}" in export_failure
-    assert 'api("/api/support/incidents"' in submit
-    assert "if (mode === \"user_reported\" && !state.support.pendingIncident?.incidentId)" in submit
     assert not re.search(r"(?:localStorage|sessionStorage)\.(?:getItem|setItem)\([^\n]*pendingIncident", APP_JS)
+
+
+def test_report_success_cleans_only_the_incident_for_its_mode():
+    submit = _function("submitSupportReport", "SUPPORT_STATUS_LABELS")
+    export_clear = _function("clearExportError", "showExportFailure")
+    success = submit.split('await api("/api/support/reports",', 1)[1].split("} catch (error)", 1)[0]
+    duplicate = submit.split('error.code === "SUPPORT_REPORT_EXISTS"', 1)[1].split("} else if", 1)[0]
+    for branch in (success, duplicate):
+        assert 'if (mode === "export_failure") clearExportError();' in branch
+        assert 'else state.support.contextualPendingIncident = null;' in branch
+    assert "state.support.pendingIncident = null" in export_clear
+    assert 'const panel = $("#export-reportable-error");' in export_clear
+    assert "if (panel) panel.hidden = true;" in export_clear
+
+
+def test_manual_report_failure_retains_contextual_incident_and_retry_reuses_it():
+    submit = _function("submitSupportReport", "SUPPORT_STATUS_LABELS")
+    incident_guard = 'if (mode === "user_reported" && !state.support.contextualPendingIncident?.incidentId) {'
+    incident_start = submit.index(incident_guard)
+    report_post = submit.index('await api("/api/support/reports",')
+    manual_create = submit[incident_start:report_post]
+    assert submit.count('api("/api/support/incidents"') == 1
+    assert submit.count('api("/api/support/reports"') == 1
+    assert 'state.support.contextualPendingIncident = {incidentId:incident.incident_id};' in manual_create
+    assert incident_start + manual_create.index('api("/api/support/incidents"') < report_post
+    assert 'const incidentId = mode === "user_reported"\n      ? state.support.contextualPendingIncident?.incidentId\n      : state.support.pendingIncident?.incidentId;' in submit
+    failed_report_branch = submit.split('message.textContent = "Не удалось отправить обращение. Повторите попытку.";', 1)[1].split("\n    }\n  } finally", 1)[0]
+    assert "contextualPendingIncident = null" not in failed_report_branch
+    assert 'mode === "user_reported" && !state.support.contextualPendingIncident?.incidentId' in submit
+    assert submit.index(incident_guard) < submit.index('api("/api/support/incidents"') < report_post
 
 
 def test_admin_incident_kinds_and_stages_are_localized_and_manual_nulls_are_omitted():
