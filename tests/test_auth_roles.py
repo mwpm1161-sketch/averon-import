@@ -26,6 +26,7 @@ class ApiResponse:
         self.status_code = status_code
         self.content = body
         self.text = body.decode("utf-8", errors="replace")
+        self.raw_headers = headers
         self.headers = {key.decode(): value.decode() for key, value in headers}
 
     def json(self):
@@ -135,6 +136,7 @@ def test_valid_user_and_admin_identity(auth_client):
             "settings": False,
             "provider_maintenance": False,
             "admin_reports": False,
+            "user_management": False,
         },
     }
     assert admin.status_code == 200
@@ -428,6 +430,9 @@ def test_every_api_route_requires_application_authentication(auth_client):
         if isinstance(route, APIRoute)
         and route.path.startswith("/api/")
         and not has_auth_dependency(route.dependant)
+        and route.path != "/api/auth/login"
     ]
 
     assert unauthenticated == []
+    login_route = next(route for route in main.app.routes if isinstance(route, APIRoute) and route.path == "/api/auth/login")
+    assert not has_auth_dependency(login_route.dependant)

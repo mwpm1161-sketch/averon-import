@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import re
+import threading
+import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
 
 from fastapi import Depends, HTTPException, Request
+
+from averon_import.services.account_auth import AccountRepository, normalize_username
+
+logger = logging.getLogger(__name__)
 
 
 class Role(str, Enum):
@@ -27,6 +35,7 @@ class Role(str, Enum):
 class CurrentUser:
     username: str
     role: Role
+    user_id: str | None = None
 
     @property
     def capabilities(self) -> dict[str, bool]:
@@ -35,6 +44,7 @@ class CurrentUser:
             "settings": is_admin,
             "provider_maintenance": is_admin,
             "admin_reports": is_admin,
+            "user_management": is_admin,
         }
 
     def public(self) -> dict[str, object]:
@@ -51,6 +61,67 @@ class AuthConfig:
     proxy_secret: str
     admin_users: frozenset[str]
     dev_user: str
+
+
+_account_repository: AccountRepository | None = None
+
+
+def configure_account_repository(repository: AccountRepository) -> None:
+    global _account_repository
+    _account_repository = repository
+
+
+class LoginRateLimiter:
+    """Bounded in-process failed-login limiter keyed by username digest."""
+
+    def __init__(self, *, max_attempts: int = 5, window_seconds: int = 900, block_seconds: int = 900, max_buckets: int = 4096):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.block_seconds = block_seconds
+        self.max_buckets = max_buckets
+        self._buckets: OrderedDict[str, tuple[deque[float], float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _bucket(self, key: str, now: float) -> tuple[deque[float], float]:
+        attempts, blocked_until = self._buckets.get(key, (deque(), 0.0))
+        while attempts and attempts[0] <= now - self.window_seconds:
+            attempts.popleft()
+        self._buckets[key] = (attempts, blocked_until)
+        self._buckets.move_to_end(key)
+        while len(self._buckets) > self.max_buckets:
+            self._buckets.popitem(last=False)
+        return attempts, blocked_until
+
+    def retry_after(self, key: str, *, now: float | None = None) -> int:
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            _, blocked_until = self._bucket(key, current)
+            return max(0, int(blocked_until - current + 0.999))
+
+    def failed(self, key: str, *, now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            attempts, blocked_until = self._bucket(key, current)
+            attempts.append(current)
+            if len(attempts) >= self.max_attempts:
+                blocked_until = current + self.block_seconds
+            self._buckets[key] = (attempts, blocked_until)
+
+    def succeeded(self, key: str) -> None:
+        with self._lock:
+            self._buckets.pop(key, None)
+
+
+login_rate_limiter = LoginRateLimiter()
+
+
+def login_bucket_key(username: object) -> str:
+    raw = username if isinstance(username, str) else ""
+    try:
+        normalized = normalize_username(raw)
+    except ValueError:
+        normalized = raw.casefold()[:256]
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
 _USERNAME_RE = re.compile(r"^[^\x00-\x1f\x7f\s]{1,128}$")
@@ -142,9 +213,33 @@ def resolve_current_user(request: Request) -> CurrentUser:
     config = auth_config()
     if config.mode == "local_dev":
         return _local_dev_user(request, config)
-    if config.mode != "trusted_proxy":
-        raise _auth_error(503, "Сервис аутентификации не настроен")
-    return _trusted_proxy_user(request, config)
+    if config.mode == "trusted_proxy":
+        return _trusted_proxy_user(request, config)
+    if config.mode == "session":
+        if _account_repository is None:
+            raise _auth_error(503, "Сервис аутентификации не настроен")
+        token = request.cookies.get("averon_session", "")
+        try:
+            session = _account_repository.resolve_session(token)
+        except Exception as exc:
+            logger.exception("Session lookup failed")
+            raise _auth_error(503, "Сервис аутентификации временно недоступен") from exc
+        if session is None:
+            raise _auth_error(401, "Требуется аутентификация")
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+            submitted_csrf = request.headers.get("X-CSRF-Token", "")
+            if len(submitted_csrf) > 128:
+                raise _auth_error(403, "Проверка запроса не пройдена")
+            submitted_hash = hashlib.sha256(submitted_csrf.encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(submitted_hash, session["csrf_hash"]):
+                raise _auth_error(403, "Проверка запроса не пройдена")
+        try:
+            role = Role(session["role"])
+        except (TypeError, ValueError) as exc:
+            logger.error("Unsupported stored account role")
+            raise _auth_error(503, "Сервис аутентификации временно недоступен") from exc
+        return CurrentUser(username=session["username"], role=role, user_id=session["user_id"])
+    raise _auth_error(503, "Сервис аутентификации не настроен")
 
 
 def get_current_user(request: Request) -> CurrentUser:
@@ -166,7 +261,10 @@ __all__ = [
     "CurrentUser",
     "Role",
     "auth_config",
+    "configure_account_repository",
     "get_current_user",
+    "login_bucket_key",
+    "login_rate_limiter",
     "require_admin",
     "require_authenticated",
     "resolve_current_user",
