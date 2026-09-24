@@ -1,4 +1,4 @@
-AVERON IMPORT 1.0.0-rc7
+AVERON IMPORT 1.0.0-rc8
 
 Быстрый запуск в Windows:
 
