@@ -20,6 +20,23 @@ const state = {
   sourcing: {row: null, result: null, projectFilter: "all"},
   sourcingHealth: null,
   currentUser: null,
+  support: {
+    pendingIncident: null,
+    sending: false,
+    admin: {
+      reports: [],
+      selectedReport: null,
+      selectedSnapshot: null,
+      statusFilter: "OPEN",
+      limit: 25,
+      offset: 0,
+      listRequest: 0,
+      detailRequest: 0,
+      snapshotRequest: 0,
+      snapshotRequested: false,
+      snapshotRowsShown: 0,
+    },
+  },
   recentDocuments: [],
   manual: {active: false, rows: []},
 };
@@ -40,15 +57,36 @@ function toast(message, type = "") {
   setTimeout(() => node.remove(), 4200);
 }
 
+class ApiError extends Error {
+  constructor(message, {status = 0, code = null, incidentId = null, reportable = false, payload = null} = {}) {
+    super(message || "Ошибка запроса");
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.incidentId = incidentId;
+    this.incident_id = incidentId;
+    this.reportable = Boolean(reportable);
+    this.payload = payload;
+  }
+}
+
 async function api(url, options = {}) {
   const response = await fetch(url, options);
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
+    let payload = null;
     try {
-      const data = await response.json();
-      message = data.detail || message;
+      payload = await response.json();
+      if (typeof payload?.detail === "string" && payload.detail.trim()) message = payload.detail;
     } catch (_) {}
-    throw new Error(message);
+    const error = payload?.error && typeof payload.error === "object" ? payload.error : {};
+    throw new ApiError(message, {
+      status: response.status,
+      code: typeof error.code === "string" ? error.code : null,
+      incidentId: typeof error.incident_id === "string" ? error.incident_id : null,
+      reportable: error.reportable === true,
+      payload,
+    });
   }
   const type = response.headers.get("content-type") || "";
   return type.includes("application/json") ? response.json() : response;
@@ -85,6 +123,10 @@ async function boot() {
     state.currentUser = currentUser;
     const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
     $("#settings-button").hidden = !isAdmin;
+    if (currentUser?.capabilities?.admin_reports === true) {
+      const reportsButton = $("#admin-reports-button");
+      if (reportsButton) reportsButton.hidden = false;
+    }
     const [config, health] = await Promise.all([
       api("/api/config"),
       api("/api/health"),
@@ -557,6 +599,7 @@ async function openExistingDocument(documentId, {announce = true} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
   const encodedId = encodeURIComponent(documentId);
   const documentData = await api(`/api/documents/${encodedId}`);
+  clearExportError();
   state.document = documentData;
   state.selectedPages = new Set();
   state.previewPage = null;
@@ -590,6 +633,7 @@ async function uploadFile(file) {
   card.classList.add("drag");
   try {
     const documentData = await api("/api/documents", {method:"POST", body:form});
+    clearExportError();
     state.document = documentData;
     localStorage.setItem("averonCurrentDocument", documentData.document_id);
     state.selectedPages.clear();
@@ -1812,7 +1856,508 @@ function renderExportColumns() {
   });
 }
 
+function clearExportError() {
+  state.support.pendingIncident = null;
+  const panel = $("#export-reportable-error");
+  if (panel) panel.hidden = true;
+}
+
+function showExportFailure(error) {
+  const incidentId = error instanceof ApiError ? error.incidentId : null;
+  if (error instanceof ApiError && error.reportable && incidentId) {
+    state.support.pendingIncident = {incidentId};
+    const panel = $("#export-reportable-error");
+    if (panel) panel.hidden = false;
+  }
+  toast(error?.message || "Не удалось сформировать Excel.", "error");
+}
+
+async function exportExcelFile(payload, successMessage) {
+  try {
+    const response = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/export`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload),
+    });
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const disposition = response.headers.get("content-disposition") || "";
+    const match = disposition.match(/filename\*=UTF-8''([^;]+)/i) || disposition.match(/filename="?([^";]+)"?/i);
+    link.download = match ? decodeURIComponent(match[1]) : payload.filename;
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+    clearExportError();
+    $("#export-modal").close();
+    toast(successMessage, "success");
+    return true;
+  } catch (error) {
+    showExportFailure(error);
+    return false;
+  }
+}
+
+function openSupportReportModal() {
+  if (!state.support.pendingIncident?.incidentId) return;
+  const modal = $("#support-report-modal");
+  if (!modal) return;
+  $("#support-report-form").reset();
+  $("#support-report-error").hidden = true;
+  modal.showModal();
+}
+
+async function submitSupportReport(event) {
+  event.preventDefault();
+  if (state.support.sending) return;
+  const incidentId = state.support.pendingIncident?.incidentId;
+  if (!incidentId) {
+    $("#support-report-modal").close();
+    return;
+  }
+  const form = $("#support-report-form");
+  const submit = $("#support-report-submit");
+  const message = $("#support-report-error");
+  const reporterFio = $("#support-reporter-fio").value.trim();
+  const description = $("#support-report-description").value.trim();
+  state.support.sending = true;
+  submit.disabled = true;
+  submit.textContent = "Отправляем…";
+  message.hidden = true;
+  try {
+    await api("/api/support/reports", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({incident_id:incidentId, reporter_fio:reporterFio, description}),
+    });
+    $("#support-report-modal").close();
+    form.reset();
+    clearExportError();
+    toast("Обращение отправлено администратору", "success");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409 && error.code === "SUPPORT_REPORT_EXISTS") {
+      $("#support-report-modal").close();
+      form.reset();
+      clearExportError();
+      toast("Обращение по этой ошибке уже отправлено.", "success");
+    } else if (error instanceof ApiError && error.status === 422) {
+      message.textContent = "Проверьте ФИО и описание: заполните поля и соблюдайте указанные ограничения по длине.";
+      message.hidden = false;
+    } else {
+      message.textContent = error?.message || "Не удалось отправить обращение.";
+      message.hidden = false;
+    }
+  } finally {
+    state.support.sending = false;
+    submit.disabled = false;
+    submit.textContent = "Отправить";
+  }
+}
+
+const SUPPORT_STATUS_LABELS = {
+  OPEN:"Открыто",
+  IN_PROGRESS:"В работе",
+  RESOLVED:"Решено",
+};
+
+function supportValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string") return value.length > 800 ? `${value.slice(0, 800)}…` : value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized.length > 800 ? `${serialized.slice(0, 800)}…` : serialized;
+  } catch (_) {
+    return "—";
+  }
+}
+
+function addSupportField(container, label, value) {
+  const field = document.createElement("div");
+  field.className = "support-field";
+  const term = document.createElement("span");
+  term.textContent = label;
+  const content = document.createElement("b");
+  content.textContent = supportValue(value);
+  field.append(term, content);
+  container.appendChild(field);
+}
+
+function openAdminSupportReports() {
+  if (state.currentUser?.capabilities?.admin_reports !== true) return;
+  const modal = $("#admin-reports-modal");
+  if (!modal) return;
+  const admin = state.support.admin;
+  admin.reports = [];
+  admin.selectedReport = null;
+  admin.selectedSnapshot = null;
+  admin.offset = 0;
+  admin.snapshotRequested = false;
+  const detail = $("#admin-report-detail");
+  if (detail) detail.textContent = "Выберите обращение, чтобы открыть его.";
+  const filter = $("#admin-report-status-filter");
+  if (filter) filter.value = admin.statusFilter;
+  modal.showModal();
+  loadAdminSupportReports();
+}
+
+function renderAdminSupportReports() {
+  const admin = state.support.admin;
+  const list = $("#admin-report-list");
+  if (!list) return;
+  list.replaceChildren();
+  if (!admin.reports.length) {
+    const empty = document.createElement("p");
+    empty.className = "support-empty";
+    empty.textContent = "Обращений на этой странице нет.";
+    list.appendChild(empty);
+  }
+  admin.reports.forEach((report) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "support-report-item";
+    button.classList.toggle("selected", admin.selectedReport?.report_id === report.report_id);
+    const heading = document.createElement("span");
+    heading.className = "support-report-item-heading";
+    const name = document.createElement("b");
+    name.textContent = supportValue(report.reporter_fio);
+    const status = document.createElement("small");
+    status.textContent = SUPPORT_STATUS_LABELS[report.status] || "Статус неизвестен";
+    heading.append(name, status);
+    const metadata = document.createElement("span");
+    metadata.className = "support-report-item-meta";
+    metadata.textContent = `${formatRecentTimestamp(report.created_at)} · документ ${supportValue(report.document_id).slice(0, 16)} · ${supportValue(report.error_code)}`;
+    const error = document.createElement("span");
+    error.className = "support-report-item-error";
+    error.textContent = supportValue(report.public_message);
+    button.append(heading, metadata, error);
+    button.addEventListener("click", () => loadAdminSupportReport(report.report_id));
+    list.appendChild(button);
+  });
+  const previous = $("#admin-report-previous");
+  const next = $("#admin-report-next");
+  const page = $("#admin-report-page");
+  if (previous) previous.disabled = admin.offset <= 0;
+  if (next) next.disabled = admin.reports.length < admin.limit;
+  if (page) page.textContent = `Страница ${Math.floor(admin.offset / admin.limit) + 1}`;
+}
+
+async function loadAdminSupportReports() {
+  if (state.currentUser?.capabilities?.admin_reports !== true) return;
+  const admin = state.support.admin;
+  const status = $("#admin-reports-status");
+  if (status) status.textContent = "Загружаем обращения…";
+  const requestId = ++admin.listRequest;
+  const params = new URLSearchParams({limit:String(admin.limit), offset:String(admin.offset)});
+  if (admin.statusFilter !== "ALL") params.set("status", admin.statusFilter);
+  try {
+    const result = await api(`/api/admin/support/reports?${params.toString()}`);
+    if (requestId !== admin.listRequest) return;
+    admin.reports = Array.isArray(result?.reports) ? result.reports : [];
+    renderAdminSupportReports();
+    if (status) status.textContent = "";
+  } catch (error) {
+    if (requestId === admin.listRequest && status) status.textContent = error?.message || "Не удалось загрузить обращения.";
+  }
+}
+
+async function loadAdminSupportReport(reportId) {
+  if (state.currentUser?.capabilities?.admin_reports !== true) return;
+  const admin = state.support.admin;
+  const requestId = ++admin.detailRequest;
+  const root = $("#admin-report-detail");
+  if (!root) return;
+  admin.selectedReport = null;
+  admin.selectedSnapshot = null;
+  admin.snapshotRequested = false;
+  admin.snapshotRowsShown = 0;
+  root.textContent = "Загружаем обращение…";
+  renderAdminSupportReports();
+  try {
+    const report = await api(`/api/admin/support/reports/${encodeURIComponent(reportId)}`);
+    if (requestId !== admin.detailRequest) return;
+    admin.selectedReport = report;
+    renderAdminSupportReports();
+    renderAdminSupportReportDetail(report);
+  } catch (error) {
+    if (requestId === admin.detailRequest) root.textContent = error?.message || "Не удалось открыть обращение.";
+  }
+}
+
+function renderAdminSupportReportDetail(report) {
+  const root = $("#admin-report-detail");
+  if (!root) return;
+  root.replaceChildren();
+  const incident = report.incident || {};
+  const title = document.createElement("h3");
+  title.className = "support-detail-title";
+  title.textContent = supportValue(report.reporter_fio);
+  root.appendChild(title);
+  const descriptionLabel = document.createElement("b");
+  descriptionLabel.className = "support-description-label";
+  descriptionLabel.textContent = "Подробное описание";
+  const description = document.createElement("p");
+  description.className = "support-description";
+  description.textContent = typeof report.description === "string" ? report.description : supportValue(report.description);
+  root.append(descriptionLabel, description);
+
+  const fields = document.createElement("div");
+  fields.className = "support-detail-grid";
+  addSupportField(fields, "Статус", SUPPORT_STATUS_LABELS[report.status] || report.status);
+  addSupportField(fields, "Создано", formatRecentTimestamp(report.created_at));
+  addSupportField(fields, "Обновлено", formatRecentTimestamp(report.updated_at));
+  addSupportField(fields, "Пользователь Averon", incident.username);
+  addSupportField(fields, "Incident ID", report.incident_id);
+  addSupportField(fields, "Document ID", incident.document_id);
+  addSupportField(fields, "Тип экспорта", incident.export_kind);
+  addSupportField(fields, "Код ошибки", incident.error_code);
+  addSupportField(fields, "Сообщение", incident.public_message);
+  addSupportField(fields, "Версия приложения", incident.app_version);
+  addSupportField(fields, "Строк в экспорте", incident.row_count);
+  addSupportField(fields, "Имя файла экспорта", incident.requested_filename);
+  addSupportField(fields, "Документ доступен", incident.document_available === true ? "Да" : "Нет");
+  root.appendChild(fields);
+
+  const actions = document.createElement("div");
+  actions.className = "support-detail-actions";
+  if (incident.document_available === true && incident.document_id) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "button secondary";
+    open.textContent = "Открыть документ";
+    open.addEventListener("click", () => openReportDocument(incident.document_id));
+    actions.appendChild(open);
+  } else {
+    const unavailable = document.createElement("p");
+    unavailable.className = "support-muted";
+    unavailable.textContent = "Исходный документ больше недоступен на сервере.";
+    actions.appendChild(unavailable);
+  }
+  const statusLabel = document.createElement("label");
+  statusLabel.className = "support-status-control";
+  statusLabel.textContent = "Статус обращения";
+  const statusSelect = document.createElement("select");
+  statusSelect.className = "select";
+  statusSelect.dataset.supportDetailStatus = "true";
+  Object.entries(SUPPORT_STATUS_LABELS).forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    statusSelect.appendChild(option);
+  });
+  statusSelect.value = report.status;
+  statusLabel.appendChild(statusSelect);
+  const saveStatus = document.createElement("button");
+  saveStatus.type = "button";
+  saveStatus.dataset.supportStatusSave = "true";
+  saveStatus.className = "button primary";
+  saveStatus.textContent = "Сохранить статус";
+  saveStatus.addEventListener("click", updateAdminSupportStatus);
+  actions.append(statusLabel, saveStatus);
+  root.appendChild(actions);
+
+  const snapshot = document.createElement("details");
+  snapshot.className = "support-snapshot";
+  const summary = document.createElement("summary");
+  summary.textContent = "Состояние при ошибке";
+  const snapshotStatus = document.createElement("p");
+  snapshotStatus.dataset.supportSnapshotStatus = "true";
+  snapshotStatus.className = "support-muted";
+  const snapshotContent = document.createElement("div");
+  snapshotContent.dataset.supportSnapshotContent = "true";
+  snapshot.append(summary, snapshotStatus, snapshotContent);
+  snapshot.addEventListener("toggle", () => {
+    if (snapshot.open && !state.support.admin.snapshotRequested) loadAdminSupportSnapshot(report.report_id);
+  });
+  root.appendChild(snapshot);
+}
+
+async function loadAdminSupportSnapshot(reportId) {
+  if (state.currentUser?.capabilities?.admin_reports !== true) return;
+  const admin = state.support.admin;
+  if (admin.selectedReport?.report_id !== reportId) return;
+  admin.snapshotRequested = true;
+  const requestId = ++admin.snapshotRequest;
+  const detailRoot = $("#admin-report-detail");
+  const status = detailRoot?.querySelector("[data-support-snapshot-status]");
+  if (!status) return;
+  status.textContent = "Загружаем снимок…";
+  try {
+    const snapshot = await api(`/api/admin/support/reports/${encodeURIComponent(reportId)}/snapshot`);
+    if (requestId !== admin.snapshotRequest || admin.selectedReport?.report_id !== reportId) return;
+    admin.selectedSnapshot = snapshot;
+    status.textContent = "";
+    renderAdminSupportSnapshot(snapshot);
+  } catch (error) {
+    if (requestId !== admin.snapshotRequest || admin.selectedReport?.report_id !== reportId) return;
+    status.textContent = error instanceof ApiError && error.code === "SNAPSHOT_UNAVAILABLE"
+      ? "Снимок состояния недоступен."
+      : error?.message || "Не удалось загрузить снимок состояния.";
+  }
+}
+
+function renderAdminSupportSnapshot(snapshot) {
+  const detailRoot = $("#admin-report-detail");
+  const root = detailRoot?.querySelector("[data-support-snapshot-content]");
+  if (!root) return;
+  root.replaceChildren();
+  const documentData = snapshot.document || {};
+  const request = snapshot.export_request || {};
+  const summary = snapshot.result_summary || {};
+  const metadata = document.createElement("div");
+  metadata.className = "support-detail-grid support-snapshot-metadata";
+  addSupportField(metadata, "Исходный PDF", documentData.filename || documentData.original_filename);
+  addSupportField(metadata, "Страниц", documentData.page_count);
+  addSupportField(metadata, "Строк в состоянии", summary.row_count ?? (Array.isArray(request.rows) ? request.rows.length : null));
+  root.appendChild(metadata);
+
+  const options = document.createElement("div");
+  options.className = "support-snapshot-options";
+  const optionsTitle = document.createElement("h4");
+  optionsTitle.textContent = "Параметры экспорта";
+  options.appendChild(optionsTitle);
+  const selectedColumns = Array.isArray(request.columns)
+    ? request.columns.map((column) => typeof column === "string" ? column : supportValue(column?.key ?? column))
+    : [];
+  const optionValues = [
+    ["Заголовки", request.include_headers === true ? "Да" : "Нет"],
+    ["Только экспортируемые строки", request.only_exportable === true ? "Да" : "Нет"],
+    ["Экспорт для проверки", request.review_export === true ? "Да" : "Нет"],
+    ["Имя файла", request.filename],
+    ["Лист", request.sheet_name],
+    ["Столбцы", selectedColumns.join(", ") || "—"],
+  ];
+  const optionGrid = document.createElement("div");
+  optionGrid.className = "support-detail-grid";
+  optionValues.forEach(([label, value]) => addSupportField(optionGrid, label, value));
+  options.appendChild(optionGrid);
+  root.appendChild(options);
+
+  const pageStatuses = snapshot.page_statuses;
+  const pageSection = document.createElement("section");
+  pageSection.className = "support-snapshot-pages";
+  const pagesTitle = document.createElement("h4");
+  pagesTitle.textContent = "Статусы страниц";
+  pageSection.appendChild(pagesTitle);
+  const pagesList = document.createElement("div");
+  pagesList.className = "support-page-statuses";
+  const pageEntries = Array.isArray(pageStatuses)
+    ? pageStatuses.map((value, index) => [String(index + 1), value])
+    : Object.entries(pageStatuses || {});
+  if (pageEntries.length) {
+    pageEntries.forEach(([page, value]) => {
+      const item = document.createElement("span");
+      item.textContent = `Страница ${page}: ${supportValue(value)}`;
+      pagesList.appendChild(item);
+    });
+  } else {
+    pagesList.textContent = "Статусы страниц не сохранены.";
+  }
+  pageSection.appendChild(pagesList);
+  root.appendChild(pageSection);
+
+  const rows = Array.isArray(request.rows) ? request.rows : [];
+  const rowHeading = document.createElement("h4");
+  rowHeading.textContent = `Строки и состояние при ошибке (${rows.length})`;
+  root.appendChild(rowHeading);
+  if (!rows.length) {
+    const empty = document.createElement("p");
+    empty.className = "support-muted";
+    empty.textContent = "Строки в снимке отсутствуют.";
+    root.appendChild(empty);
+    return;
+  }
+  const columns = selectedColumns.length ? selectedColumns : Object.keys(rows[0] || {});
+  const start = 0;
+  const end = Math.min(rows.length, Math.max(100, state.support.admin.snapshotRowsShown));
+  const wrap = document.createElement("div");
+  wrap.className = "support-snapshot-table-wrap";
+  const table = document.createElement("table");
+  table.className = "support-snapshot-table";
+  const head = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  columns.forEach((column) => {
+    const cell = document.createElement("th");
+    cell.textContent = supportValue(column);
+    headerRow.appendChild(cell);
+  });
+  head.appendChild(headerRow);
+  table.appendChild(head);
+  const body = document.createElement("tbody");
+  rows.slice(start, end).forEach((row) => {
+    const tableRow = document.createElement("tr");
+    columns.forEach((column, index) => {
+      const cell = document.createElement("td");
+      const value = Array.isArray(row) ? row[index] : row?.[column];
+      cell.textContent = supportValue(value);
+      tableRow.appendChild(cell);
+    });
+    body.appendChild(tableRow);
+  });
+  table.appendChild(body);
+  wrap.appendChild(table);
+  root.appendChild(wrap);
+  if (end < rows.length) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "button ghost support-show-more";
+    more.textContent = `Показать ещё (${Math.min(100, rows.length - end)})`;
+    more.addEventListener("click", () => {
+      state.support.admin.snapshotRowsShown = end + Math.min(100, rows.length - end);
+      renderAdminSupportSnapshot(snapshot);
+    });
+    root.appendChild(more);
+  }
+}
+
+async function openReportDocument(documentId) {
+  if (state.currentUser?.capabilities?.admin_reports !== true) return;
+  if (state.document?.document_id !== documentId && state.dirty && !confirm("Несохранённые правки будут потеряны. Открыть документ обращения?")) return;
+  try {
+    await openExistingDocument(documentId);
+    $("#admin-reports-modal").close();
+  } catch (error) {
+    toast(error?.message || "Не удалось открыть документ.", "error");
+  }
+}
+
+async function updateAdminSupportStatus() {
+  if (state.currentUser?.capabilities?.admin_reports !== true) return;
+  const admin = state.support.admin;
+  const report = admin.selectedReport;
+  const detailRoot = $("#admin-report-detail");
+  const statusSelect = detailRoot?.querySelector("[data-support-detail-status]");
+  const saveButton = detailRoot?.querySelector("[data-support-status-save]");
+  if (!report || !statusSelect || !saveButton || saveButton.disabled) return;
+  saveButton.disabled = true;
+  try {
+    const updated = await api(`/api/admin/support/reports/${encodeURIComponent(report.report_id)}`, {
+      method:"PATCH",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({status:statusSelect.value, version:report.version}),
+    });
+    if (admin.selectedReport?.report_id !== report.report_id) return;
+    admin.selectedReport = updated;
+    admin.reports = admin.reports.map((item) => item.report_id === updated.report_id
+      ? {...item, status:updated.status, updated_at:updated.updated_at, version:updated.version}
+      : item);
+    renderAdminSupportReports();
+    renderAdminSupportReportDetail(updated);
+    await loadAdminSupportReports();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409 && error.code === "STALE_REPORT_VERSION") {
+      toast("Обращение уже было изменено. Данные обновлены.", "error");
+      await Promise.all([loadAdminSupportReport(report.report_id), loadAdminSupportReports()]);
+    } else {
+      toast(error?.message || "Не удалось обновить статус обращения.", "error");
+    }
+  } finally {
+    saveButton.disabled = false;
+  }
+}
+
 async function downloadExcel() {
+  clearExportError();
   const columns = selectedExportColumns();
   if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
   try {
@@ -1832,14 +2377,7 @@ async function downloadExcel() {
       filename:$("#export-filename").value,
       sheet_name:$("#export-sheet").value,
     };
-    const response = await api(`/api/documents/${state.document.document_id}/export`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-    const blob = await response.blob();
-    const url=URL.createObjectURL(blob); const link=document.createElement("a");
-    const disposition=response.headers.get("content-disposition")||"";
-    const match=disposition.match(/filename\*=UTF-8''([^;]+)/i) || disposition.match(/filename="?([^";]+)"?/i);
-    link.download=match?decodeURIComponent(match[1]):payload.filename;
-    link.href=url; link.click(); URL.revokeObjectURL(url);
-    $("#export-modal").close(); toast("Excel сформирован", "success");
+    await exportExcelFile(payload, "Excel сформирован");
   } catch (error) { toast(error.message,"error"); }
 }
 
@@ -1852,6 +2390,7 @@ function reviewExportFilename() {
 async function downloadReviewExcel() {
   const button = $("#download-review-excel");
   if (button.disabled) return;
+  clearExportError();
   button.disabled = true;
   button.textContent = "Формируем Excel…";
   try {
@@ -1867,14 +2406,7 @@ async function downloadReviewExcel() {
       filename:reviewExportFilename(),
       sheet_name:$("#export-sheet").value,
     };
-    const response = await api(`/api/documents/${state.document.document_id}/export`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-    const blob = await response.blob();
-    const url=URL.createObjectURL(blob); const link=document.createElement("a");
-    const disposition=response.headers.get("content-disposition")||"";
-    const match=disposition.match(/filename\*=UTF-8''([^;]+)/i) || disposition.match(/filename="?([^";]+)"?/i);
-    link.download=match?decodeURIComponent(match[1]):payload.filename;
-    link.href=url; link.click(); URL.revokeObjectURL(url);
-    $("#export-modal").close(); toast("Проверочный Excel сформирован", "success");
+    await exportExcelFile(payload, "Проверочный Excel сформирован");
   } catch (error) { toast(error.message,"error"); }
   finally {
     button.disabled = false;
@@ -1884,6 +2416,7 @@ async function downloadReviewExcel() {
 
 function resetApp() {
   if (state.dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
+  clearExportError();
   Object.assign(state,{document:null,selectedPages:new Set(),previewPage:null,crop:null,rows:[],result:null,activeRowId:null,zoom:1,dirty:false});
   localStorage.removeItem("averonCurrentDocument");
   $("#thumbnail-grid").innerHTML=""; $("#new-document-button").hidden=true; setView("upload");
@@ -1942,6 +2475,34 @@ function setupEvents() {
   $("#copy-export").addEventListener("click",()=>copyRows(state.rows,selectedExportColumns(),$("#export-headers").checked));
   $("#download-excel").addEventListener("click",downloadExcel);
   $("#download-review-excel").addEventListener("click",downloadReviewExcel);
+  const reportsButton = $("#admin-reports-button");
+  if (reportsButton) reportsButton.addEventListener("click",openAdminSupportReports);
+  const supportReportButton = $("#open-support-report");
+  if (supportReportButton) supportReportButton.addEventListener("click",openSupportReportModal);
+  const supportReportForm = $("#support-report-form");
+  if (supportReportForm) supportReportForm.addEventListener("submit",submitSupportReport);
+  const closeSupportReport = $("#close-support-report");
+  if (closeSupportReport) closeSupportReport.addEventListener("click",() => $("#support-report-modal").close());
+  const cancelSupportReport = $("#cancel-support-report");
+  if (cancelSupportReport) cancelSupportReport.addEventListener("click",() => $("#support-report-modal").close());
+  const closeAdminReports = $("#close-admin-reports");
+  if (closeAdminReports) closeAdminReports.addEventListener("click",() => $("#admin-reports-modal").close());
+  const statusFilter = $("#admin-report-status-filter");
+  if (statusFilter) statusFilter.addEventListener("change",() => {
+    state.support.admin.statusFilter = statusFilter.value;
+    state.support.admin.offset = 0;
+    loadAdminSupportReports();
+  });
+  const previousReports = $("#admin-report-previous");
+  if (previousReports) previousReports.addEventListener("click",() => {
+    state.support.admin.offset = Math.max(0, state.support.admin.offset - state.support.admin.limit);
+    loadAdminSupportReports();
+  });
+  const nextReports = $("#admin-report-next");
+  if (nextReports) nextReports.addEventListener("click",() => {
+    state.support.admin.offset += state.support.admin.limit;
+    loadAdminSupportReports();
+  });
   $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
   $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());

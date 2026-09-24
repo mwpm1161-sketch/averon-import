@@ -40,6 +40,7 @@
         <div class="top-actions">
           <button class="button ghost" id="new-document-button" hidden>Новый документ</button>
           <button class="button ghost" id="settings-button" hidden>Настройки</button>
+          <button class="button ghost" id="admin-reports-button" hidden>Обращения</button>
           <button class="button ghost" id="help-button">Справка</button>
         </div>
       </header>
@@ -257,12 +258,54 @@
           <label class="check-row"><input type="checkbox" id="export-headers" checked><span>Добавить заголовки столбцов</span></label>
           <label class="check-row"><input type="checkbox" id="export-items-only" checked><span>Экспортировать только позиции и компоненты</span></label>
           <div class="export-safety" id="export-safety" role="status"></div>
+          <div class="export-reportable-error" id="export-reportable-error" role="alert" hidden>
+            <b>Не удалось сформировать Excel.</b>
+            <button class="button secondary" type="button" id="open-support-report">Сообщить о проблеме</button>
+          </div>
           <div class="export-note"><b>В Excel попадут исправленные данные</b><p>Строки со статусом «Требует проверки» будут подсвечены. Неточность OCR без критичного blocker сама по себе экспорт не блокирует.</p></div>
           <div class="export-note review-export-note"><b>Экспорт для проверки</b><p>Проверочный файл может содержать строки, требующие проверки. Он не подтверждает данные и не меняет статус распознавания.</p></div>
         </div>
       </div>
       <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button secondary" type="button" id="copy-export">Копировать таблицу</button><button class="button secondary" type="button" id="download-review-excel">Экспорт для проверки</button><button class="button primary" type="button" id="download-excel">Скачать Excel</button></div>
     </form>
+  </dialog>
+
+  <dialog class="modal" id="support-report-modal">
+    <form class="modal-card support-report-card" id="support-report-form">
+      <div class="modal-header"><div><span class="eyebrow">Обратная связь</span><h2>Сообщить о проблеме</h2><p>Опишите ошибку экспорта, чтобы администратор мог её проверить.</p></div><button class="icon-button" type="button" id="close-support-report" aria-label="Закрыть">×</button></div>
+      <label class="field-label" for="support-reporter-fio">ФИО *</label>
+      <input class="input" id="support-reporter-fio" name="reporter_fio" required minlength="3" maxlength="200" autocomplete="name">
+      <label class="field-label support-description-input-label" for="support-report-description">Подробное описание проблемы *</label>
+      <textarea class="input support-report-textarea" id="support-report-description" name="description" required minlength="20" maxlength="5000" aria-describedby="support-report-hint"></textarea>
+      <p class="hint" id="support-report-hint">Опишите, что вы ожидали получить и что произошло при экспорте.</p>
+      <p class="support-form-error" id="support-report-error" role="status" hidden></p>
+      <div class="modal-footer"><button class="button ghost" type="button" id="cancel-support-report">Отмена</button><button class="button primary" type="submit" id="support-report-submit">Отправить</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="admin-reports-modal">
+    <div class="modal-card admin-reports-card">
+      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Обращения</h2><p>Просмотр сообщений о проблемах экспорта.</p></div><button class="icon-button" type="button" id="close-admin-reports" aria-label="Закрыть">×</button></div>
+      <div class="admin-reports-toolbar">
+        <label class="field-label" for="admin-report-status-filter">Показывать</label>
+        <select class="select" id="admin-report-status-filter">
+          <option value="OPEN">Открытые</option>
+          <option value="IN_PROGRESS">В работе</option>
+          <option value="RESOLVED">Решённые</option>
+          <option value="ALL">Все</option>
+        </select>
+      </div>
+      <p class="support-muted" id="admin-reports-status" role="status"></p>
+      <div class="admin-reports-layout">
+        <section class="admin-report-list" id="admin-report-list" aria-label="Список обращений"></section>
+        <section class="admin-report-detail" id="admin-report-detail" aria-live="polite">Выберите обращение, чтобы открыть его.</section>
+      </div>
+      <div class="admin-reports-pagination">
+        <button class="button ghost" type="button" id="admin-report-previous" disabled>Назад</button>
+        <span id="admin-report-page">Страница 1</span>
+        <button class="button ghost" type="button" id="admin-report-next" disabled>Далее</button>
+      </div>
+    </div>
   </dialog>
 
   <dialog class="modal sourcing-modal" id="sourcing-modal">
