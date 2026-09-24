@@ -92,6 +92,7 @@ from averon_import.services.secrets import (
 from averon_import.services.support_reports import (
     DuplicateReport,
     IncidentNotFound,
+    INCIDENT_KIND_USER_REPORTED,
     REPORT_STATUSES,
     ReportForbidden,
     ReportNotFound,
@@ -1164,6 +1165,13 @@ class SupportReportStatusRequest(BaseModel):
     version: int = Field(ge=1)
 
 
+class SupportIncidentCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+    stage: Literal["document", "pages", "recognition", "review", "export"]
+
+
 def _document_available(document_id: str) -> bool:
     try:
         return workspace_service.get(document_id).root.is_dir()
@@ -1179,6 +1187,7 @@ def _public_support_report(report: dict[str, Any]) -> dict[str, Any]:
         "created_at": report["incident_created_at"],
         "username": report["username"],
         "role": report["role"],
+        "incident_kind": report["incident_kind"],
         "stage": report["stage"],
         "error_code": report["error_code"],
         "public_message": report["public_message"],
@@ -1214,9 +1223,55 @@ def _public_support_summary(report: dict[str, Any]) -> dict[str, Any]:
         "version": report["version"],
         "document_id": report["document_id"],
         "username": report["username"],
+        "incident_kind": report["incident_kind"],
         "error_code": report["error_code"],
         "public_message": report["public_message"],
         "row_count": report["row_count"],
+    }
+
+
+@app.post("/api/support/incidents", dependencies=[Depends(require_authenticated)])
+def create_support_incident(
+    request: SupportIncidentCreateRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    try:
+        workspace = workspace_service.get(request.document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    if not workspace.root.is_dir():
+        raise HTTPException(404, "Документ не найден")
+
+    try:
+        stored_result = workspace_service.read_json(workspace.result_path, default={})
+    except (OSError, ValueError, TypeError):
+        stored_result = {}
+    stored_result = stored_result if isinstance(stored_result, dict) else {}
+    rows = stored_result.get("rows")
+    page_statuses = stored_result.get("page_statuses")
+    result_summary = stored_result.get("summary")
+    rows = rows if isinstance(rows, list) else []
+    page_statuses = page_statuses if isinstance(page_statuses, (dict, list)) else {}
+    result_summary = result_summary if isinstance(result_summary, dict) else {}
+
+    try:
+        incident = support_repository.create_user_reported_incident(
+            document_id=request.document_id,
+            username=user.username,
+            role=user.role.value,
+            app_version=APP_VERSION,
+            stage=request.stage,
+            document=_safe_document_snapshot_metadata(workspace),
+            rows=rows,
+            page_statuses=page_statuses,
+            result_summary=result_summary,
+        )
+    except Exception as exc:
+        logger.exception("Unable to persist user-reported support incident")
+        raise HTTPException(500, "Не удалось сохранить контекст обращения") from exc
+    return {
+        "incident_id": incident["incident_id"],
+        "incident_kind": INCIDENT_KIND_USER_REPORTED,
     }
 
 

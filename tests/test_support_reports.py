@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
+import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -179,6 +181,115 @@ def _create_incident(repository, *, username="colleague", document_id="d" * 32):
     )
 
 
+def test_v1_export_incidents_reports_and_snapshot_hash_survive_transactional_upgrade(tmp_path):
+    from averon_import.services.support_reports import SCHEMA_VERSION, SupportRepository
+
+    support_dir = tmp_path / "support"
+    incidents_dir = support_dir / "incidents"
+    incidents_dir.mkdir(parents=True)
+    incident_id = "exp-legacy"
+    report_id = "rpt-legacy"
+    snapshot = {
+        "schema_version": 1,
+        "incident_id": incident_id,
+        "document_id": "d" * 32,
+        "error_code": "EXPORT_FAILED",
+    }
+    snapshot_bytes = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    (incidents_dir / f"{incident_id}.json").write_bytes(snapshot_bytes)
+
+    connection = sqlite3.connect(support_dir / "support.sqlite3")
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.executescript(
+        """
+        CREATE TABLE export_incidents (
+            incident_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            username TEXT NOT NULL,
+            role TEXT NOT NULL,
+            stage TEXT NOT NULL DEFAULT 'export',
+            error_code TEXT NOT NULL,
+            public_message TEXT NOT NULL,
+            http_status INTEGER NOT NULL,
+            app_version TEXT NOT NULL,
+            export_kind TEXT NOT NULL,
+            requested_filename TEXT,
+            row_count INTEGER,
+            snapshot_path TEXT NOT NULL,
+            snapshot_sha256 TEXT NOT NULL
+        );
+        CREATE TABLE support_reports (
+            report_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL UNIQUE,
+            reporter_fio TEXT NOT NULL,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (incident_id) REFERENCES export_incidents(incident_id)
+        );
+        CREATE INDEX idx_support_reports_status_created
+            ON support_reports(status, created_at);
+        CREATE INDEX idx_export_incidents_document ON export_incidents(document_id);
+        CREATE INDEX idx_export_incidents_created ON export_incidents(created_at);
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO export_incidents (
+            incident_id, document_id, created_at, username, role, stage,
+            error_code, public_message, http_status, app_version, export_kind,
+            requested_filename, row_count, snapshot_path, snapshot_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            incident_id, "d" * 32, "2026-01-02T03:04:05+00:00", "colleague",
+            "user", "export", "EXPORT_FAILED", "Export failed", 500,
+            "legacy-version", "production", "failed.xlsx", 3,
+            f"incidents/{incident_id}.json", hashlib.sha256(snapshot_bytes).hexdigest(),
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO support_reports (
+            report_id, incident_id, reporter_fio, description, status,
+            created_at, updated_at, version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            report_id, incident_id, "Иван Петров", "Existing linked report description",
+            "IN_PROGRESS", "2026-01-02T03:05:00+00:00", "2026-01-02T03:06:00+00:00", 4,
+        ),
+    )
+    connection.execute("PRAGMA user_version=1")
+    connection.commit()
+    connection.close()
+
+    repository = SupportRepository(support_dir)
+    incident = repository.get_incident(incident_id)
+    report = repository.get_report(report_id)
+    assert SCHEMA_VERSION == 2
+    assert incident["incident_kind"] == "export_failure"
+    assert incident["snapshot_sha256"] == hashlib.sha256(snapshot_bytes).hexdigest()
+    assert report["report_id"] == report_id
+    assert report["incident_kind"] == "export_failure"
+    assert report["status"] == "IN_PROGRESS" and report["version"] == 4
+    assert (incidents_dir / f"{incident_id}.json").read_bytes() == snapshot_bytes
+    assert repository.snapshot_for_report(report_id) == snapshot
+    with repository._connect() as migrated:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+        report_foreign_key = migrated.execute(
+            "PRAGMA foreign_key_list(support_reports)"
+        ).fetchone()
+        assert report_foreign_key["table"] == "support_incidents"
+        assert migrated.execute("SELECT COUNT(*) FROM support_reports").fetchone()[0] == 1
+
+
 def test_success_export_keeps_file_behavior_and_creates_no_incident(support_context, monkeypatch):
     client, main, repository, workspace_service, _ = support_context
     workspace = _make_workspace(workspace_service)
@@ -192,7 +303,7 @@ def test_success_export_keeps_file_behavior_and_creates_no_incident(support_cont
     assert response.status_code == 200
     assert response.content[:2] == b"PK"
     with repository._connect() as connection:
-        incident_count = connection.execute("SELECT COUNT(*) FROM export_incidents").fetchone()[0]
+        incident_count = connection.execute("SELECT COUNT(*) FROM support_incidents").fetchone()[0]
         report_count = connection.execute("SELECT COUNT(*) FROM support_reports").fetchone()[0]
     assert incident_count == 0
     assert list(repository.incidents_dir.glob("*.json")) == []
@@ -354,6 +465,7 @@ def test_snapshot_is_immutable_and_hash_matches(support_context, monkeypatch):
         json=request_payload,
     )
     incident = repository.get_incident(response.json()["error"]["incident_id"])
+    assert incident["incident_kind"] == "export_failure"
     snapshot_path = repository.incidents_dir / f"{incident['incident_id']}.json"
     before = snapshot_path.read_bytes()
     workspace_service.write_json(workspace.result_path, {"summary": {"total_rows": 999}})
@@ -362,6 +474,7 @@ def test_snapshot_is_immutable_and_hash_matches(support_context, monkeypatch):
     assert before == after
     assert hashlib.sha256(after).hexdigest() == incident["snapshot_sha256"]
     snapshot = json.loads(after.decode("utf-8"))
+    assert snapshot["incident_kind"] == "export_failure"
     assert snapshot["export_request"] == request_payload
     assert snapshot["page_statuses"]["1"]["output_status"] == "USABLE"
     assert source_pdf.exists()
@@ -421,6 +534,152 @@ def test_snapshot_sanitizes_nested_secrets_and_paths_without_losing_rows(support
     assert "[REDACTED_PATH]" in snapshot_text
 
 
+def test_user_reported_incident_validation_authorization_and_server_owned_snapshot(support_context):
+    client, _, repository, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+    stored_result = {
+        "rows": [{
+            "page": 1,
+            "name": "Насос",
+            "quantity": "2",
+            "api_key": "provider-api-key-secret",
+            "password_hash": "password-hash-secret",
+            "session_token": "session-token-secret",
+            "csrf_token": "csrf-token-secret",
+            "proxy_secret": "proxy-secret-value",
+            "credentials": {"password": "credential-password-secret"},
+            "authorization": "Bearer authorization-secret",
+            "traceback": "C:\\private\\traceback.txt",
+            "source_path": "C:\\private\\source.pdf",
+        }],
+        "page_statuses": {"1": {"output_status": "USABLE", "status": "REVIEW_REQUIRED"}},
+        "summary": {"total_rows": 1, "exportable_rows": 0},
+    }
+    workspace_service.write_json(workspace.result_path, stored_result)
+    payload = {"document_id": workspace.document_id, "stage": "review"}
+
+    assert client.get("/api/me").status_code == 401
+    unauthenticated = client.post("/api/support/incidents", json=payload)
+    assert unauthenticated.status_code == 401
+    invalid_stage = client.post(
+        "/api/support/incidents",
+        headers=_headers("colleague"),
+        json={**payload, "stage": "arbitrary-stage"},
+    )
+    assert invalid_stage.status_code == 422
+    injected_snapshot = client.post(
+        "/api/support/incidents",
+        headers=_headers("colleague"),
+        json={**payload, "snapshot": {"password": "browser-secret", "rows": [{"name": "forged"}]}},
+    )
+    assert injected_snapshot.status_code == 422
+    missing_document = client.post(
+        "/api/support/incidents",
+        headers=_headers("colleague"),
+        json={"document_id": "e" * 32, "stage": "document"},
+    )
+    assert missing_document.status_code == 404
+    with repository._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM support_incidents").fetchone()[0] == 0
+
+    created = client.post("/api/support/incidents", headers=_headers("colleague"), json=payload)
+    assert created.status_code == 200
+    incident_id = created.json()["incident_id"]
+    assert created.json()["incident_kind"] == "user_reported"
+    incident = repository.get_incident(incident_id)
+    assert incident["incident_kind"] == "user_reported"
+    assert incident["stage"] == "review"
+    assert incident["error_code"] is None
+    assert incident["http_status"] is None
+    with repository._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM support_reports").fetchone()[0] == 0
+
+    admin_created = client.post(
+        "/api/support/incidents",
+        headers=_headers("averon"),
+        json={"document_id": workspace.document_id, "stage": "pages"},
+    )
+    assert admin_created.status_code == 200
+    assert repository.get_incident(admin_created.json()["incident_id"])["role"] == "admin"
+
+    snapshot_path = repository.incidents_dir / f"{incident_id}.json"
+    original_snapshot_bytes = snapshot_path.read_bytes()
+    original_snapshot = json.loads(original_snapshot_bytes.decode("utf-8"))
+    snapshot_text = original_snapshot_bytes.decode("utf-8")
+    assert original_snapshot["schema_version"] == 1
+    assert original_snapshot["incident_kind"] == "user_reported"
+    assert original_snapshot["stage"] == original_snapshot["reported_stage"] == "review"
+    assert original_snapshot["user"] == {"username": "colleague", "role": "user"}
+    assert original_snapshot["document"] == {
+        "filename": "specification.pdf",
+        "title": "Test specification",
+        "page_count": 3,
+        "size": 1234,
+    }
+    assert original_snapshot["rows"][0]["name"] == "Насос"
+    assert original_snapshot["page_statuses"]["1"]["output_status"] == "USABLE"
+    assert original_snapshot["result_summary"]["total_rows"] == 1
+    for forbidden in (
+        "provider-api-key-secret", "password-hash-secret", "session-token-secret",
+        "csrf-token-secret", "proxy-secret-value", "credential-password-secret",
+        "authorization-secret", "C:\\private\\traceback.txt", "C:\\private\\source.pdf",
+    ):
+        assert forbidden not in snapshot_text
+    assert '"api_key"' not in snapshot_text
+    assert '"traceback"' not in snapshot_text
+    assert "[REDACTED_PATH]" in snapshot_text
+
+    report_payload = {
+        "incident_id": incident_id,
+        "reporter_fio": "Иван Петров",
+        "description": "Пользователь сообщает о неверном отображении текущего результата.",
+    }
+    created_report = client.post("/api/support/reports", headers=_headers("colleague"), json=report_payload)
+    assert created_report.status_code == 200
+    assert created_report.json()["incident"]["incident_kind"] == "user_reported"
+    assert created_report.json()["incident"]["error_code"] is None
+    assert "snapshot_path" not in created_report.json()["incident"]
+
+    foreign_report = client.post("/api/support/reports", headers=_headers("other"), json=report_payload)
+    assert foreign_report.status_code == 403
+    duplicate_report = client.post("/api/support/reports", headers=_headers("colleague"), json=report_payload)
+    assert duplicate_report.status_code == 409
+
+    report_id = created_report.json()["report_id"]
+    user_detail = client.get(
+        f"/api/admin/support/reports/{report_id}", headers=_headers("colleague")
+    )
+    assert user_detail.status_code == 403
+    admin_list = client.get("/api/admin/support/reports?limit=100&offset=0", headers=_headers("averon"))
+    assert admin_list.status_code == 200
+    matching_summary = next(item for item in admin_list.json()["reports"] if item["report_id"] == report_id)
+    assert matching_summary["incident_kind"] == "user_reported"
+    admin_detail = client.get(
+        f"/api/admin/support/reports/{report_id}", headers=_headers("averon")
+    )
+    assert admin_detail.status_code == 200
+    assert admin_detail.json()["incident"]["incident_kind"] == "user_reported"
+    snapshot_response = client.get(
+        f"/api/admin/support/reports/{report_id}/snapshot", headers=_headers("averon")
+    )
+    assert snapshot_response.status_code == 200
+    assert snapshot_response.json() == original_snapshot
+    assert hashlib.sha256(original_snapshot_bytes).hexdigest() == incident["snapshot_sha256"]
+
+    workspace_service.write_json(workspace.result_path, {"rows": [{"name": "changed"}]})
+    assert snapshot_path.read_bytes() == original_snapshot_bytes
+    shutil.rmtree(workspace.root)
+    unavailable_detail = client.get(
+        f"/api/admin/support/reports/{report_id}", headers=_headers("averon")
+    )
+    assert unavailable_detail.json()["incident"]["document_available"] is False
+    retained_snapshot = client.get(
+        f"/api/admin/support/reports/{report_id}/snapshot", headers=_headers("averon")
+    )
+    assert retained_snapshot.status_code == 200
+    assert retained_snapshot.json() == original_snapshot
+
+
 def test_snapshot_cleanup_failure_does_not_mask_persistence_error(support_context, monkeypatch):
     _, _, repository, _, _ = support_context
 
@@ -453,7 +712,7 @@ def test_snapshot_cleanup_failure_does_not_mask_persistence_error(support_contex
 
     monkeypatch.undo()
     with repository._connect() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM export_incidents").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM support_incidents").fetchone()[0] == 0
 
 
 def test_support_report_validates_ownership_duplicate_and_restart(support_context):
@@ -538,11 +797,13 @@ def test_admin_report_list_detail_snapshot_and_optimistic_status(support_context
     )
     assert admin_list.status_code == 200
     assert len(admin_list.json()["reports"]) == 1
+    assert admin_list.json()["reports"][0]["incident_kind"] == "export_failure"
     detail = client.get(
         f"/api/admin/support/reports/{report_id}",
         headers=_headers("averon"),
     )
     assert detail.status_code == 200
+    assert detail.json()["incident"]["incident_kind"] == "export_failure"
     assert detail.json()["incident"]["document_available"] is False
     snapshot = client.get(
         f"/api/admin/support/reports/{report_id}/snapshot",

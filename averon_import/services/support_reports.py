@@ -1,4 +1,4 @@
-"""Persistent export incidents and authenticated support reports."""
+"""Persistent support incidents and authenticated support reports."""
 
 from __future__ import annotations
 
@@ -15,17 +15,23 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+INCIDENT_KIND_EXPORT_FAILURE = "export_failure"
+INCIDENT_KIND_USER_REPORTED = "user_reported"
 REPORT_STATUSES = ("OPEN", "IN_PROGRESS", "RESOLVED")
 _FORBIDDEN_KEY_MARKERS = (
     "authorization",
     "api_key",
     "apikey",
+    "credential",
     "password",
     "proxy",
     "secret",
     "session",
+    "stack_trace",
+    "stacktrace",
     "token",
+    "traceback",
 )
 _ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
 _OMIT = object()
@@ -121,48 +127,144 @@ class SupportRepository:
     def _initialize(self) -> None:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, SCHEMA_VERSION}:
+            if version not in {0, 1, SCHEMA_VERSION}:
                 raise RuntimeError("Неподдерживаемая версия support schema")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS export_incidents (
-                    incident_id TEXT PRIMARY KEY,
-                    document_id TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    username TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    stage TEXT NOT NULL DEFAULT 'export',
-                    error_code TEXT NOT NULL,
-                    public_message TEXT NOT NULL,
-                    http_status INTEGER NOT NULL,
-                    app_version TEXT NOT NULL,
-                    export_kind TEXT NOT NULL,
-                    requested_filename TEXT,
-                    row_count INTEGER,
-                    snapshot_path TEXT NOT NULL,
-                    snapshot_sha256 TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS support_reports (
-                    report_id TEXT PRIMARY KEY,
-                    incident_id TEXT NOT NULL UNIQUE,
-                    reporter_fio TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    version INTEGER NOT NULL DEFAULT 1,
-                    FOREIGN KEY (incident_id) REFERENCES export_incidents(incident_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_support_reports_status_created
-                    ON support_reports(status, created_at);
-                CREATE INDEX IF NOT EXISTS idx_export_incidents_document
-                    ON export_incidents(document_id);
-                CREATE INDEX IF NOT EXISTS idx_export_incidents_created
-                    ON export_incidents(created_at);
-                """
-            )
-            if version == 0:
+            if version == SCHEMA_VERSION:
+                return
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if version == 0:
+                    tables = {
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                    }
+                    if "export_incidents" in tables:
+                        self._migrate_v1_to_v2(connection)
+                    else:
+                        self._create_schema(connection)
+                else:
+                    self._migrate_v1_to_v2(connection)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if foreign_key_errors:
+                    raise RuntimeError("Нарушена целостность support schema")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    @staticmethod
+    def _create_incidents_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE support_incidents (
+                incident_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                username TEXT NOT NULL,
+                role TEXT NOT NULL,
+                incident_kind TEXT NOT NULL CHECK (
+                    incident_kind IN ('export_failure', 'user_reported')
+                ),
+                stage TEXT NOT NULL CHECK (
+                    stage IN ('document', 'pages', 'recognition', 'review', 'export')
+                ),
+                error_code TEXT,
+                public_message TEXT,
+                http_status INTEGER,
+                app_version TEXT NOT NULL,
+                export_kind TEXT,
+                requested_filename TEXT,
+                row_count INTEGER,
+                snapshot_path TEXT NOT NULL,
+                snapshot_sha256 TEXT NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_reports_table(
+        connection: sqlite3.Connection,
+        table_name: str = "support_reports",
+    ) -> None:
+        if table_name not in {"support_reports", "support_reports_new"}:
+            raise ValueError("Invalid support reports table name")
+        connection.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                report_id TEXT PRIMARY KEY,
+                incident_id TEXT NOT NULL UNIQUE,
+                reporter_fio TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (incident_id) REFERENCES support_incidents(incident_id)
+            )
+            """
+        )
+
+    @classmethod
+    def _create_schema(cls, connection: sqlite3.Connection) -> None:
+        cls._create_incidents_table(connection)
+        cls._create_reports_table(connection)
+        cls._create_indexes(connection)
+
+    @staticmethod
+    def _create_indexes(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE INDEX idx_support_reports_status_created "
+            "ON support_reports(status, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_support_incidents_document "
+            "ON support_incidents(document_id)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_support_incidents_created "
+            "ON support_incidents(created_at)"
+        )
+
+    @classmethod
+    def _migrate_v1_to_v2(cls, connection: sqlite3.Connection) -> None:
+        """Atomically generalize export incidents without moving snapshot files."""
+        connection.execute("ALTER TABLE export_incidents RENAME TO legacy_export_incidents")
+        cls._create_incidents_table(connection)
+        connection.execute(
+            """
+            INSERT INTO support_incidents (
+                incident_id, document_id, created_at, username, role,
+                incident_kind, stage, error_code, public_message, http_status,
+                app_version, export_kind, requested_filename, row_count,
+                snapshot_path, snapshot_sha256
+            )
+            SELECT
+                incident_id, document_id, created_at, username, role,
+                'export_failure', stage, error_code, public_message, http_status,
+                app_version, export_kind, requested_filename, row_count,
+                snapshot_path, snapshot_sha256
+            FROM legacy_export_incidents
+            """
+        )
+        cls._create_reports_table(connection, "support_reports_new")
+        connection.execute(
+            """
+            INSERT INTO support_reports_new (
+                report_id, incident_id, reporter_fio, description, status,
+                created_at, updated_at, version
+            )
+            SELECT report_id, incident_id, reporter_fio, description, status,
+                   created_at, updated_at, version
+            FROM support_reports
+            """
+        )
+        connection.execute("DROP TABLE support_reports")
+        connection.execute("DROP TABLE legacy_export_incidents")
+        connection.execute("ALTER TABLE support_reports_new RENAME TO support_reports")
+        cls._create_indexes(connection)
 
     @staticmethod
     def _as_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -192,6 +294,7 @@ class SupportRepository:
         snapshot = {
             "schema_version": 1,
             "incident_id": incident_id,
+            "incident_kind": INCIDENT_KIND_EXPORT_FAILURE,
             "created_at": created_at,
             "app_version": app_version,
             "user": {"username": username, "role": role},
@@ -204,6 +307,91 @@ class SupportRepository:
             "error_code": error_code,
             "public_message": public_message,
         }
+        return self._store_incident(
+            incident_id=incident_id,
+            incident_kind=INCIDENT_KIND_EXPORT_FAILURE,
+            document_id=document_id,
+            created_at=created_at,
+            username=username,
+            role=role,
+            stage="export",
+            error_code=error_code,
+            public_message=public_message,
+            http_status=http_status,
+            app_version=app_version,
+            export_kind=export_kind,
+            requested_filename=requested_filename,
+            row_count=row_count,
+            snapshot=snapshot,
+        )
+
+    def create_user_reported_incident(
+        self,
+        *,
+        document_id: str,
+        username: str,
+        role: str,
+        app_version: str,
+        stage: str,
+        document: dict[str, Any],
+        rows: list[Any],
+        page_statuses: dict[str, Any] | list[Any],
+        result_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        incident_id = _new_id("inc")
+        created_at = _utc_now()
+        snapshot = {
+            "schema_version": 1,
+            "incident_id": incident_id,
+            "incident_kind": INCIDENT_KIND_USER_REPORTED,
+            "created_at": created_at,
+            "app_version": app_version,
+            "user": {"username": username, "role": role},
+            "document_id": document_id,
+            "document": document,
+            "stage": stage,
+            "reported_stage": stage,
+            "rows": rows,
+            "page_statuses": page_statuses,
+            "result_summary": result_summary,
+        }
+        return self._store_incident(
+            incident_id=incident_id,
+            incident_kind=INCIDENT_KIND_USER_REPORTED,
+            document_id=document_id,
+            created_at=created_at,
+            username=username,
+            role=role,
+            stage=stage,
+            error_code=None,
+            public_message=None,
+            http_status=None,
+            app_version=app_version,
+            export_kind=None,
+            requested_filename=None,
+            row_count=len(rows),
+            snapshot=snapshot,
+        )
+
+    def _store_incident(
+        self,
+        *,
+        incident_id: str,
+        incident_kind: str,
+        document_id: str,
+        created_at: str,
+        username: str,
+        role: str,
+        stage: str,
+        error_code: str | None,
+        public_message: str | None,
+        http_status: int | None,
+        app_version: str,
+        export_kind: str | None,
+        requested_filename: str | None,
+        row_count: int | None,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
         snapshot_value = _safe_snapshot_value(snapshot)
         snapshot_bytes = json.dumps(
             snapshot_value,
@@ -232,12 +420,12 @@ class SupportRepository:
             with self._connect() as connection:
                 connection.execute(
                     """
-                    INSERT INTO export_incidents (
+                    INSERT INTO support_incidents (
                         incident_id, document_id, created_at, username, role,
-                        stage, error_code, public_message, http_status,
-                        app_version, export_kind, requested_filename, row_count,
-                        snapshot_path, snapshot_sha256
-                    ) VALUES (?, ?, ?, ?, ?, 'export', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        incident_kind, stage, error_code, public_message,
+                        http_status, app_version, export_kind, requested_filename,
+                        row_count, snapshot_path, snapshot_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         incident_id,
@@ -245,6 +433,8 @@ class SupportRepository:
                         created_at,
                         username,
                         role,
+                        incident_kind,
+                        stage,
                         error_code,
                         public_message,
                         http_status,
@@ -262,7 +452,8 @@ class SupportRepository:
                 "created_at": created_at,
                 "username": username,
                 "role": role,
-                "stage": "export",
+                "incident_kind": incident_kind,
+                "stage": stage,
                 "error_code": error_code,
                 "public_message": public_message,
                 "http_status": http_status,
@@ -282,7 +473,7 @@ class SupportRepository:
     def get_incident(self, incident_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM export_incidents WHERE incident_id = ?",
+                "SELECT * FROM support_incidents WHERE incident_id = ?",
                 (incident_id,),
             ).fetchone()
         result = self._as_dict(row)
@@ -341,6 +532,7 @@ class SupportRepository:
                     incident.document_id,
                     incident.username,
                     incident.role,
+                    incident.incident_kind,
                     incident.created_at AS incident_created_at,
                     incident.stage,
                     incident.error_code,
@@ -352,7 +544,7 @@ class SupportRepository:
                     incident.row_count,
                     incident.snapshot_sha256
                 FROM support_reports AS report
-                JOIN export_incidents AS incident
+                JOIN support_incidents AS incident
                   ON incident.incident_id = report.incident_id
                 WHERE report.report_id = ?
                 """,
@@ -381,6 +573,7 @@ class SupportRepository:
                 report.version,
                 incident.document_id,
                 incident.username,
+                incident.incident_kind,
                 incident.role,
                 incident.created_at AS incident_created_at,
                 incident.error_code,
@@ -390,7 +583,7 @@ class SupportRepository:
                 incident.requested_filename,
                 incident.row_count
             FROM support_reports AS report
-            JOIN export_incidents AS incident
+            JOIN support_incidents AS incident
               ON incident.incident_id = report.incident_id
         """
         parameters: list[Any] = []
@@ -448,6 +641,8 @@ class SupportRepository:
 
 __all__ = [
     "DuplicateReport",
+    "INCIDENT_KIND_EXPORT_FAILURE",
+    "INCIDENT_KIND_USER_REPORTED",
     "IncidentNotFound",
     "REPORT_STATUSES",
     "ReportForbidden",
