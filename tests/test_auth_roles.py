@@ -132,6 +132,7 @@ def test_valid_user_and_admin_identity(auth_client):
     assert user.json() == {
         "username": "colleague",
         "role": "user",
+        "auth_mode": "trusted_proxy",
         "capabilities": {
             "settings": False,
             "provider_maintenance": False,
@@ -331,6 +332,8 @@ def test_frontend_boot_loads_settings_only_for_admin_and_hides_button_for_user()
     assert 'if (isAdmin)' in boot
     assert 'state.settings = await api("/api/settings")' in boot
     assert '$("#settings-button").hidden = !isAdmin' in boot
+    assert '$("#logout-button").hidden = authMode !== "session"' in boot
+    assert '$("#users-button").hidden = currentUser?.capabilities?.user_management !== true' in boot
     assert '<button class="button ghost" id="settings-button" hidden>' in html
 
 

@@ -20,6 +20,21 @@ const state = {
   sourcing: {row: null, result: null, projectFilter: "all"},
   sourcingHealth: null,
   currentUser: null,
+  authMode: null,
+  authState: "checking",
+  authGeneration: 0,
+  bootComplete: false,
+  loginSubmitting: false,
+  users: {
+    items: [],
+    limit: 25,
+    offset: 0,
+    hasNext: false,
+    listRequest: 0,
+    loading: false,
+    mutating: false,
+    selectedUser: null,
+  },
   support: {
     pendingIncident: null,
     sending: false,
@@ -45,6 +60,8 @@ const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
 const CRITICAL_LABELS = {quantity:"Количество", unit:"Единица", mass:"Масса"};
 const MANUAL_DRAFT_KEY = "averonManualTenderDraft";
 const MANUAL_FIELDS = ["name", "type_mark", "manufacturer", "code", "quantity", "unit"];
+let authBootPromise = null;
+let authBootGeneration = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -71,7 +88,15 @@ class ApiError extends Error {
 }
 
 async function api(url, options = {}) {
-  const response = await fetch(url, options);
+  const requestOptions = {...options};
+  const method = String(options.method || "GET").toUpperCase();
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const headers = new Headers(options.headers || {});
+    const csrfToken = readCsrfCookie();
+    if (csrfToken && !headers.has("X-CSRF-Token")) headers.set("X-CSRF-Token", csrfToken);
+    requestOptions.headers = headers;
+  }
+  const response = await fetch(url, requestOptions);
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     let payload = null;
@@ -80,16 +105,533 @@ async function api(url, options = {}) {
       if (typeof payload?.detail === "string" && payload.detail.trim()) message = payload.detail;
     } catch (_) {}
     const error = payload?.error && typeof payload.error === "object" ? payload.error : {};
-    throw new ApiError(message, {
+    const detail = payload?.detail && typeof payload.detail === "object" ? payload.detail : {};
+    const apiError = new ApiError(message, {
       status: response.status,
-      code: typeof error.code === "string" ? error.code : null,
+      code: typeof error.code === "string" ? error.code : typeof detail.code === "string" ? detail.code : null,
       incidentId: typeof error.incident_id === "string" ? error.incident_id : null,
       reportable: error.reportable === true,
       payload,
     });
+    if (response.status === 401 && url !== "/api/auth/login") handleSessionExpired();
+    throw apiError;
   }
   const type = response.headers.get("content-type") || "";
   return type.includes("application/json") ? response.json() : response;
+}
+
+function readCsrfCookie() {
+  for (const cookie of document.cookie.split(";")) {
+    const value = cookie.trim();
+    if (!value.startsWith("averon_csrf=")) continue;
+    const encodedToken = value.slice("averon_csrf=".length);
+    try { return decodeURIComponent(encodedToken); } catch (_) { return encodedToken; }
+  }
+  return "";
+}
+
+function clearProtectedMemory() {
+  state.config = null;
+  state.document = null;
+  state.selectedPages = new Set();
+  state.previewPage = null;
+  state.crop = null;
+  state.cropSelecting = false;
+  state.rows = [];
+  state.result = null;
+  state.activeRowId = null;
+  state.dirty = false;
+  state.exportOrder = [];
+  state.exportSelected = new Set();
+  state.settings = null;
+  state.sourcing = {row: null, result: null, projectFilter: "all"};
+  state.sourcingHealth = null;
+  state.currentUser = null;
+  state.bootComplete = false;
+  state.users = {items: [], limit: 25, offset: 0, hasNext: false, listRequest: 0, loading: false, mutating: false, selectedUser: null};
+  state.support.pendingIncident = null;
+  state.support.sending = false;
+  state.support.admin = {
+    reports: [], selectedReport: null, selectedSnapshot: null, statusFilter: "OPEN",
+    limit: 25, offset: 0, listRequest: 0, detailRequest: 0, snapshotRequest: 0,
+    snapshotRequested: false, snapshotRowsShown: 0,
+  };
+  state.recentDocuments = [];
+  state.manual = {active: false, rows: []};
+  $$("dialog[open]").forEach((dialog) => dialog.close());
+  ["#new-user-password", "#new-user-password-confirm", "#reset-user-password", "#reset-user-password-confirm"]
+    .forEach((selector) => { const input = $(selector); if (input) input.value = ""; });
+  const createButton = $("#create-user-submit");
+  const resetButton = $("#reset-user-password-submit");
+  if (createButton) createButton.disabled = false;
+  if (resetButton) resetButton.disabled = false;
+  const logoutButton = $("#logout-button");
+  if (logoutButton) logoutButton.disabled = false;
+  clearProtectedUi();
+  document.body.classList.remove("manual-mode");
+}
+
+function clearProtectedUi() {
+  $("#recent-documents-list").replaceChildren();
+  $("#recent-documents-panel").hidden = true;
+  $("#thumbnail-grid").replaceChildren();
+  $("#result-head").replaceChildren();
+  $("#result-body").replaceChildren();
+  $("#empty-table").hidden = false;
+  $("#pdf-preview").removeAttribute("src");
+  $("#crop-image").removeAttribute("src");
+  $("#crop-box").hidden = true;
+  $("#crop-placeholder").hidden = false;
+  $("#clear-crop").hidden = true;
+  $("#new-document-button").hidden = true;
+  $("#document-name").textContent = "Документ";
+  $("#document-meta").textContent = "";
+  $("#preview-page-label").textContent = "Страница —";
+  $("#manual-body").replaceChildren();
+  $("#manual-empty").hidden = false;
+  $("#manual-selected-count").textContent = "Выбрано: 0";
+  $("#manual-paste-input").value = "";
+  $("#users-list").replaceChildren();
+  $("#users-status").textContent = "";
+  $("#users-page").textContent = "Страница 1";
+  $("#users-previous").disabled = true;
+  $("#users-next").disabled = true;
+  $("#new-user-username").value = "";
+  $("#new-user-password").value = "";
+  $("#new-user-password-confirm").value = "";
+  $("#user-create-status").textContent = "";
+  $("#user-create-status").hidden = true;
+  $("#reset-user-username").textContent = "";
+  $("#reset-user-password-status").textContent = "";
+  $("#reset-user-password-status").hidden = true;
+  $("#sourcing-content").textContent = "Выберите позицию, чтобы начать поиск.";
+  $("#sourcing-subtitle").textContent = "Сопоставление по распознанным характеристикам";
+  $("#admin-report-list").replaceChildren();
+  $("#admin-report-detail").textContent = "Выберите обращение, чтобы открыть его.";
+  $("#admin-reports-status").textContent = "";
+  $("#admin-report-status-filter").value = "OPEN";
+  $("#admin-report-page").textContent = "Страница 1";
+  $("#admin-report-previous").disabled = true;
+  $("#admin-report-next").disabled = true;
+  $("#support-report-form").reset();
+  $("#support-report-error").textContent = "";
+  $("#support-report-error").hidden = true;
+  $("#export-reportable-error").hidden = true;
+  $("#export-safety").textContent = "";
+  ["#settings-api-key", "#settings-ai-api-key", "#settings-etm-login", "#settings-etm-password"]
+    .forEach((selector) => { $(selector).value = ""; });
+  $("#toast-root").replaceChildren();
+  $("#pdf-file").value = "";
+  $("#summary-total").textContent = "0";
+  $("#summary-ready").textContent = "0";
+  $("#summary-critical").textContent = "0";
+  $("#summary-review").textContent = "0";
+  $("#summary-selected").textContent = "0";
+  $("#processing-title").textContent = "Распознаём спецификацию";
+  $("#processing-message").textContent = "Подготовка страниц…";
+  $("#processing-count").textContent = "0 / 0";
+  $("#processing-progress").style.width = "0%";
+  setView("upload");
+}
+
+function showCheckingScreen() {
+  $("#app-shell").hidden = true;
+  $("#auth-login-screen").hidden = true;
+  $("#auth-unavailable-screen").hidden = true;
+  $("#auth-check-screen").hidden = false;
+}
+
+function showLoginScreen(message = "") {
+  state.authState = "login";
+  $("#app-shell").hidden = true;
+  $("#auth-check-screen").hidden = true;
+  $("#auth-unavailable-screen").hidden = true;
+  $("#auth-login-screen").hidden = false;
+  $("#auth-login-error").textContent = message;
+  $("#auth-login-error").hidden = !message;
+  $("#auth-login-password").value = "";
+}
+
+function showUnavailableScreen() {
+  state.authState = "unavailable";
+  $("#app-shell").hidden = true;
+  $("#auth-check-screen").hidden = true;
+  $("#auth-login-screen").hidden = true;
+  $("#auth-unavailable-screen").hidden = false;
+}
+
+function returnToLogin(message = "") {
+  state.authGeneration += 1;
+  clearProtectedMemory();
+  state.authMode = null;
+  showLoginScreen(message);
+}
+
+function handleSessionExpired() {
+  if (state.authState !== "authenticated" || state.authMode !== "session") return;
+  returnToLogin("Сессия завершена. Войдите снова.");
+}
+
+function authLoginStatus(message) {
+  const error = $("#auth-login-error");
+  error.textContent = message;
+  error.hidden = !message;
+}
+
+async function submitAuthLogin(event) {
+  event.preventDefault();
+  if (state.loginSubmitting) return;
+  const form = $("#auth-login-form");
+  if (!form.reportValidity()) return;
+  const username = $("#auth-login-username").value.trim();
+  const password = $("#auth-login-password").value;
+  const button = $("#auth-login-submit");
+  state.loginSubmitting = true;
+  button.disabled = true;
+  button.textContent = "Входим…";
+  authLoginStatus("");
+  try {
+    await api("/api/auth/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({username, password}),
+    });
+    $("#auth-login-password").value = "";
+    await boot();
+  } catch (error) {
+    $("#auth-login-password").value = "";
+    if (error instanceof ApiError && [401, 429].includes(error.status)) authLoginStatus("Неверный логин или пароль.");
+    else if (error instanceof ApiError && error.status === 503) authLoginStatus("Сервис авторизации временно недоступен. Попробуйте позже.");
+    else authLoginStatus("Не удалось выполнить вход. Повторите попытку.");
+  } finally {
+    state.loginSubmitting = false;
+    button.disabled = false;
+    button.textContent = "Войти";
+  }
+}
+
+async function logoutSession() {
+  if (state.authState !== "authenticated" || state.authMode !== "session") return;
+  const button = $("#logout-button");
+  button.disabled = true;
+  try {
+    await api("/api/auth/logout", {method:"POST"});
+    returnToLogin("Вы вышли из системы.");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      if (state.authState !== "login") returnToLogin("Сессия завершена. Войдите снова.");
+    } else if (error instanceof ApiError && error.status === 503) {
+      toast("Сервис авторизации временно недоступен. Не удалось завершить сеанс.", "error");
+    } else {
+      toast("Не удалось завершить сеанс. Повторите попытку.", "error");
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function accountErrorMessage(error) {
+  if (error?.code === "USERNAME_EXISTS") return "Пользователь с таким логином уже существует.";
+  if (error?.code === "SELF_PROTECTION") return "Нельзя отключить, изменить пароль или удалить свою учётную запись.";
+  if (error?.code === "ADMIN_ACCOUNT_PROTECTED") return "Учётные записи администраторов нельзя изменять.";
+  if (error?.code === "USER_NOT_FOUND") return "Пользователь уже отсутствует. Обновите список.";
+  if (error?.status === 403) return "Недостаточно прав для управления пользователями.";
+  if (error?.status === 503) return "Сервис авторизации временно недоступен.";
+  if (error?.status === 422) return "Проверьте логин и пароль: формат или длина не подходят требованиям.";
+  return "Не удалось выполнить действие. Проверьте данные и повторите попытку.";
+}
+
+function accountTimestampLabel(value) {
+  if (typeof value !== "string" || !value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("ru-RU", {dateStyle:"short", timeStyle:"short"}).format(date);
+}
+
+function renderAdminUsers() {
+  const users = state.users;
+  const list = $("#users-list");
+  list.replaceChildren();
+  for (const user of users.items) {
+    const row = document.createElement("article");
+    row.className = "user-row";
+    const identity = document.createElement("div");
+    identity.className = "user-identity";
+    const username = document.createElement("b");
+    username.textContent = typeof user.username === "string" ? user.username : "Без имени";
+    const role = document.createElement("span");
+    role.textContent = String(user.role || "").toLowerCase() === "admin" ? "Администратор" : "Сметчик";
+    const metadata = document.createElement("small");
+    metadata.className = "user-meta";
+    metadata.textContent = `Создан: ${accountTimestampLabel(user.created_at)} · Последний вход: ${user.last_login_at ? accountTimestampLabel(user.last_login_at) : "не было"}`;
+    identity.append(username, role, metadata);
+    const status = document.createElement("span");
+    const enabled = user.enabled === true;
+    status.className = `user-state ${enabled ? "enabled" : "disabled"}`;
+    status.textContent = enabled ? "Активен" : "Отключён";
+    row.append(identity, status);
+    if (String(user.role || "").toLowerCase() === "user") {
+      const actions = document.createElement("div");
+      actions.className = "user-actions";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = enabled ? "button ghost user-disable" : "button ghost";
+      toggle.textContent = enabled ? "Отключить" : "Включить";
+      toggle.disabled = users.loading || users.mutating;
+      toggle.addEventListener("click", () => setAccountUserEnabled(user, !enabled));
+      const reset = document.createElement("button");
+      reset.type = "button";
+      reset.className = "button ghost";
+      reset.textContent = "Сбросить пароль";
+      reset.disabled = users.loading || users.mutating;
+      reset.addEventListener("click", () => openAccountPasswordReset(user));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "button ghost user-delete";
+      remove.textContent = "Удалить";
+      remove.disabled = users.loading || users.mutating;
+      remove.addEventListener("click", () => deleteAccountUser(user));
+      actions.append(toggle, reset, remove);
+      row.append(actions);
+    }
+    list.append(row);
+  }
+  $("#users-previous").disabled = users.loading || users.mutating || users.offset === 0;
+  $("#users-next").disabled = users.loading || users.mutating || !users.hasNext;
+  $("#users-page").textContent = `Страница ${Math.floor(users.offset / users.limit) + 1}`;
+}
+
+async function loadAdminUsers(statusAfterLoad = "") {
+  if (state.currentUser?.capabilities?.user_management !== true || state.authState !== "authenticated") return;
+  const users = state.users;
+  const requestId = ++users.listRequest;
+  const generation = state.authGeneration;
+  users.loading = true;
+  $("#users-status").textContent = "Загрузка списка пользователей…";
+  renderAdminUsers();
+  try {
+    const result = await api(`/api/admin/users?limit=${users.limit}&offset=${users.offset}`);
+    if (requestId !== state.users.listRequest || generation !== state.authGeneration || state.authState !== "authenticated") return;
+    users.items = Array.isArray(result?.users) ? result.users : [];
+    users.hasNext = users.items.length === users.limit;
+    $("#users-status").textContent = statusAfterLoad || (users.items.length ? "" : "На этой странице пользователей нет.");
+    renderAdminUsers();
+  } catch (error) {
+    if (requestId !== state.users.listRequest || generation !== state.authGeneration || state.authState !== "authenticated") return;
+    $("#users-status").textContent = accountErrorMessage(error);
+  } finally {
+    if (requestId === state.users.listRequest && generation === state.authGeneration) {
+      users.loading = false;
+      renderAdminUsers();
+    }
+  }
+}
+
+function openAdminUsers() {
+  if (state.currentUser?.capabilities?.user_management !== true) return;
+  const modal = $("#users-modal");
+  if (!modal.open) modal.showModal();
+  loadAdminUsers();
+}
+
+async function refreshUsersAfterStaleVersion(generation) {
+  if (generation !== state.authGeneration || state.authState !== "authenticated") return;
+  await loadAdminUsers("Данные пользователя изменились. Список обновлён; повторите действие вручную.");
+}
+
+async function setAccountUserEnabled(user, enabled) {
+  if (state.currentUser?.capabilities?.user_management !== true || String(user.role || "").toLowerCase() !== "user" || state.users.mutating) return;
+  if (!enabled && user.enabled === true && !confirm("Пользователь потеряет доступ и активные сессии будут завершены. Отключить?")) return;
+  const generation = state.authGeneration;
+  state.users.mutating = true;
+  renderAdminUsers();
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.user_id)}`, {
+      method:"PATCH",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({enabled, version:user.version}),
+    });
+    if (generation !== state.authGeneration) return;
+    await loadAdminUsers();
+    toast(enabled ? "Пользователь включён." : "Пользователь отключён; его активные сеансы завершены.", "success");
+  } catch (error) {
+    if (generation !== state.authGeneration) return;
+    if (error?.code === "STALE_USER_VERSION") await refreshUsersAfterStaleVersion(generation);
+    else {
+      $("#users-status").textContent = accountErrorMessage(error);
+      if (error?.code === "SELF_PROTECTION" || error?.code === "ADMIN_ACCOUNT_PROTECTED") await loadAdminUsers();
+    }
+  } finally {
+    if (generation === state.authGeneration) {
+      state.users.mutating = false;
+      renderAdminUsers();
+    }
+  }
+}
+
+function openAccountPasswordReset(user) {
+  if (state.currentUser?.capabilities?.user_management !== true || String(user.role || "").toLowerCase() !== "user" || state.users.mutating) return;
+  state.users.selectedUser = user;
+  $("#reset-user-username").textContent = typeof user.username === "string" ? user.username : "";
+  $("#reset-user-password").value = "";
+  $("#reset-user-password-confirm").value = "";
+  $("#reset-user-password-status").textContent = "";
+  $("#reset-user-password-status").hidden = true;
+  $("#reset-user-password-modal").showModal();
+}
+
+async function submitAccountPasswordReset(event) {
+  event.preventDefault();
+  const user = state.users.selectedUser;
+  if (state.currentUser?.capabilities?.user_management !== true || !user || String(user.role || "").toLowerCase() !== "user" || state.users.mutating) return;
+  const form = $("#reset-user-password-form");
+  if (!form.reportValidity()) return;
+  const password = $("#reset-user-password").value;
+  const confirmation = $("#reset-user-password-confirm").value;
+  const status = $("#reset-user-password-status");
+  if (password.length < 12 || password.length > 128 || password !== confirmation) {
+    status.textContent = password !== confirmation ? "Пароли не совпадают." : "Пароль должен содержать от 12 до 128 символов.";
+    status.hidden = false;
+    return;
+  }
+  const generation = state.authGeneration;
+  state.users.mutating = true;
+  $("#reset-user-password-submit").disabled = true;
+  status.textContent = "Сохраняем новый пароль…";
+  status.hidden = false;
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.user_id)}/reset-password`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({password, version:user.version}),
+    });
+    $("#reset-user-password").value = "";
+    $("#reset-user-password-confirm").value = "";
+    if (generation !== state.authGeneration) return;
+    state.users.selectedUser = null;
+    $("#reset-user-password-modal").close();
+    await loadAdminUsers();
+    toast("Пароль изменён. Активные сеансы пользователя завершены.", "success");
+  } catch (error) {
+    if (generation !== state.authGeneration) return;
+    if (error?.code === "STALE_USER_VERSION") {
+      $("#reset-user-password").value = "";
+      $("#reset-user-password-confirm").value = "";
+      state.users.selectedUser = null;
+      $("#reset-user-password-modal").close();
+      await refreshUsersAfterStaleVersion(generation);
+    } else {
+      status.textContent = accountErrorMessage(error);
+      status.hidden = false;
+      if (error?.code === "SELF_PROTECTION" || error?.code === "ADMIN_ACCOUNT_PROTECTED") await loadAdminUsers();
+    }
+  } finally {
+    if (generation === state.authGeneration) {
+      state.users.mutating = false;
+      $("#reset-user-password-submit").disabled = false;
+      $("#reset-user-password").value = "";
+      $("#reset-user-password-confirm").value = "";
+      renderAdminUsers();
+    }
+  }
+}
+
+async function deleteAccountUser(user) {
+  if (state.currentUser?.capabilities?.user_management !== true || String(user.role || "").toLowerCase() !== "user" || state.users.mutating) return;
+  const username = typeof user.username === "string" ? user.username : "этого пользователя";
+  if (!confirm(`Удалить пользователя ${username}?\nЕго активные сессии будут завершены.\nИстория обращений останется сохранённой.`)) return;
+  const generation = state.authGeneration;
+  state.users.mutating = true;
+  renderAdminUsers();
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(user.user_id)}`, {
+      method:"DELETE",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({version:user.version}),
+    });
+    if (generation !== state.authGeneration) return;
+    state.users.selectedUser = null;
+    await loadAdminUsers();
+    toast("Пользователь удалён. История обращений сохранена.", "success");
+  } catch (error) {
+    if (generation !== state.authGeneration) return;
+    if (error?.code === "STALE_USER_VERSION") await refreshUsersAfterStaleVersion(generation);
+    else {
+      $("#users-status").textContent = accountErrorMessage(error);
+      if (error?.code === "SELF_PROTECTION" || error?.code === "ADMIN_ACCOUNT_PROTECTED") await loadAdminUsers();
+    }
+  } finally {
+    if (generation === state.authGeneration) {
+      state.users.mutating = false;
+      renderAdminUsers();
+    }
+  }
+}
+
+async function createAccountUser(event) {
+  event.preventDefault();
+  if (state.currentUser?.capabilities?.user_management !== true || state.users.mutating) return;
+  const form = $("#user-create-form");
+  if (!form.reportValidity()) return;
+  const username = $("#new-user-username").value.trim();
+  const password = $("#new-user-password").value;
+  const confirmation = $("#new-user-password-confirm").value;
+  const status = $("#user-create-status");
+  if (!/^[a-z0-9._-]{3,64}$/.test(username)) {
+    status.textContent = "Логин должен содержать 3–64 символа: строчные латинские буквы, цифры, точку, дефис или подчёркивание.";
+    status.hidden = false;
+    return;
+  }
+  if (password.length < 12 || password.length > 128) {
+    status.textContent = "Пароль должен содержать от 12 до 128 символов.";
+    status.hidden = false;
+    return;
+  }
+  if (password !== confirmation) {
+    status.textContent = "Пароли не совпадают.";
+    status.hidden = false;
+    return;
+  }
+  const generation = state.authGeneration;
+  state.users.mutating = true;
+  const button = $("#create-user-submit");
+  button.disabled = true;
+  status.textContent = "Создаём учётную запись…";
+  status.hidden = false;
+  try {
+    await api("/api/admin/users", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({username, password}),
+    });
+    $("#new-user-username").value = "";
+    $("#new-user-password").value = "";
+    $("#new-user-password-confirm").value = "";
+    if (generation !== state.authGeneration) return;
+    status.textContent = "Сметчик создан.";
+    await loadAdminUsers("Сметчик создан.");
+    toast("Сметчик создан.", "success");
+  } catch (error) {
+    if (generation !== state.authGeneration) return;
+    status.textContent = accountErrorMessage(error);
+    status.hidden = false;
+  } finally {
+    if (generation === state.authGeneration) {
+      state.users.mutating = false;
+      button.disabled = false;
+      $("#new-user-password").value = "";
+      $("#new-user-password-confirm").value = "";
+      renderAdminUsers();
+    }
+  }
+}
+
+function changeAdminUsersPage(delta) {
+  if (state.users.loading || state.users.mutating) return;
+  const nextOffset = state.users.offset + delta * state.users.limit;
+  if (nextOffset < 0 || (delta > 0 && !state.users.hasNext)) return;
+  state.users.offset = nextOffset;
+  loadAdminUsers();
 }
 
 function setView(name) {
@@ -118,38 +660,77 @@ function bytes(value) {
 }
 
 async function boot() {
-  try {
-    const currentUser = await api("/api/me");
-    state.currentUser = currentUser;
-    const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
-    $("#settings-button").hidden = !isAdmin;
-    if (currentUser?.capabilities?.admin_reports === true) {
+  if (state.authState === "authenticated" && state.bootComplete) return;
+  if (authBootPromise && authBootGeneration === state.authGeneration) return authBootPromise;
+  const generation = ++state.authGeneration;
+  state.authState = "checking";
+  showCheckingScreen();
+  const pending = (async () => {
+    try {
+      const currentUser = await api("/api/me");
+      if (generation !== state.authGeneration) return;
+      const authMode = ["session", "trusted_proxy", "local_dev"].includes(currentUser?.auth_mode) ? currentUser.auth_mode : null;
+      if (!authMode || !currentUser?.username) throw new ApiError("Сервис авторизации временно недоступен", {status:503});
+      state.currentUser = currentUser;
+      state.authMode = authMode;
+      state.authState = "authenticated";
+      const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
+      $("#settings-button").hidden = !isAdmin;
+      $("#logout-button").hidden = authMode !== "session";
+      $("#users-button").hidden = currentUser?.capabilities?.user_management !== true;
       const reportsButton = $("#admin-reports-button");
-      if (reportsButton) reportsButton.hidden = false;
+      if (reportsButton) {
+        if (currentUser?.capabilities?.admin_reports === true) reportsButton.hidden = false;
+        else reportsButton.hidden = true;
+      }
+      $("#auth-check-screen").hidden = true;
+      $("#auth-login-screen").hidden = true;
+      $("#auth-unavailable-screen").hidden = true;
+      $("#app-shell").hidden = false;
+      const [config, health] = await Promise.all([
+        api("/api/config"),
+        api("/api/health"),
+      ]);
+      if (generation !== state.authGeneration) return;
+      state.config = config;
+      state.sourcingHealth = health.sourcing || null;
+      const ocr = health.cloud_ocr;
+      state.ocrHealth = ocr;
+      updateCloudStatus();
+      if (isAdmin) {
+        state.settings = await api("/api/settings");
+        if (generation !== state.authGeneration) return;
+        initializeSettings(state.settings);
+      } else {
+        state.settings = null;
+      }
+      populateFilters();
+      initializeExportColumns();
+      loadManualDraft();
+      try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
+      if (generation !== state.authGeneration) return;
+      await resumeLastDocument();
+      if (generation !== state.authGeneration) return;
+      if (state.manual.active) openManualWorkspace();
+      state.bootComplete = true;
+    } catch (error) {
+      if (generation !== state.authGeneration) return;
+      if (state.authState === "checking") {
+        if (error instanceof ApiError && error.status === 401) returnToLogin("Введите логин и пароль для входа.");
+        else showUnavailableScreen();
+      } else if (state.authState === "authenticated") {
+        toast(error.message || "Не удалось загрузить приложение", "error");
+      }
     }
-    const [config, health] = await Promise.all([
-      api("/api/config"),
-      api("/api/health"),
-    ]);
-    state.config = config;
-    state.sourcingHealth = health.sourcing || null;
-    const ocr = health.cloud_ocr;
-    state.ocrHealth = ocr;
-    updateCloudStatus();
-    if (isAdmin) {
-      state.settings = await api("/api/settings");
-      initializeSettings(state.settings);
-    } else {
-      state.settings = null;
+  })();
+  authBootPromise = pending;
+  authBootGeneration = generation;
+  try { await pending; }
+  finally {
+    if (authBootPromise === pending) {
+      authBootPromise = null;
+      authBootGeneration = null;
     }
-    populateFilters();
-    initializeExportColumns();
-    loadManualDraft();
-    try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
-    await resumeLastDocument();
-    if (state.manual.active) openManualWorkspace();
-  } catch (error) {
-    toast(error.message, "error");
   }
 }
 
@@ -2423,6 +3004,22 @@ function resetApp() {
 }
 
 function setupEvents() {
+  $("#auth-login-form").addEventListener("submit", submitAuthLogin);
+  $("#logout-button").addEventListener("click", logoutSession);
+  $("#users-button").addEventListener("click", openAdminUsers);
+  $("#close-users").addEventListener("click", () => $("#users-modal").close());
+  $("#user-create-form").addEventListener("submit", createAccountUser);
+  $("#users-previous").addEventListener("click", () => changeAdminUsersPage(-1));
+  $("#users-next").addEventListener("click", () => changeAdminUsersPage(1));
+  $("#reset-user-password-form").addEventListener("submit", submitAccountPasswordReset);
+  const closePasswordReset = () => {
+    $("#reset-user-password").value = "";
+    $("#reset-user-password-confirm").value = "";
+    state.users.selectedUser = null;
+    $("#reset-user-password-modal").close();
+  };
+  $("#close-reset-user-password").addEventListener("click", closePasswordReset);
+  $("#cancel-reset-user-password").addEventListener("click", closePasswordReset);
   $("#pdf-file").addEventListener("change", (event) => uploadFile(event.target.files[0]));
   $("#open-manual-entry").addEventListener("click", openManualWorkspace);
   $("#manual-back-to-start").addEventListener("click", returnToStartFromManual);

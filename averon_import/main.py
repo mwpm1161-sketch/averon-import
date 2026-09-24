@@ -231,7 +231,7 @@ def admin_health():
 
 @app.get("/api/me")
 def me(user: CurrentUser = Depends(require_authenticated)):
-    return user.public()
+    return {**user.public(), "auth_mode": auth_config().mode}
 
 
 def _auth_json_error(status_code: int, code: str) -> HTTPException:

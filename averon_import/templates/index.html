@@ -8,7 +8,24 @@
 </head>
 <body>
   <div id="toast-root" class="toast-root"></div>
-  <div class="app-shell">
+  <main id="auth-check-screen" class="auth-screen" aria-live="polite">
+    <section class="auth-card"><span class="eyebrow">Averon Import</span><h1>Проверка доступа</h1><p>Подключаемся к сервису авторизации…</p></section>
+  </main>
+  <main id="auth-login-screen" class="auth-screen" hidden>
+    <form class="auth-card" id="auth-login-form" autocomplete="on">
+      <span class="eyebrow">Averon Import</span><h1>Вход в систему</h1><p>Введите учётные данные для продолжения работы.</p>
+      <label class="field-label" for="auth-login-username">Логин</label>
+      <input class="input" id="auth-login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="128">
+      <label class="field-label" for="auth-login-password">Пароль</label>
+      <input class="input" id="auth-login-password" name="password" type="password" autocomplete="current-password" required maxlength="128">
+      <p class="auth-error" id="auth-login-error" role="status" hidden></p>
+      <button class="button primary auth-submit" id="auth-login-submit" type="submit">Войти</button>
+    </form>
+  </main>
+  <main id="auth-unavailable-screen" class="auth-screen" hidden>
+    <section class="auth-card" role="status"><span class="eyebrow">Averon Import</span><h1>Сервис недоступен</h1><p>Сервис авторизации временно недоступен. Попробуйте позже.</p></section>
+  </main>
+  <div class="app-shell" id="app-shell" hidden>
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true"><span>A</span></div>
@@ -41,6 +58,8 @@
           <button class="button ghost" id="new-document-button" hidden>Новый документ</button>
           <button class="button ghost" id="settings-button" hidden>Настройки</button>
           <button class="button ghost" id="admin-reports-button" hidden>Обращения</button>
+          <button class="button ghost" id="users-button" type="button" hidden>Пользователи</button>
+          <button class="button ghost" id="logout-button" type="button" hidden>Выйти</button>
           <button class="button ghost" id="help-button">Справка</button>
         </div>
       </header>
@@ -399,6 +418,37 @@
       <p class="mode-status" id="settings-ai-connection"></p>
       <p class="mode-status" id="settings-etm-connection"></p>
       <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="save-settings">Сохранить</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="users-modal">
+    <div class="modal-card users-card">
+      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Пользователи</h2><p>Управление учётными записями оценщиков.</p></div><button class="icon-button" type="button" id="close-users" aria-label="Закрыть">×</button></div>
+      <form class="user-create-form" id="user-create-form" autocomplete="off">
+        <h3>Добавить сметчика</h3>
+        <div class="user-create-fields">
+          <label><span class="field-label">Логин</span><input class="input" id="new-user-username" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9._-]{3,64}" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+          <label><span class="field-label">Пароль</span><input class="input" id="new-user-password" name="password" type="password" required minlength="12" maxlength="128" autocomplete="new-password"></label>
+          <label><span class="field-label">Повтор пароля</span><input class="input" id="new-user-password-confirm" type="password" required minlength="12" maxlength="128" autocomplete="new-password"></label>
+        </div>
+        <p class="user-form-status" id="user-create-status" role="status" hidden></p>
+        <div class="user-create-actions"><small>Логин: латинские буквы, цифры, точка, дефис или подчёркивание.</small><button class="button primary" id="create-user-submit" type="submit">+ Создать пользователя</button></div>
+      </form>
+      <p class="user-list-status" id="users-status" role="status"></p>
+      <div class="user-list" id="users-list" aria-label="Список пользователей"></div>
+      <div class="users-pagination"><button class="button ghost" id="users-previous" type="button">Назад</button><span id="users-page">Страница 1</span><button class="button ghost" id="users-next" type="button">Далее</button></div>
+    </div>
+  </dialog>
+
+  <dialog class="modal" id="reset-user-password-modal">
+    <form class="modal-card reset-user-card" id="reset-user-password-form" autocomplete="off">
+      <div class="modal-header"><div><span class="eyebrow">Учётная запись</span><h2>Сброс пароля</h2><p>Пользователь: <b id="reset-user-username"></b></p></div><button class="icon-button" type="button" id="close-reset-user-password" aria-label="Закрыть">×</button></div>
+      <label class="field-label" for="reset-user-password">Новый пароль</label>
+      <input class="input" id="reset-user-password" type="password" required minlength="12" maxlength="128" autocomplete="new-password">
+      <label class="field-label" for="reset-user-password-confirm">Повтор пароля</label>
+      <input class="input" id="reset-user-password-confirm" type="password" required minlength="12" maxlength="128" autocomplete="new-password">
+      <p class="user-form-status" id="reset-user-password-status" role="status" hidden></p>
+      <div class="modal-footer"><button class="button ghost" id="cancel-reset-user-password" type="button">Отмена</button><button class="button primary" id="reset-user-password-submit" type="submit">Сбросить пароль</button></div>
     </form>
   </dialog>
 
