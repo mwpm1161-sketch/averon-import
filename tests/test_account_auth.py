@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 
@@ -215,6 +216,26 @@ def _session_headers(token, csrf=None):
     if csrf is not None:
         headers["X-CSRF-Token"] = csrf
     return headers
+
+
+def test_session_login_shell_and_assets_are_public_but_apis_remain_protected(session_api):
+    client, _repository = session_api
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert 'id="auth-login-screen"' in page.text
+    assert 'id="app-shell"' in page.text
+
+    stylesheet = re.search(r'<link rel="stylesheet" href="([^"]*static/styles\.css[^"]*)"', page.text)
+    script = re.search(r'<script src="([^"]*static/app\.js[^"]*)" defer></script>', page.text)
+    assert stylesheet and script
+    assert client.get(stylesheet.group(1).split("?", 1)[0]).status_code == 200
+    assert client.get(script.group(1).split("?", 1)[0]).status_code == 200
+    assert client.get("/favicon.ico").status_code == 204
+
+    assert client.get("/api/me").status_code == 401
+    assert client.get("/api/config").status_code == 401
 
 
 def test_session_login_generic_errors_cookies_csrf_and_logout(session_api, monkeypatch):

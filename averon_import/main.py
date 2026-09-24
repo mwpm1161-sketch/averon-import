@@ -191,7 +191,7 @@ app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static
 templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_authenticated)])
+@app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse(
         request=request,
