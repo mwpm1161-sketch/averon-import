@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from typing import Any, Literal
 
@@ -38,8 +39,10 @@ from averon_import.core.schemas import ExportRequest, RecognitionRequest, SaveRo
 from averon_import.services.account_auth import (
     AccountDisabled,
     AccountRepository,
+    AdminAccountProtected,
     DEFAULT_SESSION_TTL_SECONDS,
     DuplicateUsername,
+    LazyAccountRepository,
     StaleUserVersion,
     UserNotFound,
     dummy_password_verification,
@@ -55,6 +58,7 @@ from averon_import.services.auth import (
     configure_account_repository,
     login_bucket_key,
     login_rate_limiter,
+    login_work_guard,
     require_admin,
     require_authenticated,
 )
@@ -132,7 +136,7 @@ def default_data_dir() -> Path:
 
 DATA_DIR = default_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-auth_repository = AccountRepository(DATA_DIR / "auth")
+auth_repository = LazyAccountRepository(lambda: AccountRepository(DATA_DIR / "auth"))
 configure_account_repository(auth_repository)
 support_repository = SupportRepository(DATA_DIR / "support")
 
@@ -251,6 +255,12 @@ async def _auth_json_object(request: Request, *, allowed: set[str], required: se
     return payload
 
 
+def _account_repository_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
+    """Resolve the lazy repository and execute its operation in the caller's worker."""
+
+    return getattr(auth_repository, method_name)(*args, **kwargs)
+
+
 def _password_value(payload: dict[str, Any]) -> str:
     value = payload.get("password")
     if not isinstance(value, str):
@@ -310,7 +320,26 @@ async def login(request: Request):
     generic_error = {"detail": "Неверный логин или пароль"}
     if retry_after:
         return JSONResponse(generic_error, status_code=429, headers={"Retry-After": str(retry_after)})
+    if not login_work_guard.try_acquire():
+        return JSONResponse(generic_error, status_code=429, headers={"Retry-After": "1"})
+    try:
+        result = await run_in_threadpool(_authenticate_and_create_session, username, password)
+    except Exception as exc:
+        logger.exception("Account login operation failed")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
+    finally:
+        login_work_guard.release()
+    if result is None:
+        login_rate_limiter.failed(bucket)
+        return JSONResponse(generic_error, status_code=401)
+    login_rate_limiter.succeeded(bucket)
+    public_user, session = result
+    response = JSONResponse({"user": public_user})
+    _set_auth_cookies(response, session)
+    return response
 
+
+def _authenticate_and_create_session(username: object, password: object) -> tuple[dict[str, Any], dict[str, str]] | None:
     user = auth_repository.get_auth_user(username) if isinstance(username, str) else None
     if isinstance(password, str) and len(password) <= 128:
         if user is None:
@@ -323,28 +352,25 @@ async def login(request: Request):
         password_matches = False
 
     if user is None or not bool(user["enabled"]) or not password_matches:
-        login_rate_limiter.failed(bucket)
-        return JSONResponse(generic_error, status_code=401)
-
-    login_rate_limiter.succeeded(bucket)
+        return None
     try:
         session = auth_repository.create_session(user["user_id"])
     except AccountDisabled:
-        login_rate_limiter.failed(bucket)
-        return JSONResponse(generic_error, status_code=401)
-    except Exception as exc:
-        logger.exception("Could not create account session")
-        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
-    current_user = CurrentUser(username=user["username"], role=Role(user["role"]), user_id=user["user_id"])
-    response = JSONResponse({"user": current_user.public()})
-    _set_auth_cookies(response, session)
-    return response
+        return None
+    public_user = CurrentUser(
+        username=user["username"], role=Role(user["role"]), user_id=user["user_id"]
+    ).public()
+    return public_user, session
 
 
 @app.post("/api/auth/logout", status_code=204)
 def logout(request: Request, _user: CurrentUser = Depends(require_authenticated)):
     if auth_config().mode == "session":
-        auth_repository.delete_session(request.cookies.get("averon_session", ""))
+        try:
+            auth_repository.delete_session(request.cookies.get("averon_session", ""))
+        except Exception as exc:
+            logger.exception("Could not invalidate account session")
+            raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     response = Response(status_code=204)
     _clear_auth_cookies(response)
     return response
@@ -355,7 +381,11 @@ def list_account_users(
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    users = auth_repository.list_users(limit=limit, offset=offset)
+    try:
+        users = auth_repository.list_users(limit=limit, offset=offset)
+    except Exception as exc:
+        logger.exception("Could not list app-owned accounts")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     return {"users": users, "limit": limit, "offset": offset}
 
 
@@ -367,18 +397,25 @@ async def create_account_user(request: Request, _admin: CurrentUser = Depends(re
     if not isinstance(username, str):
         raise _auth_json_error(422, "INVALID_USERNAME")
     try:
-        user = auth_repository.create_user(username, password, role="user")
+        user = await run_in_threadpool(_account_repository_call, "create_user", username, password, role="user")
     except DuplicateUsername:
         raise _auth_json_error(409, "USERNAME_EXISTS") from None
     except ValueError:
         raise _auth_json_error(422, "INVALID_USERNAME") from None
+    except Exception as exc:
+        logger.exception("Could not create app-owned account")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     return {"user": user}
 
 
-def _is_current_account(target_user_id: str, current_user: CurrentUser) -> bool:
+async def _is_current_account(target_user_id: str, current_user: CurrentUser) -> bool:
     if current_user.user_id is not None:
         return current_user.user_id == target_user_id
-    target = auth_repository.get_user(target_user_id)
+    try:
+        target = await run_in_threadpool(_account_repository_call, "get_user", target_user_id)
+    except Exception as exc:
+        logger.exception("Could not resolve account for self-protection check")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     if target is None:
         return False
     try:
@@ -400,14 +437,25 @@ async def update_account_user(user_id: str, request: Request, admin: CurrentUser
     if not isinstance(payload["enabled"], bool):
         raise _auth_json_error(422, "INVALID_ENABLED")
     version = _version_value(payload)
-    if not payload["enabled"] and _is_current_account(user_id, admin):
+    if not payload["enabled"] and await _is_current_account(user_id, admin):
         raise _auth_json_error(409, "SELF_PROTECTION")
     try:
-        user = auth_repository.update_enabled(user_id, enabled=payload["enabled"], version=version)
+        user = await run_in_threadpool(
+            _account_repository_call,
+            "update_enabled",
+            user_id,
+            enabled=payload["enabled"],
+            version=version,
+        )
     except UserNotFound:
         raise _auth_json_error(404, "USER_NOT_FOUND") from None
     except StaleUserVersion:
         raise _auth_json_error(409, "STALE_USER_VERSION") from None
+    except AdminAccountProtected:
+        raise _auth_json_error(409, "ADMIN_ACCOUNT_PROTECTED") from None
+    except Exception as exc:
+        logger.exception("Could not update app-owned account")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     return {"user": user}
 
 
@@ -416,14 +464,25 @@ async def reset_account_password(user_id: str, request: Request, admin: CurrentU
     payload = await _auth_json_object(request, allowed={"password", "version"}, required={"password", "version"})
     password = _password_value(payload)
     version = _version_value(payload)
-    if _is_current_account(user_id, admin):
+    if await _is_current_account(user_id, admin):
         raise _auth_json_error(409, "SELF_PROTECTION")
     try:
-        user = auth_repository.reset_password(user_id, password, version=version)
+        user = await run_in_threadpool(
+            _account_repository_call,
+            "reset_password",
+            user_id,
+            password,
+            version=version,
+        )
     except UserNotFound:
         raise _auth_json_error(404, "USER_NOT_FOUND") from None
     except StaleUserVersion:
         raise _auth_json_error(409, "STALE_USER_VERSION") from None
+    except AdminAccountProtected:
+        raise _auth_json_error(409, "ADMIN_ACCOUNT_PROTECTED") from None
+    except Exception as exc:
+        logger.exception("Could not reset app-owned account password")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     return {"user": user}
 
 
@@ -431,14 +490,19 @@ async def reset_account_password(user_id: str, request: Request, admin: CurrentU
 async def delete_account_user(user_id: str, request: Request, admin: CurrentUser = Depends(require_admin)):
     payload = await _auth_json_object(request, allowed={"version"}, required={"version"})
     version = _version_value(payload)
-    if _is_current_account(user_id, admin):
+    if await _is_current_account(user_id, admin):
         raise _auth_json_error(409, "SELF_PROTECTION")
     try:
-        auth_repository.delete_user(user_id, version=version)
+        await run_in_threadpool(_account_repository_call, "delete_user", user_id, version=version)
     except UserNotFound:
         raise _auth_json_error(404, "USER_NOT_FOUND") from None
     except StaleUserVersion:
         raise _auth_json_error(409, "STALE_USER_VERSION") from None
+    except AdminAccountProtected:
+        raise _auth_json_error(409, "ADMIN_ACCOUNT_PROTECTED") from None
+    except Exception as exc:
+        logger.exception("Could not delete app-owned account")
+        raise HTTPException(status_code=503, detail="Сервис аутентификации временно недоступен") from exc
     return Response(status_code=204)
 
 

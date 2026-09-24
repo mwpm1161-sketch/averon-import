@@ -21,7 +21,7 @@ from enum import Enum
 
 from fastapi import Depends, HTTPException, Request
 
-from averon_import.services.account_auth import AccountRepository, normalize_username
+from averon_import.services.account_auth import AccountRepository, LazyAccountRepository, normalize_username
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,11 @@ class AuthConfig:
     dev_user: str
 
 
-_account_repository: AccountRepository | None = None
+AccountRepositoryLike = AccountRepository | LazyAccountRepository
+_account_repository: AccountRepositoryLike | None = None
 
 
-def configure_account_repository(repository: AccountRepository) -> None:
+def configure_account_repository(repository: AccountRepositoryLike) -> None:
     global _account_repository
     _account_repository = repository
 
@@ -113,6 +114,25 @@ class LoginRateLimiter:
 
 
 login_rate_limiter = LoginRateLimiter()
+
+
+class LoginWorkGuard:
+    """Non-blocking process-local bound for expensive login work."""
+
+    def __init__(self, max_concurrent: int = 2):
+        if max_concurrent < 1:
+            raise ValueError("Login concurrency must be positive")
+        self.max_concurrent = max_concurrent
+        self._semaphore = threading.BoundedSemaphore(max_concurrent)
+
+    def try_acquire(self) -> bool:
+        return self._semaphore.acquire(blocking=False)
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+login_work_guard = LoginWorkGuard(max_concurrent=2)
 
 
 def login_bucket_key(username: object) -> str:
@@ -259,12 +279,14 @@ def require_admin(user: CurrentUser = Depends(require_authenticated)) -> Current
 __all__ = [
     "AuthConfig",
     "CurrentUser",
+    "LoginWorkGuard",
     "Role",
     "auth_config",
     "configure_account_repository",
     "get_current_user",
     "login_bucket_key",
     "login_rate_limiter",
+    "login_work_guard",
     "require_admin",
     "require_authenticated",
     "resolve_current_user",

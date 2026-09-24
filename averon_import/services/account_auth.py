@@ -5,14 +5,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 1
@@ -26,6 +28,7 @@ SCRYPT_MAXMEM = 64 * 1024 * 1024
 DEFAULT_SESSION_TTL_SECONDS = 12 * 60 * 60
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 _ROLE_VALUES = ("admin", "user")
+logger = logging.getLogger(__name__)
 
 
 class AccountAuthError(Exception):
@@ -49,6 +52,10 @@ class StaleUserVersion(AccountAuthError):
 
 
 class AccountDisabled(AccountAuthError):
+    pass
+
+
+class AdminAccountProtected(AccountAuthError):
     pass
 
 
@@ -306,6 +313,8 @@ class AccountRepository:
             row = connection.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
             if row is None:
                 raise UserNotFound(user_id)
+            if row["role"] == "admin":
+                raise AdminAccountProtected(user_id)
             if int(row["version"]) != version:
                 raise StaleUserVersion(user_id)
             connection.execute(
@@ -325,6 +334,8 @@ class AccountRepository:
             row = connection.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
             if row is None:
                 raise UserNotFound(user_id)
+            if row["role"] == "admin":
+                raise AdminAccountProtected(user_id)
             if int(row["version"]) != version:
                 raise StaleUserVersion(user_id)
             connection.execute(
@@ -337,9 +348,11 @@ class AccountRepository:
 
     def delete_user(self, user_id: str, *, version: int) -> None:
         with self._transaction() as connection:
-            row = connection.execute("SELECT version FROM users WHERE user_id=?", (user_id,)).fetchone()
+            row = connection.execute("SELECT version, role FROM users WHERE user_id=?", (user_id,)).fetchone()
             if row is None:
                 raise UserNotFound(user_id)
+            if row["role"] == "admin":
+                raise AdminAccountProtected(user_id)
             if int(row["version"]) != version:
                 raise StaleUserVersion(user_id)
             connection.execute("DELETE FROM users WHERE user_id=? AND version=?", (user_id, version))
@@ -353,6 +366,7 @@ class AccountRepository:
         created_at = _timestamp(now)
         expires_at = _timestamp(now + timedelta(seconds=ttl_seconds))
         with self._transaction() as connection:
+            connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (created_at,))
             user = connection.execute("SELECT enabled FROM users WHERE user_id=?", (user_id,)).fetchone()
             if user is None or not bool(user["enabled"]):
                 raise AccountDisabled(user_id)
@@ -384,7 +398,11 @@ class AccountRepository:
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if not bool(row["enabled"]) or expires_at <= _utc_now():
-            self.delete_session_hash(token_hash)
+            try:
+                self.delete_session_hash(token_hash)
+            except Exception:
+                # Authentication outcome must not depend on best-effort cleanup.
+                logger.exception("Could not prune an invalid account session")
             return None
         return dict(row)
 
@@ -401,12 +419,39 @@ class AccountRepository:
             return int(connection.execute("SELECT COUNT(*) FROM sessions WHERE user_id=?", (user_id,)).fetchone()[0])
 
 
+class LazyAccountRepository:
+    """Defer account database initialization until an auth-store operation is needed."""
+
+    def __init__(self, factory: Callable[[], AccountRepository]):
+        self._factory = factory
+        self._repository: AccountRepository | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def initialized(self) -> bool:
+        return self._repository is not None
+
+    def _get_repository(self) -> AccountRepository:
+        repository = self._repository
+        if repository is not None:
+            return repository
+        with self._lock:
+            if self._repository is None:
+                self._repository = self._factory()
+            return self._repository
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._get_repository(), name)
+
+
 __all__ = [
     "AccountAuthError",
     "AccountDisabled",
     "AccountRepository",
+    "AdminAccountProtected",
     "DEFAULT_SESSION_TTL_SECONDS",
     "DuplicateUsername",
+    "LazyAccountRepository",
     "PASSWORD_MAX_LENGTH",
     "PASSWORD_MIN_LENGTH",
     "SCHEMA_VERSION",

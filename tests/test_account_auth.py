@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 import pytest
 
 from averon_import.services.account_auth import (
     AccountRepository,
+    AdminAccountProtected,
     DuplicateUsername,
+    LazyAccountRepository,
     StaleUserVersion,
     UserAlreadyExists,
     hash_password,
@@ -95,6 +98,64 @@ def test_disabling_and_deleting_users_revoke_sessions(tmp_path):
     repository.delete_user(user["user_id"], version=reset["version"])
     assert repository.resolve_session(final_session["token"]) is None
     assert repository.get_user(user["user_id"]) is None
+
+
+def test_admin_accounts_are_protected_from_repository_management(tmp_path):
+    repository = AccountRepository(tmp_path / "auth")
+    admin = repository.bootstrap_admin("bootstrap-admin", PASSWORD)
+    with pytest.raises(AdminAccountProtected):
+        repository.update_enabled(admin["user_id"], enabled=False, version=admin["version"])
+    with pytest.raises(AdminAccountProtected):
+        repository.reset_password(admin["user_id"], "another-valid-password", version=admin["version"])
+    with pytest.raises(AdminAccountProtected):
+        repository.delete_user(admin["user_id"], version=admin["version"])
+    assert repository.get_user(admin["user_id"])["enabled"] is True
+
+
+@pytest.mark.parametrize("invalid_state", ["expired", "disabled"])
+def test_invalid_session_cleanup_is_best_effort(tmp_path, monkeypatch, invalid_state):
+    repository = AccountRepository(tmp_path / "auth")
+    user = repository.create_user("colleague", PASSWORD)
+    session = repository.create_session(user["user_id"])
+    with sqlite3.connect(repository.db_path) as connection:
+        if invalid_state == "expired":
+            connection.execute("UPDATE sessions SET expires_at='2000-01-01T00:00:00+00:00'")
+        else:
+            connection.execute("UPDATE users SET enabled=0 WHERE user_id=?", (user["user_id"],))
+
+    def fail_cleanup(_token_hash):
+        raise sqlite3.OperationalError("cleanup failed")
+
+    monkeypatch.setattr(repository, "delete_session_hash", fail_cleanup)
+    assert repository.resolve_session(session["token"]) is None
+
+
+def test_expired_sessions_are_pruned_during_new_session_creation(tmp_path):
+    repository = AccountRepository(tmp_path / "auth")
+    user = repository.create_user("colleague", PASSWORD)
+    old_session = repository.create_session(user["user_id"])
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.execute("UPDATE sessions SET expires_at='2000-01-01T00:00:00+00:00'")
+
+    new_session = repository.create_session(user["user_id"])
+    assert repository.resolve_session(new_session["token"]) is not None
+    assert repository.resolve_session(old_session["token"]) is None
+    assert repository.session_count(user["user_id"]) == 1
+
+
+def test_lazy_account_store_does_not_initialize_until_first_operation():
+    calls = []
+
+    def fail_initialization():
+        calls.append(True)
+        raise sqlite3.OperationalError("auth store unavailable")
+
+    repository = LazyAccountRepository(fail_initialization)
+    assert repository.initialized is False
+    assert calls == []
+    with pytest.raises(sqlite3.OperationalError):
+        repository.list_users(limit=10, offset=0)
+    assert calls == [True]
 
 
 def test_bootstrap_admin_requires_explicit_replacement(tmp_path, monkeypatch, capsys):
@@ -238,6 +299,7 @@ def test_session_login_generic_errors_cookies_csrf_and_logout(session_api, monke
 def test_user_management_versions_and_self_protection(session_api):
     client, repository = session_api
     admin = repository.bootstrap_admin("admin-user", PASSWORD)
+    other_admin = repository.bootstrap_admin("another-admin", PASSWORD)
     admin_session = repository.create_session(admin["user_id"])
     headers = _session_headers(admin_session["token"], admin_session["csrf_token"])
 
@@ -254,6 +316,16 @@ def test_user_management_versions_and_self_protection(session_api):
         assert response.status_code == 409
         assert response.json()["detail"]["code"] == "SELF_PROTECTION"
 
+    for method, path, payload in (
+        ("PATCH", f"/api/admin/users/{other_admin['user_id']}", {"enabled": False, "version": other_admin["version"]}),
+        ("POST", f"/api/admin/users/{other_admin['user_id']}/reset-password", {"password": "third-valid-password", "version": other_admin["version"]}),
+        ("DELETE", f"/api/admin/users/{other_admin['user_id']}", {"version": other_admin["version"]}),
+    ):
+        response = client.request(method, path, headers=headers, json=payload)
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "ADMIN_ACCOUNT_PROTECTED"
+    assert repository.get_user(other_admin["user_id"])["enabled"] is True
+
     colleague = repository.create_user("colleague", PASSWORD)
     disabled = client.request(
         "PATCH",
@@ -262,6 +334,13 @@ def test_user_management_versions_and_self_protection(session_api):
         json={"enabled": False, "version": colleague["version"]},
     )
     assert disabled.status_code == 200
+    user_reset = client.post(
+        f"/api/admin/users/{colleague['user_id']}/reset-password",
+        headers=headers,
+        json={"password": "another-valid-password", "version": disabled.json()["user"]["version"]},
+    )
+    assert user_reset.status_code == 200
+    assert user_reset.json()["user"]["role"] == "user"
     stale_delete = client.delete(
         f"/api/admin/users/{colleague['user_id']}",
         headers=headers,
@@ -269,6 +348,13 @@ def test_user_management_versions_and_self_protection(session_api):
     )
     assert stale_delete.status_code == 409
     assert stale_delete.json()["detail"]["code"] == "STALE_USER_VERSION"
+    current_delete = client.delete(
+        f"/api/admin/users/{colleague['user_id']}",
+        headers=headers,
+        json={"version": user_reset.json()["user"]["version"]},
+    )
+    assert current_delete.status_code == 204
+    assert repository.get_user(colleague["user_id"]) is None
 
 
 def test_user_role_cannot_call_management_api_in_session_mode(session_api):
@@ -290,8 +376,215 @@ def test_session_login_rate_limit_is_bounded_and_generic(session_api):
     assert int(limited.headers["retry-after"]) > 0
 
 
+def test_saturated_login_work_guard_returns_generic_nonblocking_429(session_api, monkeypatch):
+    from averon_import import main
+    from averon_import.services.auth import LoginWorkGuard
+
+    client, repository = session_api
+    repository.bootstrap_admin("admin-user", PASSWORD)
+    guard = LoginWorkGuard(max_concurrent=1)
+    assert guard.try_acquire() is True
+    monkeypatch.setattr(main, "login_work_guard", guard)
+    response = client.post("/api/auth/login", json={"username": "arbitrary-name", "password": PASSWORD})
+    guard.release()
+
+    assert response.status_code == 429
+    assert response.json() == {"detail": "Неверный логин или пароль"}
+    assert response.headers["retry-after"] == "1"
+
+
+def test_login_hashing_and_sqlite_work_run_in_worker_thread(session_api, monkeypatch):
+    from averon_import import main
+
+    client, repository = session_api
+    repository.bootstrap_admin("admin-user", PASSWORD)
+    event_loop_thread = threading.get_ident()
+    observed_threads = []
+
+    original_lookup = repository.get_auth_user
+    original_verify = main.verify_password
+    original_create_session = repository.create_session
+
+    def track_lookup(username):
+        observed_threads.append(threading.get_ident())
+        return original_lookup(username)
+
+    def track_verify(password, encoded_hash):
+        observed_threads.append(threading.get_ident())
+        return original_verify(password, encoded_hash)
+
+    def track_create_session(user_id):
+        observed_threads.append(threading.get_ident())
+        return original_create_session(user_id)
+
+    monkeypatch.setattr(repository, "get_auth_user", track_lookup)
+    monkeypatch.setattr(main, "verify_password", track_verify)
+    monkeypatch.setattr(repository, "create_session", track_create_session)
+    response = client.post("/api/auth/login", json={"username": "admin-user", "password": PASSWORD})
+
+    assert response.status_code == 200
+    assert observed_threads
+    assert all(thread_id != event_loop_thread for thread_id in observed_threads)
+
+
+def test_async_account_create_reset_update_delete_run_in_worker_threads(session_api, monkeypatch):
+    from averon_import import main
+
+    client, repository = session_api
+    admin = repository.bootstrap_admin("admin-user", PASSWORD)
+    admin_session = repository.create_session(admin["user_id"])
+    headers = _session_headers(admin_session["token"], admin_session["csrf_token"])
+    event_loop_thread = threading.get_ident()
+    observed_threads = []
+
+    def track_method(method_name):
+        original = getattr(repository, method_name)
+
+        def tracked(*args, **kwargs):
+            observed_threads.append(threading.get_ident())
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(repository, method_name, tracked)
+
+    track_method("create_user")
+    created = client.post(
+        "/api/admin/users",
+        headers=headers,
+        json={"username": "colleague", "password": PASSWORD},
+    )
+    assert created.status_code == 201
+    user = created.json()["user"]
+
+    track_method("reset_password")
+    reset = client.post(
+        f"/api/admin/users/{user['user_id']}/reset-password",
+        headers=headers,
+        json={"password": "another-valid-password", "version": user["version"]},
+    )
+    assert reset.status_code == 200
+
+    track_method("update_enabled")
+    disabled = client.request(
+        "PATCH",
+        f"/api/admin/users/{user['user_id']}",
+        headers=headers,
+        json={"enabled": False, "version": reset.json()["user"]["version"]},
+    )
+    assert disabled.status_code == 200
+
+    track_method("delete_user")
+    deleted = client.delete(
+        f"/api/admin/users/{user['user_id']}",
+        headers=headers,
+        json={"version": disabled.json()["user"]["version"]},
+    )
+    assert deleted.status_code == 204
+    assert len(observed_threads) == 4
+    assert all(thread_id != event_loop_thread for thread_id in observed_threads)
+
+
+def test_trusted_proxy_self_protection_lookup_runs_in_worker_thread(session_api, monkeypatch):
+    from averon_import import main
+    from test_auth_roles import PROXY_SECRET, _headers
+
+    client, repository = session_api
+    admin = repository.bootstrap_admin("admin-user", PASSWORD)
+    event_loop_thread = threading.get_ident()
+    observed_threads = []
+    original_lookup = repository.get_user
+
+    def track_lookup(user_id):
+        observed_threads.append(threading.get_ident())
+        return original_lookup(user_id)
+
+    monkeypatch.setattr(repository, "get_user", track_lookup)
+    monkeypatch.setenv("AVERON_AUTH_MODE", "trusted_proxy")
+    monkeypatch.setenv("AVERON_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("AVERON_ADMIN_USERS", "admin-user")
+    response = client.request(
+        "PATCH",
+        f"/api/admin/users/{admin['user_id']}",
+        headers=_headers("admin-user"),
+        json={"enabled": False, "version": admin["version"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "SELF_PROTECTION"
+    assert observed_threads
+    assert all(thread_id != event_loop_thread for thread_id in observed_threads)
+
+
+def test_lazy_account_store_initializes_in_worker_thread(session_api, monkeypatch):
+    from averon_import import main
+    from test_auth_roles import PROXY_SECRET, _headers
+
+    client, repository = session_api
+    event_loop_thread = threading.get_ident()
+    initialized_threads = []
+
+    def initialize_store():
+        initialized_threads.append(threading.get_ident())
+        return repository
+
+    lazy_repository = LazyAccountRepository(initialize_store)
+    monkeypatch.setattr(main, "auth_repository", lazy_repository)
+    monkeypatch.setenv("AVERON_AUTH_MODE", "trusted_proxy")
+    monkeypatch.setenv("AVERON_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("AVERON_ADMIN_USERS", "admin-user")
+    response = client.post(
+        "/api/admin/users",
+        headers=_headers("admin-user"),
+        json={"username": "colleague", "password": PASSWORD},
+    )
+
+    assert response.status_code == 201
+    assert lazy_repository.initialized is True
+    assert len(initialized_threads) == 1
+    assert initialized_threads[0] != event_loop_thread
+
+
+def test_broken_account_store_does_not_break_rollback_modes(session_api, monkeypatch):
+    from averon_import import main
+    from averon_import.services import auth
+    from test_auth_roles import PROXY_SECRET, _headers
+
+    client, _repository = session_api
+    attempts = []
+
+    def unavailable_store():
+        attempts.append(True)
+        raise sqlite3.OperationalError("private auth.sqlite3 path")
+
+    broken_store = LazyAccountRepository(unavailable_store)
+    monkeypatch.setattr(main, "auth_repository", broken_store)
+    monkeypatch.setattr(auth, "_account_repository", broken_store)
+    monkeypatch.setenv("AVERON_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("AVERON_ADMIN_USERS", "admin-user")
+
+    monkeypatch.setenv("AVERON_AUTH_MODE", "trusted_proxy")
+    trusted_me = client.get("/api/me", headers=_headers("admin-user"))
+    assert trusted_me.status_code == 200
+    assert attempts == []
+    account_api = client.get("/api/admin/users", headers=_headers("admin-user"))
+    assert account_api.status_code == 503
+    assert "private auth.sqlite3 path" not in account_api.text
+
+    monkeypatch.setenv("AVERON_AUTH_MODE", "local_dev")
+    local_me = client.get("/api/me", headers={"host": "localhost:8765"})
+    assert local_me.status_code == 200
+
+    monkeypatch.setenv("AVERON_AUTH_MODE", "session")
+    session_me = client.get(
+        "/api/me",
+        headers={"cookie": "averon_session=opaque-token", **_headers("admin-user")},
+    )
+    assert session_me.status_code == 503
+    assert "private auth.sqlite3 path" not in session_me.text
+    assert attempts == [True, True]
+
+
 def test_login_rate_limiter_bounds_buckets_and_success_clears():
-    from averon_import.services.auth import LoginRateLimiter
+    from averon_import.services.auth import LoginRateLimiter, LoginWorkGuard
 
     limiter = LoginRateLimiter(max_attempts=2, window_seconds=60, block_seconds=30, max_buckets=2)
     limiter.failed("first", now=100)
@@ -302,6 +595,15 @@ def test_login_rate_limiter_bounds_buckets_and_success_clears():
     assert len(limiter._buckets) == 2
     limiter.succeeded("third")
     assert limiter.retry_after("third", now=104) == 0
+
+    guard = LoginWorkGuard(max_concurrent=2)
+    assert guard.try_acquire() is True
+    assert guard.try_acquire() is True
+    assert guard.try_acquire() is False
+    guard.release()
+    assert guard.try_acquire() is True
+    guard.release()
+    guard.release()
 
 
 def test_disabled_account_login_uses_generic_error(session_api):
