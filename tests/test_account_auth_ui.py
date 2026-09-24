@@ -144,7 +144,7 @@ def test_admin_list_is_paginated_and_server_values_are_rendered_as_text():
     assert "username.textContent" in renderer and "role.textContent" in renderer
     assert "status.textContent" in renderer
     assert 'String(user.role || "").toLowerCase() === "user"' in renderer
-    assert 'role.textContent = String(user.role || "").toLowerCase() === "admin" ? "Администратор" : "Сметчик"' in renderer
+    assert 'role.textContent = String(user.role || "").toLowerCase() === "admin" ? "Администратор" : "Пользователь"' in renderer
     assert 'metadata.textContent = `Создан: ${accountTimestampLabel(user.created_at)} · Последний вход: ${user.last_login_at ? accountTimestampLabel(user.last_login_at) : "не было"}`' in renderer
     timestamp = _function("accountTimestampLabel", "renderAdminUsers")
     assert "new Intl.DateTimeFormat" in timestamp and "new Date(value)" in timestamp
@@ -212,3 +212,15 @@ def test_auth_login_and_admin_users_markup_has_required_controls_and_no_role_sel
     assert required_ids <= ids
     assert not re.search(r'<select[^>]+(?:role|account-role)', HTML, re.I)
     assert "auth-unavailable-screen" in HTML
+
+
+def test_account_ui_uses_generic_user_terminology_for_user_role():
+    renderer = _function("renderAdminUsers", "loadAdminUsers")
+    create = _function("createAccountUser", "changeAdminUsersPage")
+    assert 'role.textContent = String(user.role || "").toLowerCase() === "admin" ? "Администратор" : "Пользователь"' in renderer
+    assert "Добавить пользователя" in HTML
+    assert "Создать пользователя" in HTML
+    assert 'status.textContent = "Пользователь добавлен"' in create
+    assert 'toast("Пользователь добавлен", "success")' in create
+    assert "Управление учётными записями пользователей." in HTML
+    assert not re.search(r"сметчик", APP_JS + HTML, re.I)

@@ -133,7 +133,7 @@ def test_support_dialog_ids_exist_have_close_actions_and_no_support_polling():
         "close-support-report", "cancel-support-report", "support-report-submit", "admin-reports-modal",
         "admin-reports-button", "close-admin-reports", "admin-report-status-filter", "admin-report-list",
         "admin-report-detail", "admin-report-previous", "admin-report-next", "admin-report-page",
-        "export-reportable-error", "open-support-report",
+        "export-reportable-error", "open-support-report", "contextual-support-report-button",
     }
     assert required_ids <= html_ids
     events = _function("setupEvents", "setZoom")

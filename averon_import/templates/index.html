@@ -60,6 +60,7 @@
           <button class="button ghost" id="admin-reports-button" hidden>Обращения</button>
           <button class="button ghost" id="users-button" type="button" hidden>Пользователи</button>
           <button class="button ghost" id="logout-button" type="button" hidden>Выйти</button>
+          <button class="button ghost" id="contextual-support-report-button" type="button" hidden>Сообщить о проблеме</button>
           <button class="button ghost" id="help-button">Справка</button>
         </div>
       </header>
@@ -291,10 +292,10 @@
 
   <dialog class="modal" id="support-report-modal">
     <form class="modal-card support-report-card" id="support-report-form">
-      <div class="modal-header"><div><span class="eyebrow">Обратная связь</span><h2>Сообщить о проблеме</h2><p>Опишите ошибку экспорта, чтобы администратор мог её проверить.</p></div><button class="icon-button" type="button" id="close-support-report" aria-label="Закрыть">×</button></div>
+      <div class="modal-header"><div><span class="eyebrow">Обратная связь</span><h2 id="support-report-title">Сообщить о проблеме</h2><p id="support-report-intro">Опишите ошибку экспорта, чтобы администратор мог её проверить.</p></div><button class="icon-button" type="button" id="close-support-report" aria-label="Закрыть">×</button></div>
       <label class="field-label" for="support-reporter-fio">ФИО *</label>
       <input class="input" id="support-reporter-fio" name="reporter_fio" required minlength="3" maxlength="200" autocomplete="name">
-      <label class="field-label support-description-input-label" for="support-report-description">Подробное описание проблемы *</label>
+      <label class="field-label support-description-input-label" id="support-report-description-label" for="support-report-description">Описание проблемы *</label>
       <textarea class="input support-report-textarea" id="support-report-description" name="description" required minlength="20" maxlength="5000" aria-describedby="support-report-hint"></textarea>
       <p class="hint" id="support-report-hint">Опишите, что вы ожидали получить и что произошло при экспорте.</p>
       <p class="support-form-error" id="support-report-error" role="status" hidden></p>
@@ -304,7 +305,7 @@
 
   <dialog class="modal" id="admin-reports-modal">
     <div class="modal-card admin-reports-card">
-      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Обращения</h2><p>Просмотр сообщений о проблемах экспорта.</p></div><button class="icon-button" type="button" id="close-admin-reports" aria-label="Закрыть">×</button></div>
+      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Обращения</h2><p>Просмотр обращений пользователей.</p></div><button class="icon-button" type="button" id="close-admin-reports" aria-label="Закрыть">×</button></div>
       <div class="admin-reports-toolbar">
         <label class="field-label" for="admin-report-status-filter">Показывать</label>
         <select class="select" id="admin-report-status-filter">
@@ -423,9 +424,9 @@
 
   <dialog class="modal" id="users-modal">
     <div class="modal-card users-card">
-      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Пользователи</h2><p>Управление учётными записями оценщиков.</p></div><button class="icon-button" type="button" id="close-users" aria-label="Закрыть">×</button></div>
+      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Пользователи</h2><p>Управление учётными записями пользователей.</p></div><button class="icon-button" type="button" id="close-users" aria-label="Закрыть">×</button></div>
       <form class="user-create-form" id="user-create-form" autocomplete="off">
-        <h3>Добавить сметчика</h3>
+        <h3>Добавить пользователя</h3>
         <div class="user-create-fields">
           <label><span class="field-label">Логин</span><input class="input" id="new-user-username" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9._-]{3,64}" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
           <label><span class="field-label">Пароль</span><input class="input" id="new-user-password" name="password" type="password" required minlength="12" maxlength="128" autocomplete="new-password"></label>

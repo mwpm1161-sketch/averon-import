@@ -37,7 +37,9 @@ const state = {
   },
   support: {
     pendingIncident: null,
+    reportMode: null,
     sending: false,
+    submissionGeneration: 0,
     admin: {
       reports: [],
       selectedReport: null,
@@ -150,7 +152,9 @@ function clearProtectedMemory() {
   state.bootComplete = false;
   state.users = {items: [], limit: 25, offset: 0, hasNext: false, listRequest: 0, loading: false, mutating: false, selectedUser: null};
   state.support.pendingIncident = null;
+  state.support.reportMode = null;
   state.support.sending = false;
+  state.support.submissionGeneration += 1;
   state.support.admin = {
     reports: [], selectedReport: null, selectedSnapshot: null, statusFilter: "OPEN",
     limit: 25, offset: 0, listRequest: 0, detailRequest: 0, snapshotRequest: 0,
@@ -376,7 +380,7 @@ function renderAdminUsers() {
     const username = document.createElement("b");
     username.textContent = typeof user.username === "string" ? user.username : "Без имени";
     const role = document.createElement("span");
-    role.textContent = String(user.role || "").toLowerCase() === "admin" ? "Администратор" : "Сметчик";
+    role.textContent = String(user.role || "").toLowerCase() === "admin" ? "Администратор" : "Пользователь";
     const metadata = document.createElement("small");
     metadata.className = "user-meta";
     metadata.textContent = `Создан: ${accountTimestampLabel(user.created_at)} · Последний вход: ${user.last_login_at ? accountTimestampLabel(user.last_login_at) : "не было"}`;
@@ -398,7 +402,7 @@ function renderAdminUsers() {
       const reset = document.createElement("button");
       reset.type = "button";
       reset.className = "button ghost";
-      reset.textContent = "Сбросить пароль";
+      reset.textContent = "Сбросить пароль пользователя";
       reset.disabled = users.loading || users.mutating;
       reset.addEventListener("click", () => openAccountPasswordReset(user));
       const remove = document.createElement("button");
@@ -624,9 +628,9 @@ async function createAccountUser(event) {
     $("#new-user-password").value = "";
     $("#new-user-password-confirm").value = "";
     if (generation !== state.authGeneration) return;
-    status.textContent = "Сметчик создан.";
-    await loadAdminUsers("Сметчик создан.");
-    toast("Сметчик создан.", "success");
+    status.textContent = "Пользователь добавлен";
+    await loadAdminUsers("Пользователь добавлен");
+    toast("Пользователь добавлен", "success");
   } catch (error) {
     if (generation !== state.authGeneration) return;
     status.textContent = accountErrorMessage(error);
@@ -650,6 +654,13 @@ function changeAdminUsersPage(delta) {
   loadAdminUsers();
 }
 
+function updateContextualSupportButton() {
+  const button = $("#contextual-support-report-button");
+  if (!button) return;
+  const activeView = $$(".view").find((view) => view.classList.contains("visible"));
+  button.hidden = state.authState !== "authenticated" || !state.document || activeView?.id === "manual-view";
+}
+
 function setView(name) {
   $$(".view").forEach((view) => view.classList.remove("visible"));
   $(`#${name}-view`).classList.add("visible");
@@ -667,6 +678,7 @@ function setView(name) {
   const [title, subtitle] = titles[name] || titles.upload;
   $("#page-title").textContent = title;
   $("#page-subtitle").textContent = subtitle;
+  updateContextualSupportButton();
 }
 
 function bytes(value) {
@@ -690,6 +702,7 @@ async function boot() {
       state.currentUser = currentUser;
       state.authMode = authMode;
       state.authState = "authenticated";
+      updateContextualSupportButton();
       const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
       $("#settings-button").hidden = !isAdmin;
       $("#logout-button").hidden = authMode !== "session";
@@ -2455,6 +2468,7 @@ function renderExportColumns() {
 
 function clearExportError() {
   state.support.pendingIncident = null;
+  if (state.support.reportMode === "export_failure") state.support.reportMode = null;
   const panel = $("#export-reportable-error");
   if (panel) panel.hidden = true;
 }
@@ -2463,6 +2477,7 @@ function showExportFailure(error) {
   const incidentId = error instanceof ApiError ? error.incidentId : null;
   if (error instanceof ApiError && error.reportable && incidentId) {
     state.support.pendingIncident = {incidentId};
+    state.support.reportMode = null;
     const panel = $("#export-reportable-error");
     if (panel) panel.hidden = false;
   }
@@ -2495,60 +2510,133 @@ async function exportExcelFile(payload, successMessage) {
   }
 }
 
-function openSupportReportModal() {
-  if (!state.support.pendingIncident?.incidentId) return;
+function openSupportReportModal(mode = "export_failure") {
   const modal = $("#support-report-modal");
   if (!modal) return;
+  if (mode === "export_failure" && !state.support.pendingIncident?.incidentId) return;
+  if (mode === "user_reported" && !state.document?.document_id) return;
+  if (!["export_failure", "user_reported"].includes(mode)) return;
+  state.support.reportMode = mode;
+  if (mode === "user_reported") state.support.pendingIncident = null;
   $("#support-report-form").reset();
+  $("#support-report-title").textContent = "Сообщить о проблеме";
+  $("#support-report-intro").textContent = mode === "user_reported"
+    ? "Расскажите, что Averon распознал, интерпретировал или показал неверно."
+    : "Опишите ошибку экспорта, чтобы администратор мог её проверить.";
+  $("#support-report-description-label").textContent = "Описание проблемы *";
+  $("#support-report-hint").textContent = mode === "user_reported"
+    ? "Опишите, что отображается неверно и как, по вашему мнению, должно быть."
+    : "Опишите, что вы ожидали получить и что произошло при экспорте.";
   $("#support-report-error").hidden = true;
   modal.showModal();
+}
+
+function clearSupportReportState() {
+  const previousMode = state.support.reportMode;
+  state.support.submissionGeneration += 1;
+  state.support.pendingIncident = null;
+  state.support.reportMode = null;
+  state.support.sending = false;
+  const form = $("#support-report-form");
+  if (form) form.reset();
+  const message = $("#support-report-error");
+  if (message) {
+    message.textContent = "";
+    message.hidden = true;
+  }
+  const submit = $("#support-report-submit");
+  if (submit) {
+    submit.disabled = false;
+    submit.textContent = "Отправить";
+  }
+  if (previousMode === "export_failure") $("#export-reportable-error").hidden = true;
 }
 
 async function submitSupportReport(event) {
   event.preventDefault();
   if (state.support.sending) return;
-  const incidentId = state.support.pendingIncident?.incidentId;
-  if (!incidentId) {
-    $("#support-report-modal").close();
-    return;
-  }
   const form = $("#support-report-form");
+  if (!form.reportValidity()) return;
   const submit = $("#support-report-submit");
   const message = $("#support-report-error");
   const reporterFio = $("#support-reporter-fio").value.trim();
   const description = $("#support-report-description").value.trim();
+  if (reporterFio.length < 3 || reporterFio.length > 200 || description.length < 20 || description.length > 5000) {
+    message.textContent = "Проверьте ФИО и описание: заполните поля и соблюдайте указанные ограничения по длине.";
+    message.hidden = false;
+    return;
+  }
+  const mode = state.support.reportMode;
+  if (mode !== "export_failure" && mode !== "user_reported") return;
+  const documentId = state.document?.document_id;
+  if (mode === "user_reported" && !documentId) {
+    message.textContent = "Откройте документ, чтобы сообщить о проблеме.";
+    message.hidden = false;
+    return;
+  }
+  if (mode === "export_failure" && !state.support.pendingIncident?.incidentId) return;
+  const generation = ++state.support.submissionGeneration;
+  const isCurrentSubmission = () => generation === state.support.submissionGeneration
+    && state.support.reportMode === mode
+    && $("#support-report-modal").open;
   state.support.sending = true;
   submit.disabled = true;
   submit.textContent = "Отправляем…";
   message.hidden = true;
   try {
+    if (mode === "user_reported" && !state.support.pendingIncident?.incidentId) {
+      const incident = await api("/api/support/incidents", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({document_id:documentId, stage:currentSupportStage()}),
+      });
+      if (!isCurrentSubmission()) return;
+      if (typeof incident?.incident_id !== "string" || !incident.incident_id) {
+        throw new Error("Не удалось подготовить обращение.");
+      }
+      state.support.pendingIncident = {incidentId:incident.incident_id};
+    }
+    const incidentId = state.support.pendingIncident?.incidentId;
+    if (!incidentId) return;
     await api("/api/support/reports", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({incident_id:incidentId, reporter_fio:reporterFio, description}),
     });
+    if (!isCurrentSubmission()) return;
     $("#support-report-modal").close();
-    form.reset();
-    clearExportError();
-    toast("Обращение отправлено администратору", "success");
+    toast("Обращение отправлено", "success");
   } catch (error) {
+    if (!isCurrentSubmission()) return;
     if (error instanceof ApiError && error.status === 409 && error.code === "SUPPORT_REPORT_EXISTS") {
       $("#support-report-modal").close();
-      form.reset();
-      clearExportError();
-      toast("Обращение по этой ошибке уже отправлено.", "success");
+      toast("Обращение уже отправлено.", "success");
     } else if (error instanceof ApiError && error.status === 422) {
       message.textContent = "Проверьте ФИО и описание: заполните поля и соблюдайте указанные ограничения по длине.";
       message.hidden = false;
     } else {
-      message.textContent = error?.message || "Не удалось отправить обращение.";
+      message.textContent = "Не удалось отправить обращение. Повторите попытку.";
       message.hidden = false;
     }
   } finally {
-    state.support.sending = false;
-    submit.disabled = false;
-    submit.textContent = "Отправить";
+    if (generation === state.support.submissionGeneration) {
+      state.support.sending = false;
+      submit.disabled = false;
+      submit.textContent = "Отправить";
+    }
   }
+}
+
+function currentSupportStage() {
+  if ($("#export-modal")?.open) return "export";
+  const activeView = $$(".view").find((view) => view.classList.contains("visible"));
+  const stageByView = {
+    "upload-view":"document",
+    "pages-view":"pages",
+    "processing-view":"recognition",
+    "review-view":"review",
+  };
+  return stageByView[activeView?.id] || "document";
 }
 
 const SUPPORT_STATUS_LABELS = {
@@ -2556,6 +2644,27 @@ const SUPPORT_STATUS_LABELS = {
   IN_PROGRESS:"В работе",
   RESOLVED:"Решено",
 };
+
+const SUPPORT_INCIDENT_KIND_LABELS = {
+  export_failure:"Ошибка экспорта",
+  user_reported:"Сообщение пользователя",
+};
+
+const SUPPORT_STAGE_LABELS = {
+  document:"Документ",
+  pages:"Страницы",
+  recognition:"Распознавание",
+  review:"Проверка",
+  export:"Экспорт",
+};
+
+function supportIncidentKindLabel(value) {
+  return SUPPORT_INCIDENT_KIND_LABELS[value] || "Обращение";
+}
+
+function supportStageLabel(value) {
+  return SUPPORT_STAGE_LABELS[value] || SUPPORT_STAGE_LABELS.document;
+}
 
 function supportValue(value) {
   if (value === null || value === undefined || value === "") return "—";
@@ -2623,10 +2732,12 @@ function renderAdminSupportReports() {
     heading.append(name, status);
     const metadata = document.createElement("span");
     metadata.className = "support-report-item-meta";
-    metadata.textContent = `${formatRecentTimestamp(report.created_at)} · документ ${supportValue(report.document_id).slice(0, 16)} · ${supportValue(report.error_code)}`;
+    const kind = report.incident_kind;
+    const errorSummary = kind === "export_failure" ? ` · ${supportValue(report.error_code)}` : "";
+    metadata.textContent = `${supportIncidentKindLabel(kind)} · ${formatRecentTimestamp(report.created_at)} · документ ${supportValue(report.document_id).slice(0, 16)}${errorSummary}`;
     const error = document.createElement("span");
     error.className = "support-report-item-error";
-    error.textContent = supportValue(report.public_message);
+    if (kind === "export_failure" && report.public_message) error.textContent = supportValue(report.public_message);
     button.append(heading, metadata, error);
     button.addEventListener("click", () => loadAdminSupportReport(report.report_id));
     list.appendChild(button);
@@ -2701,17 +2812,22 @@ function renderAdminSupportReportDetail(report) {
   const fields = document.createElement("div");
   fields.className = "support-detail-grid";
   addSupportField(fields, "Статус", SUPPORT_STATUS_LABELS[report.status] || report.status);
+  addSupportField(fields, "Тип обращения", supportIncidentKindLabel(incident.incident_kind));
   addSupportField(fields, "Создано", formatRecentTimestamp(report.created_at));
   addSupportField(fields, "Обновлено", formatRecentTimestamp(report.updated_at));
   addSupportField(fields, "Пользователь Averon", incident.username);
   addSupportField(fields, "Incident ID", report.incident_id);
   addSupportField(fields, "Document ID", incident.document_id);
-  addSupportField(fields, "Тип экспорта", incident.export_kind);
-  addSupportField(fields, "Код ошибки", incident.error_code);
-  addSupportField(fields, "Сообщение", incident.public_message);
-  addSupportField(fields, "Версия приложения", incident.app_version);
-  addSupportField(fields, "Строк в экспорте", incident.row_count);
-  addSupportField(fields, "Имя файла экспорта", incident.requested_filename);
+  addSupportField(fields, "Этап", supportStageLabel(incident.stage));
+  if (incident.incident_kind === "export_failure") {
+    addSupportField(fields, "Тип экспорта", incident.export_kind);
+    addSupportField(fields, "Код ошибки", incident.error_code);
+    addSupportField(fields, "HTTP статус", incident.http_status);
+    addSupportField(fields, "Сообщение", incident.public_message);
+    addSupportField(fields, "Версия приложения", incident.app_version);
+    addSupportField(fields, "Строк в экспорте", incident.row_count);
+    addSupportField(fields, "Имя файла экспорта", incident.requested_filename);
+  }
   addSupportField(fields, "Документ доступен", incident.document_available === true ? "Да" : "Нет");
   root.appendChild(fields);
 
@@ -2756,7 +2872,9 @@ function renderAdminSupportReportDetail(report) {
   const snapshot = document.createElement("details");
   snapshot.className = "support-snapshot";
   const summary = document.createElement("summary");
-  summary.textContent = "Состояние при ошибке";
+  summary.textContent = incident.incident_kind === "user_reported"
+    ? "Состояние на момент отправки обращения"
+    : "Состояние при ошибке";
   const snapshotStatus = document.createElement("p");
   snapshotStatus.dataset.supportSnapshotStatus = "true";
   snapshotStatus.className = "support-muted";
@@ -3088,9 +3206,13 @@ function setupEvents() {
   const reportsButton = $("#admin-reports-button");
   if (reportsButton) reportsButton.addEventListener("click",openAdminSupportReports);
   const supportReportButton = $("#open-support-report");
-  if (supportReportButton) supportReportButton.addEventListener("click",openSupportReportModal);
+  if (supportReportButton) supportReportButton.addEventListener("click",() => openSupportReportModal("export_failure"));
+  const contextualSupportReportButton = $("#contextual-support-report-button");
+  if (contextualSupportReportButton) contextualSupportReportButton.addEventListener("click",() => openSupportReportModal("user_reported"));
   const supportReportForm = $("#support-report-form");
   if (supportReportForm) supportReportForm.addEventListener("submit",submitSupportReport);
+  const supportReportModal = $("#support-report-modal");
+  if (supportReportModal) supportReportModal.addEventListener("close",clearSupportReportState);
   const closeSupportReport = $("#close-support-report");
   if (closeSupportReport) closeSupportReport.addEventListener("click",() => $("#support-report-modal").close());
   const cancelSupportReport = $("#cancel-support-report");
