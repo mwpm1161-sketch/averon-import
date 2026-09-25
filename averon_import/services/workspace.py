@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +54,8 @@ class WorkspaceService:
         self.data_dir = data_dir
         self.documents_dir = data_dir / "documents"
         self.documents_dir.mkdir(parents=True, exist_ok=True)
+        self._mutation_locks: dict[str, threading.RLock] = {}
+        self._mutation_locks_guard = threading.Lock()
 
     def create(self, source_path: Path, metadata: dict[str, Any]) -> Workspace:
         document_id = uuid.uuid4().hex
@@ -67,6 +71,28 @@ class WorkspaceService:
         if not root.exists():
             raise FileNotFoundError(document_id)
         return Workspace(document_id, root)
+
+    @contextmanager
+    def mutation_lock(self, document_id: str):
+        """Serialize canonical mutations for one document inside this process.
+
+        Averon is currently served by one application process.  Keeping a
+        per-document lock prevents concurrent review/save requests from
+        overwriting each other while allowing unrelated documents to proceed.
+        Result revisions still protect clients from stale writes.
+        """
+
+        with self._mutation_locks_guard:
+            lock = self._mutation_locks.setdefault(str(document_id), threading.RLock())
+        with lock:
+            yield
+
+    @staticmethod
+    def has_result(workspace: Workspace) -> bool:
+        try:
+            return workspace.result_path.is_file() and workspace.result_path.stat().st_size > 2
+        except OSError:
+            return False
 
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return safe metadata for existing document workspaces.
@@ -100,13 +126,16 @@ class WorkspaceService:
             review_path = root / "review_decisions.json"
             available = True
             availability_error = ""
-            has_result = False
-            if result_path.exists():
-                try:
-                    has_result = isinstance(self.read_json(result_path), dict)
-                except (OSError, ValueError, TypeError):
-                    available = False
-                    availability_error = "Данные результата недоступны"
+            # Listing recent workspaces is a hot startup path.  Do not parse
+            # potentially large result.json files merely to determine whether
+            # a result exists; full validation happens only when the document
+            # is explicitly opened.
+            try:
+                has_result = result_path.is_file() and result_path.stat().st_size > 2
+            except OSError:
+                has_result = False
+                available = False
+                availability_error = "Данные результата недоступны"
             try:
                 has_review_decisions = review_path.is_file()
                 timestamps = [metadata_path.stat().st_mtime]
