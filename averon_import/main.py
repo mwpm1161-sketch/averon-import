@@ -1763,10 +1763,19 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             updated = human_review_service.apply_decision_to_canonical(result, decision)
             updated["review_decisions_revision"] = store.revision(decisions)
             workspace_service.write_json(workspace.result_path, updated)
+        page_rows = [
+            row for row in (updated.get("rows") or [])
+            if int(row.get("page") or 0) == int(request.page)
+        ]
+        page_statuses = updated.get("page_statuses") or {}
         return {
             "saved": True,
             "decision": decision.model_dump(mode="json"),
-            "result": updated,
+            "page": int(request.page),
+            "rows": page_rows,
+            "page_status": page_statuses.get(str(request.page)),
+            "summary": updated.get("summary") or {},
+            "review_decisions_revision": updated.get("review_decisions_revision"),
         }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
