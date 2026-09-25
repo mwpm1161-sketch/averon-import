@@ -875,12 +875,16 @@ def recognize(document_id: str, request: RecognitionRequest):
             workspace.pdf_path, request.processing_mode, options, progress
         )
         document_fingerprint = workspace_service.source_fingerprint(workspace)
-        result = human_review_service.apply_saved_decisions(
-            result,
-            ReviewDecisionStore(workspace.review_decisions_path).load(),
-            document_fingerprint,
-        )
+        # Recognition itself is expensive and runs outside the document lock.
+        # Canonicalization is short and serialized: reload the latest review
+        # ledger only after acquiring the lock so a human decision made while
+        # recognition was running cannot be lost by the final commit.
         with workspace_service.mutation_lock(document_id):
+            result = human_review_service.apply_saved_decisions(
+                result,
+                ReviewDecisionStore(workspace.review_decisions_path).load(),
+                document_fingerprint,
+            )
             workspace_service.write_json(workspace.result_path, result)
         return result
 
@@ -1742,7 +1746,12 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             )
             store = ReviewDecisionStore(workspace.review_decisions_path)
             decisions = store.upsert(decision)
-            updated = human_review_service.apply_saved_decisions(result, decisions, fingerprint)
+            # The canonical result already contains every prior decision.
+            # Apply only the new immutable decision. If the process crashes
+            # between ledger and result writes, GET /results detects the
+            # revision mismatch and performs a one-time full reconciliation.
+            updated = human_review_service.apply_decision(result, decision)
+            updated["review_decisions_revision"] = store.revision(decisions)
             workspace_service.write_json(workspace.result_path, updated)
         return {
             "saved": True,
