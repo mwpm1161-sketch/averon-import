@@ -5,6 +5,7 @@ const state = {
   previewPage: null,
   crop: null,
   cropSelecting: false,
+  pageInspection: {documentId:null,page:null,zoom:1,fitWidth:true,requestId:0},
   rows: [],
   result: null,
   rowIndexes: {byId: new Map(), byPage: new Map(), byPageRefs: new Map()},
@@ -79,6 +80,9 @@ const MANUAL_DRAFT_KEY = "averonManualTenderDraft";
 const MANUAL_FIELDS = ["name", "type_mark", "manufacturer", "code", "quantity", "unit"];
 let authBootPromise = null;
 let authBootGeneration = null;
+const PAGE_INSPECTION_MIN_ZOOM = 0.2;
+const PAGE_INSPECTION_MAX_ZOOM = 2.4;
+const PAGE_INSPECTION_ZOOM_STEP = 0.2;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -157,6 +161,7 @@ function clearProtectedMemory() {
   state.document = null;
   state.selectedPages = new Set();
   state.previewPage = null;
+  updatePageInspectionOpenButton();
   state.crop = null;
   state.cropSelecting = false;
   state.rows = [];
@@ -200,6 +205,7 @@ function clearProtectedMemory() {
 }
 
 function cancelDocumentNavigation() {
+  resetPageInspection();
   state.documentNavigationGeneration = (state.documentNavigationGeneration || 0) + 1;
   if (state.documentNavigationController) {
     state.documentNavigationController.abort();
@@ -1289,6 +1295,7 @@ async function openExistingDocument(documentId, {announce = true, navigation = n
   state.document = documentData;
   state.selectedPages = new Set();
   state.previewPage = null;
+  updatePageInspectionOpenButton();
   state.crop = null;
   state.rows = [];
   rebuildResultIndexes();
@@ -1328,6 +1335,7 @@ async function uploadFile(file) {
     localStorage.setItem("averonCurrentDocument", documentData.document_id);
     state.selectedPages.clear();
     state.previewPage = null;
+    updatePageInspectionOpenButton();
     state.crop = null;
     $("#document-name").textContent = documentData.filename;
     $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
@@ -1351,7 +1359,7 @@ function renderThumbnails() {
     node.className = "thumbnail";
     node.dataset.page = page;
     node.innerHTML = `
-      <img loading="lazy" src="/api/documents/${state.document.document_id}/page/${page}?dpi=72" alt="Страница ${page}">
+      <img loading="lazy" src="${documentPageImageUrl(state.document.document_id, page, 72)}" alt="Страница ${page}">
       <div class="thumbnail-footer"><span>Страница ${page}</span><input type="checkbox" aria-label="Выбрать страницу ${page}"></div>`;
     node.addEventListener("click", (event) => {
       event.preventDefault();
@@ -1383,6 +1391,7 @@ function updatePageSelection() {
   if (state.selectedPages.size) {
     $("#page-range").value = compactRanges([...state.selectedPages].sort((a,b)=>a-b));
   }
+  updatePageInspectionOpenButton();
 }
 
 function compactRanges(pages) {
@@ -1413,14 +1422,159 @@ function parseRanges(value) {
   return pages;
 }
 
+function documentPageImageUrl(documentId, page, dpi) {
+  return `/api/documents/${encodeURIComponent(documentId)}/page/${encodeURIComponent(page)}?dpi=${encodeURIComponent(dpi)}`;
+}
+
+function updatePageInspectionOpenButton() {
+  const button = $("#page-inspection-open");
+  if (!button) return;
+  const page = Number(state.previewPage);
+  button.disabled = !state.document?.document_id || !Number.isInteger(page) || page < 1;
+}
+
 async function showCropPreview(page) {
+  if (!state.document?.document_id || !Number.isInteger(Number(page)) || Number(page) < 1) return;
+  page = Number(page);
   state.previewPage = page;
   updatePageSelection();
   const image = $("#crop-image");
   $("#crop-placeholder").hidden = true;
   image.hidden = false;
-  image.src = `/api/documents/${state.document.document_id}/page/${page}?dpi=120`;
+  image.alt = `Предпросмотр страницы ${page}`;
+  image.src = documentPageImageUrl(state.document.document_id, page, 120);
   if (state.crop) positionCropBox();
+}
+
+function resetPageInspection({closeDialog = true} = {}) {
+  const requestId = (state.pageInspection?.requestId || 0) + 1;
+  state.pageInspection = {documentId:null,page:null,zoom:1,fitWidth:true,requestId};
+  const image = $("#page-inspection-image");
+  if (image) {
+    image.onload = null;
+    image.onerror = null;
+    image.removeAttribute("src");
+    image.style.removeProperty("width");
+    image.style.removeProperty("height");
+    image.alt = "Страница";
+  }
+  const canvas = $("#page-inspection-canvas");
+  if (canvas) {
+    canvas.style.removeProperty("width");
+    canvas.style.removeProperty("height");
+  }
+  const crop = $("#page-inspection-crop");
+  if (crop) {
+    crop.hidden = true;
+    crop.removeAttribute("style");
+  }
+  const status = $("#page-inspection-status");
+  if (status) {
+    status.hidden = false;
+    status.classList.remove("failed");
+  }
+  const statusText = $("#page-inspection-status-text");
+  if (statusText) statusText.textContent = "Загружаем изображение страницы…";
+  const title = $("#page-inspection-title");
+  if (title) title.textContent = "Страница —";
+  const zoomLabel = $("#page-inspection-zoom-label");
+  if (zoomLabel) zoomLabel.textContent = "По ширине";
+  updatePageInspectionOpenButton();
+  const dialog = $("#page-inspection-modal");
+  if (closeDialog && dialog?.open) dialog.close();
+}
+
+function renderPageInspectionImage() {
+  const image = $("#page-inspection-image");
+  if (!image?.naturalWidth || !image.naturalHeight) return;
+  const width = Math.max(1, Math.round(image.naturalWidth * state.pageInspection.zoom));
+  const height = Math.max(1, Math.round(image.naturalHeight * state.pageInspection.zoom));
+  image.style.width = `${width}px`;
+  image.style.height = `${height}px`;
+  const canvas = $("#page-inspection-canvas");
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  syncPageInspectionCropOverlay();
+}
+
+function setPageInspectionZoom(value, {fitWidth = false} = {}) {
+  const zoom = Math.max(
+    PAGE_INSPECTION_MIN_ZOOM,
+    Math.min(PAGE_INSPECTION_MAX_ZOOM, Number(value) || 1),
+  );
+  state.pageInspection.zoom = zoom;
+  state.pageInspection.fitWidth = fitWidth;
+  $("#page-inspection-zoom-label").textContent = fitWidth ? "По ширине" : `${Math.round(zoom * 100)}%`;
+  renderPageInspectionImage();
+}
+
+function fitPageInspectionToWidth() {
+  const image = $("#page-inspection-image");
+  const viewport = $("#page-inspection-viewport");
+  if (!image?.naturalWidth || !viewport) return;
+  const style = window.getComputedStyle(viewport);
+  const horizontalPadding = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+  const availableWidth = Math.max(1, viewport.clientWidth - horizontalPadding);
+  const fitZoom = availableWidth / image.naturalWidth;
+  setPageInspectionZoom(fitZoom, {fitWidth:true});
+}
+
+function syncPageInspectionCropOverlay() {
+  const overlay = $("#page-inspection-crop");
+  if (!overlay) return;
+  const inspection = state.pageInspection;
+  const visible = Boolean(
+    inspection?.documentId
+      && inspection.documentId === state.document?.document_id
+      && Number.isInteger(inspection.page)
+      && state.crop
+  );
+  overlay.hidden = !visible;
+  if (!visible) return;
+  overlay.style.left = `${state.crop.x * 100}%`;
+  overlay.style.top = `${state.crop.y * 100}%`;
+  overlay.style.width = `${state.crop.width * 100}%`;
+  overlay.style.height = `${state.crop.height * 100}%`;
+}
+
+function openPageInspection() {
+  const documentId = state.document?.document_id;
+  const page = Number(state.previewPage);
+  if (!documentId || !Number.isInteger(page) || page < 1) return;
+  const dialog = $("#page-inspection-modal");
+  if (dialog.open) return;
+  resetPageInspection({closeDialog:false});
+  const requestId = state.pageInspection.requestId + 1;
+  state.pageInspection = {documentId,page,zoom:1,fitWidth:true,requestId};
+  const image = $("#page-inspection-image");
+  const status = $("#page-inspection-status");
+  const statusText = $("#page-inspection-status-text");
+  $("#page-inspection-title").textContent = `Страница ${page}`;
+  image.alt = `Страница ${page}`;
+  status.hidden = false;
+  status.classList.remove("failed");
+  statusText.textContent = "Загружаем изображение страницы…";
+  $("#page-inspection-zoom-label").textContent = "По ширине";
+  dialog.showModal();
+  image.onload = () => {
+    if (state.pageInspection.requestId !== requestId || !dialog.open) return;
+    status.hidden = true;
+    if (state.pageInspection.fitWidth) fitPageInspectionToWidth();
+    else renderPageInspectionImage();
+  };
+  image.onerror = () => {
+    if (state.pageInspection.requestId !== requestId || !dialog.open) return;
+    status.classList.add("failed");
+    statusText.textContent = "Не удалось загрузить страницу. Закройте просмотр и попробуйте снова.";
+  };
+  image.src = documentPageImageUrl(documentId, page, 200);
+  syncPageInspectionCropOverlay();
+}
+
+function closePageInspection() {
+  const dialog = $("#page-inspection-modal");
+  if (dialog.open) dialog.close();
+  else resetPageInspection({closeDialog:false});
 }
 
 function positionCropBox() {
@@ -1624,6 +1778,7 @@ function loadResult(result, options = {}) {
   state.result = result;
   if (!preservedView) {
     state.previewPage = null;
+    updatePageInspectionOpenButton();
     setZoom(1);
   }
   state.rows = result.rows.map((row) => ({
@@ -3501,6 +3656,7 @@ function resetApp() {
   cancelDocumentNavigation();
   clearExportError();
   Object.assign(state,{document:null,selectedPages:new Set(),previewPage:null,crop:null,rows:[],result:null,activeRowId:null,zoom:1,dirty:false});
+  updatePageInspectionOpenButton();
   rebuildResultIndexes();
   if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
   state.tableSearchTimer = null;
@@ -3627,8 +3783,17 @@ function setupEvents() {
     state.cropSelecting=!state.cropSelecting; $("#crop-preview").classList.toggle("selecting",state.cropSelecting);
     $("#crop-button").textContent=state.cropSelecting?"Выделите область на странице":"Выбрать область";
   });
+  $("#page-inspection-open").addEventListener("click",openPageInspection);
+  $("#page-inspection-close").addEventListener("click",closePageInspection);
+  $("#page-inspection-modal").addEventListener("close",() => resetPageInspection({closeDialog:false}));
+  $("#page-inspection-zoom-out").addEventListener("click",() => setPageInspectionZoom(state.pageInspection.zoom - PAGE_INSPECTION_ZOOM_STEP));
+  $("#page-inspection-zoom-in").addEventListener("click",() => setPageInspectionZoom(state.pageInspection.zoom + PAGE_INSPECTION_ZOOM_STEP));
+  $("#page-inspection-fit").addEventListener("click",fitPageInspectionToWidth);
   setupCropEvents();
-  window.addEventListener("resize",()=>{if(state.crop)positionCropBox();});
+  window.addEventListener("resize",()=>{
+    if(state.crop)positionCropBox();
+    if(state.pageInspection.fitWidth && $("#page-inspection-modal").open) fitPageInspectionToWidth();
+  });
   window.addEventListener("beforeunload",(event)=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
 }
 

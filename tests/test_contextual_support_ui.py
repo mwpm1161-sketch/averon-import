@@ -26,7 +26,9 @@ def test_contextual_action_is_available_to_authenticated_users_with_a_document_o
     set_view = _function("setView", "bytes")
     opener = _function("openSupportReportModal", "clearSupportReportState")
     events = _function("setupEvents", "setZoom")
-    assert 'id="contextual-support-report-button" type="button" hidden>Сообщить о проблеме' in HTML
+    assert 'id="contextual-support-report-button" type="button" hidden' in HTML
+    assert 'class="button support-action" id="contextual-support-report-button"' in HTML
+    assert "Оставить обращение" in HTML
     assert 'state.authState !== "authenticated" || !state.document' in visibility
     assert 'activeView?.id === "manual-view"' in visibility
     assert "capabilities" not in visibility and "admin_reports" not in opener
