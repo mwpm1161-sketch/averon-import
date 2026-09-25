@@ -425,13 +425,21 @@ class HumanReviewService:
                 return False
         if decision.decision == REJECT_DECISION:
             rejected = list(row.get("human_rejected_candidates") or [])
-            rejected.append({
-                "field": decision.field,
-                "candidate_value": decision.candidate_value,
-                "decision_key": decision.decision_key,
-                "evidence_fingerprint": decision.evidence_fingerprint,
-                "provenance": "human",
-            })
+            # Saved decisions may be replayed while restoring a legacy result.
+            # Rejection provenance is a set-like audit record: replaying the
+            # same immutable decision must never grow result.json.
+            if not any(
+                isinstance(item, Mapping)
+                and str(item.get("decision_key") or "") == decision.decision_key
+                for item in rejected
+            ):
+                rejected.append({
+                    "field": decision.field,
+                    "candidate_value": decision.candidate_value,
+                    "decision_key": decision.decision_key,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                    "provenance": "human",
+                })
             row["human_rejected_candidates"] = rejected
             return True
         if decision.decision == FIELD_DECISION:
