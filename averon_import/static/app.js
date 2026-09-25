@@ -1828,30 +1828,33 @@ function applyHumanDecisionPatch(response) {
   if (!Number.isFinite(page) || !patchRows || !state.result) return false;
 
   const currentPageRows = state.rows.filter((row) => Number(row.page) === page);
-  const patchById = new Map(
+  const canonicalById = new Map(
     patchRows
       .filter((row) => row && row.id !== undefined && row.id !== null)
-      .map((row) => [String(row.id), normalizeCanonicalRow(row)])
+      .map((row) => [String(row.id), row])
   );
   if (
-    patchById.size !== patchRows.length
+    canonicalById.size !== patchRows.length
     || currentPageRows.length !== patchRows.length
-    || currentPageRows.some((row) => !patchById.has(String(row.id)))
+    || currentPageRows.some((row) => !canonicalById.has(String(row.id)))
   ) {
     return false;
   }
 
-  const mergeRows = (rows) => rows.map((row) =>
-    Number(row.page) === page
-      ? (patchById.get(String(row.id)) || row)
-      : row
-  );
-  state.rows = mergeRows(state.rows);
-  if (Array.isArray(state.result.rows)) state.result.rows = mergeRows(state.result.rows);
+  const mergeRows = (rows, normalize) => rows.map((row) => {
+    if (Number(row.page) !== page) return row;
+    const canonical = canonicalById.get(String(row.id));
+    return canonical ? normalize(canonical) : row;
+  });
+  state.rows = mergeRows(state.rows, normalizeCanonicalRow);
+  if (Array.isArray(state.result.rows)) {
+    state.result.rows = mergeRows(state.result.rows, (row) => ({...row}));
+  }
   state.result.summary = response.summary || state.result.summary;
   state.result.review_decisions_revision = response.review_decisions_revision
     || state.result.review_decisions_revision;
-  if (response.page_status && state.result.page_statuses) {
+  if (response.page_status) {
+    state.result.page_statuses = state.result.page_statuses || {};
     state.result.page_statuses[String(page)] = response.page_status;
   }
 
