@@ -135,6 +135,7 @@ function readCsrfCookie() {
 }
 
 function clearProtectedMemory() {
+  cancelDocumentLoad();
   state.config = null;
   state.document = null;
   state.selectedPages = new Set();
