@@ -1596,14 +1596,7 @@ function loadResult(result, options = {}) {
   state.result = result;
   state.previewPage = null;
   setZoom(1);
-  state.rows = result.rows.map((row) => ({
-    ...row,
-    _clientDirty: false,
-    selected: row.selected ?? (
-      ["item", "component"].includes(row.row_type)
-      || (row.row_type === "note" && row.structured_table)
-    ),
-  }));
+  state.rows = result.rows.map(normalizeCanonicalRow);
   state.reviewFilter = "";
     state.dirty = false;
     buildResultHeader();
@@ -1818,6 +1811,57 @@ function continuationFragment(row) {
   return preview;
 }
 
+function normalizeCanonicalRow(row) {
+  return {
+    ...row,
+    _clientDirty: false,
+    selected: row.selected ?? (
+      ["item", "component"].includes(row.row_type)
+      || (row.row_type === "note" && row.structured_table)
+    ),
+  };
+}
+
+function applyHumanDecisionPatch(response) {
+  const page = Number(response?.page);
+  const patchRows = Array.isArray(response?.rows) ? response.rows : null;
+  if (!Number.isFinite(page) || !patchRows || !state.result) return false;
+
+  const currentPageRows = state.rows.filter((row) => Number(row.page) === page);
+  const patchById = new Map(
+    patchRows
+      .filter((row) => row && row.id !== undefined && row.id !== null)
+      .map((row) => [String(row.id), normalizeCanonicalRow(row)])
+  );
+  if (
+    patchById.size !== patchRows.length
+    || currentPageRows.length !== patchRows.length
+    || currentPageRows.some((row) => !patchById.has(String(row.id)))
+  ) {
+    return false;
+  }
+
+  const mergeRows = (rows) => rows.map((row) =>
+    Number(row.page) === page
+      ? (patchById.get(String(row.id)) || row)
+      : row
+  );
+  state.rows = mergeRows(state.rows);
+  if (Array.isArray(state.result.rows)) state.result.rows = mergeRows(state.result.rows);
+  state.result.summary = response.summary || state.result.summary;
+  state.result.review_decisions_revision = response.review_decisions_revision
+    || state.result.review_decisions_revision;
+  if (response.page_status && state.result.page_statuses) {
+    state.result.page_statuses[String(page)] = response.page_status;
+  }
+
+  const activeId = state.activeRowId;
+  renderRows();
+  updateSummary();
+  if (activeId && rowById(activeId)) selectRow(activeId);
+  return true;
+}
+
 async function submitHumanDecision(row, payload, successMessage) {
   const documentId = state.document?.document_id;
   if (!documentId) return;
@@ -1831,7 +1875,11 @@ async function submitHumanDecision(row, payload, successMessage) {
     // A response from an older click or an already-left document must never
     // replace the user's newer canonical view.
     if (requestId !== state.reviewDecisionGeneration || state.document?.document_id !== documentId) return;
-    loadResult(response.result, {announce: false});
+    if (!applyHumanDecisionPatch(response)) {
+      const authoritative = await api(`/api/documents/${documentId}/results`);
+      if (requestId !== state.reviewDecisionGeneration || state.document?.document_id !== documentId) return;
+      loadResult(authoritative, {announce: false});
+    }
     toast(`${successMessage} · Проверено пользователем ✓`, "success");
   } catch (error) {
     if (requestId !== state.reviewDecisionGeneration || state.document?.document_id !== documentId) return;
