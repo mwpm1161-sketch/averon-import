@@ -180,6 +180,7 @@ button { cursor: pointer; }
 .status-pill.review { background:#fff0bd; color:#79500a; }.status-pill.verified { background:#e2f4e9; color:#17613c; }.status-pill.edited { background:#e8ecf5; color:#334469; }
 .critical-cell { display:grid; gap:4px; min-width:0; }
 .critical-warning { display:block; padding:0 8px 7px; color:#975d05; font-size:10px; line-height:1.3; }
+.review-evidence-unavailable { display:block; margin:0 8px 5px; color:#687386; font-size:10px; line-height:1.3; }
 .secondary-candidate { margin:0 8px 7px; padding:7px 8px; border:1px solid #efd38c; border-radius:8px; background:#fff9e8; color:#6e4a0b; font-size:10px; line-height:1.35; }
 .candidate-actions { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
 .candidate-actions small { align-self:center; color:#866a2d; }

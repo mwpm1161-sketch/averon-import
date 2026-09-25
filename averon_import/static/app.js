@@ -2123,11 +2123,13 @@ function mergeHumanReviewPatch(patch) {
 
 function submitHumanDecision(row, payload, successMessage) {
   if (!state.document) return Promise.resolve();
+  const refs = physicalRefs(row);
+  if (!refs.length) return Promise.resolve();
   const documentId = state.document.document_id;
   const navigationGeneration = state.documentNavigationGeneration;
   const request = JSON.parse(JSON.stringify({
     page: row.page,
-    physical_refs: physicalRefs(row),
+    physical_refs: refs,
     ...payload,
   }));
   const send = async () => {
@@ -2172,7 +2174,15 @@ async function waitForReviewMutations(documentId) {
 }
 
 function physicalRefs(row) {
-  return row?.ocr_metadata?.physical_row_refs || row?.physical_row_refs || [];
+  const metadataRefs = row?.ocr_metadata?.physical_row_refs;
+  if (Array.isArray(metadataRefs) && metadataRefs.length > 0) return metadataRefs;
+  const rowRefs = row?.physical_row_refs;
+  if (Array.isArray(rowRefs) && rowRefs.length > 0) return rowRefs;
+  return [];
+}
+
+function hasPhysicalRefs(row) {
+  return physicalRefs(row).length > 0;
 }
 
 function sourceRowIndex(row) {
@@ -2743,8 +2753,10 @@ function cellHtml(row, key) {
     const parent = continuationParent(row);
     const fragment = continuationFragment(row);
     const parentLabel = parent ? String(parent.name || parent.type_mark || parent.code || `строка ${sourceRowIndex(parent)}`) : "";
-    const action = parent && fragment ? `<div class="candidate-actions"><small>Кандидат родителя: ${escapeHtml(parentLabel)}</small><button type="button" class="continuation-accept" data-id="${row.id}">Привязать продолжение</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Оставить на проверке</button></div>` : "";
-    return `<td><div class="semantic-review-preview">${escapeHtml(label)}${action}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
+    const hasReviewEvidence = hasPhysicalRefs(row) && hasPhysicalRefs(parent);
+    const action = parent && fragment && hasReviewEvidence ? `<div class="candidate-actions"><small>Кандидат родителя: ${escapeHtml(parentLabel)}</small><button type="button" class="continuation-accept" data-id="${row.id}">Привязать продолжение</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Оставить на проверке</button></div>` : "";
+    const evidenceNotice = hasPhysicalRefs(row) ? "" : '<small class="review-evidence-unavailable">Нет связанного OCR-доказательства · Повторно распознайте страницу</small>';
+    return `<td><div class="semantic-review-preview">${escapeHtml(label)}${evidenceNotice}${action}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
   }
   if (!CRITICAL_FIELDS.includes(key) || !isYandexCriticalRow(row)) {
     return `<td><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
@@ -2752,6 +2764,8 @@ function cellHtml(row, key) {
   const missing = missingCriticalFields(row).includes(key);
   const suspect = numericSuspectFields(row).includes(key);
   const candidate = row.value_candidates?.[key];
+  const hasReviewEvidence = hasPhysicalRefs(row);
+  const evidenceNotice = hasReviewEvidence ? "" : '<small class="review-evidence-unavailable">Нет связанного OCR-доказательства · Повторно распознайте страницу</small>';
   let annotation = "";
   const humanConfirmed = humanValueConfirmationMatches(row, key);
   const humanAbsent = humanAbsenceConfirmationMatches(row, key);
@@ -2766,15 +2780,15 @@ function cellHtml(row, key) {
     annotation = `<small class="human-verified">Проверено локальной ячейкой ✓</small>`;
   } else if (missing) {
     const candidateAction = candidate?.value_candidate
-      ? `<div class="secondary-candidate">Кандидат Yandex: <b>${escapeHtml(String(candidate.value_candidate))}</b><div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button></div></div>`
+      ? `<div class="secondary-candidate">Кандидат Yandex: <b>${escapeHtml(String(candidate.value_candidate))}</b>${hasReviewEvidence ? `<div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button></div>` : ""}</div>`
       : "";
-    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small><div class="candidate-actions"><button type="button" class="field-confirm-absent" data-id="${row.id}" data-key="${key}">В исходнике отсутствует</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Ввести</button></div>${candidateAction}`;
+    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small>${evidenceNotice}<div class="candidate-actions">${hasReviewEvidence ? `<button type="button" class="field-confirm-absent" data-id="${row.id}" data-key="${key}">В исходнике отсутствует</button>` : ""}<button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Ввести</button></div>${candidateAction}`;
   } else if (candidate?.value_candidate) {
     annotation = `<div class="secondary-candidate">Проверить · Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
-      <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;
+      ${hasReviewEvidence ? `<div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>` : `<div class="candidate-actions"><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>${evidenceNotice}`}</div>`;
   } else if (suspect) {
     const confirmLabel = value.length <= 16 ? `Подтвердить ${escapeHtml(value)}` : "Подтвердить";
-    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small><div class="candidate-actions"><button type="button" class="field-confirm-value" data-id="${row.id}" data-key="${key}">${confirmLabel}</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>`;
+    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small>${evidenceNotice}<div class="candidate-actions">${hasReviewEvidence ? `<button type="button" class="field-confirm-value" data-id="${row.id}" data-key="${key}">${confirmLabel}</button>` : ""}<button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>`;
   }
   return `<td><div class="critical-cell"><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea>${annotation}</div></td>`;
 }

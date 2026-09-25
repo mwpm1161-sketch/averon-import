@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import subprocess
 
 import pytest
 from fastapi import HTTPException
@@ -71,6 +73,65 @@ def _result(row: dict) -> dict:
         "summary": {},
         "errors": [],
     }
+
+
+def _pilot_refs(index: int) -> list[dict]:
+    return [{"table": {"page_number": 25, "table_index": 0}, "row_index": index}]
+
+
+def _pilot_shape_row(index: int = 17) -> dict:
+    return {
+        "id": "pilot-row",
+        "page": 25,
+        "row_type": "item",
+        "status": "review",
+        "name": "Воздуховод",
+        "unit": "",
+        "quantity": "",
+        "mass": "",
+        "physical_row_refs": _pilot_refs(index),
+        "ocr_metadata": {"provider": "yandex_vision", "physical_row_refs": []},
+        "value_candidates": {"unit": {"value_candidate": "шт."}},
+        "review_reasons": ["critical_value_missing"],
+        "critical_blockers": ["critical_value_missing"],
+    }
+
+
+def _pilot_shape_result(*rows: dict) -> dict:
+    return {
+        "document_fingerprint": "e" * 64,
+        "revision": 10,
+        "review_ledger_revision": 0,
+        "rows": list(rows),
+        "page_statuses": {
+            "25": {
+                "page": 25,
+                "page_disposition": "SPEC_OUTPUT",
+                "output_status": "REVIEW_REQUIRED",
+                "blockers": [],
+            }
+        },
+        "errors": [],
+        "summary": {},
+    }
+
+
+def _install_pilot_shape_document(monkeypatch, tmp_path, result):
+    from averon_import import main
+    from averon_import.services.workspace import WorkspaceService
+
+    service = WorkspaceService(tmp_path)
+    document_id = "c" * 32
+    (service.documents_dir / document_id).mkdir()
+    workspace = service.get(document_id)
+    workspace.pdf_path.write_bytes(b"synthetic pilot pdf")
+    service.write_json(workspace.metadata_path, {
+        "document_id": document_id,
+        "source_sha256": "e" * 64,
+    })
+    service.write_json(workspace.result_path, result)
+    monkeypatch.setattr(main, "workspace_service", service)
+    return main, service, document_id, workspace
 
 
 def _decision(service, result, decision, **kwargs):
@@ -489,3 +550,234 @@ def test_human_field_confirmation_controls_are_field_scoped_in_ui():
     assert 'button.matches(".field-confirm-value")' in table_events
     assert 'button.matches(".field-confirm-absent")' in table_events
     assert "Подтвердить всю строку" not in app_js
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        "ACCEPT_FIELD_CANDIDATE",
+        "REJECT_CANDIDATE",
+        "CONFIRM_FIELD_VALUE",
+        "CONFIRM_FIELD_ABSENT",
+        "ACCEPT_CONTINUATION_RELATION",
+    ],
+)
+def test_review_decisions_use_top_level_refs_when_metadata_refs_are_empty(
+    monkeypatch, tmp_path, decision
+):
+    row = _pilot_shape_row()
+    request_values = {"page": 25, "physical_refs": _pilot_refs(17), "decision": decision}
+    if decision in {"ACCEPT_FIELD_CANDIDATE", "REJECT_CANDIDATE"}:
+        request_values.update(field="unit", candidate_value="шт.")
+    elif decision == "CONFIRM_FIELD_VALUE":
+        row.update(quantity="87", value_candidates={})
+        row["review_reasons"] = ["numeric_suspect"]
+        row["critical_blockers"] = ["numeric_suspect"]
+        row["ocr_metadata"]["normalization"] = {
+            "quantity": {"numeric_suspect": True}
+        }
+        request_values.update(field="quantity", confirmed_value="87")
+    elif decision == "CONFIRM_FIELD_ABSENT":
+        row.update(unit="шт.", value_candidates={})
+        request_values.update(field="quantity")
+    else:
+        parent = _pilot_shape_row(index=16)
+        parent.update(id="pilot-parent", name="Родитель", quantity="1", value_candidates={})
+        row.update(
+            id="pilot-child",
+            row_type="semantic_review",
+            name="",
+            value_candidates={"name": {"value_candidate": "Продолжение"}},
+            semantic_review_preview="Продолжение",
+            continuation_evidence={
+                "candidate_parent_physical_refs": _pilot_refs(16),
+                "candidate_value": "Продолжение",
+            },
+        )
+        result = _pilot_shape_result(parent, row)
+        request_values.update(
+            physical_refs=_pilot_refs(17),
+            relation="human_confirmed_continuation",
+            candidate_value="Продолжение",
+            target={"parent_physical_refs": _pilot_refs(16)},
+        )
+
+    if decision != "ACCEPT_CONTINUATION_RELATION":
+        result = _pilot_shape_result(row)
+    main, service, document_id, _workspace = _install_pilot_shape_document(
+        monkeypatch, tmp_path, result
+    )
+    response = main.save_review_decision(
+        document_id, main.ReviewDecisionRequest(**request_values)
+    )
+
+    assert response["saved"] is True
+    patched = {item["id"]: item for item in response["result_patch"]["rows"]}
+    if decision == "ACCEPT_FIELD_CANDIDATE":
+        assert patched["pilot-row"]["unit"] == "шт."
+        assert service.read_json(service.get(document_id).result_path)["rows"][0]["unit"] == "шт."
+    elif decision == "REJECT_CANDIDATE":
+        assert patched["pilot-row"]["human_rejected_candidates"][0]["candidate_value"] == "шт."
+    elif decision == "CONFIRM_FIELD_VALUE":
+        assert patched["pilot-row"]["human_verified_field_values"]["quantity"]["value"] == "87"
+    elif decision == "CONFIRM_FIELD_ABSENT":
+        assert patched["pilot-row"]["human_confirmed_absent_fields"]["quantity"]["provenance"] == "human"
+    else:
+        assert set(patched) == {"pilot-parent", "pilot-child"}
+        assert "Продолжение" in patched["pilot-parent"]["name"]
+
+
+def test_empty_review_refs_return_400_without_mutating_result_or_ledger(
+    monkeypatch, tmp_path
+):
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    row = _pilot_shape_row()
+    row["physical_row_refs"] = []
+    result = _pilot_shape_result(row)
+    result["review_ledger_revision"] = 2
+    main, service, document_id, workspace = _install_pilot_shape_document(
+        monkeypatch, tmp_path, result
+    )
+    store = ReviewDecisionStore(workspace.review_decisions_path)
+    store.save([], revision=2)
+    result_before = workspace.result_path.read_bytes()
+    ledger_before = workspace.review_decisions_path.read_bytes()
+    marker_before = store.revision_path.read_bytes()
+
+    with pytest.raises(HTTPException) as error:
+        main.save_review_decision(
+            document_id,
+            main.ReviewDecisionRequest(
+                page=25,
+                physical_refs=[],
+                decision="CONFIRM_FIELD_ABSENT",
+                field="quantity",
+            ),
+        )
+
+    assert error.value.status_code == 400
+    assert "OCR-доказательство" in str(error.value.detail)
+    assert workspace.result_path.read_bytes() == result_before
+    assert workspace.review_decisions_path.read_bytes() == ledger_before
+    assert store.revision_path.read_bytes() == marker_before
+    assert service.read_json(workspace.result_path)["revision"] == 10
+
+
+def _extract_js_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}(")
+    following_functions = [
+        index
+        for marker in ("\nfunction ", "\nasync function ")
+        if (index := source.find(marker, start + 1)) >= 0
+    ]
+    end = min(following_functions) if following_functions else len(source)
+    return source[start:end]
+
+
+def test_frontend_physical_ref_resolution_guards_actions_and_keeps_indexes_consistent():
+    from pathlib import Path
+
+    source = Path("averon_import/static/app.js").read_text(encoding="utf-8")
+    function_names = (
+        "physicalRefs",
+        "hasPhysicalRefs",
+        "sourceRowIndex",
+        "continuationParentRefs",
+        "continuationParent",
+        "continuationFragment",
+        "rowRefsIndexKey",
+        "rebuildResultIndexes",
+        "updateIndexBucket",
+        "replaceResultIndex",
+        "rowById",
+        "submitHumanDecision",
+        "cellHtml",
+        "escapeHtml",
+    )
+    functions = "\n".join(_extract_js_function(source, name) for name in function_names)
+    script = f"""
+const vm = require('vm');
+const context = {{
+  state: {{rows: [], document: {{document_id: 'doc'}}, reviewMutationQueues: new Map()}},
+  CRITICAL_FIELDS: ['unit', 'quantity'],
+  CRITICAL_LABELS: {{unit: 'Единица', quantity: 'Количество'}},
+  isYandexCriticalRow: () => true,
+  missingCriticalFields: row => ['unit', 'quantity'].filter(key => !String(row[key] || '').trim()),
+  numericSuspectFields: row => row.suspect ? ['quantity'] : [],
+  humanValueConfirmationMatches: () => false,
+  humanAbsenceConfirmationMatches: () => false,
+  apiCalls: 0,
+  api: () => {{ context.apiCalls += 1; return Promise.resolve({{}}); }},
+}};
+vm.createContext(context);
+vm.runInContext({json.dumps(functions)}, context);
+const ref17 = [{{table: {{page_number: 25, table_index: 0}}, row_index: 17}}];
+const ref16 = [{{table: {{page_number: 25, table_index: 0}}, row_index: 16}}];
+const ref19 = [{{table: {{page_number: 25, table_index: 0}}, row_index: 19}}];
+const rowA = {{id: 'pilot-row', page: 25, row_type: 'item', unit: '', quantity: '',
+  physical_row_refs: ref17, ocr_metadata: {{physical_row_refs: []}},
+  value_candidates: {{unit: {{value_candidate: 'шт.'}}}}}};
+const resolvedA = context.physicalRefs(rowA);
+const htmlA = context.cellHtml(rowA, 'unit');
+const authoritative = context.physicalRefs({{physical_row_refs: ref17,
+  ocr_metadata: {{physical_row_refs: ref16}}}});
+const emptyRow = {{...rowA, physical_row_refs: [], ocr_metadata: {{physical_row_refs: []}}}};
+const htmlEmpty = context.cellHtml(emptyRow, 'unit');
+const suspectEmpty = {{...emptyRow, quantity: '87', suspect: true, value_candidates: {{}}}};
+const htmlSuspectEmpty = context.cellHtml(suspectEmpty, 'quantity');
+context.submitHumanDecision(emptyRow, {{decision: 'CONFIRM_FIELD_ABSENT'}}, 'test');
+const parent = {{id: 'parent', page: 25, row_type: 'item', name: 'parent',
+  physical_row_refs: ref16, ocr_metadata: {{physical_row_refs: []}}}};
+const child = {{id: 'child', page: 25, row_type: 'semantic_review',
+  physical_row_refs: ref17, ocr_metadata: {{physical_row_refs: []}},
+  continuation_evidence: {{candidate_parent_physical_refs: ref16}}}};
+context.state.rows = [parent, child];
+context.rebuildResultIndexes();
+const initialParent = context.continuationParent(child)?.id || null;
+const childWithoutRefs = {{...child, physical_row_refs: [], ocr_metadata: {{physical_row_refs: []}}}};
+const htmlContinuationEmpty = context.cellHtml(childWithoutRefs, 'name');
+const nextParent = {{...parent, physical_row_refs: ref19, ocr_metadata: {{physical_row_refs: []}}}};
+context.replaceResultIndex(parent, nextParent);
+const oldKey = context.rowRefsIndexKey(25, ref16);
+const newKey = context.rowRefsIndexKey(25, ref19);
+const oldBucket = context.state.rowIndexes.byPageRefs.get(oldKey) || [];
+const newBucket = context.state.rowIndexes.byPageRefs.get(newKey) || [];
+const updatedChild = {{...child, continuation_evidence: {{candidate_parent_physical_refs: ref19}}}};
+const updatedParent = context.continuationParent(updatedChild)?.id || null;
+setImmediate(() => console.log(JSON.stringify({{
+  resolvedA, metadataAuthoritative: authoritative, emptyCount: context.physicalRefs(emptyRow).length,
+  acceptVisible: htmlA.includes('candidate-accept'), rejectVisible: htmlA.includes('candidate-reject'),
+  absenceVisible: htmlA.includes('field-confirm-absent'), noEvidenceNotice: htmlEmpty.includes('Нет связанного OCR-доказательства'),
+  emptyAcceptVisible: htmlEmpty.includes('candidate-accept'), emptyRejectVisible: htmlEmpty.includes('candidate-reject'),
+  emptyAbsenceVisible: htmlEmpty.includes('field-confirm-absent'), emptyRequestCount: context.apiCalls,
+  emptyValueConfirmationVisible: htmlSuspectEmpty.includes('field-confirm-value'),
+  emptyContinuationVisible: htmlContinuationEmpty.includes('continuation-accept'),
+  emptyContinuationNotice: htmlContinuationEmpty.includes('Нет связанного OCR-доказательства'),
+  initialParent, oldBucket, newBucket, updatedParent, sourceRowIndex: context.sourceRowIndex(nextParent),
+}})));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], capture_output=True, check=True, text=True
+    )
+    actual = json.loads(completed.stdout)
+    ref17 = [{"table": {"page_number": 25, "table_index": 0}, "row_index": 17}]
+    ref16 = [{"table": {"page_number": 25, "table_index": 0}, "row_index": 16}]
+    ref19 = [{"table": {"page_number": 25, "table_index": 0}, "row_index": 19}]
+    assert actual["resolvedA"] == ref17
+    assert actual["metadataAuthoritative"] == ref16
+    assert actual["emptyCount"] == 0
+    assert actual["acceptVisible"] and actual["rejectVisible"] and actual["absenceVisible"]
+    assert actual["noEvidenceNotice"]
+    assert not actual["emptyAcceptVisible"]
+    assert not actual["emptyRejectVisible"]
+    assert not actual["emptyAbsenceVisible"]
+    assert not actual["emptyValueConfirmationVisible"]
+    assert not actual["emptyContinuationVisible"]
+    assert actual["emptyContinuationNotice"]
+    assert actual["emptyRequestCount"] == 0
+    assert actual["initialParent"] == "parent"
+    assert "parent" not in actual["oldBucket"]
+    assert actual["newBucket"] == ["parent"]
+    assert actual["updatedParent"] == "parent"
+    assert actual["sourceRowIndex"] == 19

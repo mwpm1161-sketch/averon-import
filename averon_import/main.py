@@ -1930,6 +1930,8 @@ def get_review_decisions(document_id: str):
 
 @app.post("/api/documents/{document_id}/review/decision", dependencies=[Depends(require_authenticated)])
 def save_review_decision(document_id: str, request: ReviewDecisionRequest):
+    if not request.physical_refs:
+        raise HTTPException(400, "Для строки отсутствует связанное OCR-доказательство")
     try:
         workspace = workspace_service.get(document_id)
         with document_mutation_locks.for_document(document_id):
