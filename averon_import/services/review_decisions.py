@@ -541,6 +541,30 @@ class HumanReviewService:
             copy_result=False,
         )
 
+    def apply_decision_to_canonical(
+        self,
+        result: dict[str, Any],
+        decision: ReviewDecision,
+    ) -> dict[str, Any]:
+        """Apply one decision to an owned mutable canonical result DTO.
+
+        This hot-path variant is for a result freshly loaded from result.json
+        under the document mutation lock. Raw OCR evidence remains untouched;
+        only the bounded review projection and affected page safety are
+        updated.
+        """
+
+        if decision.document_fingerprint != str(
+            result.get("document_fingerprint") or decision.document_fingerprint
+        ):
+            return result
+        self._apply_one(result, decision)
+        return recalculate_page_safety(
+            result,
+            pages={int(decision.page)},
+            copy_result=False,
+        )
+
     def apply_saved_decisions(
         self,
         result: Mapping[str, Any],
