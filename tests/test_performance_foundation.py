@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from io import BytesIO
 import json
 from pathlib import Path
 import threading
@@ -227,3 +229,83 @@ def test_review_client_ignores_out_of_order_or_cross_document_response():
     assert "state.document?.document_id !== documentId" in handler
     assert "isCurrentDocumentNavigation(navigationGeneration)" in handler
     assert "Number(response.revision || 0) < Number(state.result?.revision || 0)" in handler
+
+
+def test_automatic_restore_does_not_gate_boot_and_is_cancelable():
+    source = Path("averon_import/static/app.js").read_text(encoding="utf-8")
+    boot_start = source.index("async function boot()")
+    boot_end = source.index("\nfunction updateCloudStatus(", boot_start)
+    boot = source[boot_start:boot_end]
+    restore_start = source.index("async function resumeLastDocument()")
+    restore_end = source.index("\nasync function loadRecentDocuments(", restore_start)
+    restore = source[restore_start:restore_end]
+    open_start = source.index("async function openExistingDocument(")
+    open_end = source.index("\nasync function uploadFile(", open_start)
+    open_document = source[open_start:open_end]
+
+    assert "await resumeLastDocument()" not in boot
+    assert boot.index("state.bootComplete = true") < boot.index("void resumeLastDocument()")
+    assert "beginDocumentNavigation({automaticRestore: true})" in restore
+    assert "openExistingDocument(documentId, {announce: false, navigation})" in restore
+    assert "navigation.signal" in open_document
+    assert "isCurrentDocumentNavigation(navigation.generation)" in open_document
+    assert open_document.index("/results`, {signal:navigation.signal})") < open_document.index("state.document = documentData")
+    assert "setTimeout(" not in restore
+    assert 'state.documentNavigationController.abort()' in source
+    assert 'state.documentNavigationKind === "automatic_restore"' in source
+    assert "function openManualWorkspace() {\n  cancelDocumentNavigation();" in source
+    clear_start = source.index("function clearProtectedMemory()")
+    clear_end = source.index("\nfunction cancelDocumentNavigation()", clear_start)
+    assert "cancelDocumentNavigation();" in source[clear_start:clear_end]
+    assert "performanceCounters.httpRequests" in source
+    assert "performanceCounters.responseBytes" in source
+    assert "performanceCounters.fullTableRenders" in source
+
+
+def test_streamed_upload_persists_server_computed_pdf_fingerprint(monkeypatch, tmp_path):
+    from fastapi import UploadFile
+
+    from averon_import import main
+
+    payload = b"streamed synthetic pdf bytes"
+    service = WorkspaceService(tmp_path)
+    monkeypatch.setattr(main, "workspace_service", service)
+    monkeypatch.setattr(
+        main.pdf_service,
+        "inspect",
+        lambda path: {"page_count": 1, "title": Path(path).stem},
+    )
+
+    response = asyncio.run(
+        main.upload_document(UploadFile(filename="sample.pdf", file=BytesIO(payload)))
+    )
+
+    import hashlib
+
+    workspace = service.get(response["document_id"])
+    assert service.read_json(workspace.metadata_path)["source_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert "source_sha256" not in response
+    assert service.metrics["source_fingerprint_calculations"] == 1
+
+
+def test_cached_page_preview_does_not_rasterize_again(monkeypatch, tmp_path):
+    from averon_import import main
+
+    service = WorkspaceService(tmp_path)
+    document_id = "d" * 32
+    root = service.documents_dir / document_id
+    root.mkdir()
+    workspace = service.get(document_id)
+    service.write_json(workspace.metadata_path, {"document_id": document_id, "page_count": 1})
+    cached_page = workspace.pages_dir / "page-1-110.png"
+    cached_page.write_bytes(b"cached png")
+    monkeypatch.setattr(main, "workspace_service", service)
+    monkeypatch.setattr(
+        main.pdf_service,
+        "render_page_to_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cache miss")),
+    )
+
+    response = main.page_image(document_id, 1, dpi=110)
+
+    assert Path(response.path) == cached_page

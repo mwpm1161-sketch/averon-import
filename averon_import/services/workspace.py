@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -52,14 +54,31 @@ class WorkspaceService:
         self.data_dir = data_dir
         self.documents_dir = data_dir / "documents"
         self.documents_dir.mkdir(parents=True, exist_ok=True)
+        # Bounded in-memory counters for tests and local performance audits.
+        # They are never logged or returned to clients.
+        self.metrics = {
+            "result_reads": 0,
+            "result_writes": 0,
+            "source_fingerprint_calculations": 0,
+        }
 
-    def create(self, source_path: Path, metadata: dict[str, Any]) -> Workspace:
+    def create(
+        self,
+        source_path: Path,
+        metadata: dict[str, Any],
+        *,
+        source_sha256: str | None = None,
+    ) -> Workspace:
         document_id = uuid.uuid4().hex
         root = self.documents_dir / document_id
         root.mkdir(parents=True)
         workspace = Workspace(document_id, root)
         shutil.copy2(source_path, workspace.pdf_path)
-        self.write_json(workspace.metadata_path, {"document_id": document_id, **metadata})
+        saved_metadata = {**metadata, "document_id": document_id}
+        if source_sha256 and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            saved_metadata["source_sha256"] = source_sha256
+            self.metrics["source_fingerprint_calculations"] += 1
+        self.write_json(workspace.metadata_path, saved_metadata)
         return workspace
 
     def get(self, document_id: str) -> Workspace:
@@ -98,15 +117,7 @@ class WorkspaceService:
                 filename = "document.pdf"
             result_path = root / "result.json"
             review_path = root / "review_decisions.json"
-            available = True
-            availability_error = ""
-            has_result = False
-            if result_path.exists():
-                try:
-                    has_result = isinstance(self.read_json(result_path), dict)
-                except (OSError, ValueError, TypeError):
-                    available = False
-                    availability_error = "Данные результата недоступны"
+            has_result = result_path.is_file()
             try:
                 has_review_decisions = review_path.is_file()
                 timestamps = [metadata_path.stat().st_mtime]
@@ -128,23 +139,50 @@ class WorkspaceService:
                 "has_review_decisions": has_review_decisions,
                 "created_at": created_at,
                 "updated_at": updated_at,
-                "available": available,
-                **({"availability_error": availability_error} if availability_error else {}),
+                "available": True,
             })
         documents.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
         return documents[:bounded_limit]
 
-    @staticmethod
-    def read_json(path: Path, default=None):
+    def read_json(self, path: Path, default=None):
+        if path.name == "result.json":
+            self.metrics["result_reads"] += 1
         if not path.exists():
             return default
         return json.loads(path.read_text(encoding="utf-8"))
 
-    @staticmethod
-    def write_json(path: Path, data: Any) -> None:
+    def write_json(self, path: Path, data: Any) -> None:
         temp = path.with_suffix(path.suffix + ".tmp")
         temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
+        if path.name == "result.json":
+            self.metrics["result_writes"] += 1
+
+    def source_fingerprint(self, workspace: Workspace, calculate=None) -> str:
+        """Load the server-owned PDF fingerprint, lazily migrating old workspaces."""
+        metadata = self.read_json(workspace.metadata_path, default={})
+        if isinstance(metadata, dict):
+            cached = metadata.get("source_sha256")
+            if isinstance(cached, str) and re.fullmatch(r"[0-9a-f]{64}", cached):
+                return cached
+        calculator = calculate or _sha256_file
+        fingerprint = calculator(workspace.pdf_path)
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError("Не удалось вычислить контрольную сумму PDF")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata["document_id"] = workspace.document_id
+        metadata["source_sha256"] = fingerprint
+        self.write_json(workspace.metadata_path, metadata)
+        self.metrics["source_fingerprint_calculations"] += 1
+        return fingerprint
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _safe_non_negative_int(value: Any) -> int:

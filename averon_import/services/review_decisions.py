@@ -221,6 +221,33 @@ class ReviewDecisionStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.revision_path = self.path.with_suffix(self.path.suffix + ".revision")
+
+    def _write_revision(self, revision: int) -> None:
+        self.revision_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.revision_path.with_suffix(self.revision_path.suffix + ".tmp")
+        temporary.write_text(str(max(0, int(revision))), encoding="ascii")
+        temporary.replace(self.revision_path)
+
+    def _sync_revision(self, revision: int) -> None:
+        try:
+            current = int(self.revision_path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            current = -1
+        if current != revision:
+            self._write_revision(revision)
+
+    def load_revision(self) -> int:
+        """Read the small revision marker without parsing a steady-state ledger."""
+        if self.revision_path.is_file():
+            try:
+                return max(0, int(self.revision_path.read_text(encoding="ascii").strip()))
+            except (OSError, ValueError):
+                pass
+        if not self.path.is_file():
+            return 0
+        _, revision = self.load_snapshot()
+        return revision
 
     def load_snapshot(self) -> tuple[list[ReviewDecision], int]:
         """Return the canonical ledger and its persisted revision.
@@ -229,6 +256,8 @@ class ReviewDecisionStore:
         revision zero. The next write upgrades them to the versioned shape.
         """
         if not self.path.exists():
+            if self.revision_path.is_file():
+                self._sync_revision(0)
             return [], 0
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -251,6 +280,7 @@ class ReviewDecisionStore:
                 decisions.append(ReviewDecision.model_validate(item))
             except Exception:
                 continue
+        self._sync_revision(revision)
         return decisions, revision
 
     def load(self) -> list[ReviewDecision]:
@@ -265,6 +295,10 @@ class ReviewDecisionStore:
             "revision": revision,
             "decisions": [item.model_dump(mode="json") for item in decisions],
         }
+        # Write the marker first. If the process stops before replacing the
+        # ledger, a reader detects the revision mismatch and reloads the
+        # authoritative ledger before deciding whether recovery is needed.
+        self._write_revision(revision)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
@@ -296,6 +330,14 @@ class ReviewDecisionStore:
 
 class HumanReviewService:
     """Validate, persist and apply bounded human resolutions."""
+
+    def __init__(self) -> None:
+        # Bounded process-local counters for tests and local performance audits.
+        # They are never logged or included in application responses.
+        self.metrics = {
+            "review_decisions_replayed": 0,
+            "page_safety_pages_recalculated": 0,
+        }
 
     def document_fingerprint(self, pdf_path: Path) -> str:
         digest = hashlib.sha256()
@@ -565,7 +607,7 @@ class HumanReviewService:
         if decision.document_fingerprint != str(updated.get("document_fingerprint") or decision.document_fingerprint):
             return updated
         self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        return recalculate_page_safety(updated, metrics=self.metrics)
 
     def apply_saved_decisions(
         self,
@@ -578,11 +620,14 @@ class HumanReviewService:
         for decision in sorted(decisions, key=lambda item: item.created_at):
             if decision.document_fingerprint != document_fingerprint:
                 continue
+            self.metrics["review_decisions_replayed"] += 1
             self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        return recalculate_page_safety(updated, metrics=self.metrics)
 
 
-def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
+def recalculate_page_safety(
+    result: Mapping[str, Any], *, metrics: dict[str, int] | None = None
+) -> dict[str, Any]:
     """Rebuild page safety counters from the post-review canonical view."""
     updated = _detached_review_copy(result)
     rows = list(updated.get("rows") or [])
@@ -590,6 +635,8 @@ def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
     for page_key, original in statuses.items():
         if not isinstance(original, Mapping):
             continue
+        if metrics is not None:
+            metrics["page_safety_pages_recalculated"] += 1
         page = int(original.get("page") or page_key)
         page_rows = [row for row in rows if int(row.get("page") or 0) == page]
         diagnostics = dict(original.get("diagnostics") or {})

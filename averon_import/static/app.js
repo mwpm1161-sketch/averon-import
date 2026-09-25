@@ -26,6 +26,13 @@ const state = {
   bootComplete: false,
   documentNavigationGeneration: 0,
   documentNavigationController: null,
+  documentNavigationKind: null,
+  performanceCounters: {
+    httpRequests: 0,
+    responseBytes: 0,
+    lastResponseType: "",
+    fullTableRenders: 0,
+  },
   loginSubmitting: false,
   users: {
     items: [],
@@ -101,7 +108,11 @@ async function api(url, options = {}) {
     if (csrfToken && !headers.has("X-CSRF-Token")) headers.set("X-CSRF-Token", csrfToken);
     requestOptions.headers = headers;
   }
+  state.performanceCounters.httpRequests = Math.min(2147483647, state.performanceCounters.httpRequests + 1);
   const response = await fetch(url, requestOptions);
+  const responseBytes = Number(response.headers.get("content-length") || 0);
+  state.performanceCounters.responseBytes = Math.min(2147483647, state.performanceCounters.responseBytes + (Number.isFinite(responseBytes) ? responseBytes : 0));
+  state.performanceCounters.lastResponseType = response.headers.get("content-type") || "";
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     let payload = null;
@@ -186,12 +197,20 @@ function cancelDocumentNavigation() {
     state.documentNavigationController.abort();
     state.documentNavigationController = null;
   }
+  state.documentNavigationKind = null;
+  const restoreStatus = $("#restore-document-status");
+  if (restoreStatus) restoreStatus.hidden = true;
 }
 
-function beginDocumentNavigation() {
+function beginDocumentNavigation({automaticRestore = false} = {}) {
   cancelDocumentNavigation();
   const controller = new AbortController();
   state.documentNavigationController = controller;
+  state.documentNavigationKind = automaticRestore ? "automatic_restore" : "explicit";
+  if (automaticRestore) {
+    const restoreStatus = $("#restore-document-status");
+    if (restoreStatus) restoreStatus.hidden = false;
+  }
   return {generation: state.documentNavigationGeneration, signal: controller.signal};
 }
 
@@ -762,10 +781,10 @@ async function boot() {
       loadManualDraft();
       try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
       if (generation !== state.authGeneration) return;
-      await resumeLastDocument();
-      if (generation !== state.authGeneration) return;
-      if (state.manual.active) openManualWorkspace();
+      const manualDraftActive = state.manual.active;
+      if (manualDraftActive) openManualWorkspace();
       state.bootComplete = true;
+      if (!manualDraftActive) void resumeLastDocument();
     } catch (error) {
       if (generation !== state.authGeneration) return;
       if (state.authState === "checking") {
@@ -1095,6 +1114,7 @@ function addManualRow(values = {}) {
 }
 
 function openManualWorkspace() {
+  cancelDocumentNavigation();
   state.manual.active = true;
   if (!state.manual.rows.length) state.manual.rows.push(manualRow());
   saveManualDraft();
@@ -1193,11 +1213,26 @@ async function openManualUnderstanding(row) {
 async function resumeLastDocument() {
   const documentId = localStorage.getItem("averonCurrentDocument");
   if (!documentId) return;
+  const navigation = beginDocumentNavigation({automaticRestore: true});
   try {
-    await openExistingDocument(documentId, {announce: false});
-    toast("Последний документ восстановлен", "success");
-  } catch (_) {
-    localStorage.removeItem("averonCurrentDocument");
+    await openExistingDocument(documentId, {announce: false, navigation});
+    if (isCurrentDocumentNavigation(navigation.generation)) {
+      toast("Последний документ восстановлен", "success");
+    }
+  } catch (error) {
+    if (isCurrentDocumentNavigation(navigation.generation)
+      && localStorage.getItem("averonCurrentDocument") === documentId
+      && error?.name !== "AbortError") {
+      localStorage.removeItem("averonCurrentDocument");
+      toast(error?.message || "Не удалось открыть предыдущий документ", "error");
+    }
+  } finally {
+    if (isCurrentDocumentNavigation(navigation.generation)) {
+      const restoreStatus = $("#restore-document-status");
+      if (restoreStatus) restoreStatus.hidden = true;
+      state.documentNavigationController = null;
+      state.documentNavigationKind = null;
+    }
   }
 }
 
@@ -1225,16 +1260,23 @@ function renderRecentDocuments() {
     return `<div class="recent-document-item${unavailable ? " unavailable" : ""}"><div><b>${escapeHtml(item.filename || item.title || "Документ")}</b><small>${escapeHtml(meta)}${unavailable ? ` · ${escapeHtml(item.availability_error || "недоступен")}` : ""}</small></div><button class="button ghost recent-document-open" type="button" data-document-id="${escapeHtml(item.document_id)}"${unavailable ? " disabled" : ""}>${unavailable ? "Недоступен" : "Открыть"}</button></div>`;
   }).join("");
   list.querySelectorAll(".recent-document-open").forEach((button) => button.addEventListener("click", () => {
-    openExistingDocument(button.dataset.documentId).catch((error) => toast(error.message, "error"));
+    openExistingDocument(button.dataset.documentId).catch((error) => {
+      if (error?.name !== "AbortError") toast(error.message, "error");
+    });
   }));
 }
 
-async function openExistingDocument(documentId, {announce = true} = {}) {
+async function openExistingDocument(documentId, {announce = true, navigation = null} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
-  const navigation = beginDocumentNavigation();
+  navigation = navigation || beginDocumentNavigation();
   const encodedId = encodeURIComponent(documentId);
   const documentData = await api(`/api/documents/${encodedId}`, {signal:navigation.signal});
   if (!isCurrentDocumentNavigation(navigation.generation)) return;
+  let result = null;
+  if (documentData.has_result) {
+    result = await api(`/api/documents/${encodedId}/results`, {signal:navigation.signal});
+    if (!isCurrentDocumentNavigation(navigation.generation)) return;
+  }
   clearExportError();
   state.document = documentData;
   state.selectedPages = new Set();
@@ -1249,8 +1291,6 @@ async function openExistingDocument(documentId, {announce = true} = {}) {
   $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
   $("#new-document-button").hidden = false;
   if (documentData.has_result) {
-    const result = await api(`/api/documents/${encodedId}/results`, {signal:navigation.signal});
-    if (!isCurrentDocumentNavigation(navigation.generation)) return;
     loadResult(result, {announce});
   } else {
     setView("pages");
@@ -1285,7 +1325,7 @@ async function uploadFile(file) {
     renderThumbnails();
     loadRecentDocuments().catch(() => {});
   } catch (error) {
-    toast(error.message, "error");
+    if (error?.name !== "AbortError") toast(error.message, "error");
   } finally {
     card.classList.remove("drag");
     $("#pdf-file").value = "";
@@ -1617,6 +1657,7 @@ function filteredRows() {
 }
 
 function renderRows() {
+  state.performanceCounters.fullTableRenders = Math.min(2147483647, state.performanceCounters.fullTableRenders + 1);
   const body = $("#result-body");
   const rows = filteredRows();
   body.innerHTML = rows.map((row) => rowHtml(row)).join("");
@@ -3179,6 +3220,9 @@ function resetApp() {
 function setupEvents() {
   $("#auth-login-form").addEventListener("submit", submitAuthLogin);
   $("#logout-button").addEventListener("click", logoutSession);
+  $("#cancel-document-restore").addEventListener("click", () => {
+    if (state.documentNavigationKind === "automatic_restore") cancelDocumentNavigation();
+  });
   $("#users-button").addEventListener("click", openAdminUsers);
   $("#close-users").addEventListener("click", () => $("#users-modal").close());
   $("#users-modal").addEventListener("close", scrubUserCreateDialogSecrets);

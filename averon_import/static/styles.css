@@ -197,6 +197,9 @@ button { cursor: pointer; }
 .toast { min-width:280px; max-width:430px; padding:12px 14px; background:#17191d; color:#fff; border-radius:11px; box-shadow:0 12px 30px rgba(0,0,0,.2); font-size:12px; animation:toast-in .2s ease; }
 .toast.error { background:#9f2d26; }.toast.success { background:#17613c; }
 @keyframes toast-in { from { opacity:0; transform:translateY(-7px); } }
+.restore-document-status { position:fixed; right:18px; bottom:18px; z-index:998; display:flex; align-items:center; gap:11px; max-width:calc(100vw - 36px); padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fff; box-shadow:0 12px 35px rgba(17,24,39,.16); color:#30343a; font-size:12px; }
+.restore-document-spinner { width:15px; height:15px; flex:none; border:2px solid #dfe2e6; border-top-color:#111318; border-radius:50%; animation:spin .8s linear infinite; }
+.restore-document-status .button { min-width:28px; padding:4px 8px; font-size:18px; line-height:1; }
 @media (max-width:1300px) {
   .app-shell { grid-template-columns:220px minmax(0,1fr); }
   .sidebar { padding-left:15px; padding-right:15px; }

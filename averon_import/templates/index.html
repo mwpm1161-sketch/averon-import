@@ -8,6 +8,11 @@
 </head>
 <body>
   <div id="toast-root" class="toast-root"></div>
+  <div class="restore-document-status" id="restore-document-status" role="status" aria-live="polite" hidden>
+    <span class="restore-document-spinner" aria-hidden="true"></span>
+    <span>Открытие предыдущего документа</span>
+    <button class="button ghost" id="cancel-document-restore" type="button" aria-label="Отменить восстановление">×</button>
+  </div>
   <main id="auth-check-screen" class="auth-screen" aria-live="polite">
     <section class="auth-card"><span class="eyebrow">Averon Import</span><h1>Проверка доступа</h1><p>Подключаемся к сервису авторизации…</p></section>
   </main>

@@ -188,6 +188,16 @@ def _review_projection_current(result: dict[str, Any], ledger_revision: int) -> 
     return current == ledger_revision
 
 
+def _source_fingerprint(workspace) -> str:
+    return workspace_service.source_fingerprint(
+        workspace, human_review_service.document_fingerprint
+    )
+
+
+def _public_document_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metadata.items() if key != "source_sha256"}
+
+
 def _rebuild_sourcing_runtime() -> None:
     """Rebind sourcing dependencies after settings or secret changes."""
 
@@ -760,6 +770,7 @@ async def upload_document(file: UploadFile = File(...)):
         raise HTTPException(400, "Поддерживаются только PDF-файлы")
     max_bytes = 250 * 1024 * 1024
     total = 0
+    source_digest = hashlib.sha256()
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary:
         temp_path = Path(temporary.name)
         try:
@@ -767,6 +778,7 @@ async def upload_document(file: UploadFile = File(...)):
                 total += len(chunk)
                 if total > max_bytes:
                     raise HTTPException(413, "Размер PDF превышает 250 МБ")
+                source_digest.update(chunk)
                 temporary.write(chunk)
         except Exception:
             temp_path.unlink(missing_ok=True)
@@ -786,9 +798,10 @@ async def upload_document(file: UploadFile = File(...)):
                 ),
                 "size": total,
             },
+            source_sha256=source_digest.hexdigest(),
         )
         metadata = workspace_service.read_json(workspace.metadata_path)
-        return metadata
+        return _public_document_metadata(metadata)
     except Exception as exc:
         raise HTTPException(400, f"Не удалось открыть PDF: {exc}") from exc
     finally:
@@ -805,14 +818,17 @@ def get_document(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
         metadata = workspace_service.read_json(workspace.metadata_path)
-        result = workspace_service.read_json(workspace.result_path)
+        if not isinstance(metadata, dict):
+            raise HTTPException(404, "Метаданные документа недоступны")
         return {
-            **metadata,
-            "has_result": bool(result),
+            **_public_document_metadata(metadata),
+            "has_result": workspace.result_path.is_file(),
             "has_review_decisions": workspace.review_decisions_path.is_file(),
         }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(409, "Метаданные документа повреждены") from exc
 
 
 @app.get("/api/documents/{document_id}/page/{page_number}", dependencies=[Depends(require_authenticated)])
@@ -901,7 +917,7 @@ def recognize(document_id: str, request: RecognitionRequest):
                 )
             store = ReviewDecisionStore(workspace.review_decisions_path)
             decisions, ledger_revision = store.load_snapshot()
-            document_fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+            document_fingerprint = _source_fingerprint(workspace)
             result = human_review_service.apply_saved_decisions(
                 result, decisions, document_fingerprint
             )
@@ -931,19 +947,26 @@ def get_results(document_id: str):
             if not result:
                 raise HTTPException(404, "Результат распознавания отсутствует")
             store = ReviewDecisionStore(workspace.review_decisions_path)
-            decisions, ledger_revision = store.load_snapshot()
+            ledger_revision = store.load_revision()
             if not _review_projection_current(result, ledger_revision):
-                result = human_review_service.apply_saved_decisions(
-                    result,
-                    decisions,
-                    human_review_service.document_fingerprint(workspace.pdf_path),
-                )
-                result["review_ledger_revision"] = ledger_revision
-                result["revision"] = _result_revision(result) + 1
-                workspace_service.write_json(workspace.result_path, result)
+                decisions, ledger_revision = store.load_snapshot()
+                if not _review_projection_current(result, ledger_revision):
+                    result = human_review_service.apply_saved_decisions(
+                        result,
+                        decisions,
+                        _source_fingerprint(workspace),
+                    )
+                    result["review_ledger_revision"] = ledger_revision
+                    result["revision"] = _result_revision(result) + 1
+                    workspace_service.write_json(workspace.result_path, result)
             return result
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(
+            409,
+            "Сохранённый результат повреждён. Повторите распознавание документа.",
+        ) from exc
 
 
 @app.put("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
@@ -963,7 +986,7 @@ def save_results(document_id: str, request: SaveRowsRequest):
             existing = human_review_service.apply_saved_decisions(
                 existing,
                 decisions,
-                human_review_service.document_fingerprint(workspace.pdf_path),
+                _source_fingerprint(workspace),
             )
             rows = existing.get("rows") or []
             existing["summary"] = recognition_service._summary(
@@ -1737,7 +1760,7 @@ def get_review_decisions(document_id: str):
         workspace = workspace_service.get(document_id)
         with document_mutation_locks.for_document(document_id):
             decisions = ReviewDecisionStore(workspace.review_decisions_path).load()
-            fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+            fingerprint = _source_fingerprint(workspace)
         return {
             "document_fingerprint": fingerprint,
             "decisions": [item.model_dump(mode="json") for item in decisions if item.document_fingerprint == fingerprint],
@@ -1754,7 +1777,7 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             result = workspace_service.read_json(workspace.result_path, default={})
             if not result:
                 raise HTTPException(404, "Результат распознавания отсутствует")
-            fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+            fingerprint = _source_fingerprint(workspace)
             decision = human_review_service.create_decision(
                 result,
                 document_fingerprint=fingerprint,

@@ -27,3 +27,13 @@ Baseline validation: `python -m pytest -q` — **1043 passed, 3 failed, 2 skippe
 ## Concurrency boundary
 
 Canonical JSON files use atomic replacement. Per-document mutation locks serialize request threads in the current single-process deployment and do not block unrelated documents. These locks do not coordinate multiple server processes. A multi-process deployment requires a shared transactional store or OS/distributed locking before it can claim lost-update protection.
+
+## Phase 2 results
+
+The recent-list and document-open regressions are covered with counters and large-result fixtures. Listing and `GET /api/documents/{id}` now perform **zero result payload reads**; `has_result` comes from a file stat. A corrupt result remains listed as present and returns a clear 409 message on explicit open.
+
+New uploads hash the incoming bytes in the existing 1 MiB streaming loop and store the server-computed fingerprint in metadata. Legacy workspaces compute and atomically cache it once. The fingerprint is omitted from public metadata. A current ledger revision is read from a small atomic revision marker; a matching `GET /results` does one result read, zero decision-ledger parses, zero replays, zero source-PDF hashes, and zero result writes. A ledger/result mismatch loads and replays the ledger once, updates the canonical revision, and later GETs return read-only. If a crash leaves the revision marker ahead of the ledger replacement, the ledger is reread and the marker repaired before deciding whether canonical recovery is needed.
+
+Automatic restore starts only after `bootComplete`, uses an abortable sequential metadata/result fetch, and commits document state only after both responses pass the navigation generation check. Upload, explicit open, manual mode, reset, and session cleanup invalidate it. The existing page image cache remains keyed by workspace/page/DPI; cache writes now replace the final PNG atomically so concurrent first renders cannot expose a partial file.
+
+Focused Phase 2 validation: **49 passed** across performance-foundation, workspace/history, review-workflow, and page-range tests; compileall, JavaScript syntax, and whitespace checks passed.
