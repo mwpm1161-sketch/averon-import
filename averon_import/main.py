@@ -1011,6 +1011,7 @@ def save_results(document_id: str, request: SaveRowsRequest):
                 "saved": True,
                 "revision": existing["revision"],
                 "summary": existing["summary"],
+                "result": existing,
             }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc

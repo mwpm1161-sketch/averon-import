@@ -317,6 +317,20 @@ def critical_blockers_for_row(row: dict) -> list[str]:
     return blockers
 
 
+def row_requires_review(row: dict) -> bool:
+    """Whether a row is visibly review-required under canonical backend policy."""
+    return str(row.get("status") or "") in {"review", "unrecognized"} or bool(
+        critical_blockers_for_row(row)
+    )
+
+
+def row_is_ready(row: dict) -> bool:
+    """Whether a recognized/editable row has no canonical review blockers."""
+    return str(row.get("status") or "") in {"recognized", "verified", "edited"} and not (
+        critical_blockers_for_row(row)
+    )
+
+
 def critical_field_count(row: dict) -> int:
     missing = set(missing_critical_fields(row))
     count = len(missing)

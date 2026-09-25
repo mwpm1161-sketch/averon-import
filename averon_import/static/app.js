@@ -1518,6 +1518,9 @@ function numericShapeAgreed(row) {
 }
 
 function criticalBlockers(row) {
+  if (!row?.edited && Array.isArray(row?.critical_blockers)) {
+    return [...new Set(row.critical_blockers.map((item) => String(item)).filter(Boolean))];
+  }
   const missing = missingCriticalFields(row);
   const suspect = numericSuspectFields(row);
   const explicitlyVerified = row.status === "verified" && !missing.length;
@@ -1580,25 +1583,43 @@ function refreshClientReview(row) {
 }
 
 function loadResult(result, options = {}) {
+  const preservedView = options.preserveView ? {
+    previewPage: state.previewPage,
+    activeRowId: state.activeRowId,
+    zoom: state.zoom,
+    scrollTop: $("#result-body").scrollTop,
+  } : null;
   state.result = result;
-  state.previewPage = null;
-  setZoom(1);
+  if (!preservedView) {
+    state.previewPage = null;
+    setZoom(1);
+  }
   state.rows = result.rows.map((row) => ({
     ...row,
+    edited: false,
     selected: row.selected ?? (
       ["item", "component"].includes(row.row_type)
       || (row.row_type === "note" && row.structured_table)
     ),
   }));
-  state.rows.forEach(refreshClientReview);
-  state.reviewFilter = "";
-    state.dirty = false;
-    buildResultHeader();
+  if (!preservedView) state.reviewFilter = "";
+  state.dirty = false;
+  buildResultHeader();
   renderRows();
   updateSummary();
   setView("review");
-  const first = state.rows.find((row) => row.selected) || state.rows[0];
-  if (first) selectRow(first.id);
+  const preservedActiveRow = preservedView
+    ? state.rows.find((row) => row.id === preservedView.activeRowId)
+    : null;
+  if (preservedActiveRow) {
+    state.activeRowId = preservedActiveRow.id;
+    state.previewPage = preservedView.previewPage;
+    state.zoom = preservedView.zoom;
+    $("#result-body").scrollTop = preservedView.scrollTop;
+  } else {
+    const first = state.rows.find((row) => row.selected) || state.rows[0];
+    if (first) selectRow(first.id);
+  }
   if (options.announce === false) return;
   if (result.errors?.length) {
     const pages = result.errors.map((error) => error.page).join(", ");
@@ -1794,7 +1815,7 @@ function mergeHumanReviewPatch(patch) {
     }
     merged.edited_fields = [...new Set([...(serverRow.edited_fields || []), ...localEdits])];
     merged.edited = Boolean(localRow.edited);
-    refreshClientReview(merged);
+    if (state.dirty && merged.edited) refreshClientReview(merged);
     state.rows[index] = merged;
     resultRows[resultIndex] = serverRow;
     changedRows.push(merged);
@@ -2487,9 +2508,22 @@ function positionHighlight(row) {
 }
 
 function updateSummary() {
-  const ready = state.rows.filter((r) => ["recognized","verified","edited"].includes(r.status)).length;
-  const review = state.rows.filter((r) => ["review","unrecognized"].includes(r.status)).length;
-  const critical = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
+  const serverSummary = state.result?.summary || {};
+  const hasCanonicalCounts = !state.dirty
+    && Number.isFinite(Number(serverSummary.review_rows))
+    && Number.isFinite(Number(serverSummary.ready_rows))
+    && Number.isFinite(Number(serverSummary.unresolved_critical));
+  const ready = hasCanonicalCounts
+    ? Number(serverSummary.ready_rows)
+    : state.rows.filter((row) => ["recognized", "verified", "edited"].includes(row.status)
+      && !criticalBlockers(row).length).length;
+  const review = hasCanonicalCounts
+    ? Number(serverSummary.review_rows)
+    : state.rows.filter((row) => ["review", "unrecognized"].includes(row.status)
+      || criticalBlockers(row).length > 0).length;
+  const critical = hasCanonicalCounts
+    ? Number(serverSummary.unresolved_critical)
+    : state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
   const selected = state.rows.filter((r) => r.selected).length;
   $("#summary-total").textContent = state.rows.length;
   $("#summary-ready").textContent = ready;
@@ -2536,12 +2570,16 @@ function backendExportBlockers() {
   for (const page of rowPages) {
     if (statuses.length && !statusPages.has(page)) blockers.push(`Страница ${page}: статус отсутствует`);
   }
-  const unresolved = rows.reduce((total, row) => {
-    if (row.selected === false || ["section", "system", "skip"].includes(row.row_type)) return total;
-    if (row.row_type === "note" && !row.structured_table) return total;
-    return total + criticalFieldCount(row);
-  }, 0);
-  if (unresolved) blockers.push(`Не проверено критичных значений: ${unresolved}`);
+  const unresolvedRows = rows.filter((row) => {
+    if (row.selected === false || ["section", "system", "skip"].includes(row.row_type)) return false;
+    if (row.row_type === "note" && !row.structured_table) return false;
+    return criticalBlockers(row).length > 0;
+  });
+  unresolvedRows.slice(0, 3).forEach((row) => {
+    const page = row.page === undefined ? "?" : row.page;
+    blockers.push(`Строка ${page}: ${criticalBlockers(row).join(", ")}`);
+  });
+  if (unresolvedRows.length > 3) blockers.push(`Заблокировано строк: ${unresolvedRows.length}`);
   return [...new Set(blockers)];
 }
 
@@ -2549,14 +2587,20 @@ function updateExportSafety() {
   const node = $("#export-safety");
   if (!node) return;
   const blockers = backendExportBlockers();
-  node.classList.toggle("blocked", blockers.length > 0);
-  node.textContent = blockers.length
-    ? `Экспорт заблокирован: ${blockers.slice(0, 3).join("; ")}`
-    : "Backend подтвердил: экспорт разрешён.";
+  node.classList.toggle("blocked", blockers.length > 0 || state.dirty);
+  node.textContent = state.dirty
+    ? blockers.length
+      ? `Есть несохранённые правки. Предварительно: ${blockers.slice(0, 3).join("; ")}. Backend проверит после сохранения.`
+      : "Есть несохранённые правки. Backend проверит безопасность после сохранения."
+    : blockers.length
+      ? `Экспорт заблокирован: ${blockers.slice(0, 3).join("; ")}`
+      : "Backend подтвердил: экспорт разрешён.";
   const button = $("#download-excel");
   if (button) {
-    button.disabled = blockers.length > 0;
-    button.title = blockers.length ? "Экспорт заблокирован проверками backend" : "Скачать XLSX";
+    button.disabled = blockers.length > 0 && !state.dirty;
+    button.title = state.dirty
+      ? "Сохранить правки и проверить экспорт на backend"
+      : blockers.length ? "Экспорт заблокирован проверками backend" : "Скачать XLSX";
   }
 }
 
@@ -2568,11 +2612,15 @@ function markDirty() {
 
 async function saveRows(showToast = true) {
   if (!state.document || !state.rows.length) return null;
-  await api(`/api/documents/${state.document.document_id}/results`, {
+  if (!state.dirty) return state.result;
+  const response = await api(`/api/documents/${state.document.document_id}/results`, {
     method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows, expected_revision:Number(state.result?.revision || 0)}),
   });
-  const authoritative = await api(`/api/documents/${state.document.document_id}/results`);
-  loadResult(authoritative, {announce:false});
+  const authoritative = response?.result;
+  if (!authoritative || !Array.isArray(authoritative.rows)) {
+    throw new Error("Сервер не вернул сохранённый результат документа.");
+  }
+  loadResult(authoritative, {announce:false, preserveView:true});
   state.dirty = false; $("#save-button").textContent = "Сохранить правки";
   if (showToast) toast("Правки сохранены", "success");
   return authoritative;

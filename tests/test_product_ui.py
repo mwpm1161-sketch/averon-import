@@ -91,6 +91,38 @@ def test_review_export_is_explicit_and_not_gated_by_production_blockers():
     assert "function reviewExportFilename()" in app_js
 
 
+def test_canonical_review_counts_and_export_safety_remain_consistent():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    summary = app_js.split("function updateSummary()", 1)[1].split("function backendExportBlockers()", 1)[0]
+    blockers = app_js.split("function backendExportBlockers()", 1)[1].split("function updateExportSafety()", 1)[0]
+    safety = app_js.split("function updateExportSafety()", 1)[1].split("function markDirty()", 1)[0]
+    load_result = app_js.split("function loadResult(", 1)[1].split("const displayColumns", 1)[0]
+
+    assert "serverSummary.review_rows" in summary
+    assert "serverSummary.ready_rows" in summary
+    assert "criticalBlockers(row).length > 0" in summary
+    assert "status.blockers" in blockers
+    assert "criticalBlockers(row).length > 0" in blockers
+    assert "state.dirty" in safety
+    assert "Backend проверит безопасность после сохранения" in safety
+    assert "row.critical_blockers" in app_js
+    assert "state.rows.forEach(refreshClientReview)" not in load_result
+    assert ".data-table tr.active td { background:#eef3fa; }" in css
+
+
+def test_clean_export_skips_save_round_trip_and_dirty_save_uses_authoritative_response():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    save = app_js.split("async function saveRows(", 1)[1].split("function copyRows(", 1)[0]
+
+    assert "if (!state.dirty) return state.result;" in save
+    assert save.count("api(") == 1
+    assert "await api(`/api/documents/${state.document.document_id}/results`)" not in save
+    assert "response?.result" in save
+    assert "preserveView:true" in save
+
+
 def test_review_export_button_has_busy_and_finally_recovery_semantics():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     review_export = app_js.split("async function downloadReviewExcel()", 1)[1].split("\nfunction resetApp()", 1)[0]
@@ -122,7 +154,7 @@ def test_static_assets_use_deterministic_content_revisions_and_modal_has_no_blur
     assert "backdrop-filter" not in modal_backdrop.group(1)
 
 
-def test_export_safety_uses_backend_page_status_and_pdf_viewer_resets_cleanly():
+def test_export_safety_uses_backend_page_status_and_saved_result_preserves_pdf_viewer():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")
 
@@ -130,7 +162,8 @@ def test_export_safety_uses_backend_page_status_and_pdf_viewer_resets_cleanly():
     assert "page_statuses" in app_js
     assert "output_status" in app_js
     assert "Backend подтвердил: экспорт разрешён." in app_js
-    assert "loadResult(authoritative, {announce:false})" in app_js
+    assert "loadResult(authoritative, {announce:false, preserveView:true})" in app_js
+    assert "const preservedView = options.preserveView ?" in app_js
     assert "state.previewPage = null" in app_js
     assert "if (pageChanged) setZoom(1)" in app_js
     assert "justify-content:flex-start" in css

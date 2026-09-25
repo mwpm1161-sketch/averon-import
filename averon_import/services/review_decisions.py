@@ -22,6 +22,8 @@ from averon_import.services.review_policy import (
     critical_blockers_for_row,
     critical_field_count,
     refresh_review_state,
+    row_is_ready,
+    row_requires_review,
 )
 from averon_import.services.row_assembler import SpecificationRowAssembler
 
@@ -728,7 +730,7 @@ class HumanReviewService:
     ) -> dict[str, Any]:
         if not isinstance(summary, Mapping) or not {
             "total_rows", "status_counts", "type_counts", "page_errors",
-            "unresolved_critical", "critical_rows",
+            "unresolved_critical", "critical_rows", "review_rows", "ready_rows",
         }.issubset(summary):
             return SpecificationRowAssembler.summary(all_rows, errors)
         updated = dict(summary)
@@ -736,6 +738,8 @@ class HumanReviewService:
         type_counts = dict(summary.get("type_counts") or {})
         unresolved = int(summary.get("unresolved_critical") or 0)
         critical_rows = int(summary.get("critical_rows") or 0)
+        review_rows = int(summary.get("review_rows") or 0)
+        ready_rows = int(summary.get("ready_rows") or 0)
         for row, delta in [*((row, -1) for row in old_rows), *((row, 1) for row in new_rows)]:
             status = str(row.get("status") or "")
             row_type = str(row.get("row_type") or "")
@@ -743,6 +747,8 @@ class HumanReviewService:
             type_counts[row_type] = type_counts.get(row_type, 0) + delta
             unresolved += delta * critical_field_count(row)
             critical_rows += delta * int(bool(critical_blockers_for_row(row)))
+            review_rows += delta * int(row_requires_review(row))
+            ready_rows += delta * int(row_is_ready(row))
         updated["status_counts"] = {
             key: count for key, count in status_counts.items() if count > 0
         }
@@ -751,6 +757,8 @@ class HumanReviewService:
         }
         updated["unresolved_critical"] = max(0, unresolved)
         updated["critical_rows"] = max(0, critical_rows)
+        updated["review_rows"] = max(0, review_rows)
+        updated["ready_rows"] = max(0, ready_rows)
         return updated
 
     def apply_saved_decisions(

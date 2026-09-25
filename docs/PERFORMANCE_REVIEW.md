@@ -45,3 +45,11 @@ The normal human-decision path now applies the just-validated decision to a fres
 The browser serializes review mutations and fences each response against document identity and navigation generation. It merges only the returned row/page patch, updates readiness, replaces only affected table rows, and retains preview, zoom, active row, and table scroll position. A 500-row synthetic result regression test measured a one-row response below one tenth of the complete result JSON; the same operation performed one result read, one result write, zero source fingerprint calculations, zero saved-decision replays, zero full-result copies, one detached row, and one page-safety recalculation. A continuation decision test measured two detached rows (parent and child) and one affected page; unrelated page status was unchanged. The canonical `result.json` remains a complete atomic JSON replacement because that is the existing persistence format.
 
 Focused Phase 3 validation: **49 passed** across performance-foundation, workspace/history, and review-workflow tests; compileall, JavaScript syntax, and whitespace checks passed.
+
+## Phase 4 results
+
+Backend summaries now expose `review_rows` and `ready_rows` using the same canonical row blocker policy as export validation. A row with status `edited` still counts as review-required when it retains a critical blocker. The browser uses these counts and each saved row's canonical `critical_blockers`; page blockers remain independent, so a zero row-review count can still show the exact page-level reason that blocks production export. Unsaved edits are labeled provisional and the UI defers the authoritative readiness claim until save. Normal export still goes through the existing strict backend page and row validation.
+
+An ordinary active row now uses a neutral blue highlight while review/blocker rows retain the warning palette. Clean production export skips the unconditional row PUT and result GET. When the user has edits, one PUT returns the canonical saved result, which the client uses directly before export; the browser keeps the current preview, zoom, active row, and table scroll during that save.
+
+Focused Phase 4 validation: **71 passed** across product UI, row assembly, performance foundation, export, and critical-verification tests; compileall, JavaScript syntax, and whitespace checks passed.

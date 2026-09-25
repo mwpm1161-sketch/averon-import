@@ -147,6 +147,47 @@ def test_manual_save_rejects_stale_canonical_revision(monkeypatch, tmp_path):
     assert workspace_service.read_json(workspace.result_path)["revision"] == 3
 
 
+def test_manual_save_returns_authoritative_canonical_result_in_one_response(monkeypatch, tmp_path):
+    from averon_import import main
+
+    workspace_service = WorkspaceService(tmp_path)
+    document_id = "e" * 32
+    root = workspace_service.documents_dir / document_id
+    root.mkdir()
+    workspace = workspace_service.get(document_id)
+    workspace.pdf_path.write_bytes(b"synthetic pdf")
+    workspace_service.write_json(workspace.metadata_path, {
+        "document_id": document_id,
+        "source_sha256": "f" * 64,
+    })
+    initial_row = _review_row(10)
+    workspace_service.write_json(workspace.result_path, {
+        "document_fingerprint": "f" * 64,
+        "revision": 0,
+        "review_ledger_revision": 0,
+        "rows": [initial_row],
+        "page_statuses": {},
+        "errors": [],
+    })
+    monkeypatch.setattr(main, "workspace_service", workspace_service)
+    edited = _review_row(10)
+    edited["name"] = "Edited item"
+    edited["status"] = "edited"
+    edited["edited"] = True
+    edited["edited_fields"] = ["name"]
+
+    response = main.save_results(
+        document_id,
+        main.SaveRowsRequest(rows=[edited], expected_revision=0),
+    )
+
+    stored = workspace_service.read_json(workspace.result_path)
+    assert response["saved"] is True
+    assert response["revision"] == 1
+    assert response["result"] == stored
+    assert response["result"]["rows"][0]["name"] == "Edited item"
+
+
 def test_recognition_final_commit_cannot_overwrite_concurrent_review(monkeypatch, tmp_path):
     from averon_import import main
 
