@@ -115,6 +115,8 @@ def support_context(tmp_path, monkeypatch):
 
 
 def _make_workspace(workspace_service, document_id="d" * 32):
+    from averon_import.services.review_decisions import REVIEW_PROJECTION_VERSION
+
     root = workspace_service.documents_dir / document_id
     root.mkdir(parents=True)
     workspace_service.write_json(
@@ -132,6 +134,7 @@ def _make_workspace(workspace_service, document_id="d" * 32):
         {
             "revision": 0,
             "review_ledger_revision": 0,
+            "review_projection_version": REVIEW_PROJECTION_VERSION,
             "rows": [{
                 "id": "canonical-row",
                 "page": 1,

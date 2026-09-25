@@ -21,6 +21,7 @@ from averon_import.services.ocr.page_disposition import CONFIRMED_NON_SPEC, SPEC
 from averon_import.services.review_policy import (
     CRITICAL_FIELDS,
     human_confirmed_absence_applies,
+    human_verified_value_applies,
     critical_blockers_for_row,
     critical_field_count,
     missing_critical_fields,
@@ -36,6 +37,7 @@ RELATION_DECISION = "ACCEPT_CONTINUATION_RELATION"
 REJECT_DECISION = "REJECT_CANDIDATE"
 CONFIRM_FIELD_VALUE_DECISION = "CONFIRM_FIELD_VALUE"
 CONFIRM_FIELD_ABSENT_DECISION = "CONFIRM_FIELD_ABSENT"
+REVIEW_PROJECTION_VERSION = 1
 DECISIONS = (
     FIELD_DECISION,
     RELATION_DECISION,
@@ -649,6 +651,7 @@ class HumanReviewService:
         *,
         row_override: dict[str, Any] | None = None,
         parent_override: dict[str, Any] | None = None,
+        allow_invalidated_reaffirmation: bool = False,
     ) -> bool:
         row = row_override or self._find_row(result, decision.page, decision.physical_refs)
         if row is None:
@@ -758,12 +761,60 @@ class HumanReviewService:
             field = str(decision.field)
             current = str(row.get(field) or "").strip()
             if current and current != value:
-                return False
+                records = row.get("human_verified_field_values")
+                records = dict(records) if isinstance(records, Mapping) else {}
+                existing = records.get(field)
+                if (
+                    not isinstance(existing, Mapping)
+                    or existing.get("decision_key") == decision.decision_key
+                ):
+                    stale_record = dict(existing) if isinstance(existing, Mapping) else {}
+                    stale_record.update({
+                        "value": value,
+                        "decision": decision.decision,
+                        "decision_key": decision.decision_key,
+                        "evidence_fingerprint": decision.evidence_fingerprint,
+                        "provenance": "human",
+                        "invalidated": True,
+                    })
+                    records[field] = stale_record
+                    row["human_verified_field_values"] = records
+                if not human_verified_value_applies(row, field):
+                    row["status"] = "review"
+                    refresh_review_state(row)
+                return True
+            records = row.get("human_verified_field_values")
+            records = dict(records) if isinstance(records, Mapping) else {}
+            existing = records.get(field)
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("decision_key") == decision.decision_key
+                and existing.get("invalidated")
+                and not allow_invalidated_reaffirmation
+            ):
+                row["status"] = "review"
+                refresh_review_state(row)
+                return True
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("decision_key") == decision.decision_key
+                and not existing.get("invalidated")
+                and str(existing.get("value", "")) == value
+            ):
+                return True
             row[field] = value
             edited = list(row.get("edited_fields") or [])
             if field not in edited:
                 edited.append(field)
             row["edited_fields"] = edited
+            records[field] = {
+                "value": value,
+                "decision": decision.decision,
+                "decision_key": decision.decision_key,
+                "evidence_fingerprint": decision.evidence_fingerprint,
+                "provenance": "human",
+            }
+            row["human_verified_field_values"] = records
             confirmed = list(row.get("human_verified_fields") or [])
             if field not in confirmed:
                 confirmed.append(field)
@@ -836,7 +887,9 @@ class HumanReviewService:
         updated = _detached_review_copy(result)
         if decision.document_fingerprint != str(updated.get("document_fingerprint") or decision.document_fingerprint):
             return updated
-        self._apply_one(updated, decision)
+        self._apply_one(
+            updated, decision, allow_invalidated_reaffirmation=True
+        )
         return recalculate_page_safety(updated, metrics=self.metrics)
 
     def apply_decision_incremental(
@@ -883,9 +936,15 @@ class HumanReviewService:
                 decision,
                 row_override=rows[row_index],
                 parent_override=rows[parent_index],
+                allow_invalidated_reaffirmation=True,
             )
         else:
-            applied = self._apply_one(updated, decision, row_override=rows[row_index])
+            applied = self._apply_one(
+                updated,
+                decision,
+                row_override=rows[row_index],
+                allow_invalidated_reaffirmation=True,
+            )
         if not applied:
             return result, [], set(), False
 
@@ -970,11 +1029,47 @@ class HumanReviewService:
         self.metrics["full_result_copies"] += 1
         updated = _detached_review_copy(result)
         updated["document_fingerprint"] = document_fingerprint
+        legacy_projection = (
+            result.get("review_projection_version") != REVIEW_PROJECTION_VERSION
+        )
         for decision in sorted(decisions, key=lambda item: item.created_at):
             if decision.document_fingerprint != document_fingerprint:
                 continue
             self.metrics["review_decisions_replayed"] += 1
             self._apply_one(updated, decision)
+        if legacy_projection:
+            for row in updated.get("rows") or []:
+                legacy_fields = row.get("human_verified_fields")
+                legacy_fields = (
+                    [str(field) for field in legacy_fields if str(field).strip()]
+                    if isinstance(legacy_fields, (list, tuple, set))
+                    else []
+                )
+                human_review = row.get("human_review")
+                if (
+                    isinstance(human_review, Mapping)
+                    and human_review.get("decision") == FIELD_DECISION
+                    and human_review.get("field")
+                ):
+                    legacy_fields.append(str(human_review["field"]))
+                unresolved = {
+                    field for field in legacy_fields
+                    if not human_verified_value_applies(row, field)
+                }
+                if not unresolved:
+                    continue
+                remaining = [
+                    field for field in legacy_fields
+                    if field not in unresolved
+                ]
+                if remaining:
+                    row["human_verified_fields"] = list(dict.fromkeys(remaining))
+                else:
+                    row.pop("human_verified_fields", None)
+                if row.get("status") == "verified":
+                    row["status"] = "review"
+                refresh_review_state(row)
+        updated["review_projection_version"] = REVIEW_PROJECTION_VERSION
         return recalculate_page_safety(updated, metrics=self.metrics)
 
 

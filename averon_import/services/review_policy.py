@@ -106,18 +106,18 @@ def required_critical_fields(row: object) -> tuple[str, ...]:
 
 def human_verified_value_applies(row: dict, field: str) -> bool:
     records = row.get("human_verified_field_values")
-    if isinstance(records, dict) and field in records:
-        record = records.get(field)
-        if not isinstance(record, dict):
-            return False
-        return bool(
-            record.get("provenance") == "human"
-            and not record.get("invalidated")
-            and record.get("decision_key")
-            and record.get("evidence_fingerprint")
-            and str(record.get("value", "")) == str(row.get(field, "") or "")
-        )
-    return field in _as_list(row.get("human_verified_fields"))
+    if not isinstance(records, dict):
+        return False
+    record = records.get(field)
+    if not isinstance(record, dict):
+        return False
+    return bool(
+        record.get("provenance") == "human"
+        and not record.get("invalidated")
+        and record.get("decision_key")
+        and record.get("evidence_fingerprint")
+        and str(record.get("value", "")) == str(row.get(field, "") or "")
+    )
 
 
 def human_confirmed_absence_applies(row: object, field: str) -> bool:

@@ -1654,14 +1654,11 @@ function missingCriticalFields(row) {
 
 function humanValueConfirmationMatches(row, key) {
   const records = row?.human_verified_field_values;
-  if (records && Object.prototype.hasOwnProperty.call(records, key)) {
-    const record = records[key];
-    return !record?.invalidated
-      && record?.provenance === "human"
-      && Boolean(record.decision_key && record.evidence_fingerprint)
-      && String(record.value ?? "") === String(row?.[key] ?? "");
-  }
-  return (row?.human_verified_fields || []).includes(key);
+  const record = records?.[key];
+  return !record?.invalidated
+    && record?.provenance === "human"
+    && Boolean(record.decision_key && record.evidence_fingerprint)
+    && String(record.value ?? "") === String(row?.[key] ?? "");
 }
 
 function humanAbsenceConfirmationMatches(row, key) {

@@ -170,6 +170,7 @@ def test_get_results_current_revision_is_read_only_and_skips_replay(tmp_path, mo
     service.write_json(workspace.result_path, {
         "revision": 7,
         "review_ledger_revision": 0,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
         "rows": [],
         "page_statuses": {},
         "errors": [],
@@ -210,6 +211,7 @@ def test_get_results_repairs_ahead_ledger_revision_marker_without_false_replay(t
     service.write_json(workspace.result_path, {
         "revision": 7,
         "review_ledger_revision": 1,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
         "rows": [],
         "page_statuses": {},
         "errors": [],
@@ -315,6 +317,7 @@ def test_get_results_recovers_ledger_mismatch_once_then_stays_read_only(tmp_path
     result = {
         "revision": 4,
         "review_ledger_revision": 0,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
         "document_fingerprint": "f" * 64,
         "rows": [row],
         "page_statuses": {},

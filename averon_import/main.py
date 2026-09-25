@@ -80,6 +80,7 @@ from averon_import.services.review_decisions import (
     HumanReviewService,
     RELATION_DECISION,
     REJECT_DECISION,
+    REVIEW_PROJECTION_VERSION,
     ReviewDecision,
     ReviewDecisionLedgerCorrupt,
     ReviewDecisionStore,
@@ -185,6 +186,8 @@ def _result_revision(result: dict[str, Any] | None) -> int:
 
 
 def _review_projection_current(result: dict[str, Any], ledger_revision: int) -> bool:
+    if result.get("review_projection_version") != REVIEW_PROJECTION_VERSION:
+        return False
     try:
         current = int(result.get("review_ledger_revision", -1))
     except (TypeError, ValueError):
@@ -958,6 +961,7 @@ def recognize(document_id: str, request: RecognitionRequest):
                 result, decisions, document_fingerprint
             )
             result["review_ledger_revision"] = ledger_revision
+            result["review_projection_version"] = REVIEW_PROJECTION_VERSION
             result["revision"] = recognition_base_revision + 1
             workspace_service.write_json(workspace.result_path, result)
         return result
@@ -1103,6 +1107,7 @@ def save_results(document_id: str, request: SaveRowsRequest):
                 rows, existing.get("errors", [])
             )
             existing["review_ledger_revision"] = ledger_revision
+            existing["review_projection_version"] = REVIEW_PROJECTION_VERSION
             existing["revision"] = current_revision + 1
             workspace_service.write_json(workspace.result_path, existing)
             return {
@@ -1963,6 +1968,7 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             canonical_changed = bool(changed_rows) or ledger_changed
             if canonical_changed:
                 updated["review_ledger_revision"] = ledger_revision
+                updated["review_projection_version"] = REVIEW_PROJECTION_VERSION
                 updated["revision"] = current_revision + 1
                 workspace_service.write_json(workspace.result_path, updated)
             else:
