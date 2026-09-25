@@ -219,6 +219,12 @@ class ReviewDecision(BaseModel):
 class ReviewDecisionStore:
     """Small atomic JSON store scoped to one document workspace."""
 
+    metrics = {
+        "ledger_reads": 0,
+        "ledger_writes": 0,
+        "revision_reads": 0,
+    }
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.revision_path = self.path.with_suffix(self.path.suffix + ".revision")
@@ -239,6 +245,7 @@ class ReviewDecisionStore:
 
     def load_revision(self) -> int:
         """Read the small revision marker without parsing a steady-state ledger."""
+        self.metrics["revision_reads"] += 1
         if self.revision_path.is_file():
             try:
                 return max(0, int(self.revision_path.read_text(encoding="ascii").strip()))
@@ -259,6 +266,7 @@ class ReviewDecisionStore:
             if self.revision_path.is_file():
                 self._sync_revision(0)
             return [], 0
+        self.metrics["ledger_reads"] += 1
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -302,6 +310,7 @@ class ReviewDecisionStore:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
+        self.metrics["ledger_writes"] += 1
         return revision
 
     @staticmethod
@@ -310,19 +319,21 @@ class ReviewDecisionStore:
         right_payload = right.model_dump(mode="json", exclude={"created_at"})
         return _stable(left_payload) == _stable(right_payload)
 
-    def upsert_snapshot(self, decision: ReviewDecision) -> tuple[list[ReviewDecision], int]:
+    def upsert_snapshot(
+        self, decision: ReviewDecision
+    ) -> tuple[list[ReviewDecision], int, bool]:
         decisions, revision = self.load_snapshot()
         existing = next(
             (item for item in decisions if item.decision_key == decision.decision_key),
             None,
         )
         if existing is not None and self._same_decision(existing, decision):
-            return decisions, revision
+            return decisions, revision, False
         decisions = [item for item in decisions if item.decision_key != decision.decision_key]
         decisions.append(decision)
         decisions.sort(key=lambda item: item.created_at)
         revision = self.save(decisions, revision=revision + 1)
-        return decisions, revision
+        return decisions, revision, True
 
     def upsert(self, decision: ReviewDecision) -> list[ReviewDecision]:
         return self.upsert_snapshot(decision)[0]
@@ -337,6 +348,8 @@ class HumanReviewService:
         self.metrics = {
             "review_decisions_replayed": 0,
             "page_safety_pages_recalculated": 0,
+            "full_result_copies": 0,
+            "review_rows_detached": 0,
         }
 
     def document_fingerprint(self, pdf_path: Path) -> str:
@@ -351,6 +364,13 @@ class HumanReviewService:
         for row in result.get("rows") or []:
             if int(row.get("page") or 0) == int(page) and _same_refs(_row_refs(row), refs):
                 return row
+        return None
+
+    @staticmethod
+    def _find_row_index(result: Mapping[str, Any], page: int, refs: Any) -> int | None:
+        for index, row in enumerate(result.get("rows") or []):
+            if int(row.get("page") or 0) == int(page) and _same_refs(_row_refs(row), refs):
+                return index
         return None
 
     @staticmethod
@@ -483,8 +503,15 @@ class HumanReviewService:
         row["human_review"] = current
         row["verification_state"] = "HUMAN_VERIFIED"
 
-    def _apply_one(self, result: dict[str, Any], decision: ReviewDecision) -> bool:
-        row = self._find_row(result, decision.page, decision.physical_refs)
+    def _apply_one(
+        self,
+        result: dict[str, Any],
+        decision: ReviewDecision,
+        *,
+        row_override: dict[str, Any] | None = None,
+        parent_override: dict[str, Any] | None = None,
+    ) -> bool:
+        row = row_override or self._find_row(result, decision.page, decision.physical_refs)
         if row is None:
             return False
         parent_refs = decision.target.get("parent_physical_refs")
@@ -554,7 +581,7 @@ class HumanReviewService:
         if decision.decision == RELATION_DECISION:
             if str(row.get("row_type") or "") != "semantic_review":
                 return False
-            parent = self._find_row(result, decision.page, parent_refs)
+            parent = parent_override or self._find_row(result, decision.page, parent_refs)
             if parent is None or parent is row:
                 return False
             if str(parent.get("row_type") or "") not in {"item", "component", "item_candidate"}:
@@ -603,11 +630,128 @@ class HumanReviewService:
         return False
 
     def apply_decision(self, result: Mapping[str, Any], decision: ReviewDecision) -> dict[str, Any]:
+        self.metrics["full_result_copies"] += 1
         updated = _detached_review_copy(result)
         if decision.document_fingerprint != str(updated.get("document_fingerprint") or decision.document_fingerprint):
             return updated
         self._apply_one(updated, decision)
         return recalculate_page_safety(updated, metrics=self.metrics)
+
+    def apply_decision_incremental(
+        self, result: dict[str, Any], decision: ReviewDecision
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], set[int], bool]:
+        """Apply one decision to a freshly loaded canonical JSON projection.
+
+        Only the decision's row (and a bounded continuation parent) are
+        detached. OCR metadata is shared unchanged with the original row so
+        review policy can update the projection without rewriting OCR evidence.
+        The caller must hold the per-document mutation lock.
+        """
+        if decision.document_fingerprint != str(
+            result.get("document_fingerprint") or decision.document_fingerprint
+        ):
+            return result, [], set(), False
+        row_index = self._find_row_index(result, decision.page, decision.physical_refs)
+        if row_index is None:
+            return result, [], set(), False
+        indexes = {row_index}
+        parent_index = None
+        if decision.decision == RELATION_DECISION:
+            parent_index = self._find_row_index(
+                result,
+                decision.page,
+                decision.target.get("parent_physical_refs"),
+            )
+            if parent_index is None or parent_index == row_index:
+                return result, [], set(), False
+            indexes.add(parent_index)
+
+        original_rows = result.get("rows") or []
+        rows = list(original_rows)
+        original_by_index = {index: original_rows[index] for index in indexes}
+        for index in indexes:
+            row_copy = _detached_review_copy(original_rows[index])
+            rows[index] = row_copy
+        self.metrics["review_rows_detached"] += len(indexes)
+        updated = dict(result)
+        updated["rows"] = rows
+        if decision.decision == RELATION_DECISION:
+            applied = self._apply_one(
+                updated,
+                decision,
+                row_override=rows[row_index],
+                parent_override=rows[parent_index],
+            )
+        else:
+            applied = self._apply_one(updated, decision, row_override=rows[row_index])
+        if not applied:
+            return result, [], set(), False
+
+        # Projection refresh may update derived flags under ocr_metadata. Keep
+        # the exact source evidence object from the canonical row unchanged.
+        for index in indexes:
+            rows[index]["ocr_metadata"] = original_by_index[index].get("ocr_metadata")
+
+        changed_indexes = [
+            index for index in indexes if rows[index] != original_by_index[index]
+        ]
+        if not changed_indexes:
+            return result, [], set(), True
+        changed_rows = [rows[index] for index in changed_indexes]
+        affected_pages = {
+            int(row.get("page") or decision.page) for row in changed_rows
+        }
+        updated["document_fingerprint"] = decision.document_fingerprint
+        recalculate_page_safety(
+            updated,
+            metrics=self.metrics,
+            pages=affected_pages,
+            copy_result=False,
+            refresh_summary=False,
+        )
+        updated["summary"] = self._summary_after_row_changes(
+            result.get("summary"),
+            [original_by_index[index] for index in changed_indexes],
+            changed_rows,
+            rows,
+            result.get("errors") or [],
+        )
+        return updated, changed_rows, affected_pages, True
+
+    @staticmethod
+    def _summary_after_row_changes(
+        summary: Any,
+        old_rows: list[dict[str, Any]],
+        new_rows: list[dict[str, Any]],
+        all_rows: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not isinstance(summary, Mapping) or not {
+            "total_rows", "status_counts", "type_counts", "page_errors",
+            "unresolved_critical", "critical_rows",
+        }.issubset(summary):
+            return SpecificationRowAssembler.summary(all_rows, errors)
+        updated = dict(summary)
+        status_counts = dict(summary.get("status_counts") or {})
+        type_counts = dict(summary.get("type_counts") or {})
+        unresolved = int(summary.get("unresolved_critical") or 0)
+        critical_rows = int(summary.get("critical_rows") or 0)
+        for row, delta in [*((row, -1) for row in old_rows), *((row, 1) for row in new_rows)]:
+            status = str(row.get("status") or "")
+            row_type = str(row.get("row_type") or "")
+            status_counts[status] = status_counts.get(status, 0) + delta
+            type_counts[row_type] = type_counts.get(row_type, 0) + delta
+            unresolved += delta * critical_field_count(row)
+            critical_rows += delta * int(bool(critical_blockers_for_row(row)))
+        updated["status_counts"] = {
+            key: count for key, count in status_counts.items() if count > 0
+        }
+        updated["type_counts"] = {
+            key: count for key, count in type_counts.items() if count > 0
+        }
+        updated["unresolved_critical"] = max(0, unresolved)
+        updated["critical_rows"] = max(0, critical_rows)
+        return updated
 
     def apply_saved_decisions(
         self,
@@ -615,6 +759,7 @@ class HumanReviewService:
         decisions: list[ReviewDecision],
         document_fingerprint: str,
     ) -> dict[str, Any]:
+        self.metrics["full_result_copies"] += 1
         updated = _detached_review_copy(result)
         updated["document_fingerprint"] = document_fingerprint
         for decision in sorted(decisions, key=lambda item: item.created_at):
@@ -626,20 +771,45 @@ class HumanReviewService:
 
 
 def recalculate_page_safety(
-    result: Mapping[str, Any], *, metrics: dict[str, int] | None = None
+    result: Mapping[str, Any],
+    *,
+    metrics: dict[str, int] | None = None,
+    pages: set[int] | None = None,
+    copy_result: bool = True,
+    refresh_summary: bool = True,
 ) -> dict[str, Any]:
     """Rebuild page safety counters from the post-review canonical view."""
-    updated = _detached_review_copy(result)
+    if copy_result:
+        if metrics is not None:
+            metrics["full_result_copies"] += 1
+        updated = _detached_review_copy(result)
+    else:
+        updated = result
+        if not isinstance(updated, dict):
+            raise TypeError("Canonical result must be a mutable dictionary")
     rows = list(updated.get("rows") or [])
     statuses = dict(updated.get("page_statuses") or {})
+    affected_pages = {int(page) for page in pages} if pages is not None else None
+    rows_by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            row_page = int(row.get("page") or 0)
+        except (TypeError, ValueError):
+            continue
+        if affected_pages is None or row_page in affected_pages:
+            rows_by_page.setdefault(row_page, []).append(row)
     for page_key, original in statuses.items():
         if not isinstance(original, Mapping):
             continue
+        page = int(original.get("page") or page_key)
+        if affected_pages is not None and page not in affected_pages:
+            continue
         if metrics is not None:
             metrics["page_safety_pages_recalculated"] += 1
-        page = int(original.get("page") or page_key)
-        page_rows = [row for row in rows if int(row.get("page") or 0) == page]
-        diagnostics = dict(original.get("diagnostics") or {})
+        if not copy_result:
+            original = _detached_review_copy(original)
+        page_rows = rows_by_page.get(page, [])
+        diagnostics = _detached_review_copy(original.get("diagnostics") or {})
         # Page status diagnostics are intentionally compact and do not carry
         # the original reconstruction object.  Rehydrate the contract inputs
         # from the serialized status before recalculating human-resolved
@@ -734,7 +904,8 @@ def recalculate_page_safety(
         })
         statuses[str(page)] = page_status.as_dict()
     updated["page_statuses"] = statuses
-    updated["summary"] = SpecificationRowAssembler.summary(rows, updated.get("errors") or [])
+    if refresh_summary:
+        updated["summary"] = SpecificationRowAssembler.summary(rows, updated.get("errors") or [])
     return updated
 
 

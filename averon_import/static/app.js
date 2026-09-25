@@ -32,7 +32,9 @@ const state = {
     responseBytes: 0,
     lastResponseType: "",
     fullTableRenders: 0,
+    reviewRowPatches: 0,
   },
+  reviewMutationQueue: Promise.resolve(),
   loginSubmitting: false,
   users: {
     items: [],
@@ -1662,15 +1664,17 @@ function renderRows() {
   const rows = filteredRows();
   body.innerHTML = rows.map((row) => rowHtml(row)).join("");
   $("#empty-table").hidden = rows.length > 0;
-  body.querySelectorAll("tr").forEach((tr) => {
-    tr.addEventListener("click", (event) => {
-      if (!event.target.matches("input,textarea,select,option")) selectRow(tr.dataset.id);
-    });
+  body.querySelectorAll("tr").forEach(bindResultRow);
+}
+
+function bindResultRow(tr) {
+  tr.addEventListener("click", (event) => {
+    if (!event.target.matches("input,textarea,select,option")) selectRow(tr.dataset.id);
   });
-  body.querySelectorAll(".row-select").forEach((input) => input.addEventListener("change", (event) => {
+  tr.querySelectorAll(".row-select").forEach((input) => input.addEventListener("change", (event) => {
     const row = rowById(event.target.dataset.id); row.selected = event.target.checked; updateSummary(); markDirty();
   }));
-  body.querySelectorAll(".cell-input").forEach((input) => {
+  tr.querySelectorAll(".cell-input").forEach((input) => {
     autoHeight(input);
     input.addEventListener("input", () => {
       const row = rowById(input.dataset.id);
@@ -1683,7 +1687,7 @@ function renderRows() {
     });
     input.addEventListener("focus", () => selectRow(input.dataset.id));
   });
-  body.querySelectorAll(".cell-select").forEach((select) => select.addEventListener("change", () => {
+  tr.querySelectorAll(".cell-select").forEach((select) => select.addEventListener("change", () => {
     const row = rowById(select.dataset.id);
     row[select.dataset.key] = select.value;
     row.edited_fields = [...new Set([...(row.edited_fields || []), select.dataset.key])];
@@ -1692,7 +1696,7 @@ function renderRows() {
     refreshClientReview(row);
     markDirty(); updateSummary(); renderRows();
   }));
-  body.querySelectorAll(".candidate-accept").forEach((button) => button.addEventListener("click", (event) => {
+  tr.querySelectorAll(".candidate-accept").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     const row = rowById(button.dataset.id);
     const candidate = row?.value_candidates?.[button.dataset.key];
@@ -1703,7 +1707,7 @@ function renderRows() {
       candidate_value: String(candidate.value_candidate),
     }, `${CRITICAL_LABELS[button.dataset.key]} подтверждено пользователем`);
   }));
-  body.querySelectorAll(".continuation-accept").forEach((button) => button.addEventListener("click", (event) => {
+  tr.querySelectorAll(".continuation-accept").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     const row = rowById(button.dataset.id);
     const parent = row && continuationParent(row);
@@ -1716,7 +1720,7 @@ function renderRows() {
       target: {parent_physical_refs: physicalRefs(parent)},
     }, "Продолжение привязано пользователем");
   }));
-  body.querySelectorAll(".candidate-reject").forEach((button) => button.addEventListener("click", (event) => {
+  tr.querySelectorAll(".candidate-reject").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     const row = rowById(button.dataset.id);
     const candidate = row?.value_candidates?.[button.dataset.key];
@@ -1727,20 +1731,121 @@ function renderRows() {
       candidate_value: String(candidate.value_candidate),
     }, "Кандидат отклонён и оставлен на проверке");
   }));
-  body.querySelectorAll(".candidate-edit").forEach((button) => button.addEventListener("click", (event) => {
+  tr.querySelectorAll(".candidate-edit").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     const row = rowById(button.dataset.id);
     if (!row) return;
     selectRow(row.id);
-    const input = [...body.querySelectorAll(`.cell-input[data-id="${row.id}"]`)]
+    const input = [...tr.querySelectorAll(`.cell-input[data-id="${row.id}"]`)]
       .find((element) => element.dataset.key === button.dataset.key);
     if (input) { input.focus(); input.select(); }
   }));
-  body.querySelectorAll(".sourcing-row-button").forEach((button) => button.addEventListener("click", (event) => {
+  tr.querySelectorAll(".sourcing-row-button").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     const row = rowById(button.dataset.id);
     if (row) openSourcingForRow(row);
   }));
+}
+
+function renderPatchedReviewRows(changedRows) {
+  const body = $("#result-body");
+  const scrollTop = body.scrollTop;
+  for (const row of changedRows) {
+    [...body.querySelectorAll("tr")]
+      .find((node) => node.dataset.id === String(row.id))
+      ?.remove();
+  }
+  const visible = filteredRows();
+  for (const row of changedRows) {
+    const visibleIndex = visible.findIndex((item) => item.id === row.id);
+    if (visibleIndex < 0) continue;
+    const template = document.createElement("template");
+    template.innerHTML = rowHtml(row).trim();
+    const element = template.content.firstElementChild;
+    let anchor = null;
+    for (let index = visibleIndex + 1; index < visible.length; index += 1) {
+      anchor = [...body.querySelectorAll("tr")]
+        .find((node) => node.dataset.id === String(visible[index].id));
+      if (anchor) break;
+    }
+    body.insertBefore(element, anchor);
+    bindResultRow(element);
+    state.performanceCounters.reviewRowPatches = Math.min(2147483647, state.performanceCounters.reviewRowPatches + 1);
+  }
+  $("#empty-table").hidden = body.children.length > 0;
+  body.scrollTop = scrollTop;
+}
+
+function mergeHumanReviewPatch(patch) {
+  if (!state.result || !Array.isArray(patch?.rows)) return false;
+  const resultRows = state.result.rows || [];
+  const changedRows = [];
+  for (const serverRow of patch.rows) {
+    const index = state.rows.findIndex((row) => row.id === serverRow.id);
+    const resultIndex = resultRows.findIndex((row) => row.id === serverRow.id);
+    if (index < 0 || resultIndex < 0) return false;
+    const localRow = state.rows[index];
+    const localEdits = state.dirty && localRow.edited
+      ? [...new Set(localRow.edited_fields || [])]
+      : [];
+    const merged = {...serverRow, selected: localRow.selected};
+    for (const field of localEdits) {
+      if (Object.prototype.hasOwnProperty.call(localRow, field)) merged[field] = localRow[field];
+    }
+    merged.edited_fields = [...new Set([...(serverRow.edited_fields || []), ...localEdits])];
+    merged.edited = Boolean(localRow.edited);
+    refreshClientReview(merged);
+    state.rows[index] = merged;
+    resultRows[resultIndex] = serverRow;
+    changedRows.push(merged);
+  }
+  state.result.page_statuses = {
+    ...(state.result.page_statuses || {}),
+    ...(patch.page_statuses || {}),
+  };
+  state.result.summary = patch.summary || state.result.summary || {};
+  state.result.revision = Number(patch.revision || state.result.revision || 0);
+  state.result.review_ledger_revision = Number(
+    patch.review_ledger_revision || state.result.review_ledger_revision || 0,
+  );
+  renderPatchedReviewRows(changedRows);
+  updateSummary();
+  return true;
+}
+
+function submitHumanDecision(row, payload, successMessage) {
+  if (!state.document) return Promise.resolve();
+  const documentId = state.document.document_id;
+  const navigationGeneration = state.documentNavigationGeneration;
+  const request = JSON.parse(JSON.stringify({
+    page: row.page,
+    physical_refs: physicalRefs(row),
+    ...payload,
+  }));
+  const send = async () => {
+    if (state.document?.document_id !== documentId
+      || !isCurrentDocumentNavigation(navigationGeneration)) return;
+    try {
+      const response = await api(`/api/documents/${documentId}/review/decision`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(request),
+      });
+      const patch = response.result_patch;
+      if (state.document?.document_id !== documentId
+        || !isCurrentDocumentNavigation(navigationGeneration)
+        || Number(patch?.revision || 0) < Number(state.result?.revision || 0)) return;
+      if (!mergeHumanReviewPatch(patch)) {
+        throw new Error("Не удалось применить обновление проверки. Обновите результат документа.");
+      }
+      toast(`${successMessage} · Проверено пользователем ✓`, "success");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  };
+  const queued = state.reviewMutationQueue.then(send, send);
+  state.reviewMutationQueue = queued.catch(() => {});
+  return queued;
 }
 
 function physicalRefs(row) {
@@ -1800,26 +1905,6 @@ function continuationFragment(row) {
     if (value) return String(value).trim();
   }
   return preview;
-}
-
-async function submitHumanDecision(row, payload, successMessage) {
-  if (!state.document) return;
-  const documentId = state.document.document_id;
-  const navigationGeneration = state.documentNavigationGeneration;
-  try {
-    const response = await api(`/api/documents/${documentId}/review/decision`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({page: row.page, physical_refs: physicalRefs(row), ...payload}),
-    });
-    if (state.document?.document_id !== documentId
-      || !isCurrentDocumentNavigation(navigationGeneration)
-      || Number(response.revision || 0) < Number(state.result?.revision || 0)) return;
-    loadResult(response.result, {announce: false});
-    toast(`${successMessage} · Проверено пользователем ✓`, "success");
-  } catch (error) {
-    toast(error.message, "error");
-  }
 }
 
 function rowHtml(row) {

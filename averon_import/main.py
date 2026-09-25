@@ -188,6 +188,30 @@ def _review_projection_current(result: dict[str, Any], ledger_revision: int) -> 
     return current == ledger_revision
 
 
+def _reconcile_review_projection_locked(workspace, result: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Recover a result only when its persisted ledger revision is stale.
+
+    Callers must own the document mutation lock. The small revision marker
+    keeps the steady-state path from parsing or replaying the complete ledger.
+    """
+    store = ReviewDecisionStore(workspace.review_decisions_path)
+    ledger_revision = store.load_revision()
+    if _review_projection_current(result, ledger_revision):
+        return result, False
+    decisions, ledger_revision = store.load_snapshot()
+    if _review_projection_current(result, ledger_revision):
+        return result, False
+    updated = human_review_service.apply_saved_decisions(
+        result,
+        decisions,
+        _source_fingerprint(workspace),
+    )
+    updated["review_ledger_revision"] = ledger_revision
+    updated["revision"] = _result_revision(result) + 1
+    workspace_service.write_json(workspace.result_path, updated)
+    return updated, True
+
+
 def _source_fingerprint(workspace) -> str:
     return workspace_service.source_fingerprint(
         workspace, human_review_service.document_fingerprint
@@ -946,19 +970,7 @@ def get_results(document_id: str):
             result = workspace_service.read_json(workspace.result_path)
             if not result:
                 raise HTTPException(404, "Результат распознавания отсутствует")
-            store = ReviewDecisionStore(workspace.review_decisions_path)
-            ledger_revision = store.load_revision()
-            if not _review_projection_current(result, ledger_revision):
-                decisions, ledger_revision = store.load_snapshot()
-                if not _review_projection_current(result, ledger_revision):
-                    result = human_review_service.apply_saved_decisions(
-                        result,
-                        decisions,
-                        _source_fingerprint(workspace),
-                    )
-                    result["review_ledger_revision"] = ledger_revision
-                    result["revision"] = _result_revision(result) + 1
-                    workspace_service.write_json(workspace.result_path, result)
+            result, _recovered = _reconcile_review_projection_locked(workspace, result)
             return result
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
@@ -1777,6 +1789,8 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             result = workspace_service.read_json(workspace.result_path, default={})
             if not result:
                 raise HTTPException(404, "Результат распознавания отсутствует")
+            result, _recovered = _reconcile_review_projection_locked(workspace, result)
+            current_revision = _result_revision(result)
             fingerprint = _source_fingerprint(workspace)
             decision = human_review_service.create_decision(
                 result,
@@ -1790,16 +1804,35 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
                 target=request.target,
             )
             store = ReviewDecisionStore(workspace.review_decisions_path)
-            decisions, ledger_revision = store.upsert_snapshot(decision)
-            updated = human_review_service.apply_saved_decisions(result, decisions, fingerprint)
-            updated["review_ledger_revision"] = ledger_revision
-            updated["revision"] = _result_revision(result) + 1
-            workspace_service.write_json(workspace.result_path, updated)
+            updated, changed_rows, affected_pages, applied = (
+                human_review_service.apply_decision_incremental(result, decision)
+            )
+            if not applied:
+                raise ValueError("Решение больше не соответствует текущему OCR-доказательству")
+            _decisions, ledger_revision, ledger_changed = store.upsert_snapshot(decision)
+            canonical_changed = bool(changed_rows) or ledger_changed
+            if canonical_changed:
+                updated["review_ledger_revision"] = ledger_revision
+                updated["revision"] = current_revision + 1
+                workspace_service.write_json(workspace.result_path, updated)
+            else:
+                updated = result
+            page_statuses = updated.get("page_statuses") or {}
+            changed_page_statuses = {
+                key: value
+                for key, value in page_statuses.items()
+                if int((value or {}).get("page") or key) in affected_pages
+            }
             return {
                 "saved": True,
                 "decision": decision.model_dump(mode="json"),
-                "revision": updated["revision"],
-                "result": updated,
+                "result_patch": {
+                    "rows": changed_rows,
+                    "page_statuses": changed_page_statuses,
+                    "summary": updated.get("summary") or {},
+                    "revision": _result_revision(updated),
+                    "review_ledger_revision": int(updated.get("review_ledger_revision", ledger_revision)),
+                },
             }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
