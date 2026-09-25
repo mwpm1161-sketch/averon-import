@@ -58,6 +58,7 @@ const state = {
   recentDocuments: [],
   manual: {active: false, rows: []},
   documentLoad: {generation: 0, controller: null, kind: null},
+  reviewDecisionGeneration: 0,
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -698,6 +699,7 @@ function setResumeStatus(visible) {
 
 function cancelDocumentLoad({forgetResume = false} = {}) {
   state.documentLoad.generation += 1;
+  state.reviewDecisionGeneration += 1;
   if (state.documentLoad.controller) state.documentLoad.controller.abort();
   state.documentLoad.controller = null;
   state.documentLoad.kind = null;
@@ -1808,16 +1810,22 @@ function continuationFragment(row) {
 }
 
 async function submitHumanDecision(row, payload, successMessage) {
-  if (!state.document) return;
+  const documentId = state.document?.document_id;
+  if (!documentId) return;
+  const requestId = ++state.reviewDecisionGeneration;
   try {
-    const response = await api(`/api/documents/${state.document.document_id}/review/decision`, {
+    const response = await api(`/api/documents/${documentId}/review/decision`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({page: row.page, physical_refs: physicalRefs(row), ...payload}),
     });
+    // A response from an older click or an already-left document must never
+    // replace the user's newer canonical view.
+    if (requestId !== state.reviewDecisionGeneration || state.document?.document_id !== documentId) return;
     loadResult(response.result, {announce: false});
     toast(`${successMessage} · Проверено пользователем ✓`, "success");
   } catch (error) {
+    if (requestId !== state.reviewDecisionGeneration || state.document?.document_id !== documentId) return;
     toast(error.message, "error");
   }
 }
