@@ -334,6 +334,31 @@ def test_d5_rejected_candidate_leaves_review_and_does_not_change_canonical():
     assert updated["page_statuses"]["58"]["output_status"] == "REVIEW_REQUIRED"
 
 
+def test_d5a_rejected_candidate_replay_is_idempotent():
+    result = _result()
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(10),
+        decision="REJECT_CANDIDATE",
+        field="quantity",
+        candidate_value="4",
+    )
+
+    once = service.apply_saved_decisions(
+        result, [decision], result["document_fingerprint"]
+    )
+    twice = service.apply_saved_decisions(
+        once, [decision], result["document_fingerprint"]
+    )
+
+    rejected = twice["rows"][0]["human_rejected_candidates"]
+    assert len(rejected) == 1
+    assert rejected[0]["decision_key"] == decision.decision_key
+
+
 def test_d6_continuation_relation_requires_parent_and_never_composes_numeric_fields():
     result = _result()
     service = HumanReviewService()
