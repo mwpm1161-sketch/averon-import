@@ -4,6 +4,9 @@ import json
 import os
 import re
 from decimal import Decimal
+from pathlib import Path
+
+import pytest
 
 from averon_import.services.jobs import JobService
 from averon_import.services.sourcing.cache import SourcingCache
@@ -53,7 +56,7 @@ def test_document_listing_is_safe_newest_first_and_bounded(tmp_path):
     assert "pdf_path" not in listed[0]
 
 
-def test_document_listing_skips_corrupt_metadata_and_marks_corrupt_result(tmp_path):
+def test_document_listing_skips_corrupt_metadata_without_parsing_corrupt_result(tmp_path, monkeypatch):
     service = WorkspaceService(tmp_path)
     corrupt_metadata = service.documents_dir / ("c" * 32)
     corrupt_metadata.mkdir()
@@ -66,9 +69,17 @@ def test_document_listing_skips_corrupt_metadata_and_marks_corrupt_result(tmp_pa
     listed = service.list_recent()
 
     assert [item["document_id"] for item in listed] == ["d" * 32]
-    assert listed[0]["available"] is False
-    assert listed[0]["has_result"] is False
+    assert listed[0]["available"] is True
+    assert listed[0]["has_result"] is True
     assert listed[0]["has_review_decisions"] is True
+    assert service.metrics["result_reads"] == 0
+
+    from averon_import import main
+
+    monkeypatch.setattr(main, "workspace_service", service)
+    with pytest.raises(main.HTTPException) as error:
+        main.get_results("d" * 32)
+    assert error.value.status_code == 409
 
 
 def test_workspace_open_api_is_retrieval_only(monkeypatch, tmp_path):
@@ -85,6 +96,269 @@ def test_workspace_open_api_is_retrieval_only(monkeypatch, tmp_path):
     assert payload["document_id"] == "e" * 32
     assert payload["has_result"] is True
     assert payload["has_review_decisions"] is False
+    assert service.metrics["result_reads"] == 0
+
+
+def test_recent_listing_never_reads_large_result_payload(tmp_path, monkeypatch):
+    service = WorkspaceService(tmp_path)
+    document_id = "f" * 32
+    _write_metadata(service, document_id)
+    result_path = service.documents_dir / document_id / "result.json"
+    result_path.write_text(json.dumps({"rows": [{"name": "x" * 200_000}]}), encoding="utf-8")
+    original = service.read_json
+    reads = []
+
+    def tracked(path, default=None):
+        reads.append(Path(path).name)
+        return original(path, default)
+
+    monkeypatch.setattr(service, "read_json", tracked)
+
+    documents = service.list_recent()
+
+    assert documents[0]["has_result"] is True
+    assert reads == ["metadata.json"]
+    assert service.metrics["result_reads"] == 0
+
+
+def test_upload_fingerprint_is_saved_and_legacy_fingerprint_is_cached_once(tmp_path):
+    import hashlib
+
+    service = WorkspaceService(tmp_path)
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"synthetic source pdf")
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    uploaded = service.create(
+        source,
+        {"filename": "upload.pdf", "page_count": 1, "size": source.stat().st_size},
+        source_sha256=expected,
+    )
+    assert service.read_json(uploaded.metadata_path)["source_sha256"] == expected
+    assert service.metrics["source_fingerprint_calculations"] == 1
+
+    legacy_id = "e" * 32
+    legacy_root = service.documents_dir / legacy_id
+    legacy_root.mkdir()
+    legacy = service.get(legacy_id)
+    legacy.pdf_path.write_bytes(b"old source pdf")
+    service.write_json(legacy.metadata_path, {"document_id": legacy_id, "filename": "old.pdf"})
+    calculations = []
+
+    def calculate(path):
+        calculations.append(Path(path).read_bytes())
+        return hashlib.sha256(calculations[-1]).hexdigest()
+
+    first = service.source_fingerprint(legacy, calculate)
+    second = service.source_fingerprint(legacy, calculate)
+
+    assert first == second
+    assert calculations == [b"old source pdf"]
+    assert service.metrics["source_fingerprint_calculations"] == 2
+
+
+def test_get_results_current_revision_is_read_only_and_skips_replay(tmp_path, monkeypatch):
+    from averon_import import main
+
+    service = WorkspaceService(tmp_path)
+    document_id = "g" * 32
+    root = service.documents_dir / document_id
+    root.mkdir()
+    workspace = service.get(document_id)
+    workspace.pdf_path.write_bytes(b"synthetic source")
+    service.write_json(workspace.metadata_path, {"document_id": document_id})
+    service.write_json(workspace.result_path, {
+        "revision": 7,
+        "review_ledger_revision": 0,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
+        "rows": [],
+        "page_statuses": {},
+        "errors": [],
+    })
+    store = main.ReviewDecisionStore(workspace.review_decisions_path)
+    store.save([], revision=0)
+    before_writes = service.metrics["result_writes"]
+    monkeypatch.setattr(main, "workspace_service", service)
+    monkeypatch.setattr(
+        main.ReviewDecisionStore,
+        "load_snapshot",
+        lambda _self: (_ for _ in ()).throw(AssertionError("steady GET parsed the decision ledger")),
+    )
+    monkeypatch.setattr(
+        main.human_review_service,
+        "apply_saved_decisions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("GET replayed decisions")),
+    )
+
+    result = main.get_results(document_id)
+
+    assert result["revision"] == 7
+    assert service.metrics["result_reads"] == 1
+    assert service.metrics["result_writes"] == before_writes
+    assert service.metrics["source_fingerprint_calculations"] == 0
+
+
+def test_get_results_repairs_ahead_ledger_revision_marker_without_false_replay(tmp_path, monkeypatch):
+    from averon_import import main
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    service = WorkspaceService(tmp_path)
+    document_id = "i" * 32
+    root = service.documents_dir / document_id
+    root.mkdir()
+    workspace = service.get(document_id)
+    service.write_json(workspace.metadata_path, {"document_id": document_id})
+    service.write_json(workspace.result_path, {
+        "revision": 7,
+        "review_ledger_revision": 1,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
+        "rows": [],
+        "page_statuses": {},
+        "errors": [],
+    })
+    store = ReviewDecisionStore(workspace.review_decisions_path)
+    store.save([], revision=1)
+    store.revision_path.write_text("2", encoding="ascii")
+    monkeypatch.setattr(main, "workspace_service", service)
+    result_writes = service.metrics["result_writes"]
+
+    result = main.get_results(document_id)
+
+    assert result["revision"] == 7
+    assert service.metrics["result_writes"] == result_writes
+    assert store.revision_path.read_text(encoding="ascii") == "1"
+
+
+@pytest.mark.parametrize(
+    "corrupt_bytes",
+    [
+        b"{malformed json",
+        b'{"revision": 3, "decisions": [{"invalid": "decision"}]}',
+        b'{"revision": 3, "decisions": {"invalid": "shape"}}',
+    ],
+)
+def test_corrupt_ledger_fails_closed_without_reconciling_or_repairing_any_file(
+    tmp_path, monkeypatch, corrupt_bytes
+):
+    from fastapi import HTTPException
+
+    from averon_import import main
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    service = WorkspaceService(tmp_path)
+    document_id = "c" * 32
+    root = service.documents_dir / document_id
+    root.mkdir()
+    workspace = service.get(document_id)
+    service.write_json(workspace.metadata_path, {"document_id": document_id})
+    service.write_json(workspace.result_path, {
+        "revision": 8,
+        "review_ledger_revision": 0,
+        "rows": [],
+        "page_statuses": {},
+        "errors": [],
+    })
+    store = ReviewDecisionStore(workspace.review_decisions_path)
+    store.path.write_bytes(corrupt_bytes)
+    store.revision_path.write_text("3", encoding="ascii")
+    result_before = workspace.result_path.read_bytes()
+    ledger_before = store.path.read_bytes()
+    marker_before = store.revision_path.read_bytes()
+    monkeypatch.setattr(main, "workspace_service", service)
+
+    with pytest.raises(HTTPException) as error:
+        main.get_results(document_id)
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "История ручной проверки повреждена. Требуется восстановление."
+    assert str(store.path) not in error.value.detail
+    assert workspace.result_path.read_bytes() == result_before
+    assert store.path.read_bytes() == ledger_before
+    assert store.revision_path.read_bytes() == marker_before
+
+
+def test_missing_decision_ledger_is_an_empty_snapshot(tmp_path):
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    ledger_path = tmp_path / "review_decisions.json"
+    store = ReviewDecisionStore(ledger_path)
+
+    assert store.load_snapshot() == ([], 0)
+    assert not ledger_path.exists()
+    assert not store.revision_path.exists()
+
+
+def test_get_results_recovers_ledger_mismatch_once_then_stays_read_only(tmp_path, monkeypatch):
+    from averon_import import main
+    from averon_import.services.review_decisions import HumanReviewService, ReviewDecisionStore
+
+    service = WorkspaceService(tmp_path)
+    document_id = "h" * 32
+    root = service.documents_dir / document_id
+    root.mkdir()
+    workspace = service.get(document_id)
+    workspace.pdf_path.write_bytes(b"synthetic source")
+    row = {
+        "id": "row-10",
+        "page": 1,
+        "row_type": "item",
+        "status": "review",
+        "quantity": "",
+        "unit": "шт.",
+        "mass": "",
+        "physical_row_refs": [{"table": {"page_number": 1, "table_index": 0}, "row_index": 10}],
+        "value_candidates": {"quantity": {"value_candidate": "2"}},
+        "ocr_metadata": {
+            "physical_row_refs": [{"table": {"page_number": 1, "table_index": 0}, "row_index": 10}],
+            "raw_physical_cells": [{"row_index": 10, "raw_text": "2"}],
+            "value_candidates": {"quantity": {"value_candidate": "2"}},
+        },
+    }
+    result = {
+        "revision": 4,
+        "review_ledger_revision": 0,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
+        "document_fingerprint": "f" * 64,
+        "rows": [row],
+        "page_statuses": {},
+        "errors": [],
+    }
+    service.write_json(workspace.metadata_path, {"document_id": document_id})
+    service.write_json(workspace.result_path, result)
+    decision = HumanReviewService().create_decision(
+        result,
+        document_fingerprint="f" * 64,
+        page=1,
+        physical_refs=row["physical_row_refs"],
+        decision="REJECT_CANDIDATE",
+        field="quantity",
+        candidate_value="2",
+    )
+    ReviewDecisionStore(workspace.review_decisions_path).upsert(decision)
+    monkeypatch.setattr(main, "workspace_service", service)
+    monkeypatch.setattr(main.human_review_service, "document_fingerprint", lambda _path: "f" * 64)
+    original_apply = main.human_review_service.apply_saved_decisions
+    replayed = []
+
+    def tracked_apply(*args, **kwargs):
+        replayed.append(1)
+        return original_apply(*args, **kwargs)
+
+    monkeypatch.setattr(main.human_review_service, "apply_saved_decisions", tracked_apply)
+    writes_before = service.metrics["result_writes"]
+    replay_count_before = main.human_review_service.metrics["review_decisions_replayed"]
+
+    recovered = main.get_results(document_id)
+    again = main.get_results(document_id)
+
+    assert recovered["review_ledger_revision"] == 1
+    assert recovered["revision"] == 5
+    assert len(recovered["rows"][0]["human_rejected_candidates"]) == 1
+    assert again["revision"] == 5
+    assert len(replayed) == 1
+    assert main.human_review_service.metrics["review_decisions_replayed"] == replay_count_before + 1
+    assert service.metrics["result_writes"] == writes_before + 1
+    assert service.metrics["source_fingerprint_calculations"] == 1
 
 
 def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp_path):
@@ -310,7 +584,7 @@ def test_recent_document_ui_has_explicit_open_flow_without_recognition_call():
     assert "/recognize" not in open_flow
     assert "/suggest-pages" not in open_flow
     assert "localStorage.setItem(\"averonCurrentDocument\"" in open_flow
-    assert re.search(r"api\(`/api/documents/\$\{encodedId\}/results`\)", open_flow)
+    assert "api(`/api/documents/${encodedId}/results`, {signal:navigation.signal})" in open_flow
 
 
 def _telemetry_understanding() -> ProductUnderstandingResult:

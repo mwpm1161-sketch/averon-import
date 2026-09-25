@@ -18,6 +18,8 @@ from averon_import.services.review_policy import (
     critical_blockers_for_row,
     critical_field_count,
     refresh_review_state,
+    row_is_ready,
+    row_requires_review,
 )
 
 
@@ -425,4 +427,6 @@ class SpecificationRowAssembler:
             "page_errors": len(errors),
             "unresolved_critical": sum(critical_field_count(row) for row in rows),
             "critical_rows": sum(bool(critical_blockers_for_row(row)) for row in rows),
+            "review_rows": sum(row_requires_review(row) for row in rows),
+            "ready_rows": sum(row_is_ready(row) for row in rows),
         }

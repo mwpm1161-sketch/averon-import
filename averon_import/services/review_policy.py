@@ -104,6 +104,39 @@ def required_critical_fields(row: object) -> tuple[str, ...]:
     return CRITICAL_FIELDS
 
 
+def human_verified_value_applies(row: dict, field: str) -> bool:
+    records = row.get("human_verified_field_values")
+    if not isinstance(records, dict):
+        return False
+    record = records.get(field)
+    if not isinstance(record, dict):
+        return False
+    return bool(
+        record.get("provenance") == "human"
+        and not record.get("invalidated")
+        and record.get("decision_key")
+        and record.get("evidence_fingerprint")
+        and str(record.get("value", "")) == str(row.get(field, "") or "")
+    )
+
+
+def human_confirmed_absence_applies(row: object, field: str) -> bool:
+    values = _row_values(row)
+    if str(values.get(field, "") or "").strip():
+        return False
+    records = values.get("human_confirmed_absent_fields")
+    if not isinstance(records, dict):
+        return False
+    record = records.get(field)
+    return bool(
+        isinstance(record, dict)
+        and record.get("provenance") == "human"
+        and not record.get("invalidated")
+        and record.get("decision_key")
+        and record.get("evidence_fingerprint")
+    )
+
+
 def semantic_missing_critical_fields(row: object) -> list[str]:
     """Apply the semantic applicability contract to an OCR or UI row."""
 
@@ -121,6 +154,7 @@ def semantic_missing_critical_fields(row: object) -> list[str]:
     return [
         field for field in required_critical_fields(row)
         if not str(values.get(field, "") or "").strip()
+        and not human_confirmed_absence_applies(row, field)
     ]
 
 
@@ -195,6 +229,7 @@ def missing_critical_fields(row: dict) -> list[str]:
     return [
         key for key in CRITICAL_FIELDS
         if not str(row.get(key, "") or "").strip()
+        and not human_confirmed_absence_applies(row, key)
     ]
 
 
@@ -204,7 +239,7 @@ def _as_list(value: object) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
-def _numeric_suspect_fields(row: dict) -> set[str]:
+def _numeric_suspect_fields(row: dict, *, include_confirmed: bool = False) -> set[str]:
     metadata = row.get("ocr_metadata") or {}
     normalization = metadata.get("normalization") if isinstance(metadata, dict) else {}
     result: set[str] = set()
@@ -216,12 +251,16 @@ def _numeric_suspect_fields(row: dict) -> set[str]:
     edited_fields = set(_as_list(row.get("edited_fields")))
     for key in result & edited_fields:
         details = numeric_cell_metadata(row.get(key, ""))
-        if not details.get("numeric_suspect"):
+        records = row.get("human_verified_field_values")
+        has_confirmation_record = isinstance(records, dict) and key in records
+        if not details.get("numeric_suspect") and not has_confirmation_record:
             result.discard(key)
+    if not include_confirmed:
+        result = {key for key in result if not human_verified_value_applies(row, key)}
     return result
 
 
-def _numeric_non_scalar_fields(row: dict) -> set[str]:
+def _numeric_non_scalar_fields(row: dict, *, include_confirmed: bool = False) -> set[str]:
     metadata = row.get("ocr_metadata") or {}
     normalization = metadata.get("normalization") if isinstance(metadata, dict) else {}
     result: set[str] = set()
@@ -236,12 +275,16 @@ def _numeric_non_scalar_fields(row: dict) -> set[str]:
     edited_fields = set(_as_list(row.get("edited_fields")))
     for key in result & edited_fields:
         details = numeric_cell_metadata(row.get(key, ""))
-        if not details.get("non_scalar"):
+        records = row.get("human_verified_field_values")
+        has_confirmation_record = isinstance(records, dict) and key in records
+        if not details.get("non_scalar") and not has_confirmation_record:
             result.discard(key)
+    if not include_confirmed:
+        result = {key for key in result if not human_verified_value_applies(row, key)}
     return result
 
 
-def _numeric_shape_suspect_fields(row: dict) -> set[str]:
+def _numeric_shape_suspect_fields(row: dict, *, include_confirmed: bool = False) -> set[str]:
     metadata = row.get("ocr_metadata") or {}
     normalization = metadata.get("normalization") if isinstance(metadata, dict) else {}
     result: set[str] = set()
@@ -274,8 +317,12 @@ def _numeric_shape_suspect_fields(row: dict) -> set[str]:
     edited_fields = set(_as_list(row.get("edited_fields")))
     if "quantity" in result and "quantity" in edited_fields:
         details = numeric_cell_metadata(row.get("quantity", ""))
-        if not details.get("integer_like_decimal"):
+        records = row.get("human_verified_field_values")
+        has_confirmation_record = isinstance(records, dict) and "quantity" in records
+        if not details.get("integer_like_decimal") and not has_confirmation_record:
             result.discard("quantity")
+    if not include_confirmed:
+        result = {key for key in result if not human_verified_value_applies(row, key)}
     return result
 
 
@@ -285,7 +332,11 @@ def critical_blockers_for_row(row: dict) -> list[str]:
     reasons = set(_as_list(row.get("review_reasons")))
     reasons.update(_as_list(row.get("critical_blockers")))
     blockers: list[str] = []
-    if missing or "critical_value_missing" in reasons:
+    has_absence_confirmation = any(
+        human_confirmed_absence_applies(row, field)
+        for field in required_critical_fields(row)
+    )
+    if missing or ("critical_value_missing" in reasons and not has_absence_confirmation):
         blockers.append("critical_value_missing")
     for reason in (
         "numeric_suspect",
@@ -307,6 +358,18 @@ def critical_blockers_for_row(row: dict) -> list[str]:
         "physical_row_loss_suspected",
         "identity_cell_missing",
     ):
+        if reason == "numeric_suspect" and not _numeric_suspect_fields(row) and (
+            _numeric_suspect_fields(row, include_confirmed=True)
+        ):
+            continue
+        if reason == "numeric_non_scalar" and not _numeric_non_scalar_fields(row) and (
+            _numeric_non_scalar_fields(row, include_confirmed=True)
+        ):
+            continue
+        if reason == "numeric_shape_suspect" and not _numeric_shape_suspect_fields(row) and (
+            _numeric_shape_suspect_fields(row, include_confirmed=True)
+        ):
+            continue
         if (
             reason in STRUCTURAL_REVIEW_REASONS
             and _semantic_structural_impact(row) == "INFORMATIONAL"
@@ -315,6 +378,20 @@ def critical_blockers_for_row(row: dict) -> list[str]:
         if reason in reasons:
             blockers.append(reason)
     return blockers
+
+
+def row_requires_review(row: dict) -> bool:
+    """Whether a row is visibly review-required under canonical backend policy."""
+    return str(row.get("status") or "") in {"review", "unrecognized"} or bool(
+        critical_blockers_for_row(row)
+    )
+
+
+def row_is_ready(row: dict) -> bool:
+    """Whether a recognized/editable row has no canonical review blockers."""
+    return str(row.get("status") or "") in {"recognized", "verified", "edited"} and not (
+        critical_blockers_for_row(row)
+    )
 
 
 def critical_field_count(row: dict) -> int:
@@ -364,6 +441,31 @@ def refresh_review_state(row: dict) -> dict:
         return row
     reasons = _as_list(row.get("review_reasons"))
     previous_blockers = _as_list(row.get("critical_blockers"))
+    verified_records = row.get("human_verified_field_values")
+    if isinstance(verified_records, dict):
+        refreshed_records = {}
+        stale_confirmation = False
+        for field, original in verified_records.items():
+            record = dict(original) if isinstance(original, dict) else original
+            if isinstance(record, dict) and str(record.get("value", "")) != str(
+                row.get(field, "") or ""
+            ):
+                record["invalidated"] = True
+            if isinstance(record, dict) and record.get("invalidated"):
+                stale_confirmation = True
+            refreshed_records[field] = record
+        row["human_verified_field_values"] = refreshed_records
+        if stale_confirmation:
+            row["status"] = "review"
+    absence_confirmations = row.get("human_confirmed_absent_fields")
+    if isinstance(absence_confirmations, dict):
+        refreshed_absences = {}
+        for field, original in absence_confirmations.items():
+            record = dict(original) if isinstance(original, dict) else original
+            if isinstance(record, dict) and str(row.get(field, "") or "").strip():
+                record["invalidated"] = True
+            refreshed_absences[field] = record
+        row["human_confirmed_absent_fields"] = refreshed_absences
     reasons.extend(reason for reason in previous_blockers if reason not in reasons)
     edited_fields = set(_as_list(row.get("edited_fields")))
     metadata = row.get("ocr_metadata") or {}
@@ -391,7 +493,6 @@ def refresh_review_state(row: dict) -> dict:
     elif identity_flagged and "identity_cell_missing" not in reasons:
         reasons.append("identity_cell_missing")
     conflict_fields = set(_as_list(row.get("secondary_conflict_fields")))
-    human_verified_fields = set(_as_list(row.get("human_verified_fields")))
     if (
         "secondary_conflict" in edited_fields
         or conflict_fields.intersection(edited_fields)
@@ -417,7 +518,7 @@ def refresh_review_state(row: dict) -> dict:
         reasons.append("numeric_shape_suspect")
     for field, candidate in (row.get("value_candidates") or {}).items():
         if isinstance(candidate, dict) and candidate.get("review_reason"):
-            if field in human_verified_fields:
+            if human_verified_value_applies(row, str(field)):
                 # The candidate remains immutable OCR evidence, but an
                 # explicit human confirmation resolves its review obligation.
                 continue

@@ -5,8 +5,11 @@ const state = {
   previewPage: null,
   crop: null,
   cropSelecting: false,
+  pageInspection: {documentId:null,page:null,zoom:1,fitWidth:true,requestId:0},
   rows: [],
   result: null,
+  rowIndexes: {byId: new Map(), byPage: new Map(), byPageRefs: new Map()},
+  renderedRowById: new Map(),
   activeRowId: null,
   zoom: 1,
   dirty: false,
@@ -24,6 +27,18 @@ const state = {
   authState: "checking",
   authGeneration: 0,
   bootComplete: false,
+  documentNavigationGeneration: 0,
+  documentNavigationController: null,
+  documentNavigationKind: null,
+  performanceCounters: {
+    httpRequests: 0,
+    responseBytes: 0,
+    lastResponseType: "",
+    fullTableRenders: 0,
+    rowPatches: 0,
+  },
+  tableSearchTimer: null,
+  reviewMutationQueues: new Map(),
   loginSubmitting: false,
   users: {
     items: [],
@@ -65,6 +80,9 @@ const MANUAL_DRAFT_KEY = "averonManualTenderDraft";
 const MANUAL_FIELDS = ["name", "type_mark", "manufacturer", "code", "quantity", "unit"];
 let authBootPromise = null;
 let authBootGeneration = null;
+const PAGE_INSPECTION_MIN_ZOOM = 0.2;
+const PAGE_INSPECTION_MAX_ZOOM = 2.4;
+const PAGE_INSPECTION_ZOOM_STEP = 0.2;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -99,7 +117,11 @@ async function api(url, options = {}) {
     if (csrfToken && !headers.has("X-CSRF-Token")) headers.set("X-CSRF-Token", csrfToken);
     requestOptions.headers = headers;
   }
+  state.performanceCounters.httpRequests = Math.min(2147483647, state.performanceCounters.httpRequests + 1);
   const response = await fetch(url, requestOptions);
+  const responseBytes = Number(response.headers.get("content-length") || 0);
+  state.performanceCounters.responseBytes = Math.min(2147483647, state.performanceCounters.responseBytes + (Number.isFinite(responseBytes) ? responseBytes : 0));
+  state.performanceCounters.lastResponseType = response.headers.get("content-type") || "";
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     let payload = null;
@@ -134,13 +156,18 @@ function readCsrfCookie() {
 }
 
 function clearProtectedMemory() {
+  cancelDocumentNavigation();
   state.config = null;
   state.document = null;
   state.selectedPages = new Set();
   state.previewPage = null;
+  updatePageInspectionOpenButton();
   state.crop = null;
   state.cropSelecting = false;
   state.rows = [];
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   state.result = null;
   state.activeRowId = null;
   state.dirty = false;
@@ -175,6 +202,34 @@ function clearProtectedMemory() {
   if (logoutButton) logoutButton.disabled = false;
   clearProtectedUi();
   document.body.classList.remove("manual-mode");
+}
+
+function cancelDocumentNavigation() {
+  resetPageInspection();
+  state.documentNavigationGeneration = (state.documentNavigationGeneration || 0) + 1;
+  if (state.documentNavigationController) {
+    state.documentNavigationController.abort();
+    state.documentNavigationController = null;
+  }
+  state.documentNavigationKind = null;
+  const restoreStatus = $("#restore-document-status");
+  if (restoreStatus) restoreStatus.hidden = true;
+}
+
+function beginDocumentNavigation({automaticRestore = false} = {}) {
+  cancelDocumentNavigation();
+  const controller = new AbortController();
+  state.documentNavigationController = controller;
+  state.documentNavigationKind = automaticRestore ? "automatic_restore" : "explicit";
+  if (automaticRestore) {
+    const restoreStatus = $("#restore-document-status");
+    if (restoreStatus) restoreStatus.hidden = false;
+  }
+  return {generation: state.documentNavigationGeneration, signal: controller.signal};
+}
+
+function isCurrentDocumentNavigation(generation) {
+  return generation === state.documentNavigationGeneration;
 }
 
 function clearProtectedUi() {
@@ -740,10 +795,10 @@ async function boot() {
       loadManualDraft();
       try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
       if (generation !== state.authGeneration) return;
-      await resumeLastDocument();
-      if (generation !== state.authGeneration) return;
-      if (state.manual.active) openManualWorkspace();
+      const manualDraftActive = state.manual.active;
+      if (manualDraftActive) openManualWorkspace();
       state.bootComplete = true;
+      if (!manualDraftActive) void resumeLastDocument();
     } catch (error) {
       if (generation !== state.authGeneration) return;
       if (state.authState === "checking") {
@@ -1073,6 +1128,7 @@ function addManualRow(values = {}) {
 }
 
 function openManualWorkspace() {
+  cancelDocumentNavigation();
   state.manual.active = true;
   if (!state.manual.rows.length) state.manual.rows.push(manualRow());
   saveManualDraft();
@@ -1171,11 +1227,26 @@ async function openManualUnderstanding(row) {
 async function resumeLastDocument() {
   const documentId = localStorage.getItem("averonCurrentDocument");
   if (!documentId) return;
+  const navigation = beginDocumentNavigation({automaticRestore: true});
   try {
-    await openExistingDocument(documentId, {announce: false});
-    toast("Последний документ восстановлен", "success");
-  } catch (_) {
-    localStorage.removeItem("averonCurrentDocument");
+    await openExistingDocument(documentId, {announce: false, navigation});
+    if (isCurrentDocumentNavigation(navigation.generation)) {
+      toast("Последний документ восстановлен", "success");
+    }
+  } catch (error) {
+    if (isCurrentDocumentNavigation(navigation.generation)
+      && localStorage.getItem("averonCurrentDocument") === documentId
+      && error?.name !== "AbortError") {
+      localStorage.removeItem("averonCurrentDocument");
+      toast(error?.message || "Не удалось открыть предыдущий документ", "error");
+    }
+  } finally {
+    if (isCurrentDocumentNavigation(navigation.generation)) {
+      const restoreStatus = $("#restore-document-status");
+      if (restoreStatus) restoreStatus.hidden = true;
+      state.documentNavigationController = null;
+      state.documentNavigationKind = null;
+    }
   }
 }
 
@@ -1203,20 +1274,33 @@ function renderRecentDocuments() {
     return `<div class="recent-document-item${unavailable ? " unavailable" : ""}"><div><b>${escapeHtml(item.filename || item.title || "Документ")}</b><small>${escapeHtml(meta)}${unavailable ? ` · ${escapeHtml(item.availability_error || "недоступен")}` : ""}</small></div><button class="button ghost recent-document-open" type="button" data-document-id="${escapeHtml(item.document_id)}"${unavailable ? " disabled" : ""}>${unavailable ? "Недоступен" : "Открыть"}</button></div>`;
   }).join("");
   list.querySelectorAll(".recent-document-open").forEach((button) => button.addEventListener("click", () => {
-    openExistingDocument(button.dataset.documentId).catch((error) => toast(error.message, "error"));
+    openExistingDocument(button.dataset.documentId).catch((error) => {
+      if (error?.name !== "AbortError") toast(error.message, "error");
+    });
   }));
 }
 
-async function openExistingDocument(documentId, {announce = true} = {}) {
+async function openExistingDocument(documentId, {announce = true, navigation = null} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
+  navigation = navigation || beginDocumentNavigation();
   const encodedId = encodeURIComponent(documentId);
-  const documentData = await api(`/api/documents/${encodedId}`);
+  const documentData = await api(`/api/documents/${encodedId}`, {signal:navigation.signal});
+  if (!isCurrentDocumentNavigation(navigation.generation)) return;
+  let result = null;
+  if (documentData.has_result) {
+    result = await api(`/api/documents/${encodedId}/results`, {signal:navigation.signal});
+    if (!isCurrentDocumentNavigation(navigation.generation)) return;
+  }
   clearExportError();
   state.document = documentData;
   state.selectedPages = new Set();
   state.previewPage = null;
+  updatePageInspectionOpenButton();
   state.crop = null;
   state.rows = [];
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   state.result = null;
   state.activeRowId = null;
   state.dirty = false;
@@ -1225,7 +1309,6 @@ async function openExistingDocument(documentId, {announce = true} = {}) {
   $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
   $("#new-document-button").hidden = false;
   if (documentData.has_result) {
-    const result = await api(`/api/documents/${encodedId}/results`);
     loadResult(result, {announce});
   } else {
     setView("pages");
@@ -1241,15 +1324,18 @@ async function uploadFile(file) {
   }
   const form = new FormData();
   form.append("file", file);
+  const navigation = beginDocumentNavigation();
   const card = $("#drop-zone");
   card.classList.add("drag");
   try {
-    const documentData = await api("/api/documents", {method:"POST", body:form});
+    const documentData = await api("/api/documents", {method:"POST", body:form, signal:navigation.signal});
+    if (!isCurrentDocumentNavigation(navigation.generation)) return;
     clearExportError();
     state.document = documentData;
     localStorage.setItem("averonCurrentDocument", documentData.document_id);
     state.selectedPages.clear();
     state.previewPage = null;
+    updatePageInspectionOpenButton();
     state.crop = null;
     $("#document-name").textContent = documentData.filename;
     $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
@@ -1258,7 +1344,7 @@ async function uploadFile(file) {
     renderThumbnails();
     loadRecentDocuments().catch(() => {});
   } catch (error) {
-    toast(error.message, "error");
+    if (error?.name !== "AbortError") toast(error.message, "error");
   } finally {
     card.classList.remove("drag");
     $("#pdf-file").value = "";
@@ -1273,7 +1359,7 @@ function renderThumbnails() {
     node.className = "thumbnail";
     node.dataset.page = page;
     node.innerHTML = `
-      <img loading="lazy" src="/api/documents/${state.document.document_id}/page/${page}?dpi=72" alt="Страница ${page}">
+      <img loading="lazy" src="${documentPageImageUrl(state.document.document_id, page, 72)}" alt="Страница ${page}">
       <div class="thumbnail-footer"><span>Страница ${page}</span><input type="checkbox" aria-label="Выбрать страницу ${page}"></div>`;
     node.addEventListener("click", (event) => {
       event.preventDefault();
@@ -1305,6 +1391,7 @@ function updatePageSelection() {
   if (state.selectedPages.size) {
     $("#page-range").value = compactRanges([...state.selectedPages].sort((a,b)=>a-b));
   }
+  updatePageInspectionOpenButton();
 }
 
 function compactRanges(pages) {
@@ -1335,14 +1422,159 @@ function parseRanges(value) {
   return pages;
 }
 
+function documentPageImageUrl(documentId, page, dpi) {
+  return `/api/documents/${encodeURIComponent(documentId)}/page/${encodeURIComponent(page)}?dpi=${encodeURIComponent(dpi)}`;
+}
+
+function updatePageInspectionOpenButton() {
+  const button = $("#page-inspection-open");
+  if (!button) return;
+  const page = Number(state.previewPage);
+  button.disabled = !state.document?.document_id || !Number.isInteger(page) || page < 1;
+}
+
 async function showCropPreview(page) {
+  if (!state.document?.document_id || !Number.isInteger(Number(page)) || Number(page) < 1) return;
+  page = Number(page);
   state.previewPage = page;
   updatePageSelection();
   const image = $("#crop-image");
   $("#crop-placeholder").hidden = true;
   image.hidden = false;
-  image.src = `/api/documents/${state.document.document_id}/page/${page}?dpi=120`;
+  image.alt = `Предпросмотр страницы ${page}`;
+  image.src = documentPageImageUrl(state.document.document_id, page, 120);
   if (state.crop) positionCropBox();
+}
+
+function resetPageInspection({closeDialog = true} = {}) {
+  const requestId = (state.pageInspection?.requestId || 0) + 1;
+  state.pageInspection = {documentId:null,page:null,zoom:1,fitWidth:true,requestId};
+  const image = $("#page-inspection-image");
+  if (image) {
+    image.onload = null;
+    image.onerror = null;
+    image.removeAttribute("src");
+    image.style.removeProperty("width");
+    image.style.removeProperty("height");
+    image.alt = "Страница";
+  }
+  const canvas = $("#page-inspection-canvas");
+  if (canvas) {
+    canvas.style.removeProperty("width");
+    canvas.style.removeProperty("height");
+  }
+  const crop = $("#page-inspection-crop");
+  if (crop) {
+    crop.hidden = true;
+    crop.removeAttribute("style");
+  }
+  const status = $("#page-inspection-status");
+  if (status) {
+    status.hidden = false;
+    status.classList.remove("failed");
+  }
+  const statusText = $("#page-inspection-status-text");
+  if (statusText) statusText.textContent = "Загружаем изображение страницы…";
+  const title = $("#page-inspection-title");
+  if (title) title.textContent = "Страница —";
+  const zoomLabel = $("#page-inspection-zoom-label");
+  if (zoomLabel) zoomLabel.textContent = "По ширине";
+  updatePageInspectionOpenButton();
+  const dialog = $("#page-inspection-modal");
+  if (closeDialog && dialog?.open) dialog.close();
+}
+
+function renderPageInspectionImage() {
+  const image = $("#page-inspection-image");
+  if (!image?.naturalWidth || !image.naturalHeight) return;
+  const width = Math.max(1, Math.round(image.naturalWidth * state.pageInspection.zoom));
+  const height = Math.max(1, Math.round(image.naturalHeight * state.pageInspection.zoom));
+  image.style.width = `${width}px`;
+  image.style.height = `${height}px`;
+  const canvas = $("#page-inspection-canvas");
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  syncPageInspectionCropOverlay();
+}
+
+function setPageInspectionZoom(value, {fitWidth = false} = {}) {
+  const zoom = Math.max(
+    PAGE_INSPECTION_MIN_ZOOM,
+    Math.min(PAGE_INSPECTION_MAX_ZOOM, Number(value) || 1),
+  );
+  state.pageInspection.zoom = zoom;
+  state.pageInspection.fitWidth = fitWidth;
+  $("#page-inspection-zoom-label").textContent = fitWidth ? "По ширине" : `${Math.round(zoom * 100)}%`;
+  renderPageInspectionImage();
+}
+
+function fitPageInspectionToWidth() {
+  const image = $("#page-inspection-image");
+  const viewport = $("#page-inspection-viewport");
+  if (!image?.naturalWidth || !viewport) return;
+  const style = window.getComputedStyle(viewport);
+  const horizontalPadding = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+  const availableWidth = Math.max(1, viewport.clientWidth - horizontalPadding);
+  const fitZoom = availableWidth / image.naturalWidth;
+  setPageInspectionZoom(fitZoom, {fitWidth:true});
+}
+
+function syncPageInspectionCropOverlay() {
+  const overlay = $("#page-inspection-crop");
+  if (!overlay) return;
+  const inspection = state.pageInspection;
+  const visible = Boolean(
+    inspection?.documentId
+      && inspection.documentId === state.document?.document_id
+      && Number.isInteger(inspection.page)
+      && state.crop
+  );
+  overlay.hidden = !visible;
+  if (!visible) return;
+  overlay.style.left = `${state.crop.x * 100}%`;
+  overlay.style.top = `${state.crop.y * 100}%`;
+  overlay.style.width = `${state.crop.width * 100}%`;
+  overlay.style.height = `${state.crop.height * 100}%`;
+}
+
+function openPageInspection() {
+  const documentId = state.document?.document_id;
+  const page = Number(state.previewPage);
+  if (!documentId || !Number.isInteger(page) || page < 1) return;
+  const dialog = $("#page-inspection-modal");
+  if (dialog.open) return;
+  resetPageInspection({closeDialog:false});
+  const requestId = state.pageInspection.requestId + 1;
+  state.pageInspection = {documentId,page,zoom:1,fitWidth:true,requestId};
+  const image = $("#page-inspection-image");
+  const status = $("#page-inspection-status");
+  const statusText = $("#page-inspection-status-text");
+  $("#page-inspection-title").textContent = `Страница ${page}`;
+  image.alt = `Страница ${page}`;
+  status.hidden = false;
+  status.classList.remove("failed");
+  statusText.textContent = "Загружаем изображение страницы…";
+  $("#page-inspection-zoom-label").textContent = "По ширине";
+  dialog.showModal();
+  image.onload = () => {
+    if (state.pageInspection.requestId !== requestId || !dialog.open) return;
+    status.hidden = true;
+    if (state.pageInspection.fitWidth) fitPageInspectionToWidth();
+    else renderPageInspectionImage();
+  };
+  image.onerror = () => {
+    if (state.pageInspection.requestId !== requestId || !dialog.open) return;
+    status.classList.add("failed");
+    statusText.textContent = "Не удалось загрузить страницу. Закройте просмотр и попробуйте снова.";
+  };
+  image.src = documentPageImageUrl(documentId, page, 200);
+  syncPageInspectionCropOverlay();
+}
+
+function closePageInspection() {
+  const dialog = $("#page-inspection-modal");
+  if (dialog.open) dialog.close();
+  else resetPageInspection({closeDialog:false});
 }
 
 function positionCropBox() {
@@ -1416,7 +1648,25 @@ function missingCriticalFields(row) {
   const fields = semantic
     ? (Array.isArray(declared) ? CRITICAL_FIELDS.filter((key) => declared.includes(key)) : CRITICAL_FIELDS)
     : CRITICAL_FIELDS;
-  return fields.filter((key) => !String(row[key] ?? "").trim());
+  return fields.filter((key) => !String(row[key] ?? "").trim()
+    && !humanAbsenceConfirmationMatches(row, key));
+}
+
+function humanValueConfirmationMatches(row, key) {
+  const records = row?.human_verified_field_values;
+  const record = records?.[key];
+  return !record?.invalidated
+    && record?.provenance === "human"
+    && Boolean(record.decision_key && record.evidence_fingerprint)
+    && String(record.value ?? "") === String(row?.[key] ?? "");
+}
+
+function humanAbsenceConfirmationMatches(row, key) {
+  const record = row?.human_confirmed_absent_fields?.[key];
+  return !String(row?.[key] ?? "").trim()
+    && !record?.invalidated
+    && record?.provenance === "human"
+    && Boolean(record.decision_key && record.evidence_fingerprint);
 }
 
 function numericSuspectFields(row) {
@@ -1425,11 +1675,16 @@ function numericSuspectFields(row) {
   const edited = new Set(row?.edited_fields || []);
   return CRITICAL_FIELDS.filter((key) => {
     if (!["quantity", "mass"].includes(key)) return false;
+    if (humanValueConfirmationMatches(row, key)) return false;
+    const hasPriorConfirmation = Object.prototype.hasOwnProperty.call(
+      row?.human_verified_field_values || {}, key,
+    );
     const details = normalization[key];
     const shapeSuspect = key === "quantity" && details?.integer_like_decimal;
     if (!details?.numeric_suspect && !shapeSuspect) return false;
     if (shapeSuspect && numericShapeAgreed(row)) return false;
     if (!edited.has(key)) return true;
+    if (hasPriorConfirmation) return true;
     if (shapeSuspect && key === "quantity") {
       return /^-?\d+[.,]0$/.test(String(row[key] ?? "").trim());
     }
@@ -1449,12 +1704,17 @@ function numericShapeAgreed(row) {
 }
 
 function criticalBlockers(row) {
+  const canonical = row?.canonical_critical_blockers ?? row?.critical_blockers ?? [];
+  const canonicalBlockers = Array.isArray(canonical)
+    ? canonical.map((item) => String(item)).filter(Boolean)
+    : [];
+  if (!row?.edited) return [...new Set(canonicalBlockers)];
   const missing = missingCriticalFields(row);
   const suspect = numericSuspectFields(row);
   const explicitlyVerified = row.status === "verified" && !missing.length;
   const reasons = new Set([
-    ...(row?.review_reasons || []),
-    ...(row?.critical_blockers || []),
+    ...(row?.provisional_review_reasons || row?.review_reasons || []),
+    ...(row?.provisional_critical_blockers || []),
   ]);
   const conflictFields = new Set(row?.ocr_metadata?.secondary_conflict_fields || []);
   const edited = new Set(row?.edited_fields || []);
@@ -1465,7 +1725,7 @@ function criticalBlockers(row) {
   if (suspect.length && !explicitlyVerified) blockers.push("numeric_suspect");
   if (reasons.has("ambiguous_columns") && !explicitlyVerified) blockers.push("ambiguous_columns");
   if (conflictActive && !explicitlyVerified) blockers.push("secondary_conflict");
-  return [...new Set(blockers)];
+  return [...new Set([...canonicalBlockers, ...blockers])];
 }
 
 function criticalFieldCount(row) {
@@ -1482,8 +1742,9 @@ function criticalFieldCount(row) {
 function refreshClientReview(row) {
   const missing = missingCriticalFields(row);
   const suspect = numericSuspectFields(row);
-  const reasons = new Set(row.review_reasons || []);
-  const previousBlockers = new Set(row.critical_blockers || []);
+  const canonicalBlockers = row.canonical_critical_blockers ?? row.critical_blockers ?? [];
+  const reasons = new Set(row.provisional_review_reasons || row.review_reasons || []);
+  const previousBlockers = new Set(canonicalBlockers || []);
   const edited = new Set(row.edited_fields || []);
   const conflicts = new Set(row.ocr_metadata?.secondary_conflict_fields || []);
   reasons.delete("critical_value_missing");
@@ -1503,33 +1764,75 @@ function refreshClientReview(row) {
     reasons.delete("ambiguous_columns");
     reasons.delete("secondary_conflict");
   }
-  row.critical_fields = missing;
-  row.review_reasons = [...reasons];
-  row.critical_blockers = criticalBlockers(row);
-  if (row.critical_blockers.length && ["recognized", "verified"].includes(row.status)) row.status = "review";
+  row.provisional_critical_fields = missing;
+  row.provisional_review_reasons = [...reasons];
+  const preview = {
+    ...row,
+    canonical_critical_blockers: [],
+    critical_blockers: [],
+    provisional_critical_blockers: [],
+    provisional_review_reasons: [...reasons],
+  };
+  row.provisional_critical_blockers = criticalBlockers(preview);
+  if (criticalBlockers(row).length && ["recognized", "verified"].includes(row.status)) row.status = "review";
   return row;
 }
 
+function resultTableScrollPosition() {
+  const scroller = $("#result-table-scroll");
+  return {top: scroller.scrollTop, left: scroller.scrollLeft};
+}
+
+function restoreResultTableScroll(position) {
+  const scroller = $("#result-table-scroll");
+  scroller.scrollTop = position.top;
+  scroller.scrollLeft = position.left;
+}
+
 function loadResult(result, options = {}) {
+  const preservedView = options.preserveView ? {
+    previewPage: state.previewPage,
+    activeRowId: state.activeRowId,
+    zoom: state.zoom,
+    tableScroll: resultTableScrollPosition(),
+  } : null;
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   state.result = result;
-  state.previewPage = null;
-  setZoom(1);
+  if (!preservedView) {
+    state.previewPage = null;
+    updatePageInspectionOpenButton();
+    setZoom(1);
+  }
   state.rows = result.rows.map((row) => ({
     ...row,
+    canonical_critical_blockers: Array.isArray(row.critical_blockers) ? [...row.critical_blockers] : [],
+    provisional_critical_blockers: [],
+    edited: false,
     selected: row.selected ?? (
       ["item", "component"].includes(row.row_type)
       || (row.row_type === "note" && row.structured_table)
     ),
   }));
-  state.rows.forEach(refreshClientReview);
-  state.reviewFilter = "";
-    state.dirty = false;
-    buildResultHeader();
+  rebuildResultIndexes();
+  if (!preservedView) state.reviewFilter = "";
+  state.dirty = false;
+  buildResultHeader();
   renderRows();
   updateSummary();
   setView("review");
-  const first = state.rows.find((row) => row.selected) || state.rows[0];
-  if (first) selectRow(first.id);
+  const preservedActiveRow = preservedView
+    ? state.rows.find((row) => row.id === preservedView.activeRowId)
+    : null;
+  if (preservedActiveRow) {
+    state.activeRowId = preservedActiveRow.id;
+    state.previewPage = preservedView.previewPage;
+    state.zoom = preservedView.zoom;
+  } else {
+    const first = state.rows.find((row) => row.selected) || state.rows[0];
+    if (first) selectRow(first.id);
+  }
+  if (preservedView) restoreResultTableScroll(preservedView.tableScroll);
   if (options.announce === false) return;
   if (result.errors?.length) {
     const pages = result.errors.map((error) => error.page).join(", ");
@@ -1590,93 +1893,293 @@ function filteredRows() {
 }
 
 function renderRows() {
+  state.performanceCounters.fullTableRenders = Math.min(2147483647, state.performanceCounters.fullTableRenders + 1);
   const body = $("#result-body");
+  ensureResultTableEvents();
   const rows = filteredRows();
   body.innerHTML = rows.map((row) => rowHtml(row)).join("");
+  state.renderedRowById = new Map(
+    [...body.querySelectorAll("tr[data-id]")].map((element) => [String(element.dataset.id), element]),
+  );
   $("#empty-table").hidden = rows.length > 0;
-  body.querySelectorAll("tr").forEach((tr) => {
-    tr.addEventListener("click", (event) => {
-      if (!event.target.matches("input,textarea,select,option")) selectRow(tr.dataset.id);
-    });
+  fitTextareas(body.querySelectorAll(".cell-input"));
+}
+
+function ensureResultTableEvents() {
+  const body = $("#result-body");
+  if (body.dataset.resultEventsBound === "true") return;
+  body.dataset.resultEventsBound = "true";
+  body.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : event.target.parentElement;
+    const button = target.closest("button");
+    if (button && body.contains(button)) {
+      const row = rowById(button.dataset.id);
+      if (button.matches(".candidate-accept")) {
+        const candidate = row?.value_candidates?.[button.dataset.key];
+        if (!row || !candidate?.value_candidate) return;
+        submitHumanDecision(row, {
+          decision: "ACCEPT_FIELD_CANDIDATE",
+          field: button.dataset.key,
+          candidate_value: String(candidate.value_candidate),
+        }, `${CRITICAL_LABELS[button.dataset.key]} подтверждено пользователем`);
+        return;
+      }
+      if (button.matches(".candidate-reject")) {
+        const candidate = row?.value_candidates?.[button.dataset.key];
+        if (!row || !candidate?.value_candidate) return;
+        submitHumanDecision(row, {
+          decision: "REJECT_CANDIDATE",
+          field: button.dataset.key,
+          candidate_value: String(candidate.value_candidate),
+        }, "Кандидат отклонён и оставлен на проверке");
+        return;
+      }
+      if (button.matches(".continuation-accept")) {
+        const parent = row && continuationParent(row);
+        if (!row || !parent) return;
+        submitHumanDecision(row, {
+          decision: "ACCEPT_CONTINUATION_RELATION",
+          relation: "human_confirmed_continuation",
+          candidate_value: continuationFragment(row),
+          target: {parent_physical_refs: physicalRefs(parent)},
+        }, "Продолжение привязано пользователем");
+        return;
+      }
+      if (button.matches(".candidate-edit")) {
+        if (!row) return;
+        selectRow(row.id);
+        const input = button.closest("tr")?.querySelector(
+          `.cell-input[data-id="${row.id}"][data-key="${button.dataset.key}"]`,
+        );
+        if (input) { input.focus(); input.select(); }
+        return;
+      }
+      if (button.matches(".field-confirm-value")) {
+        if (!row) return;
+        const key = button.dataset.key;
+        submitHumanDecision(row, {
+          decision: "CONFIRM_FIELD_VALUE",
+          field: key,
+          confirmed_value: String(row[key] ?? ""),
+        }, `${CRITICAL_LABELS[key]} подтверждено`);
+        return;
+      }
+      if (button.matches(".field-confirm-absent")) {
+        if (!row) return;
+        const key = button.dataset.key;
+        submitHumanDecision(row, {
+          decision: "CONFIRM_FIELD_ABSENT",
+          field: key,
+        }, "Отсутствие поля подтверждено");
+        return;
+      }
+      if (button.matches(".sourcing-row-button") && row) {
+        openSourcingForRow(row);
+        return;
+      }
+    }
+    const tableRow = target.closest("tr[data-id]");
+    if (tableRow && !target.matches("input,textarea,select,option") && !target.closest("button")) {
+      selectRow(tableRow.dataset.id);
+    }
   });
-  body.querySelectorAll(".row-select").forEach((input) => input.addEventListener("change", (event) => {
-    const row = rowById(event.target.dataset.id); row.selected = event.target.checked; updateSummary(); markDirty();
-  }));
-  body.querySelectorAll(".cell-input").forEach((input) => {
-    autoHeight(input);
-    input.addEventListener("input", () => {
-      const row = rowById(input.dataset.id);
-      row[input.dataset.key] = input.value;
-      row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
-      if (row.status !== "verified") row.status = "edited";
-      row.edited = true;
-      refreshClientReview(row);
-      autoHeight(input); markDirty(); updateSummary();
-    });
-    input.addEventListener("focus", () => selectRow(input.dataset.id));
-  });
-  body.querySelectorAll(".cell-select").forEach((select) => select.addEventListener("change", () => {
-    const row = rowById(select.dataset.id);
-    row[select.dataset.key] = select.value;
-    row.edited_fields = [...new Set([...(row.edited_fields || []), select.dataset.key])];
-    row.edited = true;
-    if (select.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
-    refreshClientReview(row);
-    markDirty(); updateSummary(); renderRows();
-  }));
-  body.querySelectorAll(".candidate-accept").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    const candidate = row?.value_candidates?.[button.dataset.key];
-    if (!row || !candidate?.value_candidate) return;
-    submitHumanDecision(row, {
-      decision: "ACCEPT_FIELD_CANDIDATE",
-      field: button.dataset.key,
-      candidate_value: String(candidate.value_candidate),
-    }, `${CRITICAL_LABELS[button.dataset.key]} подтверждено пользователем`);
-  }));
-  body.querySelectorAll(".continuation-accept").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    const parent = row && continuationParent(row);
-    if (!row || !parent) return;
-    const fragment = continuationFragment(row);
-    submitHumanDecision(row, {
-      decision: "ACCEPT_CONTINUATION_RELATION",
-      relation: "human_confirmed_continuation",
-      candidate_value: fragment,
-      target: {parent_physical_refs: physicalRefs(parent)},
-    }, "Продолжение привязано пользователем");
-  }));
-  body.querySelectorAll(".candidate-reject").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    const candidate = row?.value_candidates?.[button.dataset.key];
-    if (!row || !candidate?.value_candidate) return;
-    submitHumanDecision(row, {
-      decision: "REJECT_CANDIDATE",
-      field: button.dataset.key,
-      candidate_value: String(candidate.value_candidate),
-    }, "Кандидат отклонён и оставлен на проверке");
-  }));
-  body.querySelectorAll(".candidate-edit").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
+  body.addEventListener("change", (event) => {
+    const control = event.target;
+    if (control.matches(".row-select")) {
+      const row = rowById(control.dataset.id);
+      if (row) { row.selected = control.checked; updateSummary(); markDirty(); }
+      return;
+    }
+    if (!control.matches(".cell-select")) return;
+    const row = rowById(control.dataset.id);
     if (!row) return;
-    selectRow(row.id);
-    const input = [...body.querySelectorAll(`.cell-input[data-id="${row.id}"]`)]
-      .find((element) => element.dataset.key === button.dataset.key);
-    if (input) { input.focus(); input.select(); }
+    const valueRecord = row.human_verified_field_values?.[control.dataset.key];
+    if (valueRecord && String(valueRecord.value ?? "") !== String(control.value ?? "")) {
+      valueRecord.invalidated = true;
+    }
+    const absenceRecord = row.human_confirmed_absent_fields?.[control.dataset.key];
+    if (absenceRecord && String(control.value ?? "").trim()) {
+      absenceRecord.invalidated = true;
+    }
+    row[control.dataset.key] = control.value;
+    row.edited_fields = [...new Set([...(row.edited_fields || []), control.dataset.key])];
+    row.edited = true;
+    if (valueRecord?.invalidated) row.status = "edited";
+    else if (control.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
+    refreshClientReview(row);
+    markDirty();
+    renderPatchedReviewRows([row]);
+    updateSummary();
+  });
+  body.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!input.matches(".cell-input")) return;
+    const row = rowById(input.dataset.id);
+    if (!row) return;
+    const valueRecord = row.human_verified_field_values?.[input.dataset.key];
+    if (valueRecord && String(valueRecord.value ?? "") !== String(input.value ?? "")) {
+      valueRecord.invalidated = true;
+    }
+    const absenceRecord = row.human_confirmed_absent_fields?.[input.dataset.key];
+    if (absenceRecord && String(input.value ?? "").trim()) {
+      absenceRecord.invalidated = true;
+    }
+    row[input.dataset.key] = input.value;
+    row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
+    if (valueRecord?.invalidated) row.status = "edited";
+    else if (row.status !== "verified") row.status = "edited";
+    row.edited = true;
+    refreshClientReview(row);
+    const tableRow = input.closest("tr");
+    tableRow.classList.toggle("review", ["review", "unrecognized"].includes(row.status));
+    tableRow.classList.toggle("critical-review", criticalBlockers(row).length > 0);
+    const statusControl = tableRow.querySelector('.cell-select[data-key="status"]');
+    if (statusControl) statusControl.value = row.status;
+    autoHeight(input);
+    markDirty();
+    updateSummary();
+  });
+  body.addEventListener("focusin", (event) => {
+    const input = event.target;
+    if (input.matches(".cell-input")) selectRow(input.dataset.id);
+  });
+}
+
+function renderPatchedReviewRows(changedRows) {
+  const body = $("#result-body");
+  const tableScroll = resultTableScrollPosition();
+  for (const row of changedRows) {
+    state.renderedRowById.get(String(row.id))?.remove();
+    state.renderedRowById.delete(String(row.id));
+  }
+  const visible = filteredRows();
+  for (const row of changedRows) {
+    const visibleIndex = visible.findIndex((item) => item.id === row.id);
+    if (visibleIndex < 0) continue;
+    const template = document.createElement("template");
+    template.innerHTML = rowHtml(row).trim();
+    const element = template.content.firstElementChild;
+    let anchor = null;
+    for (let index = visibleIndex + 1; index < visible.length; index += 1) {
+      anchor = state.renderedRowById.get(String(visible[index].id));
+      if (anchor) break;
+    }
+    body.insertBefore(element, anchor);
+    state.renderedRowById.set(String(row.id), element);
+    fitTextareas(element.querySelectorAll(".cell-input"));
+    state.performanceCounters.rowPatches = Math.min(2147483647, state.performanceCounters.rowPatches + 1);
+  }
+  $("#empty-table").hidden = body.children.length > 0;
+  restoreResultTableScroll(tableScroll);
+}
+
+function mergeHumanReviewPatch(patch) {
+  if (!state.result || !Array.isArray(patch?.rows)) return false;
+  const resultRows = state.result.rows || [];
+  const changedRows = [];
+  for (const serverRow of patch.rows) {
+    const index = state.rows.findIndex((row) => row.id === serverRow.id);
+    const resultIndex = resultRows.findIndex((row) => row.id === serverRow.id);
+    if (index < 0 || resultIndex < 0) return false;
+    const localRow = state.rows[index];
+    const localEdits = state.dirty && localRow.edited
+      ? [...new Set(localRow.edited_fields || [])]
+      : [];
+    const merged = {
+      ...serverRow,
+      canonical_critical_blockers: Array.isArray(serverRow.critical_blockers)
+        ? [...serverRow.critical_blockers]
+        : [],
+      provisional_critical_blockers: [],
+      selected: localRow.selected,
+    };
+    for (const field of localEdits) {
+      if (Object.prototype.hasOwnProperty.call(localRow, field)) merged[field] = localRow[field];
+    }
+    merged.edited_fields = [...new Set([...(serverRow.edited_fields || []), ...localEdits])];
+    merged.edited = Boolean(localRow.edited);
+    if (state.dirty && merged.edited) refreshClientReview(merged);
+    state.rows[index] = merged;
+    replaceResultIndex(localRow, merged);
+    resultRows[resultIndex] = serverRow;
+    changedRows.push(merged);
+  }
+  state.result.page_statuses = {
+    ...(state.result.page_statuses || {}),
+    ...(patch.page_statuses || {}),
+  };
+  state.result.summary = patch.summary || state.result.summary || {};
+  state.result.revision = Number(patch.revision || state.result.revision || 0);
+  state.result.review_ledger_revision = Number(
+    patch.review_ledger_revision || state.result.review_ledger_revision || 0,
+  );
+  renderPatchedReviewRows(changedRows);
+  updateSummary();
+  return true;
+}
+
+function submitHumanDecision(row, payload, successMessage) {
+  if (!state.document) return Promise.resolve();
+  const refs = physicalRefs(row);
+  if (!refs.length) return Promise.resolve();
+  const documentId = state.document.document_id;
+  const navigationGeneration = state.documentNavigationGeneration;
+  const request = JSON.parse(JSON.stringify({
+    page: row.page,
+    physical_refs: refs,
+    ...payload,
   }));
-  body.querySelectorAll(".sourcing-row-button").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    if (row) openSourcingForRow(row);
-  }));
+  const send = async () => {
+    if (state.document?.document_id !== documentId
+      || !isCurrentDocumentNavigation(navigationGeneration)) return;
+    try {
+      const response = await api(`/api/documents/${documentId}/review/decision`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(request),
+      });
+      const patch = response.result_patch;
+      if (state.document?.document_id !== documentId
+        || !isCurrentDocumentNavigation(navigationGeneration)
+        || Number(patch?.revision || 0) < Number(state.result?.revision || 0)) return;
+      if (!mergeHumanReviewPatch(patch)) {
+        throw new Error("Не удалось применить обновление проверки. Обновите результат документа.");
+      }
+      toast(`${successMessage} · Проверено пользователем ✓`, "success");
+    } catch (error) {
+      if (state.document?.document_id === documentId
+        && isCurrentDocumentNavigation(navigationGeneration)) {
+        toast(error.message, "error");
+      }
+    }
+  };
+  const previous = state.reviewMutationQueues.get(documentId) || Promise.resolve();
+  const queued = previous.then(send, send);
+  const settled = queued.catch(() => {});
+  state.reviewMutationQueues.set(documentId, settled);
+  settled.then(() => {
+    if (state.reviewMutationQueues.get(documentId) === settled) {
+      state.reviewMutationQueues.delete(documentId);
+    }
+  });
+  return queued;
+}
+
+async function waitForReviewMutations(documentId) {
+  const pending = state.reviewMutationQueues.get(documentId);
+  if (pending) await pending;
 }
 
 function physicalRefs(row) {
-  return row?.ocr_metadata?.physical_row_refs || row?.physical_row_refs || [];
+  const metadataRefs = row?.ocr_metadata?.physical_row_refs;
+  if (Array.isArray(metadataRefs) && metadataRefs.length > 0) return metadataRefs;
+  const rowRefs = row?.physical_row_refs;
+  if (Array.isArray(rowRefs) && rowRefs.length > 0) return rowRefs;
+  return [];
+}
+
+function hasPhysicalRefs(row) {
+  return physicalRefs(row).length > 0;
 }
 
 function sourceRowIndex(row) {
@@ -1712,16 +2215,20 @@ function continuationParentRefs(row) {
   return [];
 }
 
-function samePhysicalRefs(left, right) {
-  return JSON.stringify(left || []) === JSON.stringify(right || []);
-}
-
 function continuationParent(row) {
   const candidates = continuationParentRefs(row);
   if (!candidates.length) return null;
-  return state.rows.find((candidate) => candidate.page === row.page
-    && ["item", "component", "item_candidate"].includes(candidate.row_type)
-    && candidates.some((refs) => samePhysicalRefs(refs, physicalRefs(candidate)))) || null;
+  const index = state.rowIndexes.byPageRefs;
+  for (const refs of candidates) {
+    const ids = index.get(rowRefsIndexKey(row.page, refs)) || [];
+    for (const id of ids) {
+      const candidate = rowById(id);
+      if (candidate && ["item", "component", "item_candidate"].includes(candidate.row_type)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
 }
 
 function continuationFragment(row) {
@@ -1732,21 +2239,6 @@ function continuationFragment(row) {
     if (value) return String(value).trim();
   }
   return preview;
-}
-
-async function submitHumanDecision(row, payload, successMessage) {
-  if (!state.document) return;
-  try {
-    const response = await api(`/api/documents/${state.document.document_id}/review/decision`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({page: row.page, physical_refs: physicalRefs(row), ...payload}),
-    });
-    loadResult(response.result, {announce: false});
-    toast(`${successMessage} · Проверено пользователем ✓`, "success");
-  } catch (error) {
-    toast(error.message, "error");
-  }
 }
 
 function rowHtml(row) {
@@ -2258,8 +2750,10 @@ function cellHtml(row, key) {
     const parent = continuationParent(row);
     const fragment = continuationFragment(row);
     const parentLabel = parent ? String(parent.name || parent.type_mark || parent.code || `строка ${sourceRowIndex(parent)}`) : "";
-    const action = parent && fragment ? `<div class="candidate-actions"><small>Кандидат родителя: ${escapeHtml(parentLabel)}</small><button type="button" class="continuation-accept" data-id="${row.id}">Привязать продолжение</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Оставить на проверке</button></div>` : "";
-    return `<td><div class="semantic-review-preview">${escapeHtml(label)}${action}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
+    const hasReviewEvidence = hasPhysicalRefs(row) && hasPhysicalRefs(parent);
+    const action = parent && fragment && hasReviewEvidence ? `<div class="candidate-actions"><small>Кандидат родителя: ${escapeHtml(parentLabel)}</small><button type="button" class="continuation-accept" data-id="${row.id}">Привязать продолжение</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Оставить на проверке</button></div>` : "";
+    const evidenceNotice = hasPhysicalRefs(row) ? "" : '<small class="review-evidence-unavailable">Нет связанного OCR-доказательства · Повторно распознайте страницу</small>';
+    return `<td><div class="semantic-review-preview">${escapeHtml(label)}${evidenceNotice}${action}</div><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
   }
   if (!CRITICAL_FIELDS.includes(key) || !isYandexCriticalRow(row)) {
     return `<td><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea></td>`;
@@ -2267,22 +2761,31 @@ function cellHtml(row, key) {
   const missing = missingCriticalFields(row).includes(key);
   const suspect = numericSuspectFields(row).includes(key);
   const candidate = row.value_candidates?.[key];
+  const hasReviewEvidence = hasPhysicalRefs(row);
+  const evidenceNotice = hasReviewEvidence ? "" : '<small class="review-evidence-unavailable">Нет связанного OCR-доказательства · Повторно распознайте страницу</small>';
   let annotation = "";
-  const humanConfirmed = (row.human_verified_fields || []).includes(key);
+  const humanConfirmed = humanValueConfirmationMatches(row, key);
+  const humanAbsent = humanAbsenceConfirmationMatches(row, key);
   const humanRejected = (row.human_rejected_candidates || []).some((item) => item.field === key && String(item.candidate_value) === String(candidate?.value_candidate));
   if (humanConfirmed) {
     annotation = `<small class="human-verified">Проверено пользователем ✓</small>`;
+  } else if (humanAbsent) {
+    annotation = `<small class="human-verified">Отсутствие подтверждено ✓</small>`;
   } else if (humanRejected) {
     annotation = `<small class="critical-warning">Кандидат отклонён пользователем · оставлено на проверке</small>`;
   } else if (candidate?.auto_trusted) {
     annotation = `<small class="human-verified">Проверено локальной ячейкой ✓</small>`;
+  } else if (missing) {
+    const candidateAction = candidate?.value_candidate
+      ? `<div class="secondary-candidate">Кандидат Yandex: <b>${escapeHtml(String(candidate.value_candidate))}</b>${hasReviewEvidence ? `<div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button></div>` : ""}</div>`
+      : "";
+    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small>${evidenceNotice}<div class="candidate-actions">${hasReviewEvidence ? `<button type="button" class="field-confirm-absent" data-id="${row.id}" data-key="${key}">В исходнике отсутствует</button>` : ""}<button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Ввести</button></div>${candidateAction}`;
   } else if (candidate?.value_candidate) {
     annotation = `<div class="secondary-candidate">Проверить · Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
-      <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;
-  } else if (missing) {
-    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small>`;
+      ${hasReviewEvidence ? `<div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>` : `<div class="candidate-actions"><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>${evidenceNotice}`}</div>`;
   } else if (suspect) {
-    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small>`;
+    const confirmLabel = value.length <= 16 ? `Подтвердить ${escapeHtml(value)}` : "Подтвердить";
+    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small>${evidenceNotice}<div class="candidate-actions">${hasReviewEvidence ? `<button type="button" class="field-confirm-value" data-id="${row.id}" data-key="${key}">${confirmLabel}</button>` : ""}<button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>`;
   }
   return `<td><div class="critical-cell"><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea>${annotation}</div></td>`;
 }
@@ -2300,12 +2803,67 @@ function autoHeight(element) {
   element.style.height = `${Math.max(37, element.scrollHeight)}px`;
 }
 
-function rowById(id) { return state.rows.find((row) => row.id === id); }
+function fitTextareas(elements) {
+  const textareas = [...elements];
+  textareas.forEach((element) => { element.style.height = "auto"; });
+  const heights = textareas.map((element) => Math.max(37, element.scrollHeight));
+  textareas.forEach((element, index) => { element.style.height = `${heights[index]}px`; });
+}
+
+function rowRefsIndexKey(page, refs) {
+  return `${String(page ?? "")}|${JSON.stringify(refs || [])}`;
+}
+
+function rebuildResultIndexes() {
+  const indexes = {byId: new Map(), byPage: new Map(), byPageRefs: new Map()};
+  for (const row of state.rows) {
+    const id = String(row.id);
+    indexes.byId.set(id, row);
+    const page = String(row.page ?? "");
+    const pageRows = indexes.byPage.get(page) || [];
+    pageRows.push(id);
+    indexes.byPage.set(page, pageRows);
+    const key = rowRefsIndexKey(row.page, physicalRefs(row));
+    const matchingRefs = indexes.byPageRefs.get(key) || [];
+    matchingRefs.push(id);
+    indexes.byPageRefs.set(key, matchingRefs);
+  }
+  state.rowIndexes = indexes;
+  state.renderedRowById = new Map();
+}
+
+function updateIndexBucket(index, key, id, add) {
+  const values = index.get(key) || [];
+  const filtered = values.filter((value) => value !== id);
+  if (add) filtered.push(id);
+  if (filtered.length) index.set(key, filtered);
+  else index.delete(key);
+}
+
+function replaceResultIndex(previous, next) {
+  const id = String(next.id);
+  const previousPage = String(previous.page ?? "");
+  const nextPage = String(next.page ?? "");
+  const previousRefs = rowRefsIndexKey(previous.page, physicalRefs(previous));
+  const nextRefs = rowRefsIndexKey(next.page, physicalRefs(next));
+  if (previousPage !== nextPage) {
+    updateIndexBucket(state.rowIndexes.byPage, previousPage, id, false);
+    updateIndexBucket(state.rowIndexes.byPage, nextPage, id, true);
+  }
+  if (previousRefs !== nextRefs) {
+    updateIndexBucket(state.rowIndexes.byPageRefs, previousRefs, id, false);
+    updateIndexBucket(state.rowIndexes.byPageRefs, nextRefs, id, true);
+  }
+  state.rowIndexes.byId.set(id, next);
+}
+
+function rowById(id) { return state.rowIndexes.byId.get(String(id)) || null; }
 
 async function selectRow(id) {
   const row = rowById(id); if (!row) return;
+  state.renderedRowById.get(String(state.activeRowId))?.classList.remove("active");
   state.activeRowId = id;
-  $("#result-body").querySelectorAll("tr").forEach((tr) => tr.classList.toggle("active", tr.dataset.id === id));
+  state.renderedRowById.get(String(id))?.classList.add("active");
   const pageChanged = state.previewPage !== row.page;
   if (pageChanged || !$("#pdf-preview").src) {
     if (pageChanged) setZoom(1);
@@ -2329,9 +2887,22 @@ function positionHighlight(row) {
 }
 
 function updateSummary() {
-  const ready = state.rows.filter((r) => ["recognized","verified","edited"].includes(r.status)).length;
-  const review = state.rows.filter((r) => ["review","unrecognized"].includes(r.status)).length;
-  const critical = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
+  const serverSummary = state.result?.summary || {};
+  const hasCanonicalCounts = !state.dirty
+    && Number.isFinite(Number(serverSummary.review_rows))
+    && Number.isFinite(Number(serverSummary.ready_rows))
+    && Number.isFinite(Number(serverSummary.unresolved_critical));
+  const ready = hasCanonicalCounts
+    ? Number(serverSummary.ready_rows)
+    : state.rows.filter((row) => ["recognized", "verified", "edited"].includes(row.status)
+      && !criticalBlockers(row).length).length;
+  const review = hasCanonicalCounts
+    ? Number(serverSummary.review_rows)
+    : state.rows.filter((row) => ["review", "unrecognized"].includes(row.status)
+      || criticalBlockers(row).length > 0).length;
+  const critical = hasCanonicalCounts
+    ? Number(serverSummary.unresolved_critical)
+    : state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
   const selected = state.rows.filter((r) => r.selected).length;
   $("#summary-total").textContent = state.rows.length;
   $("#summary-ready").textContent = ready;
@@ -2378,12 +2949,16 @@ function backendExportBlockers() {
   for (const page of rowPages) {
     if (statuses.length && !statusPages.has(page)) blockers.push(`Страница ${page}: статус отсутствует`);
   }
-  const unresolved = rows.reduce((total, row) => {
-    if (row.selected === false || ["section", "system", "skip"].includes(row.row_type)) return total;
-    if (row.row_type === "note" && !row.structured_table) return total;
-    return total + criticalFieldCount(row);
-  }, 0);
-  if (unresolved) blockers.push(`Не проверено критичных значений: ${unresolved}`);
+  const unresolvedRows = rows.filter((row) => {
+    if (row.selected === false || ["section", "system", "skip"].includes(row.row_type)) return false;
+    if (row.row_type === "note" && !row.structured_table) return false;
+    return criticalBlockers(row).length > 0;
+  });
+  unresolvedRows.slice(0, 3).forEach((row) => {
+    const page = row.page === undefined ? "?" : row.page;
+    blockers.push(`Строка ${page}: ${criticalBlockers(row).join(", ")}`);
+  });
+  if (unresolvedRows.length > 3) blockers.push(`Заблокировано строк: ${unresolvedRows.length}`);
   return [...new Set(blockers)];
 }
 
@@ -2391,14 +2966,20 @@ function updateExportSafety() {
   const node = $("#export-safety");
   if (!node) return;
   const blockers = backendExportBlockers();
-  node.classList.toggle("blocked", blockers.length > 0);
-  node.textContent = blockers.length
-    ? `Экспорт заблокирован: ${blockers.slice(0, 3).join("; ")}`
-    : "Backend подтвердил: экспорт разрешён.";
+  node.classList.toggle("blocked", blockers.length > 0 || state.dirty);
+  node.textContent = state.dirty
+    ? blockers.length
+      ? `Есть несохранённые правки. Предварительно: ${blockers.slice(0, 3).join("; ")}. Backend проверит после сохранения.`
+      : "Есть несохранённые правки. Backend проверит безопасность после сохранения."
+    : blockers.length
+      ? `Экспорт заблокирован: ${blockers.slice(0, 3).join("; ")}`
+      : "Backend подтвердил: экспорт разрешён.";
   const button = $("#download-excel");
   if (button) {
-    button.disabled = blockers.length > 0;
-    button.title = blockers.length ? "Экспорт заблокирован проверками backend" : "Скачать XLSX";
+    button.disabled = blockers.length > 0 && !state.dirty;
+    button.title = state.dirty
+      ? "Сохранить правки и проверить экспорт на backend"
+      : blockers.length ? "Экспорт заблокирован проверками backend" : "Скачать XLSX";
   }
 }
 
@@ -2409,12 +2990,23 @@ function markDirty() {
 }
 
 async function saveRows(showToast = true) {
+  const documentId = state.document?.document_id;
+  if (!documentId) return null;
+  await waitForReviewMutations(documentId);
+  if (state.document?.document_id !== documentId) return null;
   if (!state.document || !state.rows.length) return null;
-  await api(`/api/documents/${state.document.document_id}/results`, {
-    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows}),
+  if (!state.dirty) return state.result;
+  const response = await api(`/api/documents/${state.document.document_id}/results`, {
+    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+      rows:state.rows.map(({canonical_critical_blockers, provisional_critical_blockers, provisional_critical_fields, provisional_review_reasons, ...row}) => row),
+      expected_revision:Number(state.result?.revision || 0),
+    }),
   });
-  const authoritative = await api(`/api/documents/${state.document.document_id}/results`);
-  loadResult(authoritative, {announce:false});
+  const authoritative = response?.result;
+  if (!authoritative || !Array.isArray(authoritative.rows)) {
+    throw new Error("Сервер не вернул сохранённый результат документа.");
+  }
+  loadResult(authoritative, {announce:false, preserveView:true});
   state.dirty = false; $("#save-button").textContent = "Сохранить правки";
   if (showToast) toast("Правки сохранены", "success");
   return authoritative;
@@ -3092,6 +3684,7 @@ async function downloadExcel() {
     }
     const payload = {
       columns, rows:state.rows,
+      expected_revision:Number(authoritative.revision || 0),
       include_headers:$("#export-headers").checked,
       only_exportable:$("#export-items-only").checked,
       review_export:false,
@@ -3116,11 +3709,15 @@ async function downloadReviewExcel() {
   button.textContent = "Формируем Excel…";
   try {
     if (!state.document) { toast("Сначала откройте документ", "error"); return; }
+    const documentId = state.document.document_id;
+    await waitForReviewMutations(documentId);
+    if (state.document?.document_id !== documentId) return;
     if (!state.rows.length) { toast("Нет строк для экспорта", "error"); return; }
     const columns = selectedExportColumns();
     if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
     const payload = {
       columns, rows:state.rows,
+      expected_revision:Number(state.result?.revision || 0),
       include_headers:$("#export-headers").checked,
       only_exportable:false,
       review_export:true,
@@ -3137,8 +3734,13 @@ async function downloadReviewExcel() {
 
 function resetApp() {
   if (state.dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
+  cancelDocumentNavigation();
   clearExportError();
   Object.assign(state,{document:null,selectedPages:new Set(),previewPage:null,crop:null,rows:[],result:null,activeRowId:null,zoom:1,dirty:false});
+  updatePageInspectionOpenButton();
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   localStorage.removeItem("averonCurrentDocument");
   $("#thumbnail-grid").innerHTML=""; $("#new-document-button").hidden=true; setView("upload");
 }
@@ -3146,6 +3748,9 @@ function resetApp() {
 function setupEvents() {
   $("#auth-login-form").addEventListener("submit", submitAuthLogin);
   $("#logout-button").addEventListener("click", logoutSession);
+  $("#cancel-document-restore").addEventListener("click", () => {
+    if (state.documentNavigationKind === "automatic_restore") cancelDocumentNavigation();
+  });
   $("#users-button").addEventListener("click", openAdminUsers);
   $("#close-users").addEventListener("click", () => $("#users-modal").close());
   $("#users-modal").addEventListener("close", scrubUserCreateDialogSecrets);
@@ -3200,7 +3805,15 @@ function setupEvents() {
   });
   $("#save-settings").addEventListener("click",saveSettings);
   $("#settings-sourcing-provider").addEventListener("change",updateSourcingProviderFields);
-  $("#table-search").addEventListener("input",renderRows); $("#type-filter").addEventListener("change",renderRows); $("#status-filter").addEventListener("change",renderRows);
+  $("#table-search").addEventListener("input", () => {
+    if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+    state.tableSearchTimer = setTimeout(() => {
+      state.tableSearchTimer = null;
+      renderRows();
+    }, 120);
+  });
+  $("#type-filter").addEventListener("change", renderRows);
+  $("#status-filter").addEventListener("change", renderRows);
   $("#review-filter").addEventListener("change",(event)=>{state.reviewFilter=event.target.value;renderRows();});
   $("#save-button").addEventListener("click",()=>saveRows().catch((e)=>toast(e.message,"error")));
   $("#copy-selected").addEventListener("click",()=>copyRows(state.rows,state.config.default_export_columns));
@@ -3251,8 +3864,17 @@ function setupEvents() {
     state.cropSelecting=!state.cropSelecting; $("#crop-preview").classList.toggle("selecting",state.cropSelecting);
     $("#crop-button").textContent=state.cropSelecting?"Выделите область на странице":"Выбрать область";
   });
+  $("#page-inspection-open").addEventListener("click",openPageInspection);
+  $("#page-inspection-close").addEventListener("click",closePageInspection);
+  $("#page-inspection-modal").addEventListener("close",() => resetPageInspection({closeDialog:false}));
+  $("#page-inspection-zoom-out").addEventListener("click",() => setPageInspectionZoom(state.pageInspection.zoom - PAGE_INSPECTION_ZOOM_STEP));
+  $("#page-inspection-zoom-in").addEventListener("click",() => setPageInspectionZoom(state.pageInspection.zoom + PAGE_INSPECTION_ZOOM_STEP));
+  $("#page-inspection-fit").addEventListener("click",fitPageInspectionToWidth);
   setupCropEvents();
-  window.addEventListener("resize",()=>{if(state.crop)positionCropBox();});
+  window.addEventListener("resize",()=>{
+    if(state.crop)positionCropBox();
+    if(state.pageInspection.fitWidth && $("#page-inspection-modal").open) fitPageInspectionToWidth();
+  });
   window.addEventListener("beforeunload",(event)=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
 }
 

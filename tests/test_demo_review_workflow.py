@@ -15,6 +15,7 @@ from averon_import.services.ocr.page_disposition import (
 from averon_import.services.review_decisions import (
     FIELD_DECISION,
     RELATION_DECISION,
+    REJECT_DECISION,
     HumanReviewService,
     ReviewDecisionStore,
 )
@@ -332,6 +333,91 @@ def test_d5_rejected_candidate_leaves_review_and_does_not_change_canonical():
     assert updated["rows"][0]["quantity"] == ""
     assert updated["rows"][0]["human_rejected_candidates"][0]["provenance"] == "human"
     assert updated["page_statuses"]["58"]["output_status"] == "REVIEW_REQUIRED"
+
+
+def test_saved_reject_replay_is_idempotent():
+    result = _result()
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(10),
+        decision=REJECT_DECISION,
+        field="quantity",
+        candidate_value="4",
+    )
+
+    once = service.apply_saved_decisions(
+        result, [decision], result["document_fingerprint"]
+    )
+    twice = service.apply_saved_decisions(
+        once, [decision], result["document_fingerprint"]
+    )
+
+    assert len(once["rows"][0]["human_rejected_candidates"]) == 1
+    assert len(twice["rows"][0]["human_rejected_candidates"]) == 1
+
+
+def test_saved_continuation_replay_does_not_duplicate_fragment_or_relation():
+    result = _result()
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(11),
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value="Фрагмент 11",
+        target={"parent_physical_refs": _refs(10)},
+    )
+
+    once = service.apply_saved_decisions(
+        result, [decision], result["document_fingerprint"]
+    )
+    twice = service.apply_saved_decisions(
+        once, [decision], result["document_fingerprint"]
+    )
+
+    assert twice["rows"][0]["name"].count("Фрагмент 11") == 1
+    assert len(twice["rows"][0]["human_verified_relations"]) == 1
+
+
+def test_incremental_continuation_patches_parent_and_child_on_only_affected_page():
+    result = _result()
+    result["page_statuses"]["59"] = deepcopy(result["page_statuses"]["58"])
+    result["page_statuses"]["59"]["page"] = 59
+    result["page_statuses"]["59"]["blockers"] = ["structural_layout_ambiguous"]
+    untouched_status = deepcopy(result["page_statuses"]["59"])
+    source_parent_name = result["rows"][0]["name"]
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(11),
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value="Фрагмент 11",
+        target={"parent_physical_refs": _refs(10)},
+    )
+
+    updated, changed_rows, affected_pages, applied = service.apply_decision_incremental(
+        result, decision
+    )
+
+    assert applied is True
+    assert {row["id"] for row in changed_rows} == {"row-10", "row-11"}
+    assert affected_pages == {58}
+    assert "Фрагмент 11" in updated["rows"][0]["name"]
+    assert updated["rows"][2]["row_type"] == "skip"
+    assert updated["rows"][0]["quantity"] == ""
+    assert result["rows"][0]["name"] == source_parent_name
+    assert updated["page_statuses"]["59"] == untouched_status
+    assert service.metrics["review_rows_detached"] == 2
+    assert service.metrics["page_safety_pages_recalculated"] == 1
+    assert service.metrics["full_result_copies"] == 0
 
 
 def test_d6_continuation_relation_requires_parent_and_never_composes_numeric_fields():
