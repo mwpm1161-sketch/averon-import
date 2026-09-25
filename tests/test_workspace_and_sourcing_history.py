@@ -20,6 +20,7 @@ from averon_import.services.sourcing.models import (
 )
 from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.sourcing.service import SourcingService
+from averon_import.services.review_decisions import ReviewDecisionStore
 from averon_import.services.workspace import WorkspaceService
 
 
@@ -53,22 +54,39 @@ def test_document_listing_is_safe_newest_first_and_bounded(tmp_path):
     assert "pdf_path" not in listed[0]
 
 
-def test_document_listing_skips_corrupt_metadata_and_marks_corrupt_result(tmp_path):
+def test_document_listing_skips_corrupt_metadata_without_parsing_large_results(tmp_path):
     service = WorkspaceService(tmp_path)
     corrupt_metadata = service.documents_dir / ("c" * 32)
     corrupt_metadata.mkdir()
     (corrupt_metadata / "metadata.json").write_text("{", encoding="utf-8")
     _write_metadata(service, "d" * 32, title="Incomplete")
     incomplete = service.documents_dir / ("d" * 32)
+    # Listing is intentionally metadata/stat-only. Corruption is reported
+    # when the user explicitly opens the result, not during application boot.
     (incomplete / "result.json").write_text("not-json", encoding="utf-8")
     (incomplete / "review_decisions.json").write_text("{}", encoding="utf-8")
 
     listed = service.list_recent()
 
     assert [item["document_id"] for item in listed] == ["d" * 32]
-    assert listed[0]["available"] is False
-    assert listed[0]["has_result"] is False
+    assert listed[0]["available"] is True
+    assert listed[0]["has_result"] is True
     assert listed[0]["has_review_decisions"] is True
+
+
+def test_source_fingerprint_is_cached_for_legacy_workspace(tmp_path):
+    service = WorkspaceService(tmp_path)
+    _write_metadata(service, "f" * 32, title="Legacy")
+    workspace = service.get("f" * 32)
+    workspace.pdf_path.write_bytes(b"immutable-pdf")
+
+    first = service.source_fingerprint(workspace)
+    metadata = service.read_json(workspace.metadata_path)
+    assert metadata["source_sha256"] == first
+
+    # A cached fingerprint must not require rereading source.pdf.
+    workspace.pdf_path.unlink()
+    assert service.source_fingerprint(workspace) == first
 
 
 def test_workspace_open_api_is_retrieval_only(monkeypatch, tmp_path):
@@ -85,6 +103,49 @@ def test_workspace_open_api_is_retrieval_only(monkeypatch, tmp_path):
     assert payload["document_id"] == "e" * 32
     assert payload["has_result"] is True
     assert payload["has_review_decisions"] is False
+
+
+def test_result_read_is_side_effect_free_when_review_revision_is_current(monkeypatch, tmp_path):
+    from averon_import import main
+
+    service = WorkspaceService(tmp_path)
+    _write_metadata(service, "1" * 32, title="Current")
+    workspace = service.get("1" * 32)
+    revision = ReviewDecisionStore.revision([])
+    service.write_json(workspace.result_path, {
+        "rows": [],
+        "page_statuses": {},
+        "errors": [],
+        "review_decisions_revision": revision,
+    })
+    monkeypatch.setattr(main, "workspace_service", service)
+
+    def unexpected_write(*_args, **_kwargs):
+        raise AssertionError("steady-state GET /results must not rewrite result.json")
+
+    monkeypatch.setattr(service, "write_json", unexpected_write)
+    payload = main.get_results("1" * 32)
+
+    assert payload["review_decisions_revision"] == revision
+
+
+def test_corrupt_result_is_reported_on_explicit_open_not_recent_listing(monkeypatch, tmp_path):
+    from fastapi import HTTPException
+    from averon_import import main
+
+    service = WorkspaceService(tmp_path)
+    _write_metadata(service, "2" * 32, title="Corrupt")
+    workspace = service.get("2" * 32)
+    workspace.result_path.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(main, "workspace_service", service)
+
+    try:
+        main.get_results("2" * 32)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert exc.detail == "Данные результата недоступны"
+    else:
+        raise AssertionError("corrupt explicit result open must fail")
 
 
 def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp_path):
@@ -311,6 +372,49 @@ def test_recent_document_ui_has_explicit_open_flow_without_recognition_call():
     assert "/suggest-pages" not in open_flow
     assert "localStorage.setItem(\"averonCurrentDocument\"" in open_flow
     assert re.search(r"api\(`/api/documents/\$\{encodedId\}/results`\)", open_flow)
+
+
+
+def test_previous_document_restore_is_nonblocking_cancellable_and_stale_safe():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1]
+    html = (root / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    app_js = (root / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    boot_flow = app_js[app_js.index("async function boot()"):app_js.index("function updateCloudStatus")]
+    open_flow = app_js[app_js.index("async function openExistingDocument"):app_js.index("async function uploadFile")]
+
+    assert 'id="resume-status"' in html
+    assert 'id="cancel-resume"' in html
+    assert "await resumeLastDocument()" not in boot_flow
+    assert "resumeLastDocument().catch" in boot_flow
+    assert "new AbortController()" in app_js
+    assert "{signal: request.signal}" in open_flow
+    assert "isCurrentDocumentLoad(request)" in open_flow
+    assert "cancelDocumentLoad({forgetResume: true})" in app_js
+
+
+def test_save_rows_uses_single_round_trip_and_clean_export_skips_resave():
+    from pathlib import Path
+
+    app_js = (Path(__file__).parents[1] / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    save_flow = app_js[app_js.index("async function saveRows"):app_js.index("function copyRows")]
+
+    assert "if (!state.dirty && state.result) return state.result;" in save_flow
+    assert save_flow.count("/results") == 1
+    assert "saved?.result" in save_flow
+
+
+def test_review_ui_fences_stale_parallel_decision_responses():
+    from pathlib import Path
+
+    app_js = (Path(__file__).parents[1] / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    decision_flow = app_js[app_js.index("async function submitHumanDecision"):app_js.index("function rowHtml")]
+
+    assert "const documentId = state.document?.document_id" in decision_flow
+    assert "const requestId = ++state.reviewDecisionGeneration" in decision_flow
+    assert "requestId !== state.reviewDecisionGeneration" in decision_flow
+    assert "state.document?.document_id !== documentId" in decision_flow
 
 
 def _telemetry_understanding() -> ProductUnderstandingResult:

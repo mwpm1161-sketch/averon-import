@@ -240,6 +240,15 @@ class ReviewDecisionStore:
                 continue
         return decisions
 
+    @staticmethod
+    def revision(decisions: list[ReviewDecision]) -> str:
+        """Stable revision of the complete persisted human-review ledger."""
+
+        return _sha256([
+            item.model_dump(mode="json")
+            for item in sorted(decisions, key=lambda value: value.created_at)
+        ])
+
     def save(self, decisions: list[ReviewDecision]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"decisions": [item.model_dump(mode="json") for item in decisions]}
@@ -424,7 +433,17 @@ class HumanReviewService:
             if str(decision.candidate_value or "").strip() not in _continuation_fragments(row):
                 return False
         if decision.decision == REJECT_DECISION:
-            rejected = list(row.get("human_rejected_candidates") or [])
+            rejected = [
+                item for item in list(row.get("human_rejected_candidates") or [])
+                if not (
+                    isinstance(item, Mapping)
+                    and str(item.get("decision_key") or "") == decision.decision_key
+                )
+            ]
+            # The audit record is keyed by the immutable decision identity.
+            # Replaying the same decision replaces the same record instead of
+            # growing result.json, while a newer evidence fingerprint for that
+            # key is still reflected correctly.
             rejected.append({
                 "field": decision.field,
                 "candidate_value": decision.candidate_value,
@@ -514,7 +533,37 @@ class HumanReviewService:
         if decision.document_fingerprint != str(updated.get("document_fingerprint") or decision.document_fingerprint):
             return updated
         self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        # The result is already detached. Avoid copying the full document a
+        # second time, and recalculate only the page touched by this decision.
+        return recalculate_page_safety(
+            updated,
+            pages={int(decision.page)},
+            copy_result=False,
+        )
+
+    def apply_decision_to_canonical(
+        self,
+        result: dict[str, Any],
+        decision: ReviewDecision,
+    ) -> dict[str, Any]:
+        """Apply one decision to an owned mutable canonical result DTO.
+
+        This hot-path variant is for a result freshly loaded from result.json
+        under the document mutation lock. Raw OCR evidence remains untouched;
+        only the bounded review projection and affected page safety are
+        updated.
+        """
+
+        if decision.document_fingerprint != str(
+            result.get("document_fingerprint") or decision.document_fingerprint
+        ):
+            return result
+        self._apply_one(result, decision)
+        return recalculate_page_safety(
+            result,
+            pages={int(decision.page)},
+            copy_result=False,
+        )
 
     def apply_saved_decisions(
         self,
@@ -528,18 +577,36 @@ class HumanReviewService:
             if decision.document_fingerprint != document_fingerprint:
                 continue
             self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        # The result was detached above; do not clone it again.
+        updated = recalculate_page_safety(updated, copy_result=False)
+        updated["review_decisions_revision"] = ReviewDecisionStore.revision(decisions)
+        return updated
 
 
-def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
-    """Rebuild page safety counters from the post-review canonical view."""
-    updated = _detached_review_copy(result)
+def recalculate_page_safety(
+    result: Mapping[str, Any],
+    *,
+    pages: set[int] | None = None,
+    copy_result: bool = True,
+) -> dict[str, Any]:
+    """Rebuild page safety counters from the post-review canonical view.
+
+    pages bounds incremental human-review work. copy_result=False is for
+    callers that already own a detached mutable result DTO.
+    """
+
+    updated = _detached_review_copy(result) if copy_result else result
+    if not isinstance(updated, dict):
+        updated = _detached_review_copy(updated)
     rows = list(updated.get("rows") or [])
     statuses = dict(updated.get("page_statuses") or {})
+    target_pages = {int(page) for page in pages} if pages is not None else None
     for page_key, original in statuses.items():
         if not isinstance(original, Mapping):
             continue
         page = int(original.get("page") or page_key)
+        if target_pages is not None and page not in target_pages:
+            continue
         page_rows = [row for row in rows if int(row.get("page") or 0) == page]
         diagnostics = dict(original.get("diagnostics") or {})
         # Page status diagnostics are intentionally compact and do not carry

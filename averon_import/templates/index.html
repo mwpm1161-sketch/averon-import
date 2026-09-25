@@ -8,6 +8,11 @@
 </head>
 <body>
   <div id="toast-root" class="toast-root"></div>
+  <div id="resume-status" class="resume-status" role="status" aria-live="polite" hidden>
+    <span class="resume-spinner" aria-hidden="true"></span>
+    <span>Открытие предыдущего документа</span>
+    <button id="cancel-resume" type="button" aria-label="Отменить восстановление предыдущего документа" title="Отменить">×</button>
+  </div>
   <main id="auth-check-screen" class="auth-screen" aria-live="polite">
     <section class="auth-card"><span class="eyebrow">Averon Import</span><h1>Проверка доступа</h1><p>Подключаемся к сервису авторизации…</p></section>
   </main>
@@ -213,8 +218,8 @@
         <div class="summary-row">
           <div class="summary-card"><small>Строк распознано</small><b id="summary-total">0</b></div>
           <div class="summary-card"><small>Готово</small><b id="summary-ready">0</b></div>
-          <div class="summary-card warning"><small>Требуют проверки</small><b id="summary-critical">0</b></div>
-          <div class="summary-card"><small>Статус review</small><b id="summary-review">0</b></div>
+          <div class="summary-card warning"><small>Блокирующих признаков</small><b id="summary-critical">0</b></div>
+          <div class="summary-card"><small>Строк для проверки</small><b id="summary-review">0</b></div>
           <div class="summary-card"><small>Выбрано для экспорта</small><b id="summary-selected">0</b></div>
         </div>
 
