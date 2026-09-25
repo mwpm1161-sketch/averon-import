@@ -20,6 +20,7 @@ from averon_import.services.sourcing.models import (
 )
 from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.sourcing.service import SourcingService
+from averon_import.services.review_decisions import ReviewDecisionStore
 from averon_import.services.workspace import WorkspaceService
 
 
@@ -53,22 +54,39 @@ def test_document_listing_is_safe_newest_first_and_bounded(tmp_path):
     assert "pdf_path" not in listed[0]
 
 
-def test_document_listing_skips_corrupt_metadata_and_marks_corrupt_result(tmp_path):
+def test_document_listing_skips_corrupt_metadata_without_parsing_large_results(tmp_path):
     service = WorkspaceService(tmp_path)
     corrupt_metadata = service.documents_dir / ("c" * 32)
     corrupt_metadata.mkdir()
     (corrupt_metadata / "metadata.json").write_text("{", encoding="utf-8")
     _write_metadata(service, "d" * 32, title="Incomplete")
     incomplete = service.documents_dir / ("d" * 32)
+    # Listing is intentionally metadata/stat-only. Corruption is reported
+    # when the user explicitly opens the result, not during application boot.
     (incomplete / "result.json").write_text("not-json", encoding="utf-8")
     (incomplete / "review_decisions.json").write_text("{}", encoding="utf-8")
 
     listed = service.list_recent()
 
     assert [item["document_id"] for item in listed] == ["d" * 32]
-    assert listed[0]["available"] is False
-    assert listed[0]["has_result"] is False
+    assert listed[0]["available"] is True
+    assert listed[0]["has_result"] is True
     assert listed[0]["has_review_decisions"] is True
+
+
+def test_source_fingerprint_is_cached_for_legacy_workspace(tmp_path):
+    service = WorkspaceService(tmp_path)
+    _write_metadata(service, "f" * 32, title="Legacy")
+    workspace = service.get("f" * 32)
+    workspace.pdf_path.write_bytes(b"immutable-pdf")
+
+    first = service.source_fingerprint(workspace)
+    metadata = service.read_json(workspace.metadata_path)
+    assert metadata["source_sha256"] == first
+
+    # A cached fingerprint must not require rereading source.pdf.
+    workspace.pdf_path.unlink()
+    assert service.source_fingerprint(workspace) == first
 
 
 def test_workspace_open_api_is_retrieval_only(monkeypatch, tmp_path):
@@ -85,6 +103,49 @@ def test_workspace_open_api_is_retrieval_only(monkeypatch, tmp_path):
     assert payload["document_id"] == "e" * 32
     assert payload["has_result"] is True
     assert payload["has_review_decisions"] is False
+
+
+def test_result_read_is_side_effect_free_when_review_revision_is_current(monkeypatch, tmp_path):
+    from averon_import import main
+
+    service = WorkspaceService(tmp_path)
+    _write_metadata(service, "1" * 32, title="Current")
+    workspace = service.get("1" * 32)
+    revision = ReviewDecisionStore.revision([])
+    service.write_json(workspace.result_path, {
+        "rows": [],
+        "page_statuses": {},
+        "errors": [],
+        "review_decisions_revision": revision,
+    })
+    monkeypatch.setattr(main, "workspace_service", service)
+
+    def unexpected_write(*_args, **_kwargs):
+        raise AssertionError("steady-state GET /results must not rewrite result.json")
+
+    monkeypatch.setattr(service, "write_json", unexpected_write)
+    payload = main.get_results("1" * 32)
+
+    assert payload["review_decisions_revision"] == revision
+
+
+def test_corrupt_result_is_reported_on_explicit_open_not_recent_listing(monkeypatch, tmp_path):
+    from fastapi import HTTPException
+    from averon_import import main
+
+    service = WorkspaceService(tmp_path)
+    _write_metadata(service, "2" * 32, title="Corrupt")
+    workspace = service.get("2" * 32)
+    workspace.result_path.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(main, "workspace_service", service)
+
+    try:
+        main.get_results("2" * 32)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert exc.detail == "Данные результата недоступны"
+    else:
+        raise AssertionError("corrupt explicit result open must fail")
 
 
 def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp_path):
