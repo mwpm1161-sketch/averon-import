@@ -74,6 +74,8 @@ from averon_import.services.processing_coordinator import (
 )
 from averon_import.services.recognition import RecognitionService
 from averon_import.services.review_decisions import (
+    CONFIRM_FIELD_ABSENT_DECISION,
+    CONFIRM_FIELD_VALUE_DECISION,
     FIELD_DECISION,
     HumanReviewService,
     RELATION_DECISION,
@@ -82,7 +84,7 @@ from averon_import.services.review_decisions import (
     ReviewDecisionLedgerCorrupt,
     ReviewDecisionStore,
 )
-from averon_import.services.review_policy import refresh_rows
+from averon_import.services.review_policy import critical_blockers_for_row, refresh_rows
 from averon_import.services.secrets import (
     ETM_IPRO_LOGIN,
     ETM_IPRO_PASSWORD,
@@ -993,6 +995,85 @@ def get_results(document_id: str):
         ) from exc
 
 
+def _restore_server_owned_review_state(
+    requested_rows: list[dict[str, Any]], canonical_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep OCR evidence and human audit state server-owned across row saves."""
+    canonical_by_id = {
+        str(row.get("id")): row
+        for row in canonical_rows
+        if row.get("id") is not None
+    }
+    if len(requested_rows) != len(canonical_rows):
+        raise HTTPException(409, "Набор строк изменился. Обновите результат документа.")
+
+    evidence_fields = (
+        "id",
+        "page",
+        "physical_row_refs",
+        "ocr_metadata",
+        "value_candidates",
+        "review_reasons",
+        "review_reason",
+        "critical_blockers",
+        "critical_fields",
+        "secondary_conflict_fields",
+        "human_verified_fields",
+        "human_verified_field_values",
+        "human_confirmed_absent_fields",
+        "human_rejected_candidates",
+        "human_verified_relations",
+        "human_review",
+        "verification_state",
+        "semantic_authoritative",
+        "semantic_required_critical_fields",
+        "semantic_structural_impact",
+        "semantic_review",
+        "semantic_state",
+    )
+    editable_fields = (
+        "position",
+        "name",
+        "type_mark",
+        "code",
+        "manufacturer",
+        "unit",
+        "quantity",
+        "mass",
+        "note",
+        "section",
+        "system",
+    )
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for submitted in requested_rows:
+        row_id = str(submitted.get("id") or "")
+        canonical = canonical_by_id.get(row_id)
+        if canonical is None or row_id in seen:
+            raise HTTPException(409, "Строка больше не соответствует сохранённому результату.")
+        seen.add(row_id)
+        row = dict(submitted)
+        for key in evidence_fields:
+            if key in canonical:
+                row[key] = canonical[key]
+            else:
+                row.pop(key, None)
+        edited = list(canonical.get("edited_fields") or [])
+        for key in editable_fields:
+            if row.get(key) != canonical.get(key) and key not in edited:
+                edited.append(key)
+        row["edited_fields"] = edited
+        if critical_blockers_for_row(canonical):
+            # A client status/type edit cannot turn a blocked OCR row into a
+            # verified or non-output row and thereby bypass strict export.
+            row["row_type"] = canonical.get("row_type")
+            row["status"] = "review"
+        result.append(row)
+    if seen != set(canonical_by_id):
+        raise HTTPException(409, "Набор строк изменился. Обновите результат документа.")
+    return result
+
+
 @app.put("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
 def save_results(document_id: str, request: SaveRowsRequest):
     try:
@@ -1004,7 +1085,12 @@ def save_results(document_id: str, request: SaveRowsRequest):
             current_revision = _result_revision(existing)
             if request.expected_revision != current_revision:
                 raise HTTPException(409, "Документ изменён. Обновите данные перед сохранением.")
-            existing["rows"] = refresh_rows(request.rows)
+            existing["rows"] = refresh_rows(
+                _restore_server_owned_review_state(
+                    request.rows,
+                    existing.get("rows") or [],
+                )
+            )
             store = ReviewDecisionStore(workspace.review_decisions_path)
             decisions, ledger_revision = store.load_snapshot()
             existing = human_review_service.apply_saved_decisions(
@@ -1811,10 +1897,17 @@ class ReviewDecisionRequest(BaseModel):
 
     page: int
     physical_refs: list[dict[str, Any]]
-    decision: Literal[FIELD_DECISION, RELATION_DECISION, REJECT_DECISION]
+    decision: Literal[
+        FIELD_DECISION,
+        RELATION_DECISION,
+        REJECT_DECISION,
+        CONFIRM_FIELD_VALUE_DECISION,
+        CONFIRM_FIELD_ABSENT_DECISION,
+    ]
     field: str | None = None
     relation: str | None = None
     candidate_value: str | None = None
+    confirmed_value: str | None = None
     target: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1855,6 +1948,7 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
                 field=request.field,
                 relation=request.relation,
                 candidate_value=request.candidate_value,
+                confirmed_value=request.confirmed_value,
                 target=request.target,
             )
             store = ReviewDecisionStore(workspace.review_decisions_path)

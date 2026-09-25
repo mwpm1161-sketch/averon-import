@@ -181,7 +181,7 @@ button { cursor: pointer; }
 .critical-cell { display:grid; gap:4px; min-width:0; }
 .critical-warning { display:block; padding:0 8px 7px; color:#975d05; font-size:10px; line-height:1.3; }
 .secondary-candidate { margin:0 8px 7px; padding:7px 8px; border:1px solid #efd38c; border-radius:8px; background:#fff9e8; color:#6e4a0b; font-size:10px; line-height:1.35; }
-.candidate-actions { display:flex; gap:5px; margin-top:5px; }
+.candidate-actions { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
 .candidate-actions small { align-self:center; color:#866a2d; }
 .candidate-actions button { border:1px solid #d8bd73; border-radius:6px; padding:3px 6px; background:#fff; color:#62470c; font-size:10px; }
 .candidate-actions button:hover { background:#fff1bd; }

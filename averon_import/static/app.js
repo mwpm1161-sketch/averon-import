@@ -1648,7 +1648,28 @@ function missingCriticalFields(row) {
   const fields = semantic
     ? (Array.isArray(declared) ? CRITICAL_FIELDS.filter((key) => declared.includes(key)) : CRITICAL_FIELDS)
     : CRITICAL_FIELDS;
-  return fields.filter((key) => !String(row[key] ?? "").trim());
+  return fields.filter((key) => !String(row[key] ?? "").trim()
+    && !humanAbsenceConfirmationMatches(row, key));
+}
+
+function humanValueConfirmationMatches(row, key) {
+  const records = row?.human_verified_field_values;
+  if (records && Object.prototype.hasOwnProperty.call(records, key)) {
+    const record = records[key];
+    return !record?.invalidated
+      && record?.provenance === "human"
+      && Boolean(record.decision_key && record.evidence_fingerprint)
+      && String(record.value ?? "") === String(row?.[key] ?? "");
+  }
+  return (row?.human_verified_fields || []).includes(key);
+}
+
+function humanAbsenceConfirmationMatches(row, key) {
+  const record = row?.human_confirmed_absent_fields?.[key];
+  return !String(row?.[key] ?? "").trim()
+    && !record?.invalidated
+    && record?.provenance === "human"
+    && Boolean(record.decision_key && record.evidence_fingerprint);
 }
 
 function numericSuspectFields(row) {
@@ -1657,11 +1678,16 @@ function numericSuspectFields(row) {
   const edited = new Set(row?.edited_fields || []);
   return CRITICAL_FIELDS.filter((key) => {
     if (!["quantity", "mass"].includes(key)) return false;
+    if (humanValueConfirmationMatches(row, key)) return false;
+    const hasPriorConfirmation = Object.prototype.hasOwnProperty.call(
+      row?.human_verified_field_values || {}, key,
+    );
     const details = normalization[key];
     const shapeSuspect = key === "quantity" && details?.integer_like_decimal;
     if (!details?.numeric_suspect && !shapeSuspect) return false;
     if (shapeSuspect && numericShapeAgreed(row)) return false;
     if (!edited.has(key)) return true;
+    if (hasPriorConfirmation) return true;
     if (shapeSuspect && key === "quantity") {
       return /^-?\d+[.,]0$/.test(String(row[key] ?? "").trim());
     }
@@ -1931,6 +1957,25 @@ function ensureResultTableEvents() {
         if (input) { input.focus(); input.select(); }
         return;
       }
+      if (button.matches(".field-confirm-value")) {
+        if (!row) return;
+        const key = button.dataset.key;
+        submitHumanDecision(row, {
+          decision: "CONFIRM_FIELD_VALUE",
+          field: key,
+          confirmed_value: String(row[key] ?? ""),
+        }, `${CRITICAL_LABELS[key]} подтверждено`);
+        return;
+      }
+      if (button.matches(".field-confirm-absent")) {
+        if (!row) return;
+        const key = button.dataset.key;
+        submitHumanDecision(row, {
+          decision: "CONFIRM_FIELD_ABSENT",
+          field: key,
+        }, "Отсутствие поля подтверждено");
+        return;
+      }
       if (button.matches(".sourcing-row-button") && row) {
         openSourcingForRow(row);
         return;
@@ -1951,10 +1996,19 @@ function ensureResultTableEvents() {
     if (!control.matches(".cell-select")) return;
     const row = rowById(control.dataset.id);
     if (!row) return;
+    const valueRecord = row.human_verified_field_values?.[control.dataset.key];
+    if (valueRecord && String(valueRecord.value ?? "") !== String(control.value ?? "")) {
+      valueRecord.invalidated = true;
+    }
+    const absenceRecord = row.human_confirmed_absent_fields?.[control.dataset.key];
+    if (absenceRecord && String(control.value ?? "").trim()) {
+      absenceRecord.invalidated = true;
+    }
     row[control.dataset.key] = control.value;
     row.edited_fields = [...new Set([...(row.edited_fields || []), control.dataset.key])];
     row.edited = true;
-    if (control.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
+    if (valueRecord?.invalidated) row.status = "edited";
+    else if (control.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
     refreshClientReview(row);
     markDirty();
     renderPatchedReviewRows([row]);
@@ -1965,9 +2019,18 @@ function ensureResultTableEvents() {
     if (!input.matches(".cell-input")) return;
     const row = rowById(input.dataset.id);
     if (!row) return;
+    const valueRecord = row.human_verified_field_values?.[input.dataset.key];
+    if (valueRecord && String(valueRecord.value ?? "") !== String(input.value ?? "")) {
+      valueRecord.invalidated = true;
+    }
+    const absenceRecord = row.human_confirmed_absent_fields?.[input.dataset.key];
+    if (absenceRecord && String(input.value ?? "").trim()) {
+      absenceRecord.invalidated = true;
+    }
     row[input.dataset.key] = input.value;
     row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
-    if (row.status !== "verified") row.status = "edited";
+    if (valueRecord?.invalidated) row.status = "edited";
+    else if (row.status !== "verified") row.status = "edited";
     row.edited = true;
     refreshClientReview(row);
     const tableRow = input.closest("tr");
@@ -2690,21 +2753,28 @@ function cellHtml(row, key) {
   const suspect = numericSuspectFields(row).includes(key);
   const candidate = row.value_candidates?.[key];
   let annotation = "";
-  const humanConfirmed = (row.human_verified_fields || []).includes(key);
+  const humanConfirmed = humanValueConfirmationMatches(row, key);
+  const humanAbsent = humanAbsenceConfirmationMatches(row, key);
   const humanRejected = (row.human_rejected_candidates || []).some((item) => item.field === key && String(item.candidate_value) === String(candidate?.value_candidate));
   if (humanConfirmed) {
     annotation = `<small class="human-verified">Проверено пользователем ✓</small>`;
+  } else if (humanAbsent) {
+    annotation = `<small class="human-verified">Отсутствие подтверждено ✓</small>`;
   } else if (humanRejected) {
     annotation = `<small class="critical-warning">Кандидат отклонён пользователем · оставлено на проверке</small>`;
   } else if (candidate?.auto_trusted) {
     annotation = `<small class="human-verified">Проверено локальной ячейкой ✓</small>`;
+  } else if (missing) {
+    const candidateAction = candidate?.value_candidate
+      ? `<div class="secondary-candidate">Кандидат Yandex: <b>${escapeHtml(String(candidate.value_candidate))}</b><div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button></div></div>`
+      : "";
+    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small><div class="candidate-actions"><button type="button" class="field-confirm-absent" data-id="${row.id}" data-key="${key}">В исходнике отсутствует</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Ввести</button></div>${candidateAction}`;
   } else if (candidate?.value_candidate) {
     annotation = `<div class="secondary-candidate">Проверить · Yandex повторно распознал: <b>${escapeHtml(String(candidate.value_candidate))}</b>
       <div class="candidate-actions"><button type="button" class="candidate-accept" data-id="${row.id}" data-key="${key}">Принять</button><button type="button" class="candidate-reject" data-id="${row.id}" data-key="${key}">Отклонить</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div></div>`;
-  } else if (missing) {
-    annotation = `<small class="critical-warning">⚠ ${CRITICAL_LABELS[key]} не распознано</small>`;
   } else if (suspect) {
-    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small>`;
+    const confirmLabel = value.length <= 16 ? `Подтвердить ${escapeHtml(value)}` : "Подтвердить";
+    annotation = `<small class="critical-warning">⚠ Подозрительное числовое значение</small><div class="candidate-actions"><button type="button" class="field-confirm-value" data-id="${row.id}" data-key="${key}">${confirmLabel}</button><button type="button" class="candidate-edit" data-id="${row.id}" data-key="${key}">Изменить</button></div>`;
   }
   return `<td><div class="critical-cell"><textarea rows="1" class="cell-input" data-id="${row.id}" data-key="${key}">${escapeHtml(value)}</textarea>${annotation}</div></td>`;
 }

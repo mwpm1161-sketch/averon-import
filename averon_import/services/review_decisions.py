@@ -19,8 +19,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from averon_import.services.ocr.page_contract import page_status_from_diagnostics
 from averon_import.services.ocr.page_disposition import CONFIRMED_NON_SPEC, SPEC_OUTPUT
 from averon_import.services.review_policy import (
+    CRITICAL_FIELDS,
+    human_confirmed_absence_applies,
     critical_blockers_for_row,
     critical_field_count,
+    missing_critical_fields,
     refresh_review_state,
     row_is_ready,
     row_requires_review,
@@ -31,7 +34,15 @@ from averon_import.services.row_assembler import SpecificationRowAssembler
 FIELD_DECISION = "ACCEPT_FIELD_CANDIDATE"
 RELATION_DECISION = "ACCEPT_CONTINUATION_RELATION"
 REJECT_DECISION = "REJECT_CANDIDATE"
-DECISIONS = (FIELD_DECISION, RELATION_DECISION, REJECT_DECISION)
+CONFIRM_FIELD_VALUE_DECISION = "CONFIRM_FIELD_VALUE"
+CONFIRM_FIELD_ABSENT_DECISION = "CONFIRM_FIELD_ABSENT"
+DECISIONS = (
+    FIELD_DECISION,
+    RELATION_DECISION,
+    REJECT_DECISION,
+    CONFIRM_FIELD_VALUE_DECISION,
+    CONFIRM_FIELD_ABSENT_DECISION,
+)
 REVIEW_LEDGER_CORRUPT_MESSAGE = (
     "История ручной проверки повреждена. Требуется восстановление."
 )
@@ -212,20 +223,36 @@ class ReviewDecision(BaseModel):
     relation: str | None = None
     candidate_value: str | None = None
     target: dict[str, Any] = Field(default_factory=dict)
-    decision: Literal[FIELD_DECISION, RELATION_DECISION, REJECT_DECISION]
+    confirmed_value: str | None = None
+    decision_id: str | None = None
+    decision: Literal[
+        FIELD_DECISION,
+        RELATION_DECISION,
+        REJECT_DECISION,
+        CONFIRM_FIELD_VALUE_DECISION,
+        CONFIRM_FIELD_ABSENT_DECISION,
+    ]
     created_at: datetime
     provenance: Literal["human"] = "human"
 
     @property
     def decision_key(self) -> str:
-        return _sha256({
+        identity = {
             "document_fingerprint": self.document_fingerprint,
             "page": self.page,
             "physical_refs": _refs(self.physical_refs),
             "field": self.field,
             "relation": self.relation,
             "parent_physical_refs": _refs(self.target.get("parent_physical_refs")),
-        })
+        }
+        if self.decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            identity.update({
+                "decision": self.decision,
+                "confirmed_value": self.confirmed_value,
+                "evidence_fingerprint": self.evidence_fingerprint,
+                "decision_id": self.decision_id,
+            })
+        return _sha256(identity)
 
 
 class ReviewDecisionStore:
@@ -409,6 +436,8 @@ class HumanReviewService:
         field: str | None = None,
         candidate_value: str | None = None,
         parent_refs: Any = None,
+        decision: str | None = None,
+        confirmed_value: str | None = None,
     ) -> str:
         metadata = row.get("ocr_metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
@@ -431,7 +460,68 @@ class HumanReviewService:
             ],
             "parent_physical_refs": _refs(parent_refs),
         }
+        if decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            normalization = metadata.get("normalization")
+            structural_safety = metadata.get("target_cell_structural_safety")
+            evidence.update({
+                "row_identity": row.get("id")
+                or row.get("logical_id")
+                or metadata.get("logical_id"),
+                "decision": decision,
+                "current_canonical_value": str(row.get(field or "", "") or ""),
+                "confirmed_value": confirmed_value,
+                "field_normalization": (
+                    normalization.get(field)
+                    if isinstance(normalization, Mapping) and field
+                    else None
+                ),
+                "field_structural_safety": (
+                    structural_safety.get(field)
+                    if isinstance(structural_safety, Mapping) and field
+                    else None
+                ),
+            })
         return _sha256(evidence)
+
+    @staticmethod
+    def _confirmation_decision_id(
+        row: Mapping[str, Any],
+        *,
+        decision: str,
+        field: str,
+        evidence_fingerprint: str,
+        confirmed_value: str | None,
+    ) -> str:
+        map_name = (
+            "human_verified_field_values"
+            if decision == CONFIRM_FIELD_VALUE_DECISION
+            else "human_confirmed_absent_fields"
+        )
+        records = row.get(map_name)
+        record = records.get(field) if isinstance(records, Mapping) else None
+        if (
+            isinstance(record, Mapping)
+            and not record.get("invalidated")
+            and record.get("decision") == decision
+            and record.get("evidence_fingerprint") == evidence_fingerprint
+            and str(record.get("value", "")) == str(confirmed_value or "")
+            and record.get("decision_id")
+        ):
+            return str(record["decision_id"])
+        return _sha256({
+            "decision": decision,
+            "field": field,
+            "document_fingerprint": row.get("document_fingerprint"),
+            "page": row.get("page"),
+            "physical_refs": _row_refs(row),
+            "evidence_fingerprint": evidence_fingerprint,
+            "confirmed_value": confirmed_value,
+            "supersedes": (
+                record.get("decision_id") or record.get("decision_key")
+                if isinstance(record, Mapping)
+                else None
+            ),
+        })
 
     def create_decision(
         self,
@@ -444,6 +534,7 @@ class HumanReviewService:
         field: str | None = None,
         relation: str | None = None,
         candidate_value: str | None = None,
+        confirmed_value: str | None = None,
         target: Mapping[str, Any] | None = None,
     ) -> ReviewDecision:
         if decision not in DECISIONS:
@@ -458,6 +549,21 @@ class HumanReviewService:
             candidate = self._candidate(row, field)
             if not candidate or str(candidate.get("value_candidate") or "") != str(candidate_value):
                 raise ValueError("Кандидат отсутствует или не совпадает с текущим OCR-доказательством")
+        if decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            if field not in CRITICAL_FIELDS:
+                raise ValueError("Для подтверждения нужно применимое критичное поле")
+            current_value = str(row.get(field, "") or "")
+            if decision == CONFIRM_FIELD_VALUE_DECISION:
+                if not current_value.strip():
+                    raise ValueError("Нельзя подтвердить пустое значение поля")
+                if confirmed_value != current_value:
+                    raise ValueError("Подтверждаемое значение не совпадает с текущим значением поля")
+            else:
+                if current_value.strip():
+                    raise ValueError("Поле уже содержит значение; подтверждение отсутствия устарело")
+                if field not in missing_critical_fields(row) and not human_confirmed_absence_applies(row, field):
+                    raise ValueError("Поле не является применимым отсутствующим критичным значением")
+                confirmed_value = None
         if decision == RELATION_DECISION:
             if not relation:
                 raise ValueError("Для связи продолжения укажите relation")
@@ -484,14 +590,17 @@ class HumanReviewService:
                 )
         metadata = row.get("ocr_metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
+        evidence_fingerprint = self.evidence_fingerprint(
+            row,
+            field=field,
+            candidate_value=candidate_value,
+            parent_refs=target_data.get("parent_physical_refs"),
+            decision=decision,
+            confirmed_value=confirmed_value,
+        )
         return ReviewDecision(
             document_fingerprint=document_fingerprint,
-            evidence_fingerprint=self.evidence_fingerprint(
-                row,
-                field=field,
-                candidate_value=candidate_value,
-                parent_refs=target_data.get("parent_physical_refs"),
-            ),
+            evidence_fingerprint=evidence_fingerprint,
             page=int(page),
             semantic_ref=str(
                 row.get("logical_id")
@@ -502,6 +611,18 @@ class HumanReviewService:
             field=field,
             relation=relation,
             candidate_value=str(candidate_value) if candidate_value is not None else None,
+            confirmed_value=confirmed_value,
+            decision_id=(
+                self._confirmation_decision_id(
+                    row,
+                    decision=decision,
+                    field=str(field),
+                    evidence_fingerprint=evidence_fingerprint,
+                    confirmed_value=confirmed_value,
+                )
+                if decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}
+                else None
+            ),
             target=target_data,
             decision=decision,
             created_at=datetime.now(timezone.utc),
@@ -538,6 +659,8 @@ class HumanReviewService:
             field=decision.field,
             candidate_value=decision.candidate_value,
             parent_refs=parent_refs,
+            decision=decision.decision,
+            confirmed_value=decision.confirmed_value,
         )
         if expected != decision.evidence_fingerprint:
             return False
@@ -565,6 +688,67 @@ class HumanReviewService:
                 "provenance": "human",
             })
             row["human_rejected_candidates"] = rejected
+            return True
+        if decision.decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            field = str(decision.field or "")
+            current_value = str(row.get(field, "") or "")
+            if decision.decision == CONFIRM_FIELD_VALUE_DECISION:
+                if not current_value.strip() or current_value != str(decision.confirmed_value or ""):
+                    return False
+                records = row.get("human_verified_field_values")
+                records = dict(records) if isinstance(records, Mapping) else {}
+                existing = records.get(field)
+                if isinstance(existing, Mapping) and existing.get("decision_key") == decision.decision_key:
+                    return True
+                records[field] = {
+                    "value": current_value,
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "decision_id": decision.decision_id,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                    "provenance": "human",
+                }
+                row["human_verified_field_values"] = records
+                confirmed = list(row.get("human_verified_fields") or [])
+                if field not in confirmed:
+                    confirmed.append(field)
+                row["human_verified_fields"] = confirmed
+                row["status"] = "review"
+                self._mark_human(row, {
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "field": field,
+                    "confirmed_value": current_value,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                })
+            else:
+                if current_value.strip():
+                    return False
+                if field not in missing_critical_fields(row) and not human_confirmed_absence_applies(row, field):
+                    return False
+                records = row.get("human_confirmed_absent_fields")
+                records = dict(records) if isinstance(records, Mapping) else {}
+                existing = records.get(field)
+                if isinstance(existing, Mapping) and existing.get("decision_key") == decision.decision_key:
+                    return True
+                records[field] = {
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "decision_id": decision.decision_id,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                    "provenance": "human",
+                }
+                row["human_confirmed_absent_fields"] = records
+                row["status"] = "review"
+                self._mark_human(row, {
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "field": field,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                })
+            refresh_review_state(row)
+            if not critical_blockers_for_row(row) and row.get("row_type") not in {"section", "system", "skip"}:
+                row["status"] = "verified"
             return True
         if decision.decision == FIELD_DECISION:
             candidate = self._candidate(row, decision.field)
@@ -934,6 +1118,8 @@ def recalculate_page_safety(
 
 
 __all__ = [
+    "CONFIRM_FIELD_ABSENT_DECISION",
+    "CONFIRM_FIELD_VALUE_DECISION",
     "DECISIONS",
     "FIELD_DECISION",
     "HumanReviewService",
