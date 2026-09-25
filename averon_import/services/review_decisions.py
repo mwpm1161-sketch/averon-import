@@ -433,22 +433,24 @@ class HumanReviewService:
             if str(decision.candidate_value or "").strip() not in _continuation_fragments(row):
                 return False
         if decision.decision == REJECT_DECISION:
-            rejected = list(row.get("human_rejected_candidates") or [])
-            # Saved decisions may be replayed while restoring a legacy result.
-            # Rejection provenance is a set-like audit record: replaying the
-            # same immutable decision must never grow result.json.
-            if not any(
-                isinstance(item, Mapping)
-                and str(item.get("decision_key") or "") == decision.decision_key
-                for item in rejected
-            ):
-                rejected.append({
-                    "field": decision.field,
-                    "candidate_value": decision.candidate_value,
-                    "decision_key": decision.decision_key,
-                    "evidence_fingerprint": decision.evidence_fingerprint,
-                    "provenance": "human",
-                })
+            rejected = [
+                item for item in list(row.get("human_rejected_candidates") or [])
+                if not (
+                    isinstance(item, Mapping)
+                    and str(item.get("decision_key") or "") == decision.decision_key
+                )
+            ]
+            # The audit record is keyed by the immutable decision identity.
+            # Replaying the same decision replaces the same record instead of
+            # growing result.json, while a newer evidence fingerprint for that
+            # key is still reflected correctly.
+            rejected.append({
+                "field": decision.field,
+                "candidate_value": decision.candidate_value,
+                "decision_key": decision.decision_key,
+                "evidence_fingerprint": decision.evidence_fingerprint,
+                "provenance": "human",
+            })
             row["human_rejected_candidates"] = rejected
             return True
         if decision.decision == FIELD_DECISION:
