@@ -955,7 +955,7 @@ def save_results(document_id: str, request: SaveRowsRequest):
                 rows, existing.get("errors", [])
             )
             workspace_service.write_json(workspace.result_path, existing)
-        return {"saved": True, "summary": existing["summary"]}
+        return {"saved": True, "summary": existing["summary"], "result": existing}
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
