@@ -880,7 +880,8 @@ def recognize(document_id: str, request: RecognitionRequest):
             ReviewDecisionStore(workspace.review_decisions_path).load(),
             document_fingerprint,
         )
-        workspace_service.write_json(workspace.result_path, result)
+        with workspace_service.mutation_lock(document_id):
+            workspace_service.write_json(workspace.result_path, result)
         return result
 
     job = job_service.submit(run)
@@ -902,15 +903,34 @@ def get_results(document_id: str):
         result = workspace_service.read_json(workspace.result_path)
         if not result:
             raise HTTPException(404, "Результат распознавания отсутствует")
-        result = human_review_service.apply_saved_decisions(
-            result,
-            ReviewDecisionStore(workspace.review_decisions_path).load(),
-            workspace_service.source_fingerprint(workspace),
-        )
-        workspace_service.write_json(workspace.result_path, result)
+
+        store = ReviewDecisionStore(workspace.review_decisions_path)
+        decisions = store.load()
+        expected_revision = store.revision(decisions)
+        if str(result.get("review_decisions_revision") or "") == expected_revision:
+            return result
+
+        # Legacy/crash recovery path only. Normal reads are side-effect free.
+        # Re-check under the document mutation lock so a concurrent review
+        # cannot be overwritten by this one-time reconciliation.
+        with workspace_service.mutation_lock(document_id):
+            result = workspace_service.read_json(workspace.result_path)
+            if not result:
+                raise HTTPException(404, "Результат распознавания отсутствует")
+            decisions = store.load()
+            expected_revision = store.revision(decisions)
+            if str(result.get("review_decisions_revision") or "") != expected_revision:
+                result = human_review_service.apply_saved_decisions(
+                    result,
+                    decisions,
+                    workspace_service.source_fingerprint(workspace),
+                )
+                workspace_service.write_json(workspace.result_path, result)
         return result
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(409, "Данные результата недоступны") from exc
 
 
 @app.put("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
