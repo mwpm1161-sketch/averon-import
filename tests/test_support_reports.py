@@ -354,12 +354,22 @@ def test_export_rejects_stale_revision_without_creating_workbook(
 def test_matching_revision_export_uses_canonical_saved_rows_outside_document_lock(
     support_context, monkeypatch
 ):
+    import inspect
+
     client, main, _, workspace_service, _ = support_context
     workspace = _make_workspace(workspace_service)
     stored = workspace_service.read_json(workspace.result_path)
     stored["revision"] = 10
     workspace_service.write_json(workspace.result_path, stored)
     captured = {}
+    snapshots = []
+    original_read_json = workspace_service.read_json
+
+    def tracked_read_json(path, *args, **kwargs):
+        result = original_read_json(path, *args, **kwargs)
+        if Path(path) == workspace.result_path:
+            snapshots.append(result)
+        return result
 
     def write_export(**kwargs):
         acquired = []
@@ -376,6 +386,7 @@ def test_matching_revision_export_uses_canonical_saved_rows_outside_document_loc
         kwargs["output_path"].write_bytes(b"PK-test-workbook")
         assert acquired == [True]
 
+    monkeypatch.setattr(workspace_service, "read_json", tracked_read_json)
     monkeypatch.setattr(main.export_service, "export", write_export)
     response = client.post(
         f"/api/documents/{workspace.document_id}/export",
@@ -387,6 +398,9 @@ def test_matching_revision_export_uses_canonical_saved_rows_outside_document_loc
     assert captured["rows"] == stored["rows"]
     assert captured["rows"][0]["name"] == "Каноническая строка"
     assert captured["page_statuses"] == stored["page_statuses"]
+    assert captured["rows"] is snapshots[0]["rows"]
+    assert captured["page_statuses"] is snapshots[0]["page_statuses"]
+    assert "deepcopy(" not in inspect.getsource(main.export)
 
 
 def test_dirty_save_revision_is_used_for_the_following_export(support_context, monkeypatch):
@@ -452,8 +466,12 @@ def test_export_reports_corrupt_review_ledger_safely_without_repairing_it(suppor
     from averon_import.services.review_decisions import ReviewDecisionStore
 
     workspace = _make_workspace(workspace_service)
+    result = workspace_service.read_json(workspace.result_path)
+    result["revision"] = 10
+    result["review_ledger_revision"] = 3
+    workspace_service.write_json(workspace.result_path, result)
     store = ReviewDecisionStore(workspace.review_decisions_path)
-    store.path.write_bytes(b"{broken ledger")
+    store.path.write_bytes(b"{malformed json")
     store.revision_path.write_text("3", encoding="ascii")
     result_before = workspace.result_path.read_bytes()
     ledger_before = store.path.read_bytes()
@@ -461,20 +479,25 @@ def test_export_reports_corrupt_review_ledger_safely_without_repairing_it(suppor
     export_calls = []
     monkeypatch.setattr(main.export_service, "export", lambda **kwargs: export_calls.append(kwargs))
 
-    response = client.post(
-        f"/api/documents/{workspace.document_id}/export",
-        headers=_headers("colleague"),
-        json=_export_payload("corrupt-ledger.xlsx"),
-    )
+    for review_export in (False, True):
+        response = client.post(
+            f"/api/documents/{workspace.document_id}/export",
+            headers=_headers("colleague"),
+            json=_export_payload(
+                f"corrupt-ledger-{review_export}.xlsx",
+                expected_revision=10,
+                review_export=review_export,
+            ),
+        )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "История ручной проверки повреждена. Требуется восстановление."
-    assert str(store.path) not in response.text
-    assert export_calls == []
-    assert workspace.result_path.read_bytes() == result_before
-    assert store.path.read_bytes() == ledger_before
-    assert store.revision_path.read_bytes() == marker_before
-    assert not (workspace.exports_dir / "corrupt-ledger.xlsx").exists()
+        assert response.status_code == 409
+        assert response.json()["detail"] == "История ручной проверки повреждена. Требуется восстановление."
+        assert str(store.path) not in response.text
+        assert export_calls == []
+        assert list(workspace.exports_dir.iterdir()) == []
+        assert workspace.result_path.read_bytes() == result_before
+        assert store.path.read_bytes() == ledger_before
+        assert store.revision_path.read_bytes() == marker_before
 
 
 def test_production_export_remains_blocked_by_canonical_structural_blocker(support_context):

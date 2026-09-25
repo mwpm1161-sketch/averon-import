@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 import hashlib
 import json
 import logging
@@ -79,6 +78,7 @@ from averon_import.services.review_decisions import (
     HumanReviewService,
     RELATION_DECISION,
     REJECT_DECISION,
+    ReviewDecision,
     ReviewDecisionLedgerCorrupt,
     ReviewDecisionStore,
 )
@@ -190,17 +190,25 @@ def _review_projection_current(result: dict[str, Any], ledger_revision: int) -> 
     return current == ledger_revision
 
 
-def _reconcile_review_projection_locked(workspace, result: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def _reconcile_review_projection_locked(
+    workspace,
+    result: dict[str, Any],
+    *,
+    ledger_snapshot: tuple[list[ReviewDecision], int] | None = None,
+) -> tuple[dict[str, Any], bool]:
     """Recover a result only when its persisted ledger revision is stale.
 
     Callers must own the document mutation lock. The small revision marker
     keeps the steady-state path from parsing or replaying the complete ledger.
     """
-    store = ReviewDecisionStore(workspace.review_decisions_path)
-    ledger_revision = store.load_revision()
-    if _review_projection_current(result, ledger_revision):
-        return result, False
-    decisions, ledger_revision = store.load_snapshot()
+    if ledger_snapshot is None:
+        store = ReviewDecisionStore(workspace.review_decisions_path)
+        ledger_revision = store.load_revision()
+        if _review_projection_current(result, ledger_revision):
+            return result, False
+        decisions, ledger_revision = store.load_snapshot()
+    else:
+        decisions, ledger_revision = ledger_snapshot
     if _review_projection_current(result, ledger_revision):
         return result, False
     updated = human_review_service.apply_saved_decisions(
@@ -1150,8 +1158,14 @@ def export(
             stored_result = workspace_service.read_json(workspace.result_path, default={})
             if not isinstance(stored_result, dict) or not stored_result:
                 raise HTTPException(404, "Результат распознавания отсутствует")
+            # Export requires audit integrity even when the result and revision
+            # marker agree. Validate the complete persisted ledger before taking
+            # the revision-fenced snapshot; malformed history must fail closed.
+            ledger_snapshot = ReviewDecisionStore(
+                workspace.review_decisions_path
+            ).load_snapshot()
             stored_result, _recovered = _reconcile_review_projection_locked(
-                workspace, stored_result
+                workspace, stored_result, ledger_snapshot=ledger_snapshot
             )
             current_revision = _result_revision(stored_result)
             if request.expected_revision != current_revision:
@@ -1159,13 +1173,14 @@ def export(
                     409,
                     "Документ изменён. Обновите данные перед экспортом.",
                 )
-            stored_result = deepcopy(stored_result)
-            page_statuses = deepcopy(stored_result.get("page_statuses") or {})
+            page_statuses = stored_result.get("page_statuses") or {}
             # Production exports always use canonical saved rows. Review exports
             # intentionally preserve the browser's inspection snapshot, including
             # unsaved edits, while fencing it to the current document revision.
-            export_rows = deepcopy(
-                request.rows if request.review_export else stored_result.get("rows") or []
+            export_rows = (
+                request.rows
+                if request.review_export
+                else stored_result.get("rows") or []
             )
     except HTTPException:
         raise
