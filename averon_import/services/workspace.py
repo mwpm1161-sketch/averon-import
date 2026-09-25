@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import threading
@@ -93,6 +94,39 @@ class WorkspaceService:
             return workspace.result_path.is_file() and workspace.result_path.stat().st_size > 2
         except OSError:
             return False
+
+    def source_fingerprint(self, workspace: Workspace) -> str:
+        """Return the immutable source PDF SHA-256, caching legacy workspaces.
+
+        New uploads persist this value at creation time.  Existing pilot
+        workspaces compute it once on first use instead of re-reading the PDF
+        for every result/review request.
+        """
+
+        metadata = self.read_json(workspace.metadata_path, default={})
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        cached = str(metadata.get("source_sha256") or "").strip().lower()
+        if len(cached) == 64 and all(char in "0123456789abcdef" for char in cached):
+            return cached
+
+        digest = hashlib.sha256()
+        with workspace.pdf_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        fingerprint = digest.hexdigest()
+
+        # A second request may have filled the cache while the digest was
+        # being calculated.  Serialize only the tiny metadata update and
+        # preserve every unrelated metadata field.
+        with self.mutation_lock(workspace.document_id):
+            latest = self.read_json(workspace.metadata_path, default={})
+            latest = dict(latest) if isinstance(latest, dict) else {}
+            existing = str(latest.get("source_sha256") or "").strip().lower()
+            if len(existing) == 64 and all(char in "0123456789abcdef" for char in existing):
+                return existing
+            latest["source_sha256"] = fingerprint
+            self.write_json(workspace.metadata_path, latest)
+        return fingerprint
 
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return safe metadata for existing document workspaces.
