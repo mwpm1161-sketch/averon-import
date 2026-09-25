@@ -53,3 +53,23 @@ Backend summaries now expose `review_rows` and `ready_rows` using the same canon
 An ordinary active row now uses a neutral blue highlight while review/blocker rows retain the warning palette. Clean production export skips the unconditional row PUT and result GET. When the user has edits, one PUT returns the canonical saved result, which the client uses directly before export; the browser keeps the current preview, zoom, active row, and table scroll during that save.
 
 Focused Phase 4 validation: **71 passed** across product UI, row assembly, performance foundation, export, and critical-verification tests; compileall, JavaScript syntax, and whitespace checks passed.
+
+## Phase 5 audit and decisions
+
+The result table now attaches click, input, change, and focus handlers once to its stable `<tbody>`. A select edit patches one row instead of rebuilding the table; ordinary text input updates the row model and warning classes in place. Search renders are debounced by 120 ms. Textarea heights are measured in a batch, and transient maps index rows by ID, page, and physical references. Those maps are rebuilt when a canonical result is opened and updated on row patches; they are never serialized. The existing page PNG cache remains keyed by document/page/DPI and uses atomic replacement from Phase 2.
+
+The job executor remains at one worker. OCR and PDF rendering have material per-job memory use; sourcing/ETM calls may have provider rate limits and shared clients. `JobService` retains completed payloads and tracebacks in its process-local dictionary without a bound. This pass does not change concurrency or retention because the repository does not establish safe provider concurrency or the maximum result size. A safe next design is bounded admission by workload class, keeping OCR/PDF concurrency capped by measured peak RSS, imposing explicit queue limits, and expiring terminal job records only after a retention window longer than the client polling window; completed large payloads should be released only after a client acknowledgement or that expiry. Provider concurrency and memory measurements are prerequisites.
+
+## Structural before/after measurements
+
+| Operation | Base `pilot-v1.2` | Feature branch, measured or asserted structurally |
+| --- | --- | --- |
+| Recent-document discovery | Parsed every workspace result payload | Zero result payload reads; metadata/stat only |
+| Current `GET /results` | Result + full ledger parse/replay, PDF hash, two full-result copies, all-page safety pass, result rewrite | One result read; zero ledger parse/replay, PDF hash, deep copy, safety recalculation, or write |
+| One field decision on 500 synthetic rows | Full result response, all saved decisions replayed, two full-result copies, all pages recalculated, full table replacement | One result read/write, zero PDF hashes/replays/full copies, one detached row/page recalculated; patch JSON is under 10% of full result JSON; one affected DOM row and no `loadResult()` |
+| One continuation decision | Same full replay/copy/all-page/full-response path as other decisions | Two detached rows (parent and child), one affected page under the current same-page relation contract |
+| Clean production export | PUT rows + GET result + export POST | Export POST only; clean save exits before any API request |
+| Dirty production export | PUT rows + GET result + export POST | One PUT returning canonical result + export POST; no follow-up result GET |
+| Search typing | Full table render for each input event | Full table render after a 120 ms debounce; no network polling |
+
+The review-decision counter test records one result read and write, zero cached-fingerprint calculations, zero replayed decisions, zero full-result copies, one detached row, and one page recalculation. The output-size comparison uses serialized bytes from a 500-row synthetic fixture rather than wall-clock timing, which is machine-dependent.

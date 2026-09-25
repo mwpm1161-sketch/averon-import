@@ -123,6 +123,27 @@ def test_clean_export_skips_save_round_trip_and_dirty_save_uses_authoritative_re
     assert "preserveView:true" in save
 
 
+def test_result_table_uses_delegated_events_row_indexes_and_debounced_search():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    renderer = app_js.split("function renderRows()", 1)[1].split("function ensureResultTableEvents()", 1)[0]
+    events = app_js.split("function ensureResultTableEvents()", 1)[1].split("function renderPatchedReviewRows(", 1)[0]
+    row_lookup = app_js.split("function rowById(", 1)[1].split("async function selectRow(", 1)[0]
+    continuation_lookup = app_js.split("function continuationParent(", 1)[1].split("function continuationFragment(", 1)[0]
+    search_setup = app_js.split('$("#table-search").addEventListener("input",', 1)[1].split('$("#type-filter")', 1)[0]
+
+    assert "ensureResultTableEvents();" in renderer
+    assert "body.querySelectorAll(\"tr\").forEach" not in renderer
+    assert 'body.addEventListener("click"' in events
+    assert 'body.addEventListener("change"' in events
+    assert 'body.addEventListener("input"' in events
+    assert 'body.addEventListener("focusin"' in events
+    assert "renderPatchedReviewRows([row])" in events
+    assert "renderRows()" not in events
+    assert "state.rowIndexes.byId.get(String(id))" in row_lookup
+    assert "state.rowIndexes.byPageRefs" in continuation_lookup
+    assert "}, 120);" in search_setup
+
+
 def test_review_export_button_has_busy_and_finally_recovery_semantics():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     review_export = app_js.split("async function downloadReviewExcel()", 1)[1].split("\nfunction resetApp()", 1)[0]

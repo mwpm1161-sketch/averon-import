@@ -7,6 +7,8 @@ const state = {
   cropSelecting: false,
   rows: [],
   result: null,
+  rowIndexes: {byId: new Map(), byPage: new Map(), byPageRefs: new Map()},
+  renderedRowById: new Map(),
   activeRowId: null,
   zoom: 1,
   dirty: false,
@@ -32,8 +34,9 @@ const state = {
     responseBytes: 0,
     lastResponseType: "",
     fullTableRenders: 0,
-    reviewRowPatches: 0,
+    rowPatches: 0,
   },
+  tableSearchTimer: null,
   reviewMutationQueue: Promise.resolve(),
   loginSubmitting: false,
   users: {
@@ -157,6 +160,9 @@ function clearProtectedMemory() {
   state.crop = null;
   state.cropSelecting = false;
   state.rows = [];
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   state.result = null;
   state.activeRowId = null;
   state.dirty = false;
@@ -1285,6 +1291,9 @@ async function openExistingDocument(documentId, {announce = true, navigation = n
   state.previewPage = null;
   state.crop = null;
   state.rows = [];
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   state.result = null;
   state.activeRowId = null;
   state.dirty = false;
@@ -1589,6 +1598,8 @@ function loadResult(result, options = {}) {
     zoom: state.zoom,
     scrollTop: $("#result-body").scrollTop,
   } : null;
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   state.result = result;
   if (!preservedView) {
     state.previewPage = null;
@@ -1602,6 +1613,7 @@ function loadResult(result, options = {}) {
       || (row.row_type === "note" && row.structured_table)
     ),
   }));
+  rebuildResultIndexes();
   if (!preservedView) state.reviewFilter = "";
   state.dirty = false;
   buildResultHeader();
@@ -1682,99 +1694,125 @@ function filteredRows() {
 function renderRows() {
   state.performanceCounters.fullTableRenders = Math.min(2147483647, state.performanceCounters.fullTableRenders + 1);
   const body = $("#result-body");
+  ensureResultTableEvents();
   const rows = filteredRows();
   body.innerHTML = rows.map((row) => rowHtml(row)).join("");
+  state.renderedRowById = new Map(
+    [...body.querySelectorAll("tr[data-id]")].map((element) => [String(element.dataset.id), element]),
+  );
   $("#empty-table").hidden = rows.length > 0;
-  body.querySelectorAll("tr").forEach(bindResultRow);
+  fitTextareas(body.querySelectorAll(".cell-input"));
 }
 
-function bindResultRow(tr) {
-  tr.addEventListener("click", (event) => {
-    if (!event.target.matches("input,textarea,select,option")) selectRow(tr.dataset.id);
+function ensureResultTableEvents() {
+  const body = $("#result-body");
+  if (body.dataset.resultEventsBound === "true") return;
+  body.dataset.resultEventsBound = "true";
+  body.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : event.target.parentElement;
+    const button = target.closest("button");
+    if (button && body.contains(button)) {
+      const row = rowById(button.dataset.id);
+      if (button.matches(".candidate-accept")) {
+        const candidate = row?.value_candidates?.[button.dataset.key];
+        if (!row || !candidate?.value_candidate) return;
+        submitHumanDecision(row, {
+          decision: "ACCEPT_FIELD_CANDIDATE",
+          field: button.dataset.key,
+          candidate_value: String(candidate.value_candidate),
+        }, `${CRITICAL_LABELS[button.dataset.key]} подтверждено пользователем`);
+        return;
+      }
+      if (button.matches(".candidate-reject")) {
+        const candidate = row?.value_candidates?.[button.dataset.key];
+        if (!row || !candidate?.value_candidate) return;
+        submitHumanDecision(row, {
+          decision: "REJECT_CANDIDATE",
+          field: button.dataset.key,
+          candidate_value: String(candidate.value_candidate),
+        }, "Кандидат отклонён и оставлен на проверке");
+        return;
+      }
+      if (button.matches(".continuation-accept")) {
+        const parent = row && continuationParent(row);
+        if (!row || !parent) return;
+        submitHumanDecision(row, {
+          decision: "ACCEPT_CONTINUATION_RELATION",
+          relation: "human_confirmed_continuation",
+          candidate_value: continuationFragment(row),
+          target: {parent_physical_refs: physicalRefs(parent)},
+        }, "Продолжение привязано пользователем");
+        return;
+      }
+      if (button.matches(".candidate-edit")) {
+        if (!row) return;
+        selectRow(row.id);
+        const input = button.closest("tr")?.querySelector(
+          `.cell-input[data-id="${row.id}"][data-key="${button.dataset.key}"]`,
+        );
+        if (input) { input.focus(); input.select(); }
+        return;
+      }
+      if (button.matches(".sourcing-row-button") && row) {
+        openSourcingForRow(row);
+        return;
+      }
+    }
+    const tableRow = target.closest("tr[data-id]");
+    if (tableRow && !target.matches("input,textarea,select,option") && !target.closest("button")) {
+      selectRow(tableRow.dataset.id);
+    }
   });
-  tr.querySelectorAll(".row-select").forEach((input) => input.addEventListener("change", (event) => {
-    const row = rowById(event.target.dataset.id); row.selected = event.target.checked; updateSummary(); markDirty();
-  }));
-  tr.querySelectorAll(".cell-input").forEach((input) => {
-    autoHeight(input);
-    input.addEventListener("input", () => {
-      const row = rowById(input.dataset.id);
-      row[input.dataset.key] = input.value;
-      row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
-      if (row.status !== "verified") row.status = "edited";
-      row.edited = true;
-      refreshClientReview(row);
-      autoHeight(input); markDirty(); updateSummary();
-    });
-    input.addEventListener("focus", () => selectRow(input.dataset.id));
-  });
-  tr.querySelectorAll(".cell-select").forEach((select) => select.addEventListener("change", () => {
-    const row = rowById(select.dataset.id);
-    row[select.dataset.key] = select.value;
-    row.edited_fields = [...new Set([...(row.edited_fields || []), select.dataset.key])];
-    row.edited = true;
-    if (select.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
-    refreshClientReview(row);
-    markDirty(); updateSummary(); renderRows();
-  }));
-  tr.querySelectorAll(".candidate-accept").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    const candidate = row?.value_candidates?.[button.dataset.key];
-    if (!row || !candidate?.value_candidate) return;
-    submitHumanDecision(row, {
-      decision: "ACCEPT_FIELD_CANDIDATE",
-      field: button.dataset.key,
-      candidate_value: String(candidate.value_candidate),
-    }, `${CRITICAL_LABELS[button.dataset.key]} подтверждено пользователем`);
-  }));
-  tr.querySelectorAll(".continuation-accept").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    const parent = row && continuationParent(row);
-    if (!row || !parent) return;
-    const fragment = continuationFragment(row);
-    submitHumanDecision(row, {
-      decision: "ACCEPT_CONTINUATION_RELATION",
-      relation: "human_confirmed_continuation",
-      candidate_value: fragment,
-      target: {parent_physical_refs: physicalRefs(parent)},
-    }, "Продолжение привязано пользователем");
-  }));
-  tr.querySelectorAll(".candidate-reject").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    const candidate = row?.value_candidates?.[button.dataset.key];
-    if (!row || !candidate?.value_candidate) return;
-    submitHumanDecision(row, {
-      decision: "REJECT_CANDIDATE",
-      field: button.dataset.key,
-      candidate_value: String(candidate.value_candidate),
-    }, "Кандидат отклонён и оставлен на проверке");
-  }));
-  tr.querySelectorAll(".candidate-edit").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
+  body.addEventListener("change", (event) => {
+    const control = event.target;
+    if (control.matches(".row-select")) {
+      const row = rowById(control.dataset.id);
+      if (row) { row.selected = control.checked; updateSummary(); markDirty(); }
+      return;
+    }
+    if (!control.matches(".cell-select")) return;
+    const row = rowById(control.dataset.id);
     if (!row) return;
-    selectRow(row.id);
-    const input = [...tr.querySelectorAll(`.cell-input[data-id="${row.id}"]`)]
-      .find((element) => element.dataset.key === button.dataset.key);
-    if (input) { input.focus(); input.select(); }
-  }));
-  tr.querySelectorAll(".sourcing-row-button").forEach((button) => button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const row = rowById(button.dataset.id);
-    if (row) openSourcingForRow(row);
-  }));
+    row[control.dataset.key] = control.value;
+    row.edited_fields = [...new Set([...(row.edited_fields || []), control.dataset.key])];
+    row.edited = true;
+    if (control.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
+    refreshClientReview(row);
+    markDirty();
+    renderPatchedReviewRows([row]);
+    updateSummary();
+  });
+  body.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!input.matches(".cell-input")) return;
+    const row = rowById(input.dataset.id);
+    if (!row) return;
+    row[input.dataset.key] = input.value;
+    row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
+    if (row.status !== "verified") row.status = "edited";
+    row.edited = true;
+    refreshClientReview(row);
+    const tableRow = input.closest("tr");
+    tableRow.classList.toggle("review", ["review", "unrecognized"].includes(row.status));
+    tableRow.classList.toggle("critical-review", criticalBlockers(row).length > 0);
+    const statusControl = tableRow.querySelector('.cell-select[data-key="status"]');
+    if (statusControl) statusControl.value = row.status;
+    autoHeight(input);
+    markDirty();
+    updateSummary();
+  });
+  body.addEventListener("focusin", (event) => {
+    const input = event.target;
+    if (input.matches(".cell-input")) selectRow(input.dataset.id);
+  });
 }
 
 function renderPatchedReviewRows(changedRows) {
   const body = $("#result-body");
   const scrollTop = body.scrollTop;
   for (const row of changedRows) {
-    [...body.querySelectorAll("tr")]
-      .find((node) => node.dataset.id === String(row.id))
-      ?.remove();
+    state.renderedRowById.get(String(row.id))?.remove();
+    state.renderedRowById.delete(String(row.id));
   }
   const visible = filteredRows();
   for (const row of changedRows) {
@@ -1785,13 +1823,13 @@ function renderPatchedReviewRows(changedRows) {
     const element = template.content.firstElementChild;
     let anchor = null;
     for (let index = visibleIndex + 1; index < visible.length; index += 1) {
-      anchor = [...body.querySelectorAll("tr")]
-        .find((node) => node.dataset.id === String(visible[index].id));
+      anchor = state.renderedRowById.get(String(visible[index].id));
       if (anchor) break;
     }
     body.insertBefore(element, anchor);
-    bindResultRow(element);
-    state.performanceCounters.reviewRowPatches = Math.min(2147483647, state.performanceCounters.reviewRowPatches + 1);
+    state.renderedRowById.set(String(row.id), element);
+    fitTextareas(element.querySelectorAll(".cell-input"));
+    state.performanceCounters.rowPatches = Math.min(2147483647, state.performanceCounters.rowPatches + 1);
   }
   $("#empty-table").hidden = body.children.length > 0;
   body.scrollTop = scrollTop;
@@ -1817,6 +1855,7 @@ function mergeHumanReviewPatch(patch) {
     merged.edited = Boolean(localRow.edited);
     if (state.dirty && merged.edited) refreshClientReview(merged);
     state.rows[index] = merged;
+    replaceResultIndex(localRow, merged);
     resultRows[resultIndex] = serverRow;
     changedRows.push(merged);
   }
@@ -1906,16 +1945,20 @@ function continuationParentRefs(row) {
   return [];
 }
 
-function samePhysicalRefs(left, right) {
-  return JSON.stringify(left || []) === JSON.stringify(right || []);
-}
-
 function continuationParent(row) {
   const candidates = continuationParentRefs(row);
   if (!candidates.length) return null;
-  return state.rows.find((candidate) => candidate.page === row.page
-    && ["item", "component", "item_candidate"].includes(candidate.row_type)
-    && candidates.some((refs) => samePhysicalRefs(refs, physicalRefs(candidate)))) || null;
+  const index = state.rowIndexes.byPageRefs;
+  for (const refs of candidates) {
+    const ids = index.get(rowRefsIndexKey(row.page, refs)) || [];
+    for (const id of ids) {
+      const candidate = rowById(id);
+      if (candidate && ["item", "component", "item_candidate"].includes(candidate.row_type)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
 }
 
 function continuationFragment(row) {
@@ -2479,12 +2522,67 @@ function autoHeight(element) {
   element.style.height = `${Math.max(37, element.scrollHeight)}px`;
 }
 
-function rowById(id) { return state.rows.find((row) => row.id === id); }
+function fitTextareas(elements) {
+  const textareas = [...elements];
+  textareas.forEach((element) => { element.style.height = "auto"; });
+  const heights = textareas.map((element) => Math.max(37, element.scrollHeight));
+  textareas.forEach((element, index) => { element.style.height = `${heights[index]}px`; });
+}
+
+function rowRefsIndexKey(page, refs) {
+  return `${String(page ?? "")}|${JSON.stringify(refs || [])}`;
+}
+
+function rebuildResultIndexes() {
+  const indexes = {byId: new Map(), byPage: new Map(), byPageRefs: new Map()};
+  for (const row of state.rows) {
+    const id = String(row.id);
+    indexes.byId.set(id, row);
+    const page = String(row.page ?? "");
+    const pageRows = indexes.byPage.get(page) || [];
+    pageRows.push(id);
+    indexes.byPage.set(page, pageRows);
+    const key = rowRefsIndexKey(row.page, physicalRefs(row));
+    const matchingRefs = indexes.byPageRefs.get(key) || [];
+    matchingRefs.push(id);
+    indexes.byPageRefs.set(key, matchingRefs);
+  }
+  state.rowIndexes = indexes;
+  state.renderedRowById = new Map();
+}
+
+function updateIndexBucket(index, key, id, add) {
+  const values = index.get(key) || [];
+  const filtered = values.filter((value) => value !== id);
+  if (add) filtered.push(id);
+  if (filtered.length) index.set(key, filtered);
+  else index.delete(key);
+}
+
+function replaceResultIndex(previous, next) {
+  const id = String(next.id);
+  const previousPage = String(previous.page ?? "");
+  const nextPage = String(next.page ?? "");
+  const previousRefs = rowRefsIndexKey(previous.page, physicalRefs(previous));
+  const nextRefs = rowRefsIndexKey(next.page, physicalRefs(next));
+  if (previousPage !== nextPage) {
+    updateIndexBucket(state.rowIndexes.byPage, previousPage, id, false);
+    updateIndexBucket(state.rowIndexes.byPage, nextPage, id, true);
+  }
+  if (previousRefs !== nextRefs) {
+    updateIndexBucket(state.rowIndexes.byPageRefs, previousRefs, id, false);
+    updateIndexBucket(state.rowIndexes.byPageRefs, nextRefs, id, true);
+  }
+  state.rowIndexes.byId.set(id, next);
+}
+
+function rowById(id) { return state.rowIndexes.byId.get(String(id)) || null; }
 
 async function selectRow(id) {
   const row = rowById(id); if (!row) return;
+  state.renderedRowById.get(String(state.activeRowId))?.classList.remove("active");
   state.activeRowId = id;
-  $("#result-body").querySelectorAll("tr").forEach((tr) => tr.classList.toggle("active", tr.dataset.id === id));
+  state.renderedRowById.get(String(id))?.classList.add("active");
   const pageChanged = state.previewPage !== row.page;
   if (pageChanged || !$("#pdf-preview").src) {
     if (pageChanged) setZoom(1);
@@ -3346,6 +3444,9 @@ function resetApp() {
   cancelDocumentNavigation();
   clearExportError();
   Object.assign(state,{document:null,selectedPages:new Set(),previewPage:null,crop:null,rows:[],result:null,activeRowId:null,zoom:1,dirty:false});
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
   localStorage.removeItem("averonCurrentDocument");
   $("#thumbnail-grid").innerHTML=""; $("#new-document-button").hidden=true; setView("upload");
 }
@@ -3410,7 +3511,15 @@ function setupEvents() {
   });
   $("#save-settings").addEventListener("click",saveSettings);
   $("#settings-sourcing-provider").addEventListener("change",updateSourcingProviderFields);
-  $("#table-search").addEventListener("input",renderRows); $("#type-filter").addEventListener("change",renderRows); $("#status-filter").addEventListener("change",renderRows);
+  $("#table-search").addEventListener("input", () => {
+    if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+    state.tableSearchTimer = setTimeout(() => {
+      state.tableSearchTimer = null;
+      renderRows();
+    }, 120);
+  });
+  $("#type-filter").addEventListener("change", renderRows);
+  $("#status-filter").addEventListener("change", renderRows);
   $("#review-filter").addEventListener("change",(event)=>{state.reviewFilter=event.target.value;renderRows();});
   $("#save-button").addEventListener("click",()=>saveRows().catch((e)=>toast(e.message,"error")));
   $("#copy-selected").addEventListener("click",()=>copyRows(state.rows,state.config.default_export_columns));
