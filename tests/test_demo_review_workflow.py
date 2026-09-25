@@ -299,6 +299,38 @@ def test_d3_field_decision_is_typed_and_raw_evidence_stays_immutable():
     assert row["ocr_metadata"] == before
 
 
+def test_hot_path_applies_one_decision_in_place_without_touching_other_page():
+    result = _result()
+    result["page_statuses"]["99"] = {
+        "page": 99,
+        "layout_status": "AMBIGUOUS",
+        "schema_status": "UNKNOWN",
+        "page_disposition": "POSSIBLE_SPEC_UNRESOLVED",
+        "output_status": "REVIEW_REQUIRED",
+        "blockers": ["sentinel-blocker"],
+        "diagnostics": {"sentinel": "keep-me"},
+    }
+    untouched_status = deepcopy(result["page_statuses"]["99"])
+    raw_before = deepcopy(result["rows"][0]["ocr_metadata"])
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(10),
+        decision=FIELD_DECISION,
+        field="quantity",
+        candidate_value="4",
+    )
+
+    updated = service.apply_decision_to_canonical(result, decision)
+
+    assert updated is result
+    assert updated["rows"][0]["quantity"] == "4"
+    assert updated["rows"][0]["ocr_metadata"] == raw_before
+    assert updated["page_statuses"]["99"] == untouched_status
+
+
 def test_d4_field_acceptance_recomputes_page_safety_and_strict_export(tmp_path):
     result = _result()
     service = HumanReviewService()
