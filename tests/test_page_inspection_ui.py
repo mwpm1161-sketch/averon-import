@@ -55,6 +55,19 @@ def test_logout_is_in_sidebar_utility_and_keeps_session_auth_semantics():
     assert 'api("/api/auth/logout", {method:"POST"})' in logout_flow
 
 
+def test_manual_mode_keeps_logout_utility_at_sidebar_bottom_when_status_card_is_hidden():
+    manual_visibility = re.search(
+        r"\.manual-mode\s+\.steps\s*,\s*\.manual-mode\s+\.sidebar-card\s*\{([^}]+)\}",
+        CSS,
+    )
+    manual_utility = re.search(r"\.manual-mode\s+\.sidebar-utility\s*\{([^}]+)\}", CSS)
+    base_utility = re.search(r"(?m)^\.sidebar-utility\s*\{([^}]+)\}", CSS)
+
+    assert manual_visibility and "display:none" in manual_visibility.group(1).replace(" ", "")
+    assert manual_utility and "margin-top:auto" in manual_utility.group(1).replace(" ", "")
+    assert base_utility and "margin-top:auto" not in base_utility.group(1).replace(" ", "")
+
+
 def test_support_actions_are_distinct_from_admin_reports_and_keep_event_modes():
     contextual = re.search(
         r'<button[^>]+id="contextual-support-report-button"[^>]*>(.*?)</button>', HTML, re.S

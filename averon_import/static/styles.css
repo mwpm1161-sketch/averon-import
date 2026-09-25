@@ -39,6 +39,7 @@ button { cursor: pointer; }
 .step.active > span { background:#fff; color:#111318; border-color:#fff; font-weight:700; }
 .step.active b { color:#fff; }
 .manual-mode .steps, .manual-mode .sidebar-card { display:none; }
+.manual-mode .sidebar-utility { margin-top:auto; }
 .sidebar-card { margin-top:auto; display:flex; gap:10px; align-items:center; padding:13px; border:1px solid #30343b; background:#1b1e23; border-radius:13px; }
 .sidebar-card b,.sidebar-card small { display:block; font-size:11px; }
 .sidebar-card small { color:#979da8; margin-top:3px; }
