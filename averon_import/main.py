@@ -1760,7 +1760,7 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             # Apply only the new immutable decision. If the process crashes
             # between ledger and result writes, GET /results detects the
             # revision mismatch and performs a one-time full reconciliation.
-            updated = human_review_service.apply_decision(result, decision)
+            updated = human_review_service.apply_decision_to_canonical(result, decision)
             updated["review_decisions_revision"] = store.revision(decisions)
             workspace_service.write_json(workspace.result_path, updated)
         return {
