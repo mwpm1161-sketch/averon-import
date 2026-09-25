@@ -374,6 +374,49 @@ def test_recent_document_ui_has_explicit_open_flow_without_recognition_call():
     assert re.search(r"api\(`/api/documents/\$\{encodedId\}/results`\)", open_flow)
 
 
+
+def test_previous_document_restore_is_nonblocking_cancellable_and_stale_safe():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1]
+    html = (root / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    app_js = (root / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    boot_flow = app_js[app_js.index("async function boot()"):app_js.index("function updateCloudStatus")]
+    open_flow = app_js[app_js.index("async function openExistingDocument"):app_js.index("async function uploadFile")]
+
+    assert 'id="resume-status"' in html
+    assert 'id="cancel-resume"' in html
+    assert "await resumeLastDocument()" not in boot_flow
+    assert "resumeLastDocument().catch" in boot_flow
+    assert "new AbortController()" in app_js
+    assert "{signal: request.signal}" in open_flow
+    assert "isCurrentDocumentLoad(request)" in open_flow
+    assert "cancelDocumentLoad({forgetResume: true})" in app_js
+
+
+def test_save_rows_uses_single_round_trip_and_clean_export_skips_resave():
+    from pathlib import Path
+
+    app_js = (Path(__file__).parents[1] / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    save_flow = app_js[app_js.index("async function saveRows"):app_js.index("function copyRows")]
+
+    assert "if (!state.dirty && state.result) return state.result;" in save_flow
+    assert save_flow.count("/results") == 1
+    assert "saved?.result" in save_flow
+
+
+def test_review_ui_fences_stale_parallel_decision_responses():
+    from pathlib import Path
+
+    app_js = (Path(__file__).parents[1] / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    decision_flow = app_js[app_js.index("async function submitHumanDecision"):app_js.index("function rowHtml")]
+
+    assert "const documentId = state.document?.document_id" in decision_flow
+    assert "const requestId = ++state.reviewDecisionGeneration" in decision_flow
+    assert "requestId !== state.reviewDecisionGeneration" in decision_flow
+    assert "state.document?.document_id !== documentId" in decision_flow
+
+
 def _telemetry_understanding() -> ProductUnderstandingResult:
     intent = ProductIntent(
         source_row_id="row-1",
