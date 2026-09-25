@@ -37,7 +37,7 @@ const state = {
     rowPatches: 0,
   },
   tableSearchTimer: null,
-  reviewMutationQueue: Promise.resolve(),
+  reviewMutationQueues: new Map(),
   loginSubmitting: false,
   users: {
     items: [],
@@ -1527,15 +1527,17 @@ function numericShapeAgreed(row) {
 }
 
 function criticalBlockers(row) {
-  if (!row?.edited && Array.isArray(row?.critical_blockers)) {
-    return [...new Set(row.critical_blockers.map((item) => String(item)).filter(Boolean))];
-  }
+  const canonical = row?.canonical_critical_blockers ?? row?.critical_blockers ?? [];
+  const canonicalBlockers = Array.isArray(canonical)
+    ? canonical.map((item) => String(item)).filter(Boolean)
+    : [];
+  if (!row?.edited) return [...new Set(canonicalBlockers)];
   const missing = missingCriticalFields(row);
   const suspect = numericSuspectFields(row);
   const explicitlyVerified = row.status === "verified" && !missing.length;
   const reasons = new Set([
-    ...(row?.review_reasons || []),
-    ...(row?.critical_blockers || []),
+    ...(row?.provisional_review_reasons || row?.review_reasons || []),
+    ...(row?.provisional_critical_blockers || []),
   ]);
   const conflictFields = new Set(row?.ocr_metadata?.secondary_conflict_fields || []);
   const edited = new Set(row?.edited_fields || []);
@@ -1546,7 +1548,7 @@ function criticalBlockers(row) {
   if (suspect.length && !explicitlyVerified) blockers.push("numeric_suspect");
   if (reasons.has("ambiguous_columns") && !explicitlyVerified) blockers.push("ambiguous_columns");
   if (conflictActive && !explicitlyVerified) blockers.push("secondary_conflict");
-  return [...new Set(blockers)];
+  return [...new Set([...canonicalBlockers, ...blockers])];
 }
 
 function criticalFieldCount(row) {
@@ -1563,8 +1565,9 @@ function criticalFieldCount(row) {
 function refreshClientReview(row) {
   const missing = missingCriticalFields(row);
   const suspect = numericSuspectFields(row);
-  const reasons = new Set(row.review_reasons || []);
-  const previousBlockers = new Set(row.critical_blockers || []);
+  const canonicalBlockers = row.canonical_critical_blockers ?? row.critical_blockers ?? [];
+  const reasons = new Set(row.provisional_review_reasons || row.review_reasons || []);
+  const previousBlockers = new Set(canonicalBlockers || []);
   const edited = new Set(row.edited_fields || []);
   const conflicts = new Set(row.ocr_metadata?.secondary_conflict_fields || []);
   reasons.delete("critical_value_missing");
@@ -1584,11 +1587,29 @@ function refreshClientReview(row) {
     reasons.delete("ambiguous_columns");
     reasons.delete("secondary_conflict");
   }
-  row.critical_fields = missing;
-  row.review_reasons = [...reasons];
-  row.critical_blockers = criticalBlockers(row);
-  if (row.critical_blockers.length && ["recognized", "verified"].includes(row.status)) row.status = "review";
+  row.provisional_critical_fields = missing;
+  row.provisional_review_reasons = [...reasons];
+  const preview = {
+    ...row,
+    canonical_critical_blockers: [],
+    critical_blockers: [],
+    provisional_critical_blockers: [],
+    provisional_review_reasons: [...reasons],
+  };
+  row.provisional_critical_blockers = criticalBlockers(preview);
+  if (criticalBlockers(row).length && ["recognized", "verified"].includes(row.status)) row.status = "review";
   return row;
+}
+
+function resultTableScrollPosition() {
+  const scroller = $("#result-table-scroll");
+  return {top: scroller.scrollTop, left: scroller.scrollLeft};
+}
+
+function restoreResultTableScroll(position) {
+  const scroller = $("#result-table-scroll");
+  scroller.scrollTop = position.top;
+  scroller.scrollLeft = position.left;
 }
 
 function loadResult(result, options = {}) {
@@ -1596,7 +1617,7 @@ function loadResult(result, options = {}) {
     previewPage: state.previewPage,
     activeRowId: state.activeRowId,
     zoom: state.zoom,
-    scrollTop: $("#result-body").scrollTop,
+    tableScroll: resultTableScrollPosition(),
   } : null;
   if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
   state.tableSearchTimer = null;
@@ -1607,6 +1628,8 @@ function loadResult(result, options = {}) {
   }
   state.rows = result.rows.map((row) => ({
     ...row,
+    canonical_critical_blockers: Array.isArray(row.critical_blockers) ? [...row.critical_blockers] : [],
+    provisional_critical_blockers: [],
     edited: false,
     selected: row.selected ?? (
       ["item", "component"].includes(row.row_type)
@@ -1627,11 +1650,11 @@ function loadResult(result, options = {}) {
     state.activeRowId = preservedActiveRow.id;
     state.previewPage = preservedView.previewPage;
     state.zoom = preservedView.zoom;
-    $("#result-body").scrollTop = preservedView.scrollTop;
   } else {
     const first = state.rows.find((row) => row.selected) || state.rows[0];
     if (first) selectRow(first.id);
   }
+  if (preservedView) restoreResultTableScroll(preservedView.tableScroll);
   if (options.announce === false) return;
   if (result.errors?.length) {
     const pages = result.errors.map((error) => error.page).join(", ");
@@ -1809,7 +1832,7 @@ function ensureResultTableEvents() {
 
 function renderPatchedReviewRows(changedRows) {
   const body = $("#result-body");
-  const scrollTop = body.scrollTop;
+  const tableScroll = resultTableScrollPosition();
   for (const row of changedRows) {
     state.renderedRowById.get(String(row.id))?.remove();
     state.renderedRowById.delete(String(row.id));
@@ -1832,7 +1855,7 @@ function renderPatchedReviewRows(changedRows) {
     state.performanceCounters.rowPatches = Math.min(2147483647, state.performanceCounters.rowPatches + 1);
   }
   $("#empty-table").hidden = body.children.length > 0;
-  body.scrollTop = scrollTop;
+  restoreResultTableScroll(tableScroll);
 }
 
 function mergeHumanReviewPatch(patch) {
@@ -1847,7 +1870,14 @@ function mergeHumanReviewPatch(patch) {
     const localEdits = state.dirty && localRow.edited
       ? [...new Set(localRow.edited_fields || [])]
       : [];
-    const merged = {...serverRow, selected: localRow.selected};
+    const merged = {
+      ...serverRow,
+      canonical_critical_blockers: Array.isArray(serverRow.critical_blockers)
+        ? [...serverRow.critical_blockers]
+        : [],
+      provisional_critical_blockers: [],
+      selected: localRow.selected,
+    };
     for (const field of localEdits) {
       if (Object.prototype.hasOwnProperty.call(localRow, field)) merged[field] = localRow[field];
     }
@@ -1900,12 +1930,27 @@ function submitHumanDecision(row, payload, successMessage) {
       }
       toast(`${successMessage} · Проверено пользователем ✓`, "success");
     } catch (error) {
-      toast(error.message, "error");
+      if (state.document?.document_id === documentId
+        && isCurrentDocumentNavigation(navigationGeneration)) {
+        toast(error.message, "error");
+      }
     }
   };
-  const queued = state.reviewMutationQueue.then(send, send);
-  state.reviewMutationQueue = queued.catch(() => {});
+  const previous = state.reviewMutationQueues.get(documentId) || Promise.resolve();
+  const queued = previous.then(send, send);
+  const settled = queued.catch(() => {});
+  state.reviewMutationQueues.set(documentId, settled);
+  settled.then(() => {
+    if (state.reviewMutationQueues.get(documentId) === settled) {
+      state.reviewMutationQueues.delete(documentId);
+    }
+  });
   return queued;
+}
+
+async function waitForReviewMutations(documentId) {
+  const pending = state.reviewMutationQueues.get(documentId);
+  if (pending) await pending;
 }
 
 function physicalRefs(row) {
@@ -2709,10 +2754,17 @@ function markDirty() {
 }
 
 async function saveRows(showToast = true) {
+  const documentId = state.document?.document_id;
+  if (!documentId) return null;
+  await waitForReviewMutations(documentId);
+  if (state.document?.document_id !== documentId) return null;
   if (!state.document || !state.rows.length) return null;
   if (!state.dirty) return state.result;
   const response = await api(`/api/documents/${state.document.document_id}/results`, {
-    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows, expected_revision:Number(state.result?.revision || 0)}),
+    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+      rows:state.rows.map(({canonical_critical_blockers, provisional_critical_blockers, provisional_critical_fields, provisional_review_reasons, ...row}) => row),
+      expected_revision:Number(state.result?.revision || 0),
+    }),
   });
   const authoritative = response?.result;
   if (!authoritative || !Array.isArray(authoritative.rows)) {
@@ -3396,6 +3448,7 @@ async function downloadExcel() {
     }
     const payload = {
       columns, rows:state.rows,
+      expected_revision:Number(authoritative.revision || 0),
       include_headers:$("#export-headers").checked,
       only_exportable:$("#export-items-only").checked,
       review_export:false,
@@ -3420,11 +3473,15 @@ async function downloadReviewExcel() {
   button.textContent = "Формируем Excel…";
   try {
     if (!state.document) { toast("Сначала откройте документ", "error"); return; }
+    const documentId = state.document.document_id;
+    await waitForReviewMutations(documentId);
+    if (state.document?.document_id !== documentId) return;
     if (!state.rows.length) { toast("Нет строк для экспорта", "error"); return; }
     const columns = selectedExportColumns();
     if (!columns.length) { toast("Выберите хотя бы один столбец", "error"); return; }
     const payload = {
       columns, rows:state.rows,
+      expected_revision:Number(state.result?.revision || 0),
       include_headers:$("#export-headers").checked,
       only_exportable:false,
       review_export:true,

@@ -270,7 +270,8 @@ def test_review_client_ignores_out_of_order_or_cross_document_response():
     assert "state.document?.document_id !== documentId" in handler
     assert "isCurrentDocumentNavigation(navigationGeneration)" in handler
     assert "Number(patch?.revision || 0) < Number(state.result?.revision || 0)" in handler
-    assert "state.reviewMutationQueue.then(send, send)" in handler
+    assert "state.reviewMutationQueues.get(documentId)" in handler
+    assert "previous.then(send, send)" in handler
     assert "mergeHumanReviewPatch(patch)" in handler
     assert "loadResult(response.result" not in handler
 
@@ -360,9 +361,13 @@ def test_review_patch_frontend_updates_only_changed_rows_and_keeps_view_state():
     assert "for (const row of changedRows)" in patch_renderer
     assert "body.innerHTML" not in patch_renderer
     assert "renderRows()" not in patch_renderer
-    assert "const scrollTop = body.scrollTop" in patch_renderer
-    assert "body.scrollTop = scrollTop" in patch_renderer
+    assert "const tableScroll = resultTableScrollPosition()" in patch_renderer
+    assert "restoreResultTableScroll(tableScroll)" in patch_renderer
     assert "updateSummary()" in patch_renderer
+    assert 'id="result-table-scroll"' in Path("averon_import/templates/index.html").read_text(encoding="utf-8")
+    assert '$("#result-table-scroll")' in source
+    assert "scroller.scrollTop" in source
+    assert "scroller.scrollLeft" in source
 
     start = source.index("function mergeHumanReviewPatch(")
     end = source.index("\nfunction submitHumanDecision(", start)
@@ -371,6 +376,19 @@ def test_review_patch_frontend_updates_only_changed_rows_and_keeps_view_state():
     assert "state.result.revision" in merge
     assert "state.result.review_ledger_revision" in merge
     assert "refreshClientReview(merged)" in merge
+
+
+def test_review_mutation_toasts_are_fenced_by_document_navigation():
+    source = Path("averon_import/static/app.js").read_text(encoding="utf-8")
+    start = source.index("function submitHumanDecision(")
+    end = source.index("\nfunction physicalRefs", start)
+    handler = source[start:end]
+    api = source.split("async function api(", 1)[1].split("function readCsrfCookie", 1)[0]
+
+    assert "state.document?.document_id === documentId" in handler
+    assert "isCurrentDocumentNavigation(navigationGeneration)" in handler
+    assert "toast(error.message, \"error\")" in handler
+    assert "if (response.status === 401 && url !== \"/api/auth/login\") handleSessionExpired();" in api
 
 
 def test_automatic_restore_does_not_gate_boot_and_is_cancelable():

@@ -29,6 +29,7 @@ class SaveRowsRequest(BaseModel):
 class ExportRequest(BaseModel):
     columns: list[str]
     rows: list[dict[str, Any]]
+    expected_revision: int = Field(ge=0)
     include_headers: bool = True
     only_exportable: bool = True
     filename: str = "averon_import.xlsx"

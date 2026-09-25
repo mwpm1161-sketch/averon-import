@@ -130,6 +130,19 @@ def _make_workspace(workspace_service, document_id="d" * 32):
     workspace_service.write_json(
         root / "result.json",
         {
+            "revision": 0,
+            "review_ledger_revision": 0,
+            "rows": [{
+                "id": "canonical-row",
+                "page": 1,
+                "row_type": "item",
+                "status": "recognized",
+                "selected": True,
+                "name": "Каноническая строка",
+                "position": "1",
+                "unit": "шт.",
+                "quantity": "1",
+            }],
             "summary": {"total_rows": 1},
             "page_statuses": {
                 "1": {
@@ -144,15 +157,16 @@ def _make_workspace(workspace_service, document_id="d" * 32):
     return workspace_service.get(document_id)
 
 
-def _export_payload(filename="failed.xlsx"):
+def _export_payload(filename="failed.xlsx", *, expected_revision=0, review_export=False):
     return {
         "columns": ["name"],
         "rows": [{"page": 1, "name": "Насос", "row_type": "item"}],
+        "expected_revision": expected_revision,
         "include_headers": True,
         "only_exportable": True,
         "filename": filename,
         "sheet_name": "Спецификация",
-        "review_export": False,
+        "review_export": review_export,
     }
 
 
@@ -310,6 +324,174 @@ def test_success_export_keeps_file_behavior_and_creates_no_incident(support_cont
     assert report_count == 0
     assert repository.list_reports(limit=100, offset=0) == []
     assert (workspace.exports_dir / "success.xlsx").is_file()
+
+
+@pytest.mark.parametrize("review_export", [False, True])
+def test_export_rejects_stale_revision_without_creating_workbook(
+    support_context, monkeypatch, review_export
+):
+    client, main, repository, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+    stored = workspace_service.read_json(workspace.result_path)
+    stored["revision"] = 11
+    workspace_service.write_json(workspace.result_path, stored)
+    export_calls = []
+    monkeypatch.setattr(main.export_service, "export", lambda **kwargs: export_calls.append(kwargs))
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("colleague"),
+        json=_export_payload("stale.xlsx", expected_revision=10, review_export=review_export),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Документ изменён. Обновите данные перед экспортом."
+    assert export_calls == []
+    assert not list(workspace.exports_dir.glob("*.xlsx"))
+    with repository._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM support_incidents").fetchone()[0] == 0
+
+
+def test_matching_revision_export_uses_canonical_saved_rows_outside_document_lock(
+    support_context, monkeypatch
+):
+    client, main, _, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+    stored = workspace_service.read_json(workspace.result_path)
+    stored["revision"] = 10
+    workspace_service.write_json(workspace.result_path, stored)
+    captured = {}
+
+    def write_export(**kwargs):
+        acquired = []
+
+        def acquire_document_lock():
+            with main.document_mutation_locks.for_document(workspace.document_id):
+                acquired.append(True)
+
+        import threading
+        worker = threading.Thread(target=acquire_document_lock)
+        worker.start()
+        worker.join(timeout=2)
+        captured.update(kwargs)
+        kwargs["output_path"].write_bytes(b"PK-test-workbook")
+        assert acquired == [True]
+
+    monkeypatch.setattr(main.export_service, "export", write_export)
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("colleague"),
+        json=_export_payload("canonical.xlsx", expected_revision=10),
+    )
+
+    assert response.status_code == 200
+    assert captured["rows"] == stored["rows"]
+    assert captured["rows"][0]["name"] == "Каноническая строка"
+    assert captured["page_statuses"] == stored["page_statuses"]
+
+
+def test_dirty_save_revision_is_used_for_the_following_export(support_context, monkeypatch):
+    client, main, _, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+    monkeypatch.setattr(main, "_source_fingerprint", lambda _workspace: "f" * 64)
+    rows = workspace_service.read_json(workspace.result_path)["rows"]
+    rows[0]["name"] = "Сохранённая правка"
+    saved = client.request(
+        "PUT",
+        f"/api/documents/{workspace.document_id}/results",
+        headers=_headers("colleague"),
+        json={"rows": rows, "expected_revision": 0},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["revision"] == 1
+    captured = {}
+
+    def write_export(**kwargs):
+        captured.update(kwargs)
+        kwargs["output_path"].write_bytes(b"PK-test-workbook")
+
+    monkeypatch.setattr(main.export_service, "export", write_export)
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("colleague"),
+        json=_export_payload("saved.xlsx", expected_revision=saved.json()["revision"]),
+    )
+
+    assert response.status_code == 200
+    assert captured["rows"][0]["name"] == "Сохранённая правка"
+
+
+def test_second_client_mutation_blocks_first_clients_clean_export(support_context, monkeypatch):
+    client, main, _, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+    monkeypatch.setattr(main, "_source_fingerprint", lambda _workspace: "f" * 64)
+    rows = workspace_service.read_json(workspace.result_path)["rows"]
+    rows[0]["name"] = "Правка второго клиента"
+    updated = client.request(
+        "PUT",
+        f"/api/documents/{workspace.document_id}/results",
+        headers=_headers("second-client"),
+        json={"rows": rows, "expected_revision": 0},
+    )
+    assert updated.status_code == 200
+    export_calls = []
+    monkeypatch.setattr(main.export_service, "export", lambda **kwargs: export_calls.append(kwargs))
+
+    stale = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("first-client"),
+        json=_export_payload("first-client.xlsx", expected_revision=0),
+    )
+
+    assert stale.status_code == 409
+    assert export_calls == []
+    assert not (workspace.exports_dir / "first-client.xlsx").exists()
+
+
+def test_export_reports_corrupt_review_ledger_safely_without_repairing_it(support_context, monkeypatch):
+    client, main, _, workspace_service, _ = support_context
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    workspace = _make_workspace(workspace_service)
+    store = ReviewDecisionStore(workspace.review_decisions_path)
+    store.path.write_bytes(b"{broken ledger")
+    store.revision_path.write_text("3", encoding="ascii")
+    result_before = workspace.result_path.read_bytes()
+    ledger_before = store.path.read_bytes()
+    marker_before = store.revision_path.read_bytes()
+    export_calls = []
+    monkeypatch.setattr(main.export_service, "export", lambda **kwargs: export_calls.append(kwargs))
+
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("colleague"),
+        json=_export_payload("corrupt-ledger.xlsx"),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "История ручной проверки повреждена. Требуется восстановление."
+    assert str(store.path) not in response.text
+    assert export_calls == []
+    assert workspace.result_path.read_bytes() == result_before
+    assert store.path.read_bytes() == ledger_before
+    assert store.revision_path.read_bytes() == marker_before
+    assert not (workspace.exports_dir / "corrupt-ledger.xlsx").exists()
+
+
+def test_production_export_remains_blocked_by_canonical_structural_blocker(support_context):
+    client, _, _, workspace_service, _ = support_context
+    workspace = _make_workspace(workspace_service)
+    stored = workspace_service.read_json(workspace.result_path)
+    stored["rows"][0]["critical_blockers"] = ["structural_layout_ambiguous"]
+    workspace_service.write_json(workspace.result_path, stored)
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/export",
+        headers=_headers("colleague"),
+        json=_export_payload("blocked.xlsx"),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "EXPORT_VALIDATION_FAILED"
+    assert not (workspace.exports_dir / "blocked.xlsx").exists()
 
 
 def test_value_error_creates_reportable_incident_with_safe_contract(support_context, monkeypatch):

@@ -32,6 +32,16 @@ FIELD_DECISION = "ACCEPT_FIELD_CANDIDATE"
 RELATION_DECISION = "ACCEPT_CONTINUATION_RELATION"
 REJECT_DECISION = "REJECT_CANDIDATE"
 DECISIONS = (FIELD_DECISION, RELATION_DECISION, REJECT_DECISION)
+REVIEW_LEDGER_CORRUPT_MESSAGE = (
+    "История ручной проверки повреждена. Требуется восстановление."
+)
+
+
+class ReviewDecisionLedgerCorrupt(ValueError):
+    """The persisted decision ledger is present but cannot be trusted."""
+
+    def __init__(self) -> None:
+        super().__init__(REVIEW_LEDGER_CORRUPT_MESSAGE)
 
 
 def _stable(value: Any) -> str:
@@ -264,32 +274,38 @@ class ReviewDecisionStore:
         Legacy list payloads and dictionaries without a revision are read as
         revision zero. The next write upgrades them to the versioned shape.
         """
-        if not self.path.exists():
+        try:
+            self.path.stat()
+        except FileNotFoundError:
             if self.revision_path.is_file():
                 self._sync_revision(0)
             return [], 0
+        except OSError as exc:
+            raise ReviewDecisionLedgerCorrupt() from exc
         self.metrics["ledger_reads"] += 1
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return [], 0
+        except (OSError, ValueError) as exc:
+            raise ReviewDecisionLedgerCorrupt() from exc
         if isinstance(payload, dict):
-            raw = payload.get("decisions", [])
-            try:
-                revision = max(0, int(payload.get("revision", 0)))
-            except (TypeError, ValueError):
-                revision = 0
+            if "decisions" not in payload or not isinstance(payload["decisions"], list):
+                raise ReviewDecisionLedgerCorrupt()
+            raw = payload["decisions"]
+            revision_value = payload.get("revision", 0)
+            if type(revision_value) is not int or revision_value < 0:
+                raise ReviewDecisionLedgerCorrupt()
+            revision = revision_value
         else:
+            if not isinstance(payload, list):
+                raise ReviewDecisionLedgerCorrupt()
             raw = payload
             revision = 0
-        if not isinstance(raw, list):
-            return [], revision
         decisions: list[ReviewDecision] = []
         for item in raw:
             try:
                 decisions.append(ReviewDecision.model_validate(item))
-            except Exception:
-                continue
+            except Exception as exc:
+                raise ReviewDecisionLedgerCorrupt() from exc
         self._sync_revision(revision)
         return decisions, revision
 

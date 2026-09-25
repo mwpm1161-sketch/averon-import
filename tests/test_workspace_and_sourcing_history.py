@@ -227,6 +227,65 @@ def test_get_results_repairs_ahead_ledger_revision_marker_without_false_replay(t
     assert store.revision_path.read_text(encoding="ascii") == "1"
 
 
+@pytest.mark.parametrize(
+    "corrupt_bytes",
+    [
+        b"{malformed json",
+        b'{"revision": 3, "decisions": [{"invalid": "decision"}]}',
+        b'{"revision": 3, "decisions": {"invalid": "shape"}}',
+    ],
+)
+def test_corrupt_ledger_fails_closed_without_reconciling_or_repairing_any_file(
+    tmp_path, monkeypatch, corrupt_bytes
+):
+    from fastapi import HTTPException
+
+    from averon_import import main
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    service = WorkspaceService(tmp_path)
+    document_id = "c" * 32
+    root = service.documents_dir / document_id
+    root.mkdir()
+    workspace = service.get(document_id)
+    service.write_json(workspace.metadata_path, {"document_id": document_id})
+    service.write_json(workspace.result_path, {
+        "revision": 8,
+        "review_ledger_revision": 0,
+        "rows": [],
+        "page_statuses": {},
+        "errors": [],
+    })
+    store = ReviewDecisionStore(workspace.review_decisions_path)
+    store.path.write_bytes(corrupt_bytes)
+    store.revision_path.write_text("3", encoding="ascii")
+    result_before = workspace.result_path.read_bytes()
+    ledger_before = store.path.read_bytes()
+    marker_before = store.revision_path.read_bytes()
+    monkeypatch.setattr(main, "workspace_service", service)
+
+    with pytest.raises(HTTPException) as error:
+        main.get_results(document_id)
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "История ручной проверки повреждена. Требуется восстановление."
+    assert str(store.path) not in error.value.detail
+    assert workspace.result_path.read_bytes() == result_before
+    assert store.path.read_bytes() == ledger_before
+    assert store.revision_path.read_bytes() == marker_before
+
+
+def test_missing_decision_ledger_is_an_empty_snapshot(tmp_path):
+    from averon_import.services.review_decisions import ReviewDecisionStore
+
+    ledger_path = tmp_path / "review_decisions.json"
+    store = ReviewDecisionStore(ledger_path)
+
+    assert store.load_snapshot() == ([], 0)
+    assert not ledger_path.exists()
+    assert not store.revision_path.exists()
+
+
 def test_get_results_recovers_ledger_mismatch_once_then_stays_read_only(tmp_path, monkeypatch):
     from averon_import import main
     from averon_import.services.review_decisions import HumanReviewService, ReviewDecisionStore

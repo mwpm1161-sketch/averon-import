@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import logging
@@ -78,6 +79,7 @@ from averon_import.services.review_decisions import (
     HumanReviewService,
     RELATION_DECISION,
     REJECT_DECISION,
+    ReviewDecisionLedgerCorrupt,
     ReviewDecisionStore,
 )
 from averon_import.services.review_policy import refresh_rows
@@ -974,6 +976,8 @@ def get_results(document_id: str):
             return result
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except ReviewDecisionLedgerCorrupt as exc:
+        raise HTTPException(409, str(exc)) from exc
     except (OSError, ValueError, TypeError) as exc:
         raise HTTPException(
             409,
@@ -1015,6 +1019,8 @@ def save_results(document_id: str, request: SaveRowsRequest):
             }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except ReviewDecisionLedgerCorrupt as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def safe_filename(value: str) -> str:
@@ -1139,6 +1145,40 @@ def export(
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
+    try:
+        with document_mutation_locks.for_document(document_id):
+            stored_result = workspace_service.read_json(workspace.result_path, default={})
+            if not isinstance(stored_result, dict) or not stored_result:
+                raise HTTPException(404, "Результат распознавания отсутствует")
+            stored_result, _recovered = _reconcile_review_projection_locked(
+                workspace, stored_result
+            )
+            current_revision = _result_revision(stored_result)
+            if request.expected_revision != current_revision:
+                raise HTTPException(
+                    409,
+                    "Документ изменён. Обновите данные перед экспортом.",
+                )
+            stored_result = deepcopy(stored_result)
+            page_statuses = deepcopy(stored_result.get("page_statuses") or {})
+            # Production exports always use canonical saved rows. Review exports
+            # intentionally preserve the browser's inspection snapshot, including
+            # unsaved edits, while fencing it to the current document revision.
+            export_rows = deepcopy(
+                request.rows if request.review_export else stored_result.get("rows") or []
+            )
+    except HTTPException:
+        raise
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    except ReviewDecisionLedgerCorrupt as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(
+            409,
+            "Не удалось проверить сохранённое состояние документа перед экспортом.",
+        ) from exc
+
     filename = (
         review_export_filename(request.filename)
         if request.review_export
@@ -1146,13 +1186,7 @@ def export(
     )
     output: Path | None = None
     temporary_output: Path | None = None
-    stored_result: dict[str, Any] = {}
     try:
-        try:
-            stored_result = workspace_service.read_json(workspace.result_path, default={})
-        except Exception as exc:
-            raise RuntimeError("Не удалось прочитать состояние экспорта") from exc
-        stored_result = stored_result if isinstance(stored_result, dict) else {}
         output = workspace.exports_dir / filename
         file_descriptor, temporary_name = tempfile.mkstemp(
             prefix=".averon-export-",
@@ -1162,18 +1196,20 @@ def export(
         os.close(file_descriptor)
         temporary_output = Path(temporary_name)
         export_service.export(
-            rows=request.rows,
+            rows=export_rows,
             columns=request.columns,
             output_path=temporary_output,
             sheet_name=request.sheet_name,
             include_headers=request.include_headers,
             only_exportable=request.only_exportable,
-            page_statuses=stored_result.get("page_statuses") or {},
+            page_statuses=page_statuses,
             review_export=request.review_export,
             enforce_safety=not request.review_export,
         )
         os.replace(temporary_output, output)
         temporary_output = None
+    except HTTPException:
+        raise
     except ValueError as exc:
         public_message = _safe_export_validation_message(exc)
         incident_id = _record_export_incident(
@@ -1780,6 +1816,8 @@ def get_review_decisions(document_id: str):
         }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except ReviewDecisionLedgerCorrupt as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/documents/{document_id}/review/decision", dependencies=[Depends(require_authenticated)])
@@ -1837,6 +1875,8 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
+    except ReviewDecisionLedgerCorrupt as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

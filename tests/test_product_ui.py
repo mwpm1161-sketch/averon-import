@@ -121,6 +121,27 @@ def test_clean_export_skips_save_round_trip_and_dirty_save_uses_authoritative_re
     assert "await api(`/api/documents/${state.document.document_id}/results`)" not in save
     assert "response?.result" in save
     assert "preserveView:true" in save
+    assert "await waitForReviewMutations(documentId)" in save
+    assert "state.reviewMutationQueues.get(documentId)" in app_js
+    assert "expected_revision:Number(authoritative.revision || 0)" in app_js
+
+
+def test_local_review_keeps_canonical_structural_blockers_and_serializes_no_preview_state():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    load_result = app_js.split("function loadResult(", 1)[1].split("const displayColumns", 1)[0]
+    critical = app_js.split("function criticalBlockers(", 1)[1].split("function criticalFieldCount(", 1)[0]
+    refresh = app_js.split("function refreshClientReview(", 1)[1].split("function resultTableScrollPosition", 1)[0]
+    save = app_js.split("async function saveRows(", 1)[1].split("function copyRows(", 1)[0]
+
+    assert "canonical_critical_blockers: Array.isArray(row.critical_blockers)" in load_result
+    assert "canonicalBlockers" in critical
+    assert "canonicalBlockers, ...blockers" in critical
+    assert "row.provisional_critical_blockers = criticalBlockers(preview)" in refresh
+    assert "row.critical_blockers =" not in refresh
+    assert "row.review_reasons =" not in refresh
+    assert "provisional_critical_blockers" in save
+    assert "provisional_review_reasons" in save
+    assert "expected_revision:Number(state.result?.revision || 0)" in save
 
 
 def test_result_table_uses_delegated_events_row_indexes_and_debounced_search():
