@@ -1733,6 +1733,17 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
             if not result:
                 raise HTTPException(404, "Результат распознавания отсутствует")
             fingerprint = workspace_service.source_fingerprint(workspace)
+            store = ReviewDecisionStore(workspace.review_decisions_path)
+            decisions = store.load()
+            ledger_revision = store.revision(decisions)
+            if str(result.get("review_decisions_revision") or "") != ledger_revision:
+                # Repair a legacy/crash-interrupted canonical result before
+                # validating a new decision against it. Without this guard a
+                # new decision could stamp a ledger revision that includes an
+                # older decision which was never applied to result.json.
+                result = human_review_service.apply_saved_decisions(
+                    result, decisions, fingerprint
+                )
             decision = human_review_service.create_decision(
                 result,
                 document_fingerprint=fingerprint,
@@ -1744,7 +1755,6 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
                 candidate_value=request.candidate_value,
                 target=request.target,
             )
-            store = ReviewDecisionStore(workspace.review_decisions_path)
             decisions = store.upsert(decision)
             # The canonical result already contains every prior decision.
             # Apply only the new immutable decision. If the process crashes
