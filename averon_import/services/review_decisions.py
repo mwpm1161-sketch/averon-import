@@ -240,6 +240,15 @@ class ReviewDecisionStore:
                 continue
         return decisions
 
+    @staticmethod
+    def revision(decisions: list[ReviewDecision]) -> str:
+        """Stable revision of the complete persisted human-review ledger."""
+
+        return _sha256([
+            item.model_dump(mode="json")
+            for item in sorted(decisions, key=lambda value: value.created_at)
+        ])
+
     def save(self, decisions: list[ReviewDecision]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"decisions": [item.model_dump(mode="json") for item in decisions]}
@@ -536,7 +545,9 @@ class HumanReviewService:
             if decision.document_fingerprint != document_fingerprint:
                 continue
             self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        updated = recalculate_page_safety(updated)
+        updated["review_decisions_revision"] = ReviewDecisionStore.revision(decisions)
+        return updated
 
 
 def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
