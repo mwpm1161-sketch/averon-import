@@ -23,6 +23,7 @@ class RecognitionRequest(BaseModel):
 
 class SaveRowsRequest(BaseModel):
     rows: list[dict[str, Any]]
+    expected_revision: int = Field(ge=0)
 
 
 class ExportRequest(BaseModel):

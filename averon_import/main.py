@@ -64,6 +64,7 @@ from averon_import.services.auth import (
 )
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
+from averon_import.services.document_mutation import DocumentMutationLocks
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.pdf_service import PdfService
 from averon_import.services.processing_coordinator import (
@@ -169,6 +170,22 @@ sourcing_provider = sourcing_runtime.providers["local_catalog"]
 demo_store_provider = sourcing_runtime.providers["demo_store_http"]
 sourcing_service = sourcing_runtime.service
 human_review_service = HumanReviewService()
+document_mutation_locks = DocumentMutationLocks()
+
+
+def _result_revision(result: dict[str, Any] | None) -> int:
+    try:
+        return max(0, int((result or {}).get("revision", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _review_projection_current(result: dict[str, Any], ledger_revision: int) -> bool:
+    try:
+        current = int(result.get("review_ledger_revision", -1))
+    except (TypeError, ValueError):
+        return False
+    return current == ledger_revision
 
 
 def _rebuild_sourcing_runtime() -> None:
@@ -868,17 +885,29 @@ def recognize(document_id: str, request: RecognitionRequest):
         ai_provider=request.ai_provider,
     )
 
+    with document_mutation_locks.for_document(document_id):
+        before_recognition = workspace_service.read_json(workspace.result_path, default={})
+        recognition_base_revision = _result_revision(before_recognition)
+
     def run(progress):
         result = coordinator.process_document(
             workspace.pdf_path, request.processing_mode, options, progress
         )
-        document_fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
-        result = human_review_service.apply_saved_decisions(
-            result,
-            ReviewDecisionStore(workspace.review_decisions_path).load(),
-            document_fingerprint,
-        )
-        workspace_service.write_json(workspace.result_path, result)
+        with document_mutation_locks.for_document(document_id):
+            current = workspace_service.read_json(workspace.result_path, default={})
+            if _result_revision(current) != recognition_base_revision:
+                raise RuntimeError(
+                    "Документ изменён во время распознавания. Новый результат не применён."
+                )
+            store = ReviewDecisionStore(workspace.review_decisions_path)
+            decisions, ledger_revision = store.load_snapshot()
+            document_fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+            result = human_review_service.apply_saved_decisions(
+                result, decisions, document_fingerprint
+            )
+            result["review_ledger_revision"] = ledger_revision
+            result["revision"] = recognition_base_revision + 1
+            workspace_service.write_json(workspace.result_path, result)
         return result
 
     job = job_service.submit(run)
@@ -897,16 +926,22 @@ def get_job(job_id: str):
 def get_results(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
-        result = workspace_service.read_json(workspace.result_path)
-        if not result:
-            raise HTTPException(404, "Результат распознавания отсутствует")
-        result = human_review_service.apply_saved_decisions(
-            result,
-            ReviewDecisionStore(workspace.review_decisions_path).load(),
-            human_review_service.document_fingerprint(workspace.pdf_path),
-        )
-        workspace_service.write_json(workspace.result_path, result)
-        return result
+        with document_mutation_locks.for_document(document_id):
+            result = workspace_service.read_json(workspace.result_path)
+            if not result:
+                raise HTTPException(404, "Результат распознавания отсутствует")
+            store = ReviewDecisionStore(workspace.review_decisions_path)
+            decisions, ledger_revision = store.load_snapshot()
+            if not _review_projection_current(result, ledger_revision):
+                result = human_review_service.apply_saved_decisions(
+                    result,
+                    decisions,
+                    human_review_service.document_fingerprint(workspace.pdf_path),
+                )
+                result["review_ledger_revision"] = ledger_revision
+                result["revision"] = _result_revision(result) + 1
+                workspace_service.write_json(workspace.result_path, result)
+            return result
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
@@ -915,20 +950,33 @@ def get_results(document_id: str):
 def save_results(document_id: str, request: SaveRowsRequest):
     try:
         workspace = workspace_service.get(document_id)
-        existing = workspace_service.read_json(workspace.result_path, default={})
-        rows = refresh_rows(request.rows)
-        existing["rows"] = rows
-        existing = human_review_service.apply_saved_decisions(
-            existing,
-            ReviewDecisionStore(workspace.review_decisions_path).load(),
-            human_review_service.document_fingerprint(workspace.pdf_path),
-        )
-        rows = existing.get("rows") or []
-        existing["summary"] = recognition_service._summary(
-            rows, existing.get("errors", [])
-        )
-        workspace_service.write_json(workspace.result_path, existing)
-        return {"saved": True, "summary": existing["summary"]}
+        with document_mutation_locks.for_document(document_id):
+            existing = workspace_service.read_json(workspace.result_path, default={})
+            if not existing:
+                raise HTTPException(404, "Результат распознавания отсутствует")
+            current_revision = _result_revision(existing)
+            if request.expected_revision != current_revision:
+                raise HTTPException(409, "Документ изменён. Обновите данные перед сохранением.")
+            existing["rows"] = refresh_rows(request.rows)
+            store = ReviewDecisionStore(workspace.review_decisions_path)
+            decisions, ledger_revision = store.load_snapshot()
+            existing = human_review_service.apply_saved_decisions(
+                existing,
+                decisions,
+                human_review_service.document_fingerprint(workspace.pdf_path),
+            )
+            rows = existing.get("rows") or []
+            existing["summary"] = recognition_service._summary(
+                rows, existing.get("errors", [])
+            )
+            existing["review_ledger_revision"] = ledger_revision
+            existing["revision"] = current_revision + 1
+            workspace_service.write_json(workspace.result_path, existing)
+            return {
+                "saved": True,
+                "revision": existing["revision"],
+                "summary": existing["summary"],
+            }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
@@ -1687,8 +1735,9 @@ class ReviewDecisionRequest(BaseModel):
 def get_review_decisions(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
-        decisions = ReviewDecisionStore(workspace.review_decisions_path).load()
-        fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+        with document_mutation_locks.for_document(document_id):
+            decisions = ReviewDecisionStore(workspace.review_decisions_path).load()
+            fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
         return {
             "document_fingerprint": fingerprint,
             "decisions": [item.model_dump(mode="json") for item in decisions if item.document_fingerprint == fingerprint],
@@ -1701,30 +1750,34 @@ def get_review_decisions(document_id: str):
 def save_review_decision(document_id: str, request: ReviewDecisionRequest):
     try:
         workspace = workspace_service.get(document_id)
-        result = workspace_service.read_json(workspace.result_path, default={})
-        if not result:
-            raise HTTPException(404, "Результат распознавания отсутствует")
-        fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
-        decision = human_review_service.create_decision(
-            result,
-            document_fingerprint=fingerprint,
-            page=request.page,
-            physical_refs=request.physical_refs,
-            decision=request.decision,
-            field=request.field,
-            relation=request.relation,
-            candidate_value=request.candidate_value,
-            target=request.target,
-        )
-        store = ReviewDecisionStore(workspace.review_decisions_path)
-        decisions = store.upsert(decision)
-        updated = human_review_service.apply_saved_decisions(result, decisions, fingerprint)
-        workspace_service.write_json(workspace.result_path, updated)
-        return {
-            "saved": True,
-            "decision": decision.model_dump(mode="json"),
-            "result": updated,
-        }
+        with document_mutation_locks.for_document(document_id):
+            result = workspace_service.read_json(workspace.result_path, default={})
+            if not result:
+                raise HTTPException(404, "Результат распознавания отсутствует")
+            fingerprint = human_review_service.document_fingerprint(workspace.pdf_path)
+            decision = human_review_service.create_decision(
+                result,
+                document_fingerprint=fingerprint,
+                page=request.page,
+                physical_refs=request.physical_refs,
+                decision=request.decision,
+                field=request.field,
+                relation=request.relation,
+                candidate_value=request.candidate_value,
+                target=request.target,
+            )
+            store = ReviewDecisionStore(workspace.review_decisions_path)
+            decisions, ledger_revision = store.upsert_snapshot(decision)
+            updated = human_review_service.apply_saved_decisions(result, decisions, fingerprint)
+            updated["review_ledger_revision"] = ledger_revision
+            updated["revision"] = _result_revision(result) + 1
+            workspace_service.write_json(workspace.result_path, updated)
+            return {
+                "saved": True,
+                "decision": decision.model_dump(mode="json"),
+                "revision": updated["revision"],
+                "result": updated,
+            }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
     except ValueError as exc:

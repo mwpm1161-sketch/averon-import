@@ -222,37 +222,76 @@ class ReviewDecisionStore:
     def __init__(self, path: Path):
         self.path = Path(path)
 
-    def load(self) -> list[ReviewDecision]:
+    def load_snapshot(self) -> tuple[list[ReviewDecision], int]:
+        """Return the canonical ledger and its persisted revision.
+
+        Legacy list payloads and dictionaries without a revision are read as
+        revision zero. The next write upgrades them to the versioned shape.
+        """
         if not self.path.exists():
-            return []
+            return [], 0
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return []
-        raw = payload.get("decisions", payload) if isinstance(payload, dict) else payload
+            return [], 0
+        if isinstance(payload, dict):
+            raw = payload.get("decisions", [])
+            try:
+                revision = max(0, int(payload.get("revision", 0)))
+            except (TypeError, ValueError):
+                revision = 0
+        else:
+            raw = payload
+            revision = 0
         if not isinstance(raw, list):
-            return []
+            return [], revision
         decisions: list[ReviewDecision] = []
         for item in raw:
             try:
                 decisions.append(ReviewDecision.model_validate(item))
             except Exception:
                 continue
-        return decisions
+        return decisions, revision
 
-    def save(self, decisions: list[ReviewDecision]) -> None:
+    def load(self) -> list[ReviewDecision]:
+        return self.load_snapshot()[0]
+
+    def save(self, decisions: list[ReviewDecision], *, revision: int | None = None) -> int:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"decisions": [item.model_dump(mode="json") for item in decisions]}
+        if revision is None:
+            revision = self.load_snapshot()[1] + 1
+        revision = max(0, int(revision))
+        payload = {
+            "revision": revision,
+            "decisions": [item.model_dump(mode="json") for item in decisions],
+        }
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
+        return revision
 
-    def upsert(self, decision: ReviewDecision) -> list[ReviewDecision]:
-        decisions = [item for item in self.load() if item.decision_key != decision.decision_key]
+    @staticmethod
+    def _same_decision(left: ReviewDecision, right: ReviewDecision) -> bool:
+        left_payload = left.model_dump(mode="json", exclude={"created_at"})
+        right_payload = right.model_dump(mode="json", exclude={"created_at"})
+        return _stable(left_payload) == _stable(right_payload)
+
+    def upsert_snapshot(self, decision: ReviewDecision) -> tuple[list[ReviewDecision], int]:
+        decisions, revision = self.load_snapshot()
+        existing = next(
+            (item for item in decisions if item.decision_key == decision.decision_key),
+            None,
+        )
+        if existing is not None and self._same_decision(existing, decision):
+            return decisions, revision
+        decisions = [item for item in decisions if item.decision_key != decision.decision_key]
         decisions.append(decision)
         decisions.sort(key=lambda item: item.created_at)
-        self.save(decisions)
-        return decisions
+        revision = self.save(decisions, revision=revision + 1)
+        return decisions, revision
+
+    def upsert(self, decision: ReviewDecision) -> list[ReviewDecision]:
+        return self.upsert_snapshot(decision)[0]
 
 
 class HumanReviewService:
@@ -425,6 +464,12 @@ class HumanReviewService:
                 return False
         if decision.decision == REJECT_DECISION:
             rejected = list(row.get("human_rejected_candidates") or [])
+            if any(
+                isinstance(item, Mapping)
+                and item.get("decision_key") == decision.decision_key
+                for item in rejected
+            ):
+                return True
             rejected.append({
                 "field": decision.field,
                 "candidate_value": decision.candidate_value,
@@ -476,7 +521,6 @@ class HumanReviewService:
             if not fragment:
                 return False
             parent_name = str(parent.get("name") or "").strip()
-            parent["name"] = f"{parent_name} {fragment}".strip()
             relations = list(parent.get("human_verified_relations") or [])
             relation_record = {
                 "relation": decision.relation,
@@ -485,7 +529,14 @@ class HumanReviewService:
                 "fragment": fragment,
                 "decision_key": decision.decision_key,
             }
-            relations.append(relation_record)
+            already_related = any(
+                isinstance(item, Mapping)
+                and item.get("decision_key") == decision.decision_key
+                for item in relations
+            )
+            if not already_related:
+                parent["name"] = f"{parent_name} {fragment}".strip()
+                relations.append(relation_record)
             parent["human_verified_relations"] = relations
             self._mark_human(parent, {
                 "decision": decision.decision,

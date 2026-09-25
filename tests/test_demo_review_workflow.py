@@ -15,6 +15,7 @@ from averon_import.services.ocr.page_disposition import (
 from averon_import.services.review_decisions import (
     FIELD_DECISION,
     RELATION_DECISION,
+    REJECT_DECISION,
     HumanReviewService,
     ReviewDecisionStore,
 )
@@ -332,6 +333,55 @@ def test_d5_rejected_candidate_leaves_review_and_does_not_change_canonical():
     assert updated["rows"][0]["quantity"] == ""
     assert updated["rows"][0]["human_rejected_candidates"][0]["provenance"] == "human"
     assert updated["page_statuses"]["58"]["output_status"] == "REVIEW_REQUIRED"
+
+
+def test_saved_reject_replay_is_idempotent():
+    result = _result()
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(10),
+        decision=REJECT_DECISION,
+        field="quantity",
+        candidate_value="4",
+    )
+
+    once = service.apply_saved_decisions(
+        result, [decision], result["document_fingerprint"]
+    )
+    twice = service.apply_saved_decisions(
+        once, [decision], result["document_fingerprint"]
+    )
+
+    assert len(once["rows"][0]["human_rejected_candidates"]) == 1
+    assert len(twice["rows"][0]["human_rejected_candidates"]) == 1
+
+
+def test_saved_continuation_replay_does_not_duplicate_fragment_or_relation():
+    result = _result()
+    service = HumanReviewService()
+    decision = service.create_decision(
+        result,
+        document_fingerprint=result["document_fingerprint"],
+        page=58,
+        physical_refs=_refs(11),
+        decision=RELATION_DECISION,
+        relation="human_confirmed_continuation",
+        candidate_value="Фрагмент 11",
+        target={"parent_physical_refs": _refs(10)},
+    )
+
+    once = service.apply_saved_decisions(
+        result, [decision], result["document_fingerprint"]
+    )
+    twice = service.apply_saved_decisions(
+        once, [decision], result["document_fingerprint"]
+    )
+
+    assert twice["rows"][0]["name"].count("Фрагмент 11") == 1
+    assert len(twice["rows"][0]["human_verified_relations"]) == 1
 
 
 def test_d6_continuation_relation_requires_parent_and_never_composes_numeric_fields():

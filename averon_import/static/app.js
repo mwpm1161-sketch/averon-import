@@ -24,6 +24,8 @@ const state = {
   authState: "checking",
   authGeneration: 0,
   bootComplete: false,
+  documentNavigationGeneration: 0,
+  documentNavigationController: null,
   loginSubmitting: false,
   users: {
     items: [],
@@ -134,6 +136,7 @@ function readCsrfCookie() {
 }
 
 function clearProtectedMemory() {
+  cancelDocumentNavigation();
   state.config = null;
   state.document = null;
   state.selectedPages = new Set();
@@ -175,6 +178,25 @@ function clearProtectedMemory() {
   if (logoutButton) logoutButton.disabled = false;
   clearProtectedUi();
   document.body.classList.remove("manual-mode");
+}
+
+function cancelDocumentNavigation() {
+  state.documentNavigationGeneration = (state.documentNavigationGeneration || 0) + 1;
+  if (state.documentNavigationController) {
+    state.documentNavigationController.abort();
+    state.documentNavigationController = null;
+  }
+}
+
+function beginDocumentNavigation() {
+  cancelDocumentNavigation();
+  const controller = new AbortController();
+  state.documentNavigationController = controller;
+  return {generation: state.documentNavigationGeneration, signal: controller.signal};
+}
+
+function isCurrentDocumentNavigation(generation) {
+  return generation === state.documentNavigationGeneration;
 }
 
 function clearProtectedUi() {
@@ -1209,8 +1231,10 @@ function renderRecentDocuments() {
 
 async function openExistingDocument(documentId, {announce = true} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
+  const navigation = beginDocumentNavigation();
   const encodedId = encodeURIComponent(documentId);
-  const documentData = await api(`/api/documents/${encodedId}`);
+  const documentData = await api(`/api/documents/${encodedId}`, {signal:navigation.signal});
+  if (!isCurrentDocumentNavigation(navigation.generation)) return;
   clearExportError();
   state.document = documentData;
   state.selectedPages = new Set();
@@ -1225,7 +1249,8 @@ async function openExistingDocument(documentId, {announce = true} = {}) {
   $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
   $("#new-document-button").hidden = false;
   if (documentData.has_result) {
-    const result = await api(`/api/documents/${encodedId}/results`);
+    const result = await api(`/api/documents/${encodedId}/results`, {signal:navigation.signal});
+    if (!isCurrentDocumentNavigation(navigation.generation)) return;
     loadResult(result, {announce});
   } else {
     setView("pages");
@@ -1241,10 +1266,12 @@ async function uploadFile(file) {
   }
   const form = new FormData();
   form.append("file", file);
+  const navigation = beginDocumentNavigation();
   const card = $("#drop-zone");
   card.classList.add("drag");
   try {
-    const documentData = await api("/api/documents", {method:"POST", body:form});
+    const documentData = await api("/api/documents", {method:"POST", body:form, signal:navigation.signal});
+    if (!isCurrentDocumentNavigation(navigation.generation)) return;
     clearExportError();
     state.document = documentData;
     localStorage.setItem("averonCurrentDocument", documentData.document_id);
@@ -1736,12 +1763,17 @@ function continuationFragment(row) {
 
 async function submitHumanDecision(row, payload, successMessage) {
   if (!state.document) return;
+  const documentId = state.document.document_id;
+  const navigationGeneration = state.documentNavigationGeneration;
   try {
-    const response = await api(`/api/documents/${state.document.document_id}/review/decision`, {
+    const response = await api(`/api/documents/${documentId}/review/decision`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({page: row.page, physical_refs: physicalRefs(row), ...payload}),
     });
+    if (state.document?.document_id !== documentId
+      || !isCurrentDocumentNavigation(navigationGeneration)
+      || Number(response.revision || 0) < Number(state.result?.revision || 0)) return;
     loadResult(response.result, {announce: false});
     toast(`${successMessage} · Проверено пользователем ✓`, "success");
   } catch (error) {
@@ -2411,7 +2443,7 @@ function markDirty() {
 async function saveRows(showToast = true) {
   if (!state.document || !state.rows.length) return null;
   await api(`/api/documents/${state.document.document_id}/results`, {
-    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows}),
+    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows, expected_revision:Number(state.result?.revision || 0)}),
   });
   const authoritative = await api(`/api/documents/${state.document.document_id}/results`);
   loadResult(authoritative, {announce:false});
@@ -3137,6 +3169,7 @@ async function downloadReviewExcel() {
 
 function resetApp() {
   if (state.dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
+  cancelDocumentNavigation();
   clearExportError();
   Object.assign(state,{document:null,selectedPages:new Set(),previewPage:null,crop:null,rows:[],result:null,activeRowId:null,zoom:1,dirty:false});
   localStorage.removeItem("averonCurrentDocument");
