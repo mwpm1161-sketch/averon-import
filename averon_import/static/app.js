@@ -1524,6 +1524,9 @@ function numericShapeAgreed(row) {
 }
 
 function criticalBlockers(row) {
+  if (row?._clientDirty !== true && Array.isArray(row?.critical_blockers)) {
+    return [...new Set(row.critical_blockers.map((reason) => String(reason)).filter(Boolean))];
+  }
   const missing = missingCriticalFields(row);
   const suspect = numericSuspectFields(row);
   const explicitlyVerified = row.status === "verified" && !missing.length;
@@ -1544,6 +1547,10 @@ function criticalBlockers(row) {
 }
 
 function criticalFieldCount(row) {
+  const authoritativeBlockers = criticalBlockers(row);
+  if (row?._clientDirty !== true && Array.isArray(row?.critical_blockers)) {
+    return authoritativeBlockers.length;
+  }
   const missing = missingCriticalFields(row);
   const suspect = row.status === "verified" && !missing.length
     ? []
@@ -1591,12 +1598,12 @@ function loadResult(result, options = {}) {
   setZoom(1);
   state.rows = result.rows.map((row) => ({
     ...row,
+    _clientDirty: false,
     selected: row.selected ?? (
       ["item", "component"].includes(row.row_type)
       || (row.row_type === "note" && row.structured_table)
     ),
   }));
-  state.rows.forEach(refreshClientReview);
   state.reviewFilter = "";
     state.dirty = false;
     buildResultHeader();
@@ -1685,6 +1692,7 @@ function renderRows() {
       row.edited_fields = [...new Set([...(row.edited_fields || []), input.dataset.key])];
       if (row.status !== "verified") row.status = "edited";
       row.edited = true;
+      row._clientDirty = true;
       refreshClientReview(row);
       autoHeight(input); markDirty(); updateSummary();
     });
@@ -1695,6 +1703,7 @@ function renderRows() {
     row[select.dataset.key] = select.value;
     row.edited_fields = [...new Set([...(row.edited_fields || []), select.dataset.key])];
     row.edited = true;
+    row._clientDirty = true;
     if (select.dataset.key !== "status" && row.status !== "verified") row.status = "edited";
     refreshClientReview(row);
     markDirty(); updateSummary(); renderRows();
@@ -2410,14 +2419,18 @@ function positionHighlight(row) {
 }
 
 function updateSummary() {
-  const ready = state.rows.filter((r) => ["recognized","verified","edited"].includes(r.status)).length;
-  const review = state.rows.filter((r) => ["review","unrecognized"].includes(r.status)).length;
+  const requiresReview = state.rows.filter((row) =>
+    ["review","unrecognized"].includes(row.status) || criticalBlockers(row).length > 0
+  );
+  const ready = state.rows.filter((row) =>
+    ["recognized","verified","edited"].includes(row.status) && !criticalBlockers(row).length
+  ).length;
   const critical = state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
   const selected = state.rows.filter((r) => r.selected).length;
   $("#summary-total").textContent = state.rows.length;
   $("#summary-ready").textContent = ready;
   $("#summary-critical").textContent = critical;
-  $("#summary-review").textContent = review;
+  $("#summary-review").textContent = requiresReview.length;
   $("#summary-selected").textContent = selected;
   updateExportSafety();
 }
@@ -2491,10 +2504,14 @@ function markDirty() {
 
 async function saveRows(showToast = true) {
   if (!state.document || !state.rows.length) return null;
-  await api(`/api/documents/${state.document.document_id}/results`, {
-    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows:state.rows}),
+  if (!state.dirty && state.result) return state.result;
+  const saved = await api(`/api/documents/${state.document.document_id}/results`, {
+    method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({rows:state.rows.map(({_clientDirty, ...row}) => row)}),
   });
-  const authoritative = await api(`/api/documents/${state.document.document_id}/results`);
+  const authoritative = saved?.result;
+  if (!authoritative) throw new Error("Сервер не вернул сохранённый результат");
   loadResult(authoritative, {announce:false});
   state.dirty = false; $("#save-button").textContent = "Сохранить правки";
   if (showToast) toast("Правки сохранены", "success");
