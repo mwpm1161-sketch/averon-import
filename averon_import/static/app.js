@@ -57,6 +57,7 @@ const state = {
   },
   recentDocuments: [],
   manual: {active: false, rows: []},
+  documentLoad: {generation: 0, controller: null, kind: null},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -689,6 +690,48 @@ function bytes(value) {
   return `${(value / 1024 / 1024).toFixed(1)} МБ`;
 }
 
+function setResumeStatus(visible) {
+  const status = $("#resume-status");
+  if (status) status.hidden = !visible;
+}
+
+function cancelDocumentLoad({forgetResume = false} = {}) {
+  state.documentLoad.generation += 1;
+  if (state.documentLoad.controller) state.documentLoad.controller.abort();
+  state.documentLoad.controller = null;
+  state.documentLoad.kind = null;
+  setResumeStatus(false);
+  if (forgetResume) localStorage.removeItem("averonCurrentDocument");
+}
+
+function beginDocumentLoad(kind) {
+  cancelDocumentLoad();
+  const controller = new AbortController();
+  const request = {
+    generation: state.documentLoad.generation,
+    controller,
+    signal: controller.signal,
+    kind,
+  };
+  state.documentLoad.controller = controller;
+  state.documentLoad.kind = kind;
+  setResumeStatus(kind === "resume");
+  return request;
+}
+
+function isCurrentDocumentLoad(request) {
+  return request.generation === state.documentLoad.generation
+    && request.controller === state.documentLoad.controller
+    && !request.signal.aborted;
+}
+
+function finishDocumentLoad(request) {
+  if (!isCurrentDocumentLoad(request)) return;
+  state.documentLoad.controller = null;
+  state.documentLoad.kind = null;
+  setResumeStatus(false);
+}
+
 async function boot() {
   if (state.authState === "authenticated" && state.bootComplete) return;
   if (authBootPromise && authBootGeneration === state.authGeneration) return authBootPromise;
@@ -740,10 +783,14 @@ async function boot() {
       loadManualDraft();
       try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
       if (generation !== state.authGeneration) return;
-      await resumeLastDocument();
-      if (generation !== state.authGeneration) return;
-      if (state.manual.active) openManualWorkspace();
       state.bootComplete = true;
+      if (state.manual.active) {
+        openManualWorkspace();
+      } else {
+        // Restoring a large result is deliberately outside the critical boot
+        // path.  The app is usable immediately and the restore is cancellable.
+        resumeLastDocument().catch(() => {});
+      }
     } catch (error) {
       if (generation !== state.authGeneration) return;
       if (state.authState === "checking") {
@@ -1073,6 +1120,7 @@ function addManualRow(values = {}) {
 }
 
 function openManualWorkspace() {
+  cancelDocumentLoad({forgetResume: true});
   state.manual.active = true;
   if (!state.manual.rows.length) state.manual.rows.push(manualRow());
   saveManualDraft();
@@ -1172,10 +1220,15 @@ async function resumeLastDocument() {
   const documentId = localStorage.getItem("averonCurrentDocument");
   if (!documentId) return;
   try {
-    await openExistingDocument(documentId, {announce: false});
-    toast("Последний документ восстановлен", "success");
-  } catch (_) {
+    const restored = await openExistingDocument(documentId, {
+      announce: false,
+      kind: "resume",
+    });
+    if (restored) toast("Последний документ восстановлен", "success");
+  } catch (error) {
+    if (error?.name === "AbortError") return;
     localStorage.removeItem("averonCurrentDocument");
+    setResumeStatus(false);
   }
 }
 
@@ -1207,31 +1260,48 @@ function renderRecentDocuments() {
   }));
 }
 
-async function openExistingDocument(documentId, {announce = true} = {}) {
+async function openExistingDocument(documentId, {announce = true, kind = "open"} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
+  const request = beginDocumentLoad(kind);
   const encodedId = encodeURIComponent(documentId);
-  const documentData = await api(`/api/documents/${encodedId}`);
-  clearExportError();
-  state.document = documentData;
-  state.selectedPages = new Set();
-  state.previewPage = null;
-  state.crop = null;
-  state.rows = [];
-  state.result = null;
-  state.activeRowId = null;
-  state.dirty = false;
-  localStorage.setItem("averonCurrentDocument", documentData.document_id);
-  $("#document-name").textContent = documentData.filename;
-  $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
-  $("#new-document-button").hidden = false;
-  if (documentData.has_result) {
-    const result = await api(`/api/documents/${encodedId}/results`);
-    loadResult(result, {announce});
-  } else {
-    setView("pages");
-    renderThumbnails();
+  try {
+    const documentData = await api(`/api/documents/${encodedId}`, {signal: request.signal});
+    if (!isCurrentDocumentLoad(request)) return false;
+
+    let result = null;
+    if (documentData.has_result) {
+      result = await api(`/api/documents/${encodedId}/results`, {signal: request.signal});
+      if (!isCurrentDocumentLoad(request)) return false;
+    }
+
+    // Commit only after every required response belongs to the still-current
+    // navigation. A slow restore can therefore never overwrite a document
+    // that the user opened or uploaded afterwards.
+    clearExportError();
+    state.document = documentData;
+    state.selectedPages = new Set();
+    state.previewPage = null;
+    state.crop = null;
+    state.rows = [];
+    state.result = null;
+    state.activeRowId = null;
+    state.dirty = false;
+    localStorage.setItem("averonCurrentDocument", documentData.document_id);
+    $("#document-name").textContent = documentData.filename;
+    $("#document-meta").textContent = `${documentData.page_count} стр. · ${bytes(documentData.size)}`;
+    $("#new-document-button").hidden = false;
+
+    if (result) {
+      loadResult(result, {announce});
+    } else {
+      setView("pages");
+      renderThumbnails();
+      if (announce) toast("Документ открыт", "success");
+    }
+    return true;
+  } finally {
+    finishDocumentLoad(request);
   }
-  if (announce && !documentData.has_result) toast("Документ открыт", "success");
 }
 
 async function uploadFile(file) {
@@ -1239,6 +1309,8 @@ async function uploadFile(file) {
     toast("Выберите PDF-файл", "error");
     return;
   }
+  // A user-selected upload always wins over an automatic restore.
+  cancelDocumentLoad();
   const form = new FormData();
   form.append("file", file);
   const card = $("#drop-zone");
@@ -3137,6 +3209,7 @@ async function downloadReviewExcel() {
 
 function resetApp() {
   if (state.dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
+  cancelDocumentLoad({forgetResume: true});
   clearExportError();
   Object.assign(state,{document:null,selectedPages:new Set(),previewPage:null,crop:null,rows:[],result:null,activeRowId:null,zoom:1,dirty:false});
   localStorage.removeItem("averonCurrentDocument");
@@ -3145,6 +3218,7 @@ function resetApp() {
 
 function setupEvents() {
   $("#auth-login-form").addEventListener("submit", submitAuthLogin);
+  $("#cancel-resume").addEventListener("click", () => cancelDocumentLoad({forgetResume: true}));
   $("#logout-button").addEventListener("click", logoutSession);
   $("#users-button").addEventListener("click", openAdminUsers);
   $("#close-users").addEventListener("click", () => $("#users-modal").close());
