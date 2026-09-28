@@ -290,22 +290,29 @@ button { cursor: pointer; }
 .ai-disabled-note { display:grid; gap:4px; margin-top:13px; padding:12px 14px; border-radius:11px; background:#f3f4f6; color:#555c66; font-size:11px; line-height:1.4; }
 .ai-disabled-note b { color:#30353c; font-size:12px; }
 .settings-card { width:min(720px,calc(100vw - 80px)); }
-.settings-card { max-height:calc(100vh - 32px); overflow:auto; box-sizing:border-box; }
-.settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+.settings-card { min-width:0; max-width:calc(100vw - 32px); max-height:calc(100vh - 32px); overflow:auto; box-sizing:border-box; }
+.settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; min-width:0; }
+.settings-grid > * { min-width:0; }
 .settings-grid .hint { margin:6px 0 0; }
 .settings-grid input:disabled { background:#f3f4f6; color:#8a919b; }
-.one-c-history-panel { display:grid; gap:12px; margin-top:4px; padding:14px; border:1px solid var(--line); border-radius:13px; background:#fafbfc; }
-.one-c-history-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.settings-card .modal-header > div { min-width:0; }
+.settings-card .modal-header h2,.settings-card .modal-header p { overflow-wrap:anywhere; }
+.one-c-history-panel { display:grid; gap:12px; min-width:0; max-width:100%; margin-top:4px; padding:14px; border:1px solid var(--line); border-radius:13px; background:#fafbfc; }
+.one-c-history-panel > * { min-width:0; max-width:100%; }
+.one-c-history-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; min-width:0; }
+.one-c-history-heading > * { min-width:0; }
+.one-c-history-panel h3,.one-c-history-panel h4,.one-c-history-panel p,.one-c-history-panel .field-label { overflow-wrap:anywhere; }
+.one-c-history-panel input,.one-c-history-panel select { width:100%; min-width:0; max-width:100%; }
+.one-c-history-panel button { min-width:0; max-width:100%; white-space:normal; overflow-wrap:anywhere; }
 .one-c-history-heading h3 { margin:3px 0 4px; font-size:15px; }
 .one-c-history-heading p { margin:0; color:var(--muted); font-size:10px; line-height:1.45; }
-.one-c-history-upload { display:grid; grid-template-columns:1fr 1fr auto; align-items:end; gap:9px; }
+.one-c-history-upload { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr)); align-items:end; gap:9px; min-width:0; }
 .one-c-history-upload label { display:grid; gap:4px; min-width:0; }
-.one-c-history-upload input { min-width:0; }
-.one-c-history-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin:10px 0; }
+.one-c-history-controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr)); gap:10px; margin:10px 0; min-width:0; }
 .one-c-history-controls label { min-width:0; }
 .one-c-history-panel h4 { margin:14px 0 3px; font-size:12px; }
 .one-c-history-panel .hint { margin:0; color:var(--muted); font-size:10px; line-height:1.4; }
-.one-c-history-mappings { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 12px; }
+.one-c-history-mappings { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr)); gap:8px 12px; min-width:0; }
 .one-c-history-map { display:grid; gap:4px; min-width:0; }
 .one-c-history-map .field-label { margin:0; font-size:10px; }
 .one-c-history-map.recommended .field-label::after { content:" · рекомендуется"; color:#8a5d00; font-weight:500; }
@@ -314,9 +321,9 @@ button { cursor: pointer; }
 .one-c-history-sample { width:100%; border-collapse:collapse; font-size:10px; }
 .one-c-history-sample th,.one-c-history-sample td { padding:6px 8px; border-bottom:1px solid #eceff2; text-align:left; white-space:nowrap; }
 .one-c-history-sample th { position:sticky; top:0; background:#f5f7f9; color:#59616c; }
-.one-c-history-actions { justify-content:flex-end; padding-top:0; }
+.one-c-history-actions { justify-content:flex-end; flex-wrap:wrap; padding-top:0; }
 @media (max-width:720px) { .settings-grid { grid-template-columns:1fr; } }
-@media (max-width:720px) { .one-c-history-upload,.one-c-history-controls,.one-c-history-mappings { grid-template-columns:1fr; } .one-c-history-heading { flex-direction:column; } }
+@media (max-width:720px) { .one-c-history-heading { flex-direction:column; } }
 
 /* Sourcing panel: existing neutral engineering UI language. */
 .sourcing-column, .sourcing-cell { min-width:150px; }
