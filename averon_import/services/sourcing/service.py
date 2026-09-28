@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any, Callable
 
+from averon_import.core.unit_normalization import normalize_sourcing_unit_family
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.matching import (
     OfferMatcher,
@@ -36,44 +37,8 @@ from averon_import.services.sourcing.providers.base import (
 )
 
 
-_PRICE_UNIT_FAMILIES = {
-    "шт": "piece",
-    "штука": "piece",
-    "штуки": "piece",
-    "штук": "piece",
-    "м": "meter",
-    "m": "meter",
-    "м2": "square_meter",
-    "m2": "square_meter",
-    "м3": "cubic_meter",
-    "m3": "cubic_meter",
-    "кг": "kilogram",
-    "kg": "kilogram",
-    "т": "tonne",
-    "ton": "tonne",
-    "tonne": "tonne",
-    "тонна": "tonne",
-    "тонны": "tonne",
-    "тонн": "tonne",
-    "компл": "set",
-    "комплект": "set",
-    "упак": "pack",
-    "упаковка": "pack",
-    "л": "litre",
-    "l": "litre",
-    "litre": "litre",
-    "литр": "litre",
-    "литра": "litre",
-    "литров": "litre",
-}
-
-
 def _price_unit_family(value: Any) -> str | None:
-    normalized = " ".join(str(value or "").casefold().split())
-    if not normalized:
-        return None
-    normalized = normalized.replace("²", "2").replace("³", "3").rstrip(".")
-    return _PRICE_UNIT_FAMILIES.get(normalized)
+    return normalize_sourcing_unit_family(value)
 
 
 def _units_compatible(source_unit: Any, price_unit: Any) -> bool:

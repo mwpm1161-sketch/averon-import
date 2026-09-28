@@ -34,7 +34,7 @@ from averon_import.services.sourcing.product_understanding import (
 from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
 from averon_import.services.sourcing.providers.base import SourcingProvider
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
-from averon_import.services.sourcing.service import SourcingService, _units_compatible
+from averon_import.services.sourcing.service import SourcingService, _price_unit_family, _units_compatible
 
 
 def make_intent(**updates) -> ProductIntent:
@@ -654,6 +654,21 @@ def test_s15_quantity_times_price_is_calculated_without_mutating_row(tmp_path):
 )
 def test_price_unit_compatibility_accepts_only_explicit_equivalent_families(source_unit, price_unit):
     assert _units_compatible(source_unit, price_unit) is True
+
+
+def test_shared_unit_normalization_preserves_every_legacy_sourcing_alias():
+    expected = {
+        "шт": "piece", "штука": "piece", "штуки": "piece", "штук": "piece",
+        "м": "meter", "m": "meter", "м2": "square_meter", "m2": "square_meter",
+        "м3": "cubic_meter", "m3": "cubic_meter", "кг": "kilogram", "kg": "kilogram",
+        "т": "tonne", "ton": "tonne", "tonne": "tonne", "тонна": "tonne",
+        "тонны": "tonne", "тонн": "tonne", "компл": "set", "комплект": "set",
+        "упак": "pack", "упаковка": "pack", "л": "litre", "l": "litre",
+        "litre": "litre", "литр": "litre", "литра": "litre", "литров": "litre",
+    }
+    assert {unit: _price_unit_family(unit) for unit in expected} == expected
+    assert _price_unit_family("м²") == "square_meter"
+    assert _price_unit_family("㎏") is None
 
 
 @pytest.mark.parametrize(

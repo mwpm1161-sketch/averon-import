@@ -162,6 +162,7 @@ def test_client_role_header_is_ignored(auth_client):
     ("method", "path", "kwargs"),
     [
         ("get", "/api/settings", {}),
+        ("get", "/api/admin/one-c-history", {}),
         ("put", "/api/settings", {"json": {"processing_mode": "cloud"}}),
         ("delete", "/api/settings/yandex-api-key", {}),
         ("delete", "/api/settings/yandex-ai-api-key", {}),
@@ -188,6 +189,13 @@ def test_admin_settings_endpoint_remains_available(auth_client):
 
     assert response.status_code == 200
     assert "yandex" in response.json()
+
+
+def test_one_c_history_status_is_available_to_admin_only(auth_client):
+    assert auth_client.get("/api/admin/one-c-history", headers=_headers("colleague")).status_code == 403
+    admin = auth_client.get("/api/admin/one-c-history", headers=_headers("averon"))
+    assert admin.status_code == 200
+    assert admin.json()["profiles"] == []
 
 
 def test_admin_provider_maintenance_endpoints_remain_available(auth_client, monkeypatch):
@@ -442,6 +450,23 @@ def test_every_api_route_requires_application_authentication(auth_client):
     assert unauthenticated == []
     login_route = next(route for route in main.app.routes if isinstance(route, APIRoute) and route.path == "/api/auth/login")
     assert not has_auth_dependency(login_route.dependant)
+
+
+def test_one_c_history_routes_require_admin_dependency(auth_client):
+    from averon_import import main
+    from averon_import.services.auth import require_admin
+
+    def has_admin_dependency(dependant):
+        if dependant.call is require_admin:
+            return True
+        return any(has_admin_dependency(child) for child in dependant.dependencies)
+
+    routes = [
+        route for route in main.app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/admin/one-c-history")
+    ]
+    assert routes
+    assert all(has_admin_dependency(route.dependant) for route in routes)
 
 
 def _make_cleanup_workspace(service, document_id: str):

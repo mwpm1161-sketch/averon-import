@@ -460,6 +460,40 @@
       <p class="mode-status" id="settings-connection"></p>
       <p class="mode-status" id="settings-ai-connection"></p>
       <p class="mode-status" id="settings-etm-connection"></p>
+      <section class="one-c-history-panel" aria-labelledby="one-c-history-title">
+        <div class="one-c-history-heading">
+          <div><span class="eyebrow">Администрирование</span><h3 id="one-c-history-title">История закупок 1С</h3><p>Загрузите отчёт, проверьте сопоставление и подтвердите замену текущего снимка.</p></div>
+          <button class="button ghost" type="button" id="one-c-history-refresh">Обновить статус</button>
+        </div>
+        <p class="mode-status" id="one-c-history-status" role="status">История ещё не импортирована.</p>
+        <div class="one-c-history-upload">
+          <label><span class="field-label">Отчёт XLSX</span><input class="input" id="one-c-history-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>
+          <label><span class="field-label">Профиль импорта</span><select class="select" id="one-c-history-profile"><option value="">Автоматически определить</option></select></label>
+          <button class="button ghost" type="button" id="one-c-history-preview">Предпросмотр</button>
+        </div>
+        <div id="one-c-history-preview-panel" hidden>
+          <div class="one-c-history-controls">
+            <label><span class="field-label">Лист</span><select class="select" id="one-c-history-sheet"></select></label>
+            <label><span class="field-label">Строка заголовка</span><input class="input" id="one-c-history-header-row" type="number" min="1" max="50"></label>
+            <label><span class="field-label">Структура отчёта</span><select class="select" id="one-c-history-layout"><option value="hierarchical_grouped">Иерархические группы</option><option value="flat">Плоский отчёт</option></select></label>
+            <label><span class="field-label">Разбор единицы из названия</span><select class="select" id="one-c-history-name-strategy"><option value="none">Не разбирать</option><option value="comma_suffix_unit">Суффикс после запятой</option><option value="comma_or_parentheses">Запятая или скобки</option></select></label>
+          </div>
+          <h4>Сопоставление полей</h4>
+          <p class="hint">Код номенклатуры настоятельно рекомендуется. Без него одинаковые названия сохраняются как отдельные неоднозначные группы.</p>
+          <div id="one-c-history-mappings" class="one-c-history-mappings"></div>
+          <label class="one-c-history-save-profile"><input type="checkbox" id="one-c-history-save-profile"> Сохранить или обновить профиль</label>
+          <div class="one-c-history-controls">
+            <label><span class="field-label">Название профиля</span><input class="input" id="one-c-history-profile-name" maxlength="100" placeholder="Например, 1С — поступления"></label>
+            <label><span class="field-label">Обновить профиль</span><select class="select" id="one-c-history-profile-update"><option value="">Создать новый</option></select></label>
+          </div>
+          <p class="mode-status" id="one-c-history-summary" role="status"></p>
+          <div class="one-c-history-sample-wrap"><table class="one-c-history-sample"><thead><tr><th>Строка</th><th>Номенклатура</th><th>Код</th><th>Ед.</th><th>Дата</th><th>Кол-во</th><th>Цена с НДС</th><th>Сумма с НДС</th></tr></thead><tbody id="one-c-history-sample"></tbody></table></div>
+          <div class="modal-footer one-c-history-actions">
+            <button class="button ghost" type="button" id="one-c-history-analyze">Проверить сопоставление</button>
+            <button class="button primary" type="button" id="one-c-history-import" disabled>Импортировать / заменить историю</button>
+          </div>
+        </div>
+      </section>
       <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="save-settings">Сохранить</button></div>
     </form>
   </dialog>

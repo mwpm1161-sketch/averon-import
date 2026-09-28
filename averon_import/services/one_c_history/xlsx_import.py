@@ -1,0 +1,805 @@
+from __future__ import annotations
+
+from collections import Counter
+import copy
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import unicodedata
+import zipfile
+from xml.etree import ElementTree
+
+from openpyxl import load_workbook
+
+from averon_import.core.unit_normalization import normalize_unit_family
+from averon_import.services.one_c_history.models import FIELD_NAMES
+
+
+PARSER_VERSION = 1
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_ZIP_MEMBERS = 1500
+MAX_UNCOMPRESSED_BYTES = 120 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 100
+MAX_ROWS = 50_000
+MAX_COLUMNS = 100
+MAX_HEADER_SCAN_ROWS = 50
+MAX_HEADER_LENGTH = 512
+MAX_PREVIEW_ROWS = 12
+MAX_WARNING_EXAMPLES = 5
+
+FIELD_ALIASES = {
+    "item_code": {"кодноменклатуры", "номенклатурныйкод", "номерноменклатуры", "номеркодноменклатуры", "номенклатурныйномер", "itemcode", "nomenclaturenumber", "1citemcode"},
+    "item_name": {"номенклатураедизм", "номенклатура", "наименование", "товар", "номенклатуранаименование", "itemname", "item"},
+    "unit": {"едизм", "единицаизмерения", "единица", "unit", "measurementunit"},
+    "quantity": {"колво", "количество", "количествоединиц", "qty", "quantity"},
+    "reported_unit_price_gross": {"ценасндс", "ценасучетомндс", "ценабрутто", "цена", "unitpricegross", "grossunitprice", "reportedunitpricegross"},
+    "amount_gross": {"суммасндс", "суммаучетомндс", "суммабрутто", "сумма", "amountgross", "grossamount"},
+    "document_date": {"датадокумента", "датапоступления", "дата", "documentdate", "date"},
+    "document_type": {"типдокумента", "виддокумента", "типоперации", "documenttype"},
+    "document_reference": {"документприхода", "документ", "номердокумента", "основание", "documentreference", "document"},
+    "counterparty": {"контрагент", "поставщик", "наименованиеконтрагента", "counterparty", "supplier"},
+    "contract": {"договор", "контракт", "contract"},
+    "article": {"артикул", "кодтовара", "article", "sku"},
+    "manufacturer": {"производитель", "бренд", "manufacturer", "brand"},
+    "characteristic": {"характеристика", "характеристиканоменклатуры", "characteristic"},
+    "supplier_code": {"кодпоставщика", "suppliercode"},
+    "supplier_inn": {"инн", "иннпоставщика", "supplierinn"},
+    "vat_rate": {"ставкандс", "ндс", "vatrate"},
+    "currency": {"валюта", "currency"},
+    "organization": {"организация", "organization"},
+    "document_stable_reference": {"ссылканадокумент", "идентификатордокумента", "documentid", "documentstablereference"},
+    "document_line_number": {"номерстроки", "номерпозиции", "linenumber", "documentlinenumber"},
+}
+
+EVENT_FIELDS = (
+    "quantity", "reported_unit_price_gross", "amount_gross", "document_date",
+    "document_type", "document_reference", "counterparty", "contract",
+)
+
+
+class OneCImportError(ValueError):
+    """An import error safe to show to the administrator."""
+
+
+@dataclass(frozen=True)
+class ParsedEvent:
+    item_key: str
+    item_code: str | None
+    item_name: str
+    raw_unit: str
+    unit_family: str | None
+    identity_quality: str
+    group_number: int | None
+    source_row: int
+    document_date: str | None
+    document_type: str
+    document_reference: str
+    counterparty: str
+    contract: str
+    quantity: str | None
+    reported_unit_price_gross: str | None
+    effective_unit_price_gross: str | None
+    amount_gross: str | None
+    price_usable: bool
+    optional_facts: dict[str, str | None]
+    source_facts: dict[str, str | None]
+
+
+@dataclass
+class ParsedWorkbook:
+    filename: str
+    file_sha256: str
+    sheet_name: str
+    header_row: int
+    headers: list[str]
+    header_signature: str
+    layout_type: str
+    field_mapping: dict[str, int | None]
+    item_name_parse_strategy: str
+    events: list[ParsedEvent]
+    item_count: int
+    group_count: int
+    physical_row_count: int
+    distinct_counterparty_count: int
+    unit_vocabulary_count: int
+    period_start: str | None
+    period_end: str | None
+    document_type_counts: dict[str, int]
+    document_type_other_event_count: int
+    supplier_missing_count: int
+    unusable_price_count: int
+    missing_code_count: int
+    repeated_display_label_count: int
+    code_conflict_count: int
+    skipped_row_count: int
+    warnings: list[dict]
+
+    def summary(self) -> dict:
+        return {
+            "sheet_name": self.sheet_name,
+            "header_row": self.header_row,
+            "layout_type": self.layout_type,
+            "period_start": self.period_start,
+            "period_end": self.period_end,
+            "item_count": self.item_count,
+            "group_count": self.group_count,
+            "physical_row_count": self.physical_row_count,
+            "distinct_counterparty_count": self.distinct_counterparty_count,
+            "unit_vocabulary_count": self.unit_vocabulary_count,
+            "event_count": len(self.events),
+            "usable_price_event_count": sum(event.price_usable for event in self.events),
+            "supplier_missing_count": self.supplier_missing_count,
+            "unusable_price_count": self.unusable_price_count,
+            "missing_code_count": self.missing_code_count,
+            "repeated_display_label_count": self.repeated_display_label_count,
+            "code_conflict_count": self.code_conflict_count,
+            "skipped_row_count": self.skipped_row_count,
+            "document_type_counts": self.document_type_counts,
+            "document_type_other_event_count": self.document_type_other_event_count,
+            "warning_count": len(self.warnings),
+            "warnings": self.warnings[:MAX_WARNING_EXAMPLES],
+        }
+
+    def sample(self) -> list[dict]:
+        def short(value: str | None, limit: int = 240) -> str | None:
+            return value[:limit] if value is not None else None
+
+        return [
+            {
+                "source_row": event.source_row,
+                "item_name": short(event.item_name),
+                "item_code_present": bool(event.item_code),
+                "unit": short(event.raw_unit, 80),
+                "document_date": event.document_date,
+                "document_type": short(event.document_type, 120),
+                "quantity": short(event.quantity, 80),
+                "reported_unit_price_gross": short(event.reported_unit_price_gross, 80),
+                "effective_unit_price_gross": short(event.effective_unit_price_gross, 80),
+                "amount_gross": short(event.amount_gross, 80),
+                "price_usable": event.price_usable,
+            }
+            for event in self.events[:MAX_PREVIEW_ROWS]
+        ]
+
+
+def _header_key(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
+    return re.sub(r"[^a-zа-я0-9]+", "", text)
+
+
+def header_signature(headers: list[str]) -> str:
+    normalized = [_header_key(value) for value in headers]
+    payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _header_mapping(headers: list[str]) -> dict[str, int | None]:
+    result: dict[str, int | None] = {key: None for key in FIELD_NAMES}
+    for index, label in enumerate(headers):
+        normalized = _header_key(label)
+        for field, aliases in FIELD_ALIASES.items():
+            if result[field] is None and normalized in aliases:
+                result[field] = index
+    return result
+
+
+def _relationship_mentions_lowercase_shared_strings(archive: zipfile.ZipFile) -> bool:
+    member = "xl/_rels/workbook.xml.rels"
+    try:
+        root = ElementTree.fromstring(archive.read(member))
+    except (KeyError, ElementTree.ParseError):
+        return False
+    for relationship in root:
+        rel_type = str(relationship.attrib.get("Type") or "").casefold()
+        target = str(relationship.attrib.get("Target") or "")
+        if rel_type.endswith("/sharedstrings"):
+            return target.replace("\\", "/").endswith("sharedStrings.xml")
+    return False
+
+
+def preflight_xlsx(path: Path) -> Path | None:
+    """Validate OOXML bounds; return a temporary narrow shared-string fix if needed."""
+    try:
+        archive = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise OneCImportError("Файл не является корректной книгой XLSX.") from exc
+    with archive:
+        infos = archive.infolist()
+        if not infos or len(infos) > MAX_ZIP_MEMBERS:
+            raise OneCImportError("Архив XLSX содержит недопустимое число компонентов.")
+        total_uncompressed = 0
+        names: set[str] = set()
+        folded_names: set[str] = set()
+        for info in infos:
+            name = info.filename.replace("\\", "/")
+            parts = Path(name).parts
+            if name.startswith("/") or ".." in parts or name in names or (parts and ":" in parts[0]) or "\x00" in name:
+                raise OneCImportError("Архив XLSX содержит небезопасные или повторные компоненты.")
+            if name.casefold() in folded_names:
+                raise OneCImportError("Архив XLSX содержит повторные компоненты без учёта регистра.")
+            names.add(name)
+            folded_names.add(name.casefold())
+            if info.file_size < 0 or info.compress_size < 0:
+                raise OneCImportError("Архив XLSX повреждён.")
+            total_uncompressed += info.file_size
+            if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
+                raise OneCImportError("Распакованный размер XLSX превышает допустимый предел.")
+            if info.file_size > 1024 and (info.compress_size == 0 or info.file_size / info.compress_size > MAX_COMPRESSION_RATIO):
+                raise OneCImportError("Коэффициент сжатия XLSX превышает допустимый предел.")
+            lower = name.casefold()
+            if "vbaproject.bin" in lower or lower.startswith("xl/externallinks/"):
+                raise OneCImportError("Книги с макросами или внешними ссылками не поддерживаются.")
+            if name.endswith(".rels"):
+                if info.file_size > 1_048_576:
+                    raise OneCImportError("Метаданные связей XLSX превышают допустимый размер.")
+                try:
+                    relationship_root = ElementTree.fromstring(archive.read(info))
+                except ElementTree.ParseError as exc:
+                    raise OneCImportError("Метаданные XLSX повреждены.") from exc
+                if any(str(node.attrib.get("TargetMode", "")).casefold() == "external" for node in relationship_root):
+                    raise OneCImportError("Внешние ссылки в XLSX не поддерживаются.")
+
+        canonical = "xl/sharedStrings.xml"
+        case_variants = [info for info in infos if info.filename.casefold() == canonical.casefold()]
+        if canonical in names or not case_variants or not _relationship_mentions_lowercase_shared_strings(archive):
+            return None
+        if len(case_variants) != 1 or case_variants[0].filename != "xl/SharedStrings.xml":
+            raise OneCImportError("Несовпадение регистра компонента sharedStrings не поддерживается.")
+        fd, temp_name = tempfile.mkstemp(prefix="averon-onec-normalized-", suffix=".xlsx", dir=path.parent)
+        os.close(fd)
+        normalized_path = Path(temp_name)
+        try:
+            with zipfile.ZipFile(normalized_path, "w") as output:
+                output.comment = archive.comment
+                for info in infos:
+                    replacement = info
+                    if info.filename == "xl/SharedStrings.xml":
+                        replacement = copy.copy(info)
+                        replacement.filename = "xl/sharedStrings.xml"
+                        replacement.orig_filename = "xl/sharedStrings.xml"
+                    with archive.open(info, "r") as source, output.open(replacement, "w") as destination:
+                        while chunk := source.read(1024 * 1024):
+                            destination.write(chunk)
+            return normalized_path
+        except Exception:
+            normalized_path.unlink(missing_ok=True)
+            raise
+
+
+def _open_workbook(path: Path):
+    normalized = preflight_xlsx(path)
+    try:
+        return load_workbook(normalized or path, read_only=True, data_only=False, keep_links=False), normalized
+    except Exception as exc:
+        if normalized:
+            normalized.unlink(missing_ok=True)
+        raise OneCImportError("Не удалось прочитать книгу XLSX. Проверьте формат и структуру файла.") from exc
+
+
+def _detect_header(sheet) -> tuple[int, list[str], dict[str, int | None]]:
+    best: tuple[int, int, list[str], dict[str, int | None]] | None = None
+    for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=MAX_HEADER_SCAN_ROWS, values_only=True), start=1):
+        headers = [str(value).strip() if value is not None else "" for value in row]
+        if any(len(value) > MAX_HEADER_LENGTH for value in headers):
+            raise OneCImportError("Заголовок XLSX превышает допустимую длину.")
+        while headers and not headers[-1]:
+            headers.pop()
+        mapping = _header_mapping(headers)
+        present = {field for field, index in mapping.items() if index is not None}
+        score = len(present)
+        core = "item_name" in present and bool(present.intersection({"quantity", "reported_unit_price_gross", "amount_gross"}))
+        if core and (best is None or score > best[0]):
+            best = (score, row_number, headers, mapping)
+    if best is None:
+        raise OneCImportError("Не удалось определить строку заголовков. Настройте сопоставление вручную.")
+    return best[1], best[2], best[3]
+
+
+def _fallback_header(sheet) -> tuple[int, list[str], dict[str, int | None]]:
+    """Find a bounded candidate header row when none of the aliases are known."""
+    best: tuple[int, int, list[str]] | None = None
+    for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=MAX_HEADER_SCAN_ROWS, values_only=True), start=1):
+        headers = [str(value).strip() if value is not None else "" for value in row]
+        if any(len(value) > MAX_HEADER_LENGTH for value in headers):
+            continue
+        while headers and not headers[-1]:
+            headers.pop()
+        populated = sum(bool(value) for value in headers)
+        if populated >= 2 and (best is None or populated > best[0]):
+            best = (populated, row_number, headers)
+    if best is None:
+        raise OneCImportError("В книге не удалось найти строку заголовков для ручного сопоставления.")
+    return best[1], best[2], {key: None for key in FIELD_NAMES}
+
+
+def inspect_sheet(path: Path, sheet_name: str, header_row: int | None = None) -> tuple[int, list[str], dict[str, int | None], str]:
+    """Return bounded header metadata for a selected workbook sheet."""
+    workbook, normalized = _open_workbook(path)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise OneCImportError("Выбранный лист отсутствует в книге.")
+        sheet = workbook[sheet_name]
+        if (sheet.max_column or 0) > MAX_COLUMNS or (sheet.max_row or 0) > MAX_ROWS + MAX_HEADER_SCAN_ROWS:
+            raise OneCImportError("Размер листа XLSX превышает допустимые пределы.")
+        if header_row is None:
+            try:
+                selected_row, headers, mapping = _detect_header(sheet)
+            except OneCImportError:
+                selected_row, headers, mapping = _fallback_header(sheet)
+            return selected_row, headers, mapping, _infer_layout(sheet, selected_row, mapping)
+        if header_row > min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0):
+            raise OneCImportError("Строка заголовка выходит за допустимый диапазон.")
+        values = next(sheet.iter_rows(min_row=header_row, max_row=header_row, values_only=True), ())
+        headers = [str(value).strip() if value is not None else "" for value in values]
+        if any(len(value) > MAX_HEADER_LENGTH for value in headers):
+            raise OneCImportError("Заголовок XLSX превышает допустимую длину.")
+        while headers and not headers[-1]:
+            headers.pop()
+        if not headers or len(headers) > MAX_COLUMNS:
+            raise OneCImportError("В выбранной строке заголовков нет допустимых столбцов.")
+        mapping = _header_mapping(headers)
+        return header_row, headers, mapping, _infer_layout(sheet, header_row, mapping)
+    finally:
+        workbook.close()
+        if normalized:
+            normalized.unlink(missing_ok=True)
+
+
+def _cell_value(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    text = str(value).strip()
+    return text if text else None
+
+
+def _has_mapped_value(row: tuple, mapping: dict[str, int | None], fields: tuple[str, ...]) -> bool:
+    return any(
+        (index := mapping.get(field)) is not None and index < len(row) and _cell_value(row[index]) is not None
+        for field in fields
+    )
+
+
+def _infer_layout(sheet, header_row: int, mapping: dict[str, int | None]) -> str:
+    populated_names = 0
+    detail_rows = 0
+    name_index = mapping.get("item_name")
+    if name_index is None:
+        return "flat"
+    for row in sheet.iter_rows(min_row=header_row + 1, max_row=min(header_row + 101, MAX_ROWS), values_only=True):
+        if _has_mapped_value(row, mapping, EVENT_FIELDS):
+            detail_rows += 1
+            if name_index < len(row) and _cell_value(row[name_index]):
+                populated_names += 1
+    if detail_rows and populated_names / detail_rows < 0.65:
+        return "hierarchical_grouped"
+    return "flat"
+
+
+def detect_workbook(path: Path) -> dict:
+    workbook, normalized = _open_workbook(path)
+    try:
+        sheets = list(workbook.sheetnames)
+        candidates = []
+        for sheet_name in sheets:
+            sheet = workbook[sheet_name]
+            if (sheet.max_column or 0) > MAX_COLUMNS or (sheet.max_row or 0) > MAX_ROWS + MAX_HEADER_SCAN_ROWS:
+                continue
+            try:
+                row, headers, mapping = _detect_header(sheet)
+            except OneCImportError:
+                try:
+                    row, headers, mapping = _fallback_header(sheet)
+                except OneCImportError:
+                    continue
+            score = sum(index is not None for index in mapping.values())
+            candidates.append((sheet_name, row, headers, mapping, sheet, score))
+        if not candidates:
+            raise OneCImportError("В книге нет листа с заголовками для ручного сопоставления.")
+        tdsheet = next((candidate for candidate in candidates if candidate[0].casefold() == "tdsheet"), None)
+        recognized = [candidate for candidate in candidates if candidate[5] > 0]
+        selected = tdsheet or (max(recognized, key=lambda candidate: candidate[5]) if recognized else candidates[0])
+        sheet_name, header_row, headers, mapping, sheet, _score = selected
+        if len(headers) > MAX_COLUMNS or (sheet.max_column or 0) > MAX_COLUMNS:
+            raise OneCImportError("В листе XLSX слишком много столбцов.")
+        if (sheet.max_row or 0) > MAX_ROWS + header_row:
+            raise OneCImportError("В листе XLSX слишком много строк.")
+        layout = _infer_layout(sheet, header_row, mapping)
+        return {
+            "sheet_names": sheets,
+            "sheet_name": sheet_name,
+            "header_row": header_row,
+            "headers": headers,
+            "header_signature": header_signature(headers),
+            "layout_type": layout,
+            "field_mapping": mapping,
+            "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
+        }
+    finally:
+        workbook.close()
+        if normalized:
+            normalized.unlink(missing_ok=True)
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        parsed = Decimal(str(value))
+    else:
+        raw = str(value).strip().replace("\u00a0", "").replace("\u202f", "").replace(" ", "")
+        if not raw:
+            return None
+        if re.fullmatch(r"[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)[eE][+-]?\d+", raw):
+            try:
+                parsed = Decimal(raw.replace(",", "."))
+            except InvalidOperation:
+                return None
+            if not parsed.is_finite():
+                return None
+            parts = parsed.as_tuple()
+            return parsed if len(parts.digits) <= 30 and parts.exponent >= -18 and abs(parsed.adjusted()) <= 30 else None
+        negative = raw.startswith("(") and raw.endswith(")")
+        raw = raw.strip("()")
+        raw = re.sub(r"[^0-9,\.\-+]", "", raw)
+        if not raw or raw in {"-", "+", ".", ","}:
+            return None
+        if "," in raw and "." in raw:
+            decimal_separator = "," if raw.rfind(",") > raw.rfind(".") else "."
+            group_separator = "." if decimal_separator == "," else ","
+            raw = raw.replace(group_separator, "").replace(decimal_separator, ".")
+        elif "," in raw:
+            raw = raw.replace(".", "").replace(",", ".")
+        elif raw.count(".") > 1:
+            head, tail = raw.rsplit(".", 1)
+            raw = head.replace(".", "") + ("." + tail if len(tail) <= 2 else tail)
+        try:
+            parsed = Decimal(raw)
+        except InvalidOperation:
+            return None
+        if negative:
+            parsed = -abs(parsed)
+    if not parsed.is_finite():
+        return None
+    parts = parsed.as_tuple()
+    if len(parts.digits) > 30 or parts.exponent < -18 or abs(parsed.adjusted()) > 30:
+        return None
+    return parsed
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return format(value.normalize(), "f")
+
+
+def _date_value(value: object) -> str | None:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if value is None:
+        return None
+    text = str(value).strip()
+    for pattern in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y", "%Y.%m.%d"):
+        try:
+            return datetime.strptime(text, pattern).date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
+def _document_type_value(explicit_value: object | None, document_reference: str) -> str:
+    explicit = _cell_value(explicit_value)
+    if explicit:
+        return explicit
+    normalized = unicodedata.normalize("NFKC", document_reference).casefold().replace("ё", "е").strip()
+    known_prefixes = (
+        "поступление товаров и услуг",
+        "авансовый отчет",
+        "корректировка поступления",
+    )
+    for prefix in known_prefixes:
+        if normalized.startswith(prefix):
+            return prefix[0].upper() + prefix[1:]
+    return ""
+
+
+def _mapped(row: tuple, mapping: dict[str, int | None], field: str) -> object | None:
+    index = mapping.get(field)
+    return row[index] if index is not None and index < len(row) else None
+
+
+def _split_name_unit(name: str, raw_unit: str, strategy: str) -> tuple[str, str]:
+    if raw_unit:
+        if raw_unit != name and normalize_unit_family(raw_unit):
+            return name, raw_unit
+        if normalize_unit_family(raw_unit):
+            return name, raw_unit
+    if strategy in {"comma_suffix_unit", "comma_or_parentheses"} and "," in name:
+        base, suffix = name.rsplit(",", 1)
+        suffix = suffix.strip()
+        if base.strip() and suffix and normalize_unit_family(suffix):
+            return base.strip(), suffix
+    if strategy == "comma_or_parentheses":
+        match = re.match(r"^(.*?)[(]\s*([^()]+?)\s*[)]$", name)
+        if match and normalize_unit_family(match.group(2)):
+            return match.group(1).strip(), match.group(2).strip()
+    return name.strip(), raw_unit
+
+
+def parse_workbook(
+    path: Path,
+    *,
+    filename: str,
+    file_sha256: str,
+    sheet_name: str,
+    header_row: int,
+    headers: list[str],
+    layout_type: str,
+    field_mapping: dict[str, int | None],
+    item_name_parse_strategy: str,
+) -> ParsedWorkbook:
+    if layout_type not in {"hierarchical_grouped", "flat"}:
+        raise OneCImportError("Неизвестный тип структуры отчёта.")
+    if not headers or len(headers) > MAX_COLUMNS:
+        raise OneCImportError("В XLSX нет допустимых заголовков.")
+    if any(index is not None and index >= len(headers) for index in field_mapping.values()):
+        raise OneCImportError("Сопоставление содержит столбец вне заголовков.")
+    if field_mapping.get("item_name") is None:
+        raise OneCImportError("Сопоставьте поле «Наименование номенклатуры».")
+    if not any(field_mapping.get(name) is not None for name in ("quantity", "reported_unit_price_gross", "amount_gross")):
+        raise OneCImportError("Сопоставьте хотя бы одно поле: количество, цена или сумма.")
+
+    workbook, normalized = _open_workbook(path)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise OneCImportError("Выбранный лист отсутствует в книге.")
+        sheet = workbook[sheet_name]
+        if (sheet.max_column or 0) > MAX_COLUMNS or len(headers) > MAX_COLUMNS:
+            raise OneCImportError("В листе XLSX слишком много столбцов.")
+        if (sheet.max_row or 0) > MAX_ROWS + header_row:
+            raise OneCImportError("В листе XLSX слишком много строк.")
+        physical_row_count = sheet.max_row or 0
+
+        events: list[ParsedEvent] = []
+        current_item: tuple[str, str, str, str, int, str] | None = None
+        item_keys: set[str] = set()
+        labels_by_group: Counter[str] = Counter()
+        codes_by_key: dict[str, dict[str, str | None]] = {}
+        unit_values: set[str] = set()
+        identity_issues: list[dict] = []
+        type_counts: Counter[str] = Counter()
+        event_dates: list[str] = []
+        group_count = 0
+        observed_rows = 0
+        skipped_row_count = 0
+
+        for row_number, cells in enumerate(
+            sheet.iter_rows(min_row=header_row + 1, values_only=False), start=header_row + 1
+        ):
+            observed_rows += 1
+            if observed_rows > MAX_ROWS:
+                raise OneCImportError("В листе XLSX слишком много строк.")
+            row = tuple(cell.value for cell in cells)
+            if not any(_cell_value(value) is not None for value in row):
+                continue
+            if any(cell.data_type == "f" for cell in cells):
+                raise OneCImportError("Формулы в исходном отчёте не поддерживаются. Сохраните значения без формул.")
+
+            raw_name = _cell_value(_mapped(row, field_mapping, "item_name")) or ""
+            raw_unit_cell = _cell_value(_mapped(row, field_mapping, "unit")) or ""
+            item_code_value = _cell_value(_mapped(row, field_mapping, "item_code"))
+            if item_code_value and re.fullmatch(r"[-+]?\d+\.0+", item_code_value):
+                item_code_value = item_code_value.split(".", 1)[0]
+            event_present = _has_mapped_value(row, field_mapping, EVENT_FIELDS)
+            has_identity_fields = bool(raw_name or item_code_value)
+
+            if layout_type == "hierarchical_grouped":
+                if has_identity_fields and not event_present:
+                    group_count += 1
+                    name, unit = _split_name_unit(raw_name, raw_unit_cell, item_name_parse_strategy)
+                    if unit:
+                        unit_values.add(unit)
+                    if not item_code_value:
+                        labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
+                    current_item = ("", item_code_value or "", name, unit, group_count, raw_name)
+                    continue
+                if has_identity_fields:
+                    name, unit = _split_name_unit(raw_name, raw_unit_cell, item_name_parse_strategy)
+                    if raw_name:
+                        if unit:
+                            unit_values.add(unit)
+                        group_count += 1
+                        if not item_code_value:
+                            labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
+                        current_item = ("", item_code_value or "", name, unit, group_count, raw_name)
+                if not event_present:
+                    skipped_row_count += 1
+                    continue
+                if current_item is None:
+                    if not has_identity_fields:
+                        current_item = ("", "", "", "", row_number, "")
+                        group_count += 1
+                    else:
+                        current_item = ("", item_code_value or "", raw_name, raw_unit_cell, row_number, raw_name)
+                        group_count += 1
+                _, group_code, current_name, current_unit, group_number, raw_group_label = current_item
+                code = item_code_value or group_code or None
+                name = current_name or raw_name
+                unit = current_unit or raw_unit_cell
+                group_num: int | None = group_number
+            else:
+                if not event_present:
+                    skipped_row_count += 1
+                    continue
+                name, unit = _split_name_unit(raw_name, raw_unit_cell, item_name_parse_strategy)
+                if unit:
+                    unit_values.add(unit)
+                code = item_code_value or None
+                group_count += 1
+                group_num = group_count
+                raw_group_label = raw_name
+                if not code:
+                    labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
+
+            if name and not unit and item_name_parse_strategy != "none":
+                name, unit = _split_name_unit(name, unit, item_name_parse_strategy)
+            code_key = unicodedata.normalize("NFKC", code).strip() if code else ""
+            if code_key:
+                item_key = "1c:" + hashlib.sha256(code_key.encode("utf-8")).hexdigest()
+                quality = "stable_1c_code"
+                current_description = {
+                    "unit": unit,
+                    **{
+                        field: _cell_value(_mapped(row, field_mapping, field))
+                        for field in ("article", "manufacturer", "characteristic")
+                    },
+                }
+                previous_description = codes_by_key.get(item_key)
+                if previous_description is None:
+                    codes_by_key[item_key] = current_description
+                else:
+                    conflict = False
+                    for field, current_fact in current_description.items():
+                        previous_fact = previous_description.get(field)
+                        if not previous_fact and current_fact:
+                            previous_description[field] = current_fact
+                        elif previous_fact and current_fact:
+                            if field == "unit":
+                                previous_family = normalize_unit_family(previous_fact)
+                                current_family = normalize_unit_family(current_fact)
+                                differs = previous_family != current_family if previous_family and current_family else _header_key(previous_fact) != _header_key(current_fact)
+                            else:
+                                differs = _header_key(previous_fact) != _header_key(current_fact)
+                            conflict = conflict or differs
+                    if conflict:
+                        identity_issues.append({"code": "stable_code_description_conflict", "source_row": row_number})
+            else:
+                identity_material = f"{_header_key(name)}|{_header_key(unit)}"
+                if layout_type == "hierarchical_grouped":
+                    item_key = "weak:" + hashlib.sha256(f"{identity_material}|group:{group_num}".encode("utf-8")).hexdigest()
+                else:
+                    item_key = "weak:" + hashlib.sha256(f"{identity_material}|row:{row_number}".encode("utf-8")).hexdigest()
+                quality = "missing_stable_code" if name else "missing_item_identity"
+
+            raw_quantity = _mapped(row, field_mapping, "quantity")
+            raw_price = _mapped(row, field_mapping, "reported_unit_price_gross")
+            raw_amount = _mapped(row, field_mapping, "amount_gross")
+            quantity = _parse_decimal(raw_quantity)
+            reported_price = _parse_decimal(raw_price)
+            amount = _parse_decimal(raw_amount)
+            effective_price = amount / quantity if amount is not None and quantity is not None and quantity > 0 else reported_price
+            source_facts = {
+                field: _cell_value(_mapped(row, field_mapping, field))
+                for field in FIELD_NAMES if field_mapping.get(field) is not None
+            }
+            if raw_group_label or raw_name:
+                source_facts["raw_item_label"] = raw_group_label or raw_name
+            document_reference = _cell_value(_mapped(row, field_mapping, "document_reference")) or ""
+            document_type = _document_type_value(_mapped(row, field_mapping, "document_type"), document_reference)
+            date_value = _date_value(_mapped(row, field_mapping, "document_date"))
+            if date_value:
+                event_dates.append(date_value)
+            if document_type:
+                type_counts[document_type] += 1
+            item_keys.add(item_key)
+            optional = {
+                field: _cell_value(_mapped(row, field_mapping, field))
+                for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
+            }
+            events.append(ParsedEvent(
+                item_key=item_key,
+                item_code=code,
+                item_name=name,
+                raw_unit=unit,
+                unit_family=normalize_unit_family(unit),
+                identity_quality=quality,
+                group_number=group_num,
+                source_row=row_number,
+                document_date=date_value,
+                document_type=document_type,
+                document_reference=document_reference,
+                counterparty=_cell_value(_mapped(row, field_mapping, "counterparty")) or "",
+                contract=_cell_value(_mapped(row, field_mapping, "contract")) or "",
+                quantity=_decimal_text(quantity),
+                reported_unit_price_gross=_decimal_text(reported_price),
+                effective_unit_price_gross=_decimal_text(effective_price),
+                amount_gross=_decimal_text(amount),
+                price_usable=effective_price is not None,
+                optional_facts=optional,
+                source_facts=source_facts,
+            ))
+
+        workbook.close()
+        repeated_display_labels = sum(1 for count in labels_by_group.values() if count > 1)
+        missing_code_count = sum(1 for event in events if event.item_code is None)
+        supplier_missing_count = sum(1 for event in events if not event.counterparty)
+        distinct_counterparty_count = len({event.counterparty for event in events if event.counterparty})
+        unit_vocabulary_count = len(unit_values)
+        unusable_price_count = sum(1 for event in events if not event.price_usable)
+        code_conflict_count = len(identity_issues)
+        type_count_pairs = type_counts.most_common(50)
+        bounded_type_counts = dict(type_count_pairs)
+        other_type_event_count = sum(type_counts.values()) - sum(bounded_type_counts.values())
+        warnings: list[dict] = []
+        if missing_code_count:
+            warnings.append({"code": "missing_stable_code", "count": missing_code_count, "message": "В отчёте не выгружен код номенклатуры. История будет импортирована, но идентификация одинаковых позиций будет менее надёжной."})
+        if repeated_display_labels:
+            warnings.append({"code": "repeated_display_label_groups", "count": repeated_display_labels, "message": "Обнаружены повторяющиеся подписи групп без кода 1С; их каноническая идентичность неизвестна, группы сохранены раздельно без объединения."})
+        if supplier_missing_count:
+            warnings.append({"code": "events_without_supplier", "count": supplier_missing_count, "message": "Часть событий не содержит контрагента; такие события сохраняются."})
+        if unusable_price_count:
+            warnings.append({"code": "events_without_usable_price", "count": unusable_price_count, "message": "События без цены или суммы сохраняются без пригодной цены."})
+        if code_conflict_count:
+            warnings.append({"code": "stable_code_identity_conflict", "count": code_conflict_count, "message": "У одного кода обнаружены различные описательные данные или единицы; факты сохранены для проверки."})
+        if not events:
+            raise OneCImportError("В выбранной структуре не найдены строки событий закупки.")
+        return ParsedWorkbook(
+            filename=Path(filename).name[:255], file_sha256=file_sha256, sheet_name=sheet_name,
+            header_row=header_row, headers=headers, header_signature=header_signature(headers),
+            layout_type=layout_type, field_mapping=field_mapping,
+            item_name_parse_strategy=item_name_parse_strategy, events=events,
+            item_count=len(item_keys), group_count=group_count,
+            physical_row_count=physical_row_count,
+            distinct_counterparty_count=distinct_counterparty_count,
+            unit_vocabulary_count=unit_vocabulary_count,
+            period_start=min(event_dates) if event_dates else None,
+            period_end=max(event_dates) if event_dates else None,
+            document_type_counts=bounded_type_counts, document_type_other_event_count=other_type_event_count,
+            supplier_missing_count=supplier_missing_count,
+            unusable_price_count=unusable_price_count, missing_code_count=missing_code_count,
+            repeated_display_label_count=repeated_display_labels, code_conflict_count=code_conflict_count,
+            skipped_row_count=skipped_row_count,
+            warnings=warnings,
+        )
+    except OneCImportError:
+        raise
+    except Exception as exc:
+        raise OneCImportError("Не удалось разобрать выбранный лист XLSX.") from exc
+    finally:
+        try:
+            workbook.close()
+        finally:
+            if normalized:
+                normalized.unlink(missing_ok=True)
+
+
+def summarize_rows(parsed: ParsedWorkbook) -> list[dict]:
+    return parsed.sample()
+
+
+__all__ = [
+    "FIELD_ALIASES", "MAX_PREVIEW_ROWS", "PARSER_VERSION", "ParsedWorkbook",
+    "OneCImportError", "detect_workbook", "header_signature", "inspect_sheet", "parse_workbook",
+    "preflight_xlsx",
+]

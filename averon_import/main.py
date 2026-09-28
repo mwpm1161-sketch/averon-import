@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -66,6 +66,9 @@ from averon_import.services.auth import (
 )
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
+from averon_import.services.one_c_history import OneCHistoryImportService, OneCHistoryRepository
+from averon_import.services.one_c_history.models import ImportMappingRequest, PreviewMappingRequest
+from averon_import.services.one_c_history.xlsx_import import OneCImportError
 from averon_import.services.document_mutation import DocumentMutationLocks
 from averon_import.services.document_lifecycle import (
     DocumentActivityRegistry,
@@ -161,6 +164,8 @@ ai_service = AiCorrectionService.from_env()
 smart_ai = SmartAIIntegration(service=ai_service)
 job_service = JobService(max_workers=1)
 app_settings_service = AppSettingsService(DATA_DIR)
+one_c_history_repository = OneCHistoryRepository(DATA_DIR)
+one_c_history_service = OneCHistoryImportService(one_c_history_repository)
 secret_store = create_secret_store(DATA_DIR)
 yandex_vision_provider = YandexVisionProvider(
     settings_service=app_settings_service,
@@ -342,6 +347,57 @@ def admin_health():
         "secret_insecure": secret_store.is_insecure,
     }
     return payload
+
+
+@app.get("/api/admin/one-c-history", dependencies=[Depends(require_admin)])
+def get_one_c_history_status():
+    return one_c_history_repository.public_status()
+
+
+@app.post("/api/admin/one-c-history/previews", dependencies=[Depends(require_admin)])
+async def create_one_c_history_preview(
+    file: UploadFile = File(...),
+    profile_id: str | None = Form(default=None),
+):
+    try:
+        return await one_c_history_service.create_preview(file, profile_id=profile_id)
+    except OneCImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/one-c-history/previews/{preview_id}/mapping", dependencies=[Depends(require_admin)])
+async def analyze_one_c_history_preview(preview_id: str, request: PreviewMappingRequest):
+    try:
+        return await one_c_history_service.analyze_preview(preview_id, request)
+    except OneCImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/one-c-history/previews/{preview_id}/sheets/{sheet_name}", dependencies=[Depends(require_admin)])
+async def inspect_one_c_history_sheet(
+    preview_id: str,
+    sheet_name: str,
+    header_row: int | None = Query(default=None, ge=1, le=50),
+):
+    try:
+        return await one_c_history_service.inspect_preview_sheet(preview_id, sheet_name, header_row)
+    except OneCImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/one-c-history/imports", dependencies=[Depends(require_admin)])
+async def confirm_one_c_history_import(request: ImportMappingRequest):
+    try:
+        return await one_c_history_service.import_confirmed(request)
+    except OneCImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/admin/one-c-history/profiles/{profile_id}", dependencies=[Depends(require_admin)])
+def delete_one_c_history_profile(profile_id: str):
+    if not one_c_history_repository.delete_profile(profile_id):
+        raise HTTPException(status_code=404, detail="Профиль импорта не найден.")
+    return {"deleted": True}
 
 
 @app.get("/api/me")

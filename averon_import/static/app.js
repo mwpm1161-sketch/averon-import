@@ -20,6 +20,7 @@ const state = {
   aiProvider: "off",
   reviewFilter: "",
   settings: null,
+  oneCHistory: {status:null, preview:null, analysisReady:false, busy:false},
   sourcing: {row: null, result: null, projectFilter: "all"},
   sourcingHealth: null,
   currentUser: null,
@@ -885,6 +886,257 @@ function initializeSettings(settings) {
     etmStatus.className = etmLoginReady && etmPasswordReady ? "mode-status ok" : "mode-status warning";
   }
   updateSourcingStatus();
+}
+
+const ONE_C_HISTORY_FIELDS = [
+  ["item_code", "Номер/код номенклатуры", true], ["item_name", "Наименование номенклатуры", false],
+  ["unit", "Единица измерения", false], ["quantity", "Количество", false],
+  ["reported_unit_price_gross", "Цена с НДС", false], ["amount_gross", "Сумма с НДС", false],
+  ["document_date", "Дата документа", false], ["document_type", "Тип документа", false],
+  ["document_reference", "Документ прихода", false], ["counterparty", "Контрагент / поставщик", false],
+  ["contract", "Договор", false], ["article", "Артикул", false], ["manufacturer", "Производитель / бренд", false],
+  ["characteristic", "Характеристика", false], ["supplier_code", "Код поставщика", false],
+  ["supplier_inn", "ИНН поставщика", false], ["vat_rate", "Ставка НДС", false], ["currency", "Валюта", false],
+  ["organization", "Организация", false], ["document_stable_reference", "Стабильная ссылка документа", false],
+  ["document_line_number", "Номер строки документа", false],
+];
+
+function setOneCHistoryMessage(message, kind = "") {
+  const node = $("#one-c-history-summary");
+  if (!node) return;
+  node.textContent = message;
+  node.className = `mode-status${kind ? ` ${kind}` : ""}`;
+}
+
+function formatOneCHistoryDate(value) {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString("ru-RU");
+}
+
+async function loadOneCHistoryStatus() {
+  try {
+    const status = await api("/api/admin/one-c-history");
+    state.oneCHistory.status = status;
+    renderOneCHistoryStatus();
+  } catch (error) {
+    const node = $("#one-c-history-status");
+    node.textContent = `Не удалось загрузить состояние истории: ${error.message}`;
+    node.className = "mode-status warning";
+  }
+}
+
+function renderOneCHistoryStatus() {
+  const status = state.oneCHistory.status || {};
+  const active = status.active_import;
+  const profileById = new Map((status.profiles || []).map((profile) => [profile.profile_id, profile.name]));
+  const node = $("#one-c-history-status");
+  if (active) {
+    const period = active.period_start || active.period_end ? `${active.period_start || "?"} — ${active.period_end || "?"}` : "период не определён";
+    const profileName = active.mapping_profile_id ? profileById.get(active.mapping_profile_id) || "сохранённый профиль" : "без профиля";
+    node.textContent = `Активная история: ${period}; ${active.item_count || 0} номенклатурных идентификаторов; ${active.event_count || 0} событий; ${active.usable_price_event_count || 0} событий с пригодной ценой; импортирована ${formatOneCHistoryDate(active.imported_at)}; профиль: ${profileName}.`;
+    node.className = active.warning_count ? "mode-status warning" : "mode-status ok";
+    if (Array.isArray(active.warnings) && active.warnings.length) {
+      node.textContent += ` Предупреждения: ${active.warnings.map((warning) => `${warning.message} (${warning.count})`).join(" ")}`;
+    }
+  } else {
+    node.textContent = "История ещё не импортирована.";
+    node.className = "mode-status";
+  }
+  const lastAttempt = status.last_attempt;
+  if (lastAttempt) node.textContent += ` Последняя попытка: ${lastAttempt.status} · ${formatOneCHistoryDate(lastAttempt.attempted_at)}.`;
+  for (const selector of ["#one-c-history-profile", "#one-c-history-profile-update"]) {
+    const select = $(selector);
+    if (!select) continue;
+    const selected = select.value;
+    while (select.options.length > (selector.endsWith("profile-update") ? 1 : 1)) select.remove(1);
+    (status.profiles || []).forEach((profile) => select.add(new Option(profile.name, profile.profile_id)));
+    if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+  }
+}
+
+function renderOneCHistoryMapping(headers, mapping = {}) {
+  const container = $("#one-c-history-mappings");
+  container.replaceChildren();
+  ONE_C_HISTORY_FIELDS.forEach(([field, label, recommended]) => {
+    const wrapper = document.createElement("label");
+    wrapper.className = `one-c-history-map${recommended ? " recommended" : ""}`;
+    const title = document.createElement("span");
+    title.className = "field-label";
+    title.textContent = label;
+    const select = document.createElement("select");
+    select.className = "select";
+    select.dataset.oneCHistoryField = field;
+    select.add(new Option("Не сопоставлено", ""));
+    (headers || []).forEach((header, index) => select.add(new Option(`${index + 1}. ${header || "(пустой заголовок)"}`, String(index))));
+    const selected = mapping[field];
+    select.value = selected === null || selected === undefined ? "" : String(selected);
+    wrapper.append(title, select);
+    container.append(wrapper);
+  });
+}
+
+function oneCHistoryMappingPayload() {
+  const mapping = {};
+  $$("#one-c-history-mappings select").forEach((select) => {
+    mapping[select.dataset.oneCHistoryField] = select.value === "" ? null : Number(select.value);
+  });
+  return mapping;
+}
+
+function renderOneCHistoryPreview(preview) {
+  state.oneCHistory.preview = preview;
+  state.oneCHistory.analysisReady = !preview.mapping_required;
+  $("#one-c-history-preview-panel").hidden = false;
+  const sheet = $("#one-c-history-sheet");
+  sheet.replaceChildren();
+  (preview.sheet_names || [preview.sheet_name]).forEach((name) => sheet.add(new Option(name, name)));
+  sheet.value = preview.sheet_name;
+  $("#one-c-history-header-row").value = preview.header_row;
+  $("#one-c-history-layout").value = preview.layout_type;
+  $("#one-c-history-name-strategy").value = preview.item_name_parse_strategy || "none";
+  renderOneCHistoryMapping(preview.headers, preview.field_mapping || {});
+  renderOneCHistorySummary(preview);
+}
+
+function renderOneCHistorySummary(preview) {
+  const summary = preview.summary || {};
+  const warningLines = (summary.warnings || []).map((warning) => `${warning.message} (${warning.count})`);
+  if (summary.missing_code_count > 0 && !warningLines.some((line) => line.includes("код номенклатуры"))) {
+    warningLines.unshift("В отчёте не выгружен код номенклатуры. История будет импортирована, но идентификация одинаковых позиций будет менее надёжной.");
+  }
+  const lines = [];
+  if (summary.event_count !== undefined && summary.missing_code_count === 0 && preview.field_mapping?.item_code !== null && preview.field_mapping?.item_code !== undefined) {
+    lines.push("В сопоставлении обнаружен стабильный код номенклатуры; он используется как каноническая идентичность.");
+  }
+  if (summary.event_count !== undefined) {
+    const period = summary.period_start || summary.period_end ? `${summary.period_start || "?"} — ${summary.period_end || "?"}` : "период не определён";
+    lines.push(`Предпросмотр: ${period}; ${summary.physical_row_count || 0} физических строк; ${summary.group_count || 0} групп; ${summary.event_count || 0} событий; ${summary.item_count || 0} номенклатурных идентификаторов; ${summary.distinct_counterparty_count || 0} контрагентов; ${summary.unit_vocabulary_count || 0} единиц; ${summary.usable_price_event_count || 0} событий с пригодной ценой.`);
+  }
+  if (preview.mapping_required) lines.push("Сопоставление требует проверки. Импорт станет доступен после обновления предпросмотра.");
+  if (warningLines.length) lines.push(...warningLines);
+  if (preview.sha256) lines.push(`SHA-256: ${preview.sha256}`);
+  setOneCHistoryMessage(lines.join(" ") || "Выберите сопоставление и нажмите «Проверить сопоставление».", warningLines.length || preview.mapping_required ? "warning" : "ok");
+  const tbody = $("#one-c-history-sample");
+  tbody.replaceChildren();
+  (preview.sample || []).slice(0, 12).forEach((row) => {
+    const tr = document.createElement("tr");
+    [row.source_row, row.item_name, row.item_code_present ? "есть" : "нет", row.unit, row.document_date, row.quantity, row.effective_unit_price_gross || row.reported_unit_price_gross, row.amount_gross]
+      .forEach((value) => { const td = document.createElement("td"); td.textContent = value === null || value === undefined || value === "" ? "—" : String(value); tr.append(td); });
+    tbody.append(tr);
+  });
+  $("#one-c-history-import").disabled = !state.oneCHistory.analysisReady || state.oneCHistory.busy;
+}
+
+async function startOneCHistoryPreview() {
+  const file = $("#one-c-history-file").files?.[0];
+  if (!file) { toast("Выберите отчёт XLSX", "error"); return; }
+  state.oneCHistory.busy = true;
+  state.oneCHistory.preview = null;
+  state.oneCHistory.analysisReady = false;
+  $("#one-c-history-preview-panel").hidden = true;
+  setOneCHistoryMessage("Проверяем архив и строим ограниченный предпросмотр…");
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    if ($("#one-c-history-profile").value) form.append("profile_id", $("#one-c-history-profile").value);
+    const preview = await api("/api/admin/one-c-history/previews", {method:"POST", body:form});
+    renderOneCHistoryPreview(preview);
+  } catch (error) {
+    setOneCHistoryMessage(error.message, "warning");
+    toast(error.message, "error");
+  } finally {
+    state.oneCHistory.busy = false;
+  }
+}
+
+async function inspectOneCHistorySheet() {
+  const preview = state.oneCHistory.preview;
+  if (!preview) return;
+  try {
+    const sheetName = $("#one-c-history-sheet").value;
+    const headerRow = Number($("#one-c-history-header-row").value) || null;
+    const query = headerRow ? `?header_row=${encodeURIComponent(headerRow)}` : "";
+    const result = await api(`/api/admin/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/sheets/${encodeURIComponent(sheetName)}${query}`);
+    preview.sheet_name = sheetName;
+    preview.header_row = result.header_row;
+    preview.headers = result.headers;
+    preview.field_mapping = result.field_mapping;
+    preview.layout_type = result.layout_type || preview.layout_type;
+    $("#one-c-history-header-row").value = result.header_row;
+    $("#one-c-history-layout").value = preview.layout_type;
+    renderOneCHistoryMapping(result.headers, result.field_mapping);
+    state.oneCHistory.analysisReady = false;
+    renderOneCHistorySummary({...preview, mapping_required:true, summary:{warnings:[]}, sample:[]});
+  } catch (error) {
+    setOneCHistoryMessage(error.message, "warning");
+  }
+}
+
+async function analyzeOneCHistoryMapping() {
+  const preview = state.oneCHistory.preview;
+  if (!preview) return;
+  state.oneCHistory.busy = true;
+  state.oneCHistory.analysisReady = false;
+  $("#one-c-history-import").disabled = true;
+  try {
+    const analyzed = await api(`/api/admin/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/mapping`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        sheet_name:$("#one-c-history-sheet").value,
+        header_row:Number($("#one-c-history-header-row").value),
+        layout_type:$("#one-c-history-layout").value,
+        field_mapping:oneCHistoryMappingPayload(),
+        item_name_parse_strategy:$("#one-c-history-name-strategy").value,
+      }),
+    });
+    renderOneCHistoryPreview(analyzed);
+    state.oneCHistory.analysisReady = true;
+    $("#one-c-history-import").disabled = false;
+  } catch (error) {
+    setOneCHistoryMessage(error.message, "warning");
+    toast(error.message, "error");
+  } finally {
+    state.oneCHistory.busy = false;
+  }
+}
+
+async function importOneCHistory() {
+  const preview = state.oneCHistory.preview;
+  if (!preview || !state.oneCHistory.analysisReady) return;
+  const saveProfile = $("#one-c-history-save-profile").checked;
+  const profileId = $("#one-c-history-profile-update").value || null;
+  const profileName = $("#one-c-history-profile-name").value.trim();
+  if (saveProfile && !profileId && !profileName) { toast("Укажите название нового профиля", "error"); return; }
+  if (!window.confirm("Импортировать этот отчёт и заменить активный снимок истории закупок 1С?")) return;
+  state.oneCHistory.busy = true;
+  $("#one-c-history-import").disabled = true;
+  try {
+    const result = await api("/api/admin/one-c-history/imports", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        preview_id:preview.preview_id,
+        sheet_name:$("#one-c-history-sheet").value,
+        header_row:Number($("#one-c-history-header-row").value),
+        layout_type:$("#one-c-history-layout").value,
+        field_mapping:oneCHistoryMappingPayload(),
+        item_name_parse_strategy:$("#one-c-history-name-strategy").value,
+        save_profile:saveProfile,
+        profile_id:saveProfile ? profileId : null,
+        profile_name:profileName || null,
+      }),
+    });
+    toast(result.idempotent ? "Этот XLSX уже является активной историей" : "История закупок 1С заменена", "success");
+    state.oneCHistory.preview = null;
+    state.oneCHistory.analysisReady = false;
+    $("#one-c-history-preview-panel").hidden = true;
+    await loadOneCHistoryStatus();
+  } catch (error) {
+    setOneCHistoryMessage(error.message, "warning");
+    toast(error.message, "error");
+  } finally {
+    state.oneCHistory.busy = false;
+  }
 }
 
 function updateSourcingProviderFields() {
@@ -4014,6 +4266,21 @@ function setupEvents() {
     if (String(state.currentUser?.role || "").toLowerCase() !== "admin") return;
     initializeSettings(state.settings || {});
     $("#settings-modal").showModal();
+    loadOneCHistoryStatus();
+  });
+  $("#one-c-history-refresh").addEventListener("click",loadOneCHistoryStatus);
+  $("#one-c-history-preview").addEventListener("click",startOneCHistoryPreview);
+  $("#one-c-history-analyze").addEventListener("click",analyzeOneCHistoryMapping);
+  $("#one-c-history-import").addEventListener("click",importOneCHistory);
+  $("#one-c-history-sheet").addEventListener("change",() => { $("#one-c-history-header-row").value = ""; inspectOneCHistorySheet(); });
+  $("#one-c-history-header-row").addEventListener("change",inspectOneCHistorySheet);
+  ["#one-c-history-layout", "#one-c-history-name-strategy", "#one-c-history-mappings"].forEach((selector) => {
+    $(selector).addEventListener("change",() => {
+      if (!state.oneCHistory.preview) return;
+      state.oneCHistory.analysisReady = false;
+      $("#one-c-history-import").disabled = true;
+      setOneCHistoryMessage("Сопоставление изменено. Проверьте предпросмотр перед импортом.", "warning");
+    });
   });
   $("#save-settings").addEventListener("click",saveSettings);
   $("#settings-sourcing-provider").addEventListener("change",updateSourcingProviderFields);
