@@ -45,6 +45,7 @@ class CurrentUser:
             "provider_maintenance": is_admin,
             "admin_reports": is_admin,
             "user_management": is_admin,
+            "document_management": is_admin,
         }
 
     def public(self) -> dict[str, object]:

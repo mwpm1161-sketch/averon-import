@@ -121,6 +121,8 @@ def test_recent_listing_never_reads_large_result_payload(tmp_path, monkeypatch):
     assert service.metrics["result_reads"] == 0
 
 
+
+
 def test_upload_fingerprint_is_saved_and_legacy_fingerprint_is_cached_once(tmp_path):
     import hashlib
 
@@ -161,7 +163,7 @@ def test_get_results_current_revision_is_read_only_and_skips_replay(tmp_path, mo
     from averon_import import main
 
     service = WorkspaceService(tmp_path)
-    document_id = "g" * 32
+    document_id = "1" * 32
     root = service.documents_dir / document_id
     root.mkdir()
     workspace = service.get(document_id)
@@ -203,7 +205,7 @@ def test_get_results_repairs_ahead_ledger_revision_marker_without_false_replay(t
     from averon_import.services.review_decisions import ReviewDecisionStore
 
     service = WorkspaceService(tmp_path)
-    document_id = "i" * 32
+    document_id = "2" * 32
     root = service.documents_dir / document_id
     root.mkdir()
     workspace = service.get(document_id)
@@ -293,7 +295,7 @@ def test_get_results_recovers_ledger_mismatch_once_then_stays_read_only(tmp_path
     from averon_import.services.review_decisions import HumanReviewService, ReviewDecisionStore
 
     service = WorkspaceService(tmp_path)
-    document_id = "h" * 32
+    document_id = "3" * 32
     root = service.documents_dir / document_id
     root.mkdir()
     workspace = service.get(document_id)

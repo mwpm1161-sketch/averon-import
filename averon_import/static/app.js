@@ -71,6 +71,7 @@ const state = {
     },
   },
   recentDocuments: [],
+  pendingDocumentDelete: null,
   manual: {active: false, rows: []},
 };
 
@@ -138,11 +139,25 @@ async function api(url, options = {}) {
       reportable: error.reportable === true,
       payload,
     });
+    const missingDocumentId = documentIdFromApiUrl(url);
+    if (response.status === 404 && message === "Документ не найден" && missingDocumentId) {
+      apiError.documentDeleted = true;
+      apiError.message = "Документ был удалён администратором.";
+      if (state.document?.document_id === missingDocumentId) {
+        clearDeletedCurrentDocument(missingDocumentId, {notify:false});
+      }
+      void loadRecentDocuments().catch(() => {});
+    }
     if (response.status === 401 && url !== "/api/auth/login") handleSessionExpired();
     throw apiError;
   }
   const type = response.headers.get("content-type") || "";
   return type.includes("application/json") ? response.json() : response;
+}
+
+function documentIdFromApiUrl(url) {
+  const match = String(url || "").match(/^\/api\/(?:admin\/)?documents\/([0-9a-f]{32})(?:\/|\?|$)/);
+  return match ? match[1] : null;
 }
 
 function readCsrfCookie() {
@@ -1268,16 +1283,129 @@ function renderRecentDocuments() {
   const list = $("#recent-documents-list");
   if (!panel || !list) return;
   panel.hidden = !state.recentDocuments.length;
+  const canDelete = state.authState === "authenticated"
+    && state.currentUser?.capabilities?.document_management === true;
   list.innerHTML = state.recentDocuments.map((item) => {
     const unavailable = item.available === false;
     const meta = `${item.page_count || 0} стр. · ${item.has_result ? "результат сохранён" : "без результата"} · ${formatRecentTimestamp(item.updated_at)}`;
-    return `<div class="recent-document-item${unavailable ? " unavailable" : ""}"><div><b>${escapeHtml(item.filename || item.title || "Документ")}</b><small>${escapeHtml(meta)}${unavailable ? ` · ${escapeHtml(item.availability_error || "недоступен")}` : ""}</small></div><button class="button ghost recent-document-open" type="button" data-document-id="${escapeHtml(item.document_id)}"${unavailable ? " disabled" : ""}>${unavailable ? "Недоступен" : "Открыть"}</button></div>`;
+    const documentId = escapeHtml(item.document_id);
+    const deleteButton = canDelete ? `<button class="button ghost recent-document-trash" type="button" data-document-id="${documentId}" data-document-name="${escapeHtml(item.filename || item.title || "Документ")}" aria-label="Удалить документ" title="Удалить документ"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M4.5 6h11m-9.5 0 .65 10h7.7L15 6M8 6V4h4v2m-3 3v4m2-4v4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg></button>` : "";
+    return `<div class="recent-document-item${unavailable ? " unavailable" : ""}"><div><b>${escapeHtml(item.filename || item.title || "Документ")}</b><small>${escapeHtml(meta)}${unavailable ? ` · ${escapeHtml(item.availability_error || "недоступен")}` : ""}</small></div><div class="recent-document-actions"><button class="button ghost recent-document-open" type="button" data-document-id="${documentId}"${unavailable ? " disabled" : ""}>${unavailable ? "Недоступен" : "Открыть"}</button>${deleteButton}</div></div>`;
   }).join("");
   list.querySelectorAll(".recent-document-open").forEach((button) => button.addEventListener("click", () => {
     openExistingDocument(button.dataset.documentId).catch((error) => {
       if (error?.name !== "AbortError") toast(error.message, "error");
     });
   }));
+  list.querySelectorAll(".recent-document-trash").forEach((button) => button.addEventListener("click", () => {
+    openDeleteDocumentDialog(button.dataset.documentId, button.dataset.documentName || "Документ");
+  }));
+}
+
+function openDeleteDocumentDialog(documentId, documentName) {
+  if (state.currentUser?.capabilities?.document_management !== true || state.authState !== "authenticated") return;
+  state.pendingDocumentDelete = {documentId, documentName};
+  $("#delete-document-name").textContent = documentName;
+  const status = $("#delete-document-status");
+  status.textContent = "";
+  status.hidden = true;
+  const confirmButton = $("#confirm-delete-document");
+  confirmButton.disabled = false;
+  confirmButton.textContent = "Удалить документ";
+  $("#delete-document-modal").showModal();
+}
+
+async function deleteSelectedDocument() {
+  const target = state.pendingDocumentDelete;
+  if (!target || state.currentUser?.capabilities?.document_management !== true) return;
+  const confirmButton = $("#confirm-delete-document");
+  const status = $("#delete-document-status");
+  confirmButton.disabled = true;
+  confirmButton.textContent = "Удаляем…";
+  status.hidden = true;
+  try {
+    const result = await api(`/api/admin/documents/${encodeURIComponent(target.documentId)}`, {method:"DELETE"});
+    clearDeletedCurrentDocument(target.documentId, {notify:false});
+    $("#delete-document-modal").close();
+    state.pendingDocumentDelete = null;
+    await loadRecentDocuments().catch(() => {
+      state.recentDocuments = state.recentDocuments.filter((item) => item.document_id !== target.documentId);
+      renderRecentDocuments();
+    });
+    const size = bytes(result?.freed_bytes);
+    toast(`Документ удалён · освобождено ${size || "размер неизвестен"}`, "success");
+  } catch (error) {
+    if (error?.documentDeleted) {
+      $("#delete-document-modal").close();
+      state.pendingDocumentDelete = null;
+      void loadRecentDocuments().catch(() => {});
+      toast(error.message, "error");
+      return;
+    }
+    status.textContent = error.message || "Не удалось удалить документ.";
+    status.hidden = false;
+  } finally {
+    confirmButton.disabled = false;
+    confirmButton.textContent = "Удалить документ";
+  }
+}
+
+function clearDeletedCurrentDocument(documentId, {notify = true} = {}) {
+  if (state.document?.document_id !== documentId) return false;
+  cancelDocumentNavigation();
+  clearExportError();
+  Object.assign(state, {
+    document:null,
+    selectedPages:new Set(),
+    previewPage:null,
+    crop:null,
+    cropSelecting:false,
+    rows:[],
+    result:null,
+    activeRowId:null,
+    zoom:1,
+    dirty:false,
+    sourcing:{row:null,result:null,projectFilter:state.sourcing.projectFilter || "all"},
+  });
+  rebuildResultIndexes();
+  if (state.tableSearchTimer) clearTimeout(state.tableSearchTimer);
+  state.tableSearchTimer = null;
+  if (localStorage.getItem("averonCurrentDocument") === documentId) localStorage.removeItem("averonCurrentDocument");
+  $("#thumbnail-grid").innerHTML = "";
+  $("#result-body").innerHTML = "";
+  $("#result-head").innerHTML = "";
+  $("#empty-table").hidden = true;
+  $("#result-table-scroll").scrollTop = 0;
+  $("#summary-total").textContent = "0";
+  $("#summary-ready").textContent = "0";
+  $("#summary-critical").textContent = "0";
+  $("#summary-review").textContent = "0";
+  $("#summary-selected").textContent = "0";
+  $("#document-name").textContent = "Документ";
+  $("#document-meta").textContent = "";
+  $("#new-document-button").hidden = true;
+  const cropImage = $("#crop-image");
+  cropImage.removeAttribute("src");
+  cropImage.hidden = true;
+  $("#crop-box").hidden = true;
+  $("#crop-box").removeAttribute("style");
+  $("#crop-placeholder").hidden = false;
+  const pdfPreview = $("#pdf-preview");
+  pdfPreview.removeAttribute("src");
+  $("#row-highlight").hidden = true;
+  $("#preview-page-label").textContent = "Страница —";
+  setZoom(1);
+  $("#sourcing-content").innerHTML = '<p class="hint">Выберите позицию, чтобы начать поиск.</p>';
+  $("#sourcing-subtitle").textContent = "Сопоставление по распознанным характеристикам";
+  resetPageInspection();
+  for (const selector of ["#export-modal", "#sourcing-modal"]) {
+    const dialog = $(selector);
+    if (dialog?.open) dialog.close();
+  }
+  updatePageInspectionOpenButton();
+  setView("upload");
+  if (notify) toast("Документ был удалён администратором.", "error");
+  return true;
 }
 
 async function openExistingDocument(documentId, {announce = true, navigation = null} = {}) {
@@ -3848,6 +3976,11 @@ function setupEvents() {
   ["dragleave","drop"].forEach((name)=>drop.addEventListener(name,(e)=>{e.preventDefault();drop.classList.remove("drag");}));
   drop.addEventListener("drop",(e)=>uploadFile(e.dataTransfer.files[0]));
   $("#refresh-recent-documents").addEventListener("click",()=>loadRecentDocuments().catch((e)=>toast(e.message,"error")));
+  const deleteDocumentModal = $("#delete-document-modal");
+  deleteDocumentModal.addEventListener("close", () => { state.pendingDocumentDelete = null; });
+  $("#close-delete-document").addEventListener("click", () => deleteDocumentModal.close());
+  $("#cancel-delete-document").addEventListener("click", () => deleteDocumentModal.close());
+  $("#confirm-delete-document").addEventListener("click", deleteSelectedDocument);
   $("#apply-range").addEventListener("click",()=>{try{state.selectedPages=parseRanges($("#page-range").value);updatePageSelection();const p=[...state.selectedPages][0];if(p)showCropPreview(p);}catch(e){toast(e.message,"error");}});
   $("#suggest-pages").addEventListener("click",async()=>{
     const button=$("#suggest-pages"); const old=button.textContent; button.disabled=true; button.textContent="Анализируем…";

@@ -262,6 +262,7 @@ def test_session_login_generic_errors_cookies_csrf_and_logout(session_api, monke
             "provider_maintenance": True,
             "admin_reports": True,
             "user_management": True,
+            "document_management": True,
         },
     }
     token = _cookie(login, "averon_session")

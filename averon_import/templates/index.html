@@ -464,6 +464,17 @@
     </form>
   </dialog>
 
+  <dialog class="modal" id="delete-document-modal" aria-labelledby="delete-document-title">
+    <div class="modal-card delete-document-card">
+      <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2 id="delete-document-title">Удалить документ?</h2></div><button class="icon-button" type="button" id="close-delete-document" aria-label="Закрыть">×</button></div>
+      <p>Будет безвозвратно удалён файл, распознанные данные, ручные исправления, экспорт и история подбора этого документа.</p>
+      <p class="delete-document-name" id="delete-document-name"></p>
+      <p class="delete-document-warning">Аудит обращений в поддержку сохранится. Восстановить удалённый документ будет нельзя.</p>
+      <p class="delete-document-status" id="delete-document-status" role="status" hidden></p>
+      <div class="modal-footer"><button class="button ghost" type="button" id="cancel-delete-document">Отмена</button><button class="button delete-document-confirm" type="button" id="confirm-delete-document">Удалить документ</button></div>
+    </div>
+  </dialog>
+
   <dialog class="modal" id="users-modal">
     <div class="modal-card users-card">
       <div class="modal-header"><div><span class="eyebrow">Администрирование</span><h2>Пользователи</h2><p>Управление учётными записями пользователей.</p></div><button class="icon-button" type="button" id="close-users" aria-label="Закрыть">×</button></div>

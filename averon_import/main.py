@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import webbrowser
@@ -65,6 +66,10 @@ from averon_import.services.auth import (
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
 from averon_import.services.document_mutation import DocumentMutationLocks
+from averon_import.services.document_lifecycle import (
+    DocumentActivityRegistry,
+    DocumentUnavailable,
+)
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.pdf_service import PdfService
 from averon_import.services.processing_coordinator import (
@@ -113,7 +118,7 @@ from averon_import.services.sourcing.demo_catalog import (
 from averon_import.services.sourcing.models import ProductIntent
 from averon_import.services.sourcing.runtime import create_sourcing_runtime
 from averon_import.services.sourcing.run_history import SourcingRunHistory
-from averon_import.services.workspace import WorkspaceService
+from averon_import.services.workspace import WorkspaceService, validate_document_id
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
@@ -176,6 +181,35 @@ demo_store_provider = sourcing_runtime.providers["demo_store_http"]
 sourcing_service = sourcing_runtime.service
 human_review_service = HumanReviewService()
 document_mutation_locks = DocumentMutationLocks()
+document_activity_registry = DocumentActivityRegistry()
+
+
+def require_document_activity(document_id: str):
+    try:
+        with document_activity_registry.lease(document_id):
+            yield
+    except DocumentUnavailable as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+
+
+def _submit_document_job(document_id: str, run):
+    """Hold a lifecycle lease from queueing through the background job's exit."""
+    try:
+        release = document_activity_registry.acquire(document_id)
+    except DocumentUnavailable as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+
+    def leased_run(progress):
+        try:
+            return run(progress)
+        finally:
+            release()
+
+    try:
+        return job_service.submit(leased_run)
+    except Exception:
+        release()
+        raise
 
 
 def _result_revision(result: dict[str, Any] | None) -> int:
@@ -852,7 +886,55 @@ def list_documents(limit: int = 50):
     return {"documents": workspace_service.list_recent(limit)}
 
 
-@app.get("/api/documents/{document_id}", dependencies=[Depends(require_authenticated)])
+@app.delete("/api/admin/documents/{document_id}", dependencies=[Depends(require_admin)])
+def delete_document_workspace(document_id: str):
+    try:
+        document_id = validate_document_id(document_id)
+    except ValueError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    if not document_activity_registry.begin_delete(document_id):
+        raise HTTPException(
+            409,
+            "Документ сейчас используется. Повторите удаление после завершения операции.",
+        )
+
+    tombstone: Path | None = None
+    try:
+        with document_mutation_locks.for_document(document_id):
+            # Re-check under the canonical mutation lock after blocking new
+            # lifecycle leases. The directory rename is atomic on this volume.
+            workspace_service.get(document_id)
+            tombstone = workspace_service.move_to_tombstone(document_id)
+    except FileNotFoundError as exc:
+        document_activity_registry.cancel_delete(document_id)
+        raise HTTPException(404, "Документ не найден") from exc
+    except OSError as exc:
+        document_activity_registry.cancel_delete(document_id)
+        logger.exception("Unable to move document workspace to deletion tombstone")
+        raise HTTPException(500, "Не удалось безопасно удалить документ.") from exc
+
+    freed_bytes: int | None = None
+    try:
+        try:
+            freed_bytes = workspace_service.tree_size_bytes(tombstone)
+        except OSError:
+            logger.exception("Unable to determine deleted workspace size: %s", tombstone)
+        shutil.rmtree(tombstone)
+    except OSError as exc:
+        document_activity_registry.finish_delete(document_id)
+        logger.exception("Workspace tombstone requires administrator cleanup: %s", tombstone)
+        raise HTTPException(
+            500,
+            "Документ удалён из списка, но не удалось полностью очистить его файлы. Обратитесь к администратору.",
+        ) from exc
+    document_activity_registry.finish_delete(document_id)
+    return {"deleted": True, "document_id": document_id, "freed_bytes": freed_bytes}
+
+
+@app.get(
+    "/api/documents/{document_id}",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def get_document(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -870,7 +952,10 @@ def get_document(document_id: str):
         raise HTTPException(409, "Метаданные документа повреждены") from exc
 
 
-@app.get("/api/documents/{document_id}/page/{page_number}", dependencies=[Depends(require_authenticated)])
+@app.get(
+    "/api/documents/{document_id}/page/{page_number}",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def page_image(document_id: str, page_number: int, dpi: int = 110):
     try:
         workspace = workspace_service.get(document_id)
@@ -888,7 +973,10 @@ def page_image(document_id: str, page_number: int, dpi: int = 110):
         raise HTTPException(404, "Документ не найден") from exc
 
 
-@app.post("/api/documents/{document_id}/suggest-pages", dependencies=[Depends(require_authenticated)])
+@app.post(
+    "/api/documents/{document_id}/suggest-pages",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def suggest_pages(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -901,10 +989,13 @@ def suggest_pages(document_id: str):
             workspace.pdf_path, workspace.pages_dir, metadata["page_count"], progress
         )
 
-    return job_service.submit(run).public()
+    return _submit_document_job(document_id, run).public()
 
 
-@app.post("/api/documents/{document_id}/recognize", dependencies=[Depends(require_authenticated)])
+@app.post(
+    "/api/documents/{document_id}/recognize",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def recognize(document_id: str, request: RecognitionRequest):
     try:
         workspace = workspace_service.get(document_id)
@@ -966,7 +1057,7 @@ def recognize(document_id: str, request: RecognitionRequest):
             workspace_service.write_json(workspace.result_path, result)
         return result
 
-    job = job_service.submit(run)
+    job = _submit_document_job(document_id, run)
     return job.public()
 
 
@@ -978,7 +1069,10 @@ def get_job(job_id: str):
         raise HTTPException(404, "Задание не найдено") from exc
 
 
-@app.get("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
+@app.get(
+    "/api/documents/{document_id}/results",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def get_results(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -1078,7 +1172,10 @@ def _restore_server_owned_review_state(
     return result
 
 
-@app.put("/api/documents/{document_id}/results", dependencies=[Depends(require_authenticated)])
+@app.put(
+    "/api/documents/{document_id}/results",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def save_results(document_id: str, request: SaveRowsRequest):
     try:
         workspace = workspace_service.get(document_id)
@@ -1233,7 +1330,10 @@ def _record_export_incident(
         return None
 
 
-@app.post("/api/documents/{document_id}/export", dependencies=[Depends(require_authenticated)])
+@app.post(
+    "/api/documents/{document_id}/export",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def export(
     document_id: str,
     request: ExportRequest,
@@ -1462,39 +1562,40 @@ def create_support_incident(
     user: CurrentUser = Depends(require_authenticated),
 ):
     try:
-        workspace = workspace_service.get(request.document_id)
+        with document_activity_registry.lease(request.document_id):
+            workspace = workspace_service.get(request.document_id)
+            if not workspace.root.is_dir():
+                raise FileNotFoundError(request.document_id)
+
+            try:
+                stored_result = workspace_service.read_json(workspace.result_path, default={})
+            except (OSError, ValueError, TypeError):
+                stored_result = {}
+            stored_result = stored_result if isinstance(stored_result, dict) else {}
+            rows = stored_result.get("rows")
+            page_statuses = stored_result.get("page_statuses")
+            result_summary = stored_result.get("summary")
+            rows = rows if isinstance(rows, list) else []
+            page_statuses = page_statuses if isinstance(page_statuses, (dict, list)) else {}
+            result_summary = result_summary if isinstance(result_summary, dict) else {}
+
+            try:
+                incident = support_repository.create_user_reported_incident(
+                    document_id=request.document_id,
+                    username=user.username,
+                    role=user.role.value,
+                    app_version=APP_VERSION,
+                    stage=request.stage,
+                    document=_safe_document_snapshot_metadata(workspace),
+                    rows=rows,
+                    page_statuses=page_statuses,
+                    result_summary=result_summary,
+                )
+            except Exception as exc:
+                logger.exception("Unable to persist user-reported support incident")
+                raise HTTPException(500, "Не удалось сохранить контекст обращения") from exc
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
-    if not workspace.root.is_dir():
-        raise HTTPException(404, "Документ не найден")
-
-    try:
-        stored_result = workspace_service.read_json(workspace.result_path, default={})
-    except (OSError, ValueError, TypeError):
-        stored_result = {}
-    stored_result = stored_result if isinstance(stored_result, dict) else {}
-    rows = stored_result.get("rows")
-    page_statuses = stored_result.get("page_statuses")
-    result_summary = stored_result.get("summary")
-    rows = rows if isinstance(rows, list) else []
-    page_statuses = page_statuses if isinstance(page_statuses, (dict, list)) else {}
-    result_summary = result_summary if isinstance(result_summary, dict) else {}
-
-    try:
-        incident = support_repository.create_user_reported_incident(
-            document_id=request.document_id,
-            username=user.username,
-            role=user.role.value,
-            app_version=APP_VERSION,
-            stage=request.stage,
-            document=_safe_document_snapshot_metadata(workspace),
-            rows=rows,
-            page_statuses=page_statuses,
-            result_summary=result_summary,
-        )
-    except Exception as exc:
-        logger.exception("Unable to persist user-reported support incident")
-        raise HTTPException(500, "Не удалось сохранить контекст обращения") from exc
     return {
         "incident_id": incident["incident_id"],
         "incident_kind": INCIDENT_KIND_USER_REPORTED,
@@ -1879,7 +1980,8 @@ def _submit_sourcing_project_job(
                 )
             raise
 
-    return job_service.submit(run).public()
+    job = _submit_document_job(document_id, run) if document_id is not None else job_service.submit(run)
+    return job.public()
 
 
 @app.post("/api/sourcing/search-all", dependencies=[Depends(require_authenticated)])
@@ -1916,7 +2018,10 @@ class ReviewDecisionRequest(BaseModel):
     target: dict[str, Any] = Field(default_factory=dict)
 
 
-@app.get("/api/documents/{document_id}/review", dependencies=[Depends(require_authenticated)])
+@app.get(
+    "/api/documents/{document_id}/review",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def get_review_decisions(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
@@ -1933,7 +2038,10 @@ def get_review_decisions(document_id: str):
         raise HTTPException(409, str(exc)) from exc
 
 
-@app.post("/api/documents/{document_id}/review/decision", dependencies=[Depends(require_authenticated)])
+@app.post(
+    "/api/documents/{document_id}/review/decision",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def save_review_decision(document_id: str, request: ReviewDecisionRequest):
     if not request.physical_refs:
         raise HTTPException(400, "Для строки отсутствует связанное OCR-доказательство")
@@ -1998,13 +2106,19 @@ def save_review_decision(document_id: str, request: ReviewDecisionRequest):
         raise HTTPException(400, str(exc)) from exc
 
 
-@app.post("/api/documents/{document_id}/sourcing/search", dependencies=[Depends(require_authenticated)])
+@app.post(
+    "/api/documents/{document_id}/sourcing/search",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def document_sourcing_search(document_id: str, request: SourcingRowRequest):
     _ensure_document(document_id)
     return sourcing_search(request)
 
 
-@app.post("/api/documents/{document_id}/sourcing/search-all", dependencies=[Depends(require_authenticated)])
+@app.post(
+    "/api/documents/{document_id}/sourcing/search-all",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def document_sourcing_search_all(document_id: str, request: SourcingProjectRequest):
     _ensure_document(document_id)
     # The client sends the current selected/exportable rows, including any
@@ -2018,14 +2132,20 @@ def document_sourcing_search_all(document_id: str, request: SourcingProjectReque
     )
 
 
-@app.get("/api/documents/{document_id}/sourcing/runs", dependencies=[Depends(require_authenticated)])
+@app.get(
+    "/api/documents/{document_id}/sourcing/runs",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def list_sourcing_runs(document_id: str):
     _ensure_document(document_id)
     workspace = workspace_service.get(document_id)
     return {"runs": SourcingRunHistory(workspace.sourcing_runs_dir).list_public()}
 
 
-@app.get("/api/documents/{document_id}/sourcing/runs/{run_id}", dependencies=[Depends(require_authenticated)])
+@app.get(
+    "/api/documents/{document_id}/sourcing/runs/{run_id}",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+)
 def get_sourcing_run(document_id: str, run_id: str):
     _ensure_document(document_id)
     workspace = workspace_service.get(document_id)

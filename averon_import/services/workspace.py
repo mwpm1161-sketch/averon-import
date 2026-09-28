@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import shutil
+import stat
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_DOCUMENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def validate_document_id(document_id: str) -> str:
+    value = str(document_id or "")
+    if not _DOCUMENT_ID_RE.fullmatch(value):
+        raise ValueError("Недопустимый идентификатор документа")
+    return value
 
 
 @dataclass(slots=True)
@@ -82,10 +93,52 @@ class WorkspaceService:
         return workspace
 
     def get(self, document_id: str) -> Workspace:
+        try:
+            document_id = validate_document_id(document_id)
+        except ValueError as exc:
+            raise FileNotFoundError("Документ не найден") from exc
         root = self.documents_dir / document_id
-        if not root.exists():
+        if self.documents_dir.is_symlink() or root.is_symlink() or not root.is_dir():
             raise FileNotFoundError(document_id)
         return Workspace(document_id, root)
+
+    @property
+    def tombstones_dir(self) -> Path:
+        return self.data_dir / ".deleting"
+
+    def move_to_tombstone(self, document_id: str) -> Path:
+        document_id = validate_document_id(document_id)
+        if self.documents_dir.is_symlink():
+            raise OSError("Каталог документов не может быть символической ссылкой")
+        root = self.documents_dir / document_id
+        if root.is_symlink() or not root.is_dir():
+            raise FileNotFoundError(document_id)
+        tombstones = self.tombstones_dir
+        tombstones.mkdir(parents=True, exist_ok=True)
+        if tombstones.is_symlink() or not tombstones.is_dir():
+            raise OSError("Каталог удаления недоступен")
+        tombstone = tombstones / f"{document_id}-{uuid.uuid4().hex}"
+        root.rename(tombstone)
+        return tombstone
+
+    @staticmethod
+    def tree_size_bytes(root: Path) -> int:
+        total = 0
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    info = entry.stat(follow_symlinks=False)
+                    is_junction = getattr(path, "is_junction", lambda: False)()
+                    if entry.is_symlink() or is_junction:
+                        total += info.st_size
+                    elif stat.S_ISDIR(info.st_mode):
+                        pending.append(path)
+                    elif stat.S_ISREG(info.st_mode):
+                        total += info.st_size
+        return total
 
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return safe metadata for existing document workspaces.
@@ -96,12 +149,14 @@ class WorkspaceService:
 
         bounded_limit = max(1, min(int(limit), 100))
         documents: list[dict[str, Any]] = []
+        if self.documents_dir.is_symlink() or not self.documents_dir.is_dir():
+            return documents
         try:
             candidates = list(self.documents_dir.iterdir())
         except OSError:
             return []
         for root in candidates:
-            if not root.is_dir() or not root.name or len(root.name) > 128:
+            if root.is_symlink() or not root.is_dir() or not _DOCUMENT_ID_RE.fullmatch(root.name):
                 continue
             metadata_path = root / "metadata.json"
             try:
