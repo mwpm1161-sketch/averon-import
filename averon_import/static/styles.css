@@ -170,6 +170,7 @@ button { cursor: pointer; }
 .data-table td { min-height:37px; border-bottom:1px solid #eceef0; border-right:1px solid #eceef0; background:#fff; padding:0; vertical-align:top; }
 .data-table tr.active td { background:#eef3fa; }.data-table tr.review td { background:#fffdf6; }
 .data-table tr.critical-review td { background:#fff4e5; }
+.data-table tr.dirty-resolved td { background:#f3f6fa; }
 .data-table td.selector,.data-table th.selector { position:sticky; left:0; width:43px; min-width:43px; text-align:center; background:#fafbfc; z-index:5; }
 .data-table td.selector { padding-top:10px; }.data-table input[type=checkbox] { accent-color:#111318; }
 .cell-input { width:100%; min-height:37px; border:0; background:transparent; padding:9px 8px; outline:none; resize:none; overflow:hidden; line-height:1.35; font-size:11px; }

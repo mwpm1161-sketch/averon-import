@@ -1,6 +1,8 @@
 import hashlib
+import json
 from pathlib import Path
 import re
+import subprocess
 
 
 ROOT = Path(__file__).parents[1]
@@ -102,7 +104,7 @@ def test_canonical_review_counts_and_export_safety_remain_consistent():
 
     assert "serverSummary.review_rows" in summary
     assert "serverSummary.ready_rows" in summary
-    assert "criticalBlockers(row).length > 0" in summary
+    assert "effectiveDisplayBlockers(row).length > 0" in summary
     assert "status.blockers" in blockers
     assert "criticalBlockers(row).length > 0" in blockers
     assert "state.dirty" in safety
@@ -110,6 +112,91 @@ def test_canonical_review_counts_and_export_safety_remain_consistent():
     assert "row.critical_blockers" in app_js
     assert "state.rows.forEach(refreshClientReview)" not in load_result
     assert ".data-table tr.active td { background:#eef3fa; }" in css
+
+
+def test_dirty_resolved_review_rows_use_provisional_display_blockers_only():
+    app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    css = (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    def extract_function(name):
+        start = app_js.index(f"function {name}(")
+        ends = [
+            index for marker in ("\nfunction ", "\nasync function ")
+            if (index := app_js.find(marker, start + 1)) >= 0
+        ]
+        end = min(ends) if ends else len(app_js)
+        return app_js[start:end]
+
+    functions = "\n".join(extract_function(name) for name in (
+        "provisionalFieldBlockerResolved",
+        "effectiveDisplayBlockers",
+        "displayReviewState",
+    ))
+    script = f"""
+const vm = require('vm');
+const context = {{
+  state: {{dirty: true}},
+  isYandexCriticalRow: () => true,
+  missingCriticalFields: row => row.localMissing || [],
+  numericSuspectFields: row => row.localSuspects || [],
+  criticalBlockers: row => row.canonical_critical_blockers || [],
+}};
+vm.createContext(context);
+vm.runInContext({json.dumps(functions)}, context);
+const cleanProvisional = {{provisional_critical_blockers: [], provisional_review_reasons: []}};
+const missingUnit = {{...cleanProvisional, unit: 'м', edited: true, edited_fields: ['unit'],
+  canonical_critical_blockers: ['critical_value_missing'], localMissing: [],
+  ocr_metadata: {{provider: 'yandex_vision'}}}};
+const structural = {{...missingUnit, canonical_critical_blockers: [
+  'critical_value_missing', 'physical_row_unresolved'
+]}};
+const numericSuspect = {{...cleanProvisional, quantity: '87', edited: true,
+  edited_fields: ['quantity'], canonical_critical_blockers: ['numeric_suspect'],
+  localSuspects: [], ocr_metadata: {{normalization: {{quantity: {{numeric_suspect: true}}}}}}}};
+const invalidNumeric = {{...numericSuspect, quantity: 'не число'}};
+const nonScalar = {{...cleanProvisional, quantity: '2', edited: true,
+  provisional_review_reasons: ['numeric_non_scalar'],
+  edited_fields: ['quantity'], canonical_critical_blockers: ['numeric_non_scalar'],
+  ocr_metadata: {{normalization: {{quantity: {{non_scalar: true}}}}}}}};
+const shapeSuspect = {{...cleanProvisional, quantity: '87', edited: true,
+  edited_fields: ['quantity'], canonical_critical_blockers: ['numeric_shape_suspect'],
+  localSuspects: [], ocr_metadata: {{normalization: {{quantity: {{integer_like_decimal: true}}}}}}}};
+const beforeCanonical = JSON.stringify(missingUnit.canonical_critical_blockers);
+const result = {{
+  missing: context.displayReviewState(missingUnit),
+  structural: context.displayReviewState(structural),
+  numericSuspect: context.displayReviewState(numericSuspect),
+  invalidNumeric: context.displayReviewState(invalidNumeric),
+  nonScalar: context.displayReviewState(nonScalar),
+  shapeSuspect: context.displayReviewState(shapeSuspect),
+  canonicalUnchanged: beforeCanonical === JSON.stringify(missingUnit.canonical_critical_blockers),
+}};
+context.state.dirty = false;
+const saved = {{...missingUnit, edited: false, canonical_critical_blockers: []}};
+result.saved = context.displayReviewState(saved);
+console.log(JSON.stringify(result));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, check=True, text=True)
+    actual = json.loads(completed.stdout)
+
+    assert actual["missing"] == {"critical": False, "dirtyResolved": True}
+    assert actual["structural"] == {"critical": True, "dirtyResolved": False}
+    assert actual["numericSuspect"] == {"critical": False, "dirtyResolved": True}
+    assert actual["invalidNumeric"] == {"critical": True, "dirtyResolved": False}
+    assert actual["nonScalar"] == {"critical": False, "dirtyResolved": True}
+    assert actual["shapeSuspect"] == {"critical": False, "dirtyResolved": True}
+    assert actual["canonicalUnchanged"]
+    assert actual["saved"] == {"critical": False, "dirtyResolved": False}
+
+    summary = app_js.split("function updateSummary()", 1)[1].split("function backendExportBlockers()", 1)[0]
+    backend = app_js.split("function backendExportBlockers()", 1)[1].split("function updateExportSafety()", 1)[0]
+    renderer = app_js.split("function rowHtml(row)", 1)[1].split("function sourcingEligible", 1)[0]
+    load_result = app_js.split("function loadResult(", 1)[1].split("const displayColumns", 1)[0]
+    assert "effectiveDisplayBlockers(row)" in summary
+    assert "criticalBlockers(row).length > 0" in backend
+    assert "displayReviewState(row)" in renderer
+    assert "edited: false" in load_result and "state.dirty = false" in load_result
+    assert ".data-table tr.dirty-resolved td { background:#f3f6fa; }" in css
 
 
 def test_clean_export_skips_save_round_trip_and_dirty_save_uses_authoritative_response():

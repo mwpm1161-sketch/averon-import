@@ -1728,12 +1728,78 @@ function criticalBlockers(row) {
   return [...new Set([...canonicalBlockers, ...blockers])];
 }
 
+function provisionalFieldBlockerResolved(row, reason) {
+  if (!state.dirty || !row?.edited) return false;
+  const provisionalBlockers = new Set(row.provisional_critical_blockers || []);
+  const provisionalReasons = new Set(row.provisional_review_reasons || []);
+  if (provisionalBlockers.has(reason)
+    || (reason !== "numeric_non_scalar" && provisionalReasons.has(reason))) return false;
+
+  const edited = new Set(row.edited_fields || []);
+  const normalization = row?.ocr_metadata?.normalization || {};
+  const scalarValue = (key) => /^-?\d+(?:[.,]\d+)?$/.test(String(row?.[key] ?? "").trim());
+  if (reason === "critical_value_missing") {
+    return isYandexCriticalRow(row) && missingCriticalFields(row).length === 0;
+  }
+  if (reason === "numeric_suspect") {
+    const fields = ["quantity", "mass"]
+      .filter((key) => normalization[key]?.numeric_suspect);
+    return fields.length > 0
+      && fields.every((key) => edited.has(key)
+        && scalarValue(key)
+        && !numericSuspectFields(row).includes(key));
+  }
+  if (reason === "numeric_non_scalar") {
+    const fields = ["quantity", "mass"].filter((key) => (
+      normalization[key]?.non_scalar
+      || normalization[key]?.numeric_shape === "NON_SCALAR_SLASH"
+    ));
+    return fields.length > 0
+      && fields.every((key) => edited.has(key) && scalarValue(key));
+  }
+  if (reason === "numeric_shape_suspect") {
+    return Boolean(normalization.quantity?.integer_like_decimal)
+      && edited.has("quantity")
+      && scalarValue("quantity")
+      && !/^-?\d+[.,]0$/.test(String(row.quantity ?? "").trim());
+  }
+  return false;
+}
+
+function effectiveDisplayBlockers(row) {
+  const canonical = row?.canonical_critical_blockers ?? row?.critical_blockers ?? [];
+  const blockers = Array.isArray(canonical)
+    ? canonical.map((item) => String(item)).filter(Boolean)
+    : [];
+  if (!state.dirty || !row?.edited) return criticalBlockers(row);
+
+  const keptCanonical = blockers.filter((reason) => !provisionalFieldBlockerResolved(row, reason));
+  return [...new Set([
+    ...keptCanonical,
+    ...(row.provisional_critical_blockers || []).map((item) => String(item)).filter(Boolean),
+  ])];
+}
+
+function displayReviewState(row) {
+  const blockers = effectiveDisplayBlockers(row);
+  return {
+    critical: blockers.length > 0,
+    dirtyResolved: Boolean(state.dirty && row?.edited && blockers.length === 0),
+  };
+}
+
+function updateDisplayReviewClasses(tableRow, row) {
+  const display = displayReviewState(row);
+  tableRow.classList.toggle("critical-review", display.critical);
+  tableRow.classList.toggle("dirty-resolved", display.dirtyResolved);
+}
+
 function criticalFieldCount(row) {
   const missing = missingCriticalFields(row);
   const suspect = row.status === "verified" && !missing.length
     ? []
     : numericSuspectFields(row).filter((field) => !missing.includes(field));
-  const blockers = criticalBlockers(row);
+  const blockers = effectiveDisplayBlockers(row);
   return missing.length + suspect.length
     || (blockers.some((reason) => ["ambiguous_columns", "secondary_conflict"].includes(reason)) ? 1 : 0)
     || (blockers.includes("numeric_suspect") ? 1 : 0);
@@ -1881,7 +1947,7 @@ function filteredRows() {
     if (type && row.row_type !== type) return false;
     if (status && row.status !== status) return false;
     const missing = missingCriticalFields(row);
-    const blockers = criticalBlockers(row);
+    const blockers = effectiveDisplayBlockers(row);
     if (reviewFilter === "critical" && !blockers.length) return false;
     if (reviewFilter === "quantity-missing" && !missing.includes("quantity")) return false;
     if (reviewFilter === "unit-missing" && !missing.includes("unit")) return false;
@@ -2030,13 +2096,13 @@ function ensureResultTableEvents() {
     else if (row.status !== "verified") row.status = "edited";
     row.edited = true;
     refreshClientReview(row);
+    markDirty();
     const tableRow = input.closest("tr");
     tableRow.classList.toggle("review", ["review", "unrecognized"].includes(row.status));
-    tableRow.classList.toggle("critical-review", criticalBlockers(row).length > 0);
+    updateDisplayReviewClasses(tableRow, row);
     const statusControl = tableRow.querySelector('.cell-select[data-key="status"]');
     if (statusControl) statusControl.value = row.status;
     autoHeight(input);
-    markDirty();
     updateSummary();
   });
   body.addEventListener("focusin", (event) => {
@@ -2244,10 +2310,12 @@ function continuationFragment(row) {
 function rowHtml(row) {
   const active = row.id === state.activeRowId ? "active" : "";
   const review = ["review","unrecognized"].includes(row.status) ? "review" : "";
-  const critical = criticalBlockers(row).length ? "critical-review" : "";
+  const display = displayReviewState(row);
+  const critical = display.critical ? "critical-review" : "";
+  const dirtyResolved = display.dirtyResolved ? "dirty-resolved" : "";
   const human = row.verification_state === "HUMAN_VERIFIED" || row.human_review ? `<span class="human-verified">Проверено пользователем ✓</span>` : "";
   const ocrVerified = !human && (row.status === "verified" || row.ocr_metadata?.semantic_state === "VERIFIED") ? `<span class="ocr-verified">Подтверждено OCR</span>` : "";
-  return `<tr data-id="${row.id}" class="${active} ${review} ${critical}">
+  return `<tr data-id="${row.id}" class="${active} ${review} ${critical} ${dirtyResolved}">
     <td class="selector"><input class="row-select" data-id="${row.id}" type="checkbox" ${row.selected ? "checked" : ""}></td>
     ${displayColumns.map((key) => cellHtml(row,key)).join("")}
     <td class="sourcing-cell">${human || ocrVerified}${sourcingEligible(row) ? `<button type="button" class="button text sourcing-row-button" data-id="${row.id}">Найти предложения</button>` : ""}</td>
@@ -2895,11 +2963,11 @@ function updateSummary() {
   const ready = hasCanonicalCounts
     ? Number(serverSummary.ready_rows)
     : state.rows.filter((row) => ["recognized", "verified", "edited"].includes(row.status)
-      && !criticalBlockers(row).length).length;
+      && !effectiveDisplayBlockers(row).length).length;
   const review = hasCanonicalCounts
     ? Number(serverSummary.review_rows)
     : state.rows.filter((row) => ["review", "unrecognized"].includes(row.status)
-      || criticalBlockers(row).length > 0).length;
+      || effectiveDisplayBlockers(row).length > 0).length;
   const critical = hasCanonicalCounts
     ? Number(serverSummary.unresolved_critical)
     : state.rows.reduce((total, row) => total + criticalFieldCount(row), 0);
