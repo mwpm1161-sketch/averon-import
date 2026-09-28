@@ -288,3 +288,37 @@ def test_recognition_normalizes_selected_pages_before_provider_call():
 
     assert provider.received_pages == [1, 2]
     assert result["pages"] == [1, 2]
+
+
+def test_summary_counts_edited_rows_with_authoritative_blockers_as_review_required():
+    rows = [
+        {
+            "status": "edited",
+            "row_type": "item",
+            "name": "Позиция",
+            "unit": "шт.",
+            "quantity": "2",
+            "mass": "",
+            "critical_fields": [],
+            "review_reasons": ["structural_layout_ambiguous"],
+            "critical_blockers": ["structural_layout_ambiguous"],
+            "edited_fields": ["name"],
+        },
+        {
+            "status": "verified",
+            "row_type": "item",
+            "name": "Подтверждено",
+            "unit": "шт.",
+            "quantity": "1",
+            "mass": "",
+            "critical_fields": [],
+            "review_reasons": [],
+            "critical_blockers": [],
+            "edited_fields": [],
+        },
+    ]
+
+    summary = SpecificationRowAssembler.summary(rows, [])
+
+    assert summary["review_rows"] == 1
+    assert summary["ready_rows"] == 1

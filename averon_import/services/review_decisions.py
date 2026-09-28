@@ -19,9 +19,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from averon_import.services.ocr.page_contract import page_status_from_diagnostics
 from averon_import.services.ocr.page_disposition import CONFIRMED_NON_SPEC, SPEC_OUTPUT
 from averon_import.services.review_policy import (
+    CRITICAL_FIELDS,
+    human_confirmed_absence_applies,
+    human_verified_value_applies,
     critical_blockers_for_row,
     critical_field_count,
+    missing_critical_fields,
     refresh_review_state,
+    row_is_ready,
+    row_requires_review,
 )
 from averon_import.services.row_assembler import SpecificationRowAssembler
 
@@ -29,7 +35,26 @@ from averon_import.services.row_assembler import SpecificationRowAssembler
 FIELD_DECISION = "ACCEPT_FIELD_CANDIDATE"
 RELATION_DECISION = "ACCEPT_CONTINUATION_RELATION"
 REJECT_DECISION = "REJECT_CANDIDATE"
-DECISIONS = (FIELD_DECISION, RELATION_DECISION, REJECT_DECISION)
+CONFIRM_FIELD_VALUE_DECISION = "CONFIRM_FIELD_VALUE"
+CONFIRM_FIELD_ABSENT_DECISION = "CONFIRM_FIELD_ABSENT"
+REVIEW_PROJECTION_VERSION = 1
+DECISIONS = (
+    FIELD_DECISION,
+    RELATION_DECISION,
+    REJECT_DECISION,
+    CONFIRM_FIELD_VALUE_DECISION,
+    CONFIRM_FIELD_ABSENT_DECISION,
+)
+REVIEW_LEDGER_CORRUPT_MESSAGE = (
+    "История ручной проверки повреждена. Требуется восстановление."
+)
+
+
+class ReviewDecisionLedgerCorrupt(ValueError):
+    """The persisted decision ledger is present but cannot be trusted."""
+
+    def __init__(self) -> None:
+        super().__init__(REVIEW_LEDGER_CORRUPT_MESSAGE)
 
 
 def _stable(value: Any) -> str:
@@ -200,63 +225,179 @@ class ReviewDecision(BaseModel):
     relation: str | None = None
     candidate_value: str | None = None
     target: dict[str, Any] = Field(default_factory=dict)
-    decision: Literal[FIELD_DECISION, RELATION_DECISION, REJECT_DECISION]
+    confirmed_value: str | None = None
+    decision_id: str | None = None
+    decision: Literal[
+        FIELD_DECISION,
+        RELATION_DECISION,
+        REJECT_DECISION,
+        CONFIRM_FIELD_VALUE_DECISION,
+        CONFIRM_FIELD_ABSENT_DECISION,
+    ]
     created_at: datetime
     provenance: Literal["human"] = "human"
 
     @property
     def decision_key(self) -> str:
-        return _sha256({
+        identity = {
             "document_fingerprint": self.document_fingerprint,
             "page": self.page,
             "physical_refs": _refs(self.physical_refs),
             "field": self.field,
             "relation": self.relation,
             "parent_physical_refs": _refs(self.target.get("parent_physical_refs")),
-        })
+        }
+        if self.decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            identity.update({
+                "decision": self.decision,
+                "confirmed_value": self.confirmed_value,
+                "evidence_fingerprint": self.evidence_fingerprint,
+                "decision_id": self.decision_id,
+            })
+        return _sha256(identity)
 
 
 class ReviewDecisionStore:
     """Small atomic JSON store scoped to one document workspace."""
 
+    metrics = {
+        "ledger_reads": 0,
+        "ledger_writes": 0,
+        "revision_reads": 0,
+    }
+
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.revision_path = self.path.with_suffix(self.path.suffix + ".revision")
 
-    def load(self) -> list[ReviewDecision]:
-        if not self.path.exists():
-            return []
+    def _write_revision(self, revision: int) -> None:
+        self.revision_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.revision_path.with_suffix(self.revision_path.suffix + ".tmp")
+        temporary.write_text(str(max(0, int(revision))), encoding="ascii")
+        temporary.replace(self.revision_path)
+
+    def _sync_revision(self, revision: int) -> None:
+        try:
+            current = int(self.revision_path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            current = -1
+        if current != revision:
+            self._write_revision(revision)
+
+    def load_revision(self) -> int:
+        """Read the small revision marker without parsing a steady-state ledger."""
+        self.metrics["revision_reads"] += 1
+        if self.revision_path.is_file():
+            try:
+                return max(0, int(self.revision_path.read_text(encoding="ascii").strip()))
+            except (OSError, ValueError):
+                pass
+        if not self.path.is_file():
+            return 0
+        _, revision = self.load_snapshot()
+        return revision
+
+    def load_snapshot(self) -> tuple[list[ReviewDecision], int]:
+        """Return the canonical ledger and its persisted revision.
+
+        Legacy list payloads and dictionaries without a revision are read as
+        revision zero. The next write upgrades them to the versioned shape.
+        """
+        try:
+            self.path.stat()
+        except FileNotFoundError:
+            if self.revision_path.is_file():
+                self._sync_revision(0)
+            return [], 0
+        except OSError as exc:
+            raise ReviewDecisionLedgerCorrupt() from exc
+        self.metrics["ledger_reads"] += 1
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        raw = payload.get("decisions", payload) if isinstance(payload, dict) else payload
-        if not isinstance(raw, list):
-            return []
+        except (OSError, ValueError) as exc:
+            raise ReviewDecisionLedgerCorrupt() from exc
+        if isinstance(payload, dict):
+            if "decisions" not in payload or not isinstance(payload["decisions"], list):
+                raise ReviewDecisionLedgerCorrupt()
+            raw = payload["decisions"]
+            revision_value = payload.get("revision", 0)
+            if type(revision_value) is not int or revision_value < 0:
+                raise ReviewDecisionLedgerCorrupt()
+            revision = revision_value
+        else:
+            if not isinstance(payload, list):
+                raise ReviewDecisionLedgerCorrupt()
+            raw = payload
+            revision = 0
         decisions: list[ReviewDecision] = []
         for item in raw:
             try:
                 decisions.append(ReviewDecision.model_validate(item))
-            except Exception:
-                continue
-        return decisions
+            except Exception as exc:
+                raise ReviewDecisionLedgerCorrupt() from exc
+        self._sync_revision(revision)
+        return decisions, revision
 
-    def save(self, decisions: list[ReviewDecision]) -> None:
+    def load(self) -> list[ReviewDecision]:
+        return self.load_snapshot()[0]
+
+    def save(self, decisions: list[ReviewDecision], *, revision: int | None = None) -> int:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"decisions": [item.model_dump(mode="json") for item in decisions]}
+        if revision is None:
+            revision = self.load_snapshot()[1] + 1
+        revision = max(0, int(revision))
+        payload = {
+            "revision": revision,
+            "decisions": [item.model_dump(mode="json") for item in decisions],
+        }
+        # Write the marker first. If the process stops before replacing the
+        # ledger, a reader detects the revision mismatch and reloads the
+        # authoritative ledger before deciding whether recovery is needed.
+        self._write_revision(revision)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
+        self.metrics["ledger_writes"] += 1
+        return revision
 
-    def upsert(self, decision: ReviewDecision) -> list[ReviewDecision]:
-        decisions = [item for item in self.load() if item.decision_key != decision.decision_key]
+    @staticmethod
+    def _same_decision(left: ReviewDecision, right: ReviewDecision) -> bool:
+        left_payload = left.model_dump(mode="json", exclude={"created_at"})
+        right_payload = right.model_dump(mode="json", exclude={"created_at"})
+        return _stable(left_payload) == _stable(right_payload)
+
+    def upsert_snapshot(
+        self, decision: ReviewDecision
+    ) -> tuple[list[ReviewDecision], int, bool]:
+        decisions, revision = self.load_snapshot()
+        existing = next(
+            (item for item in decisions if item.decision_key == decision.decision_key),
+            None,
+        )
+        if existing is not None and self._same_decision(existing, decision):
+            return decisions, revision, False
+        decisions = [item for item in decisions if item.decision_key != decision.decision_key]
         decisions.append(decision)
         decisions.sort(key=lambda item: item.created_at)
-        self.save(decisions)
-        return decisions
+        revision = self.save(decisions, revision=revision + 1)
+        return decisions, revision, True
+
+    def upsert(self, decision: ReviewDecision) -> list[ReviewDecision]:
+        return self.upsert_snapshot(decision)[0]
 
 
 class HumanReviewService:
     """Validate, persist and apply bounded human resolutions."""
+
+    def __init__(self) -> None:
+        # Bounded process-local counters for tests and local performance audits.
+        # They are never logged or included in application responses.
+        self.metrics = {
+            "review_decisions_replayed": 0,
+            "page_safety_pages_recalculated": 0,
+            "full_result_copies": 0,
+            "review_rows_detached": 0,
+        }
 
     def document_fingerprint(self, pdf_path: Path) -> str:
         digest = hashlib.sha256()
@@ -270,6 +411,13 @@ class HumanReviewService:
         for row in result.get("rows") or []:
             if int(row.get("page") or 0) == int(page) and _same_refs(_row_refs(row), refs):
                 return row
+        return None
+
+    @staticmethod
+    def _find_row_index(result: Mapping[str, Any], page: int, refs: Any) -> int | None:
+        for index, row in enumerate(result.get("rows") or []):
+            if int(row.get("page") or 0) == int(page) and _same_refs(_row_refs(row), refs):
+                return index
         return None
 
     @staticmethod
@@ -290,6 +438,8 @@ class HumanReviewService:
         field: str | None = None,
         candidate_value: str | None = None,
         parent_refs: Any = None,
+        decision: str | None = None,
+        confirmed_value: str | None = None,
     ) -> str:
         metadata = row.get("ocr_metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
@@ -312,7 +462,68 @@ class HumanReviewService:
             ],
             "parent_physical_refs": _refs(parent_refs),
         }
+        if decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            normalization = metadata.get("normalization")
+            structural_safety = metadata.get("target_cell_structural_safety")
+            evidence.update({
+                "row_identity": row.get("id")
+                or row.get("logical_id")
+                or metadata.get("logical_id"),
+                "decision": decision,
+                "current_canonical_value": str(row.get(field or "", "") or ""),
+                "confirmed_value": confirmed_value,
+                "field_normalization": (
+                    normalization.get(field)
+                    if isinstance(normalization, Mapping) and field
+                    else None
+                ),
+                "field_structural_safety": (
+                    structural_safety.get(field)
+                    if isinstance(structural_safety, Mapping) and field
+                    else None
+                ),
+            })
         return _sha256(evidence)
+
+    @staticmethod
+    def _confirmation_decision_id(
+        row: Mapping[str, Any],
+        *,
+        decision: str,
+        field: str,
+        evidence_fingerprint: str,
+        confirmed_value: str | None,
+    ) -> str:
+        map_name = (
+            "human_verified_field_values"
+            if decision == CONFIRM_FIELD_VALUE_DECISION
+            else "human_confirmed_absent_fields"
+        )
+        records = row.get(map_name)
+        record = records.get(field) if isinstance(records, Mapping) else None
+        if (
+            isinstance(record, Mapping)
+            and not record.get("invalidated")
+            and record.get("decision") == decision
+            and record.get("evidence_fingerprint") == evidence_fingerprint
+            and str(record.get("value", "")) == str(confirmed_value or "")
+            and record.get("decision_id")
+        ):
+            return str(record["decision_id"])
+        return _sha256({
+            "decision": decision,
+            "field": field,
+            "document_fingerprint": row.get("document_fingerprint"),
+            "page": row.get("page"),
+            "physical_refs": _row_refs(row),
+            "evidence_fingerprint": evidence_fingerprint,
+            "confirmed_value": confirmed_value,
+            "supersedes": (
+                record.get("decision_id") or record.get("decision_key")
+                if isinstance(record, Mapping)
+                else None
+            ),
+        })
 
     def create_decision(
         self,
@@ -325,6 +536,7 @@ class HumanReviewService:
         field: str | None = None,
         relation: str | None = None,
         candidate_value: str | None = None,
+        confirmed_value: str | None = None,
         target: Mapping[str, Any] | None = None,
     ) -> ReviewDecision:
         if decision not in DECISIONS:
@@ -339,6 +551,21 @@ class HumanReviewService:
             candidate = self._candidate(row, field)
             if not candidate or str(candidate.get("value_candidate") or "") != str(candidate_value):
                 raise ValueError("Кандидат отсутствует или не совпадает с текущим OCR-доказательством")
+        if decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            if field not in CRITICAL_FIELDS:
+                raise ValueError("Для подтверждения нужно применимое критичное поле")
+            current_value = str(row.get(field, "") or "")
+            if decision == CONFIRM_FIELD_VALUE_DECISION:
+                if not current_value.strip():
+                    raise ValueError("Нельзя подтвердить пустое значение поля")
+                if confirmed_value != current_value:
+                    raise ValueError("Подтверждаемое значение не совпадает с текущим значением поля")
+            else:
+                if current_value.strip():
+                    raise ValueError("Поле уже содержит значение; подтверждение отсутствия устарело")
+                if field not in missing_critical_fields(row) and not human_confirmed_absence_applies(row, field):
+                    raise ValueError("Поле не является применимым отсутствующим критичным значением")
+                confirmed_value = None
         if decision == RELATION_DECISION:
             if not relation:
                 raise ValueError("Для связи продолжения укажите relation")
@@ -365,14 +592,17 @@ class HumanReviewService:
                 )
         metadata = row.get("ocr_metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
+        evidence_fingerprint = self.evidence_fingerprint(
+            row,
+            field=field,
+            candidate_value=candidate_value,
+            parent_refs=target_data.get("parent_physical_refs"),
+            decision=decision,
+            confirmed_value=confirmed_value,
+        )
         return ReviewDecision(
             document_fingerprint=document_fingerprint,
-            evidence_fingerprint=self.evidence_fingerprint(
-                row,
-                field=field,
-                candidate_value=candidate_value,
-                parent_refs=target_data.get("parent_physical_refs"),
-            ),
+            evidence_fingerprint=evidence_fingerprint,
             page=int(page),
             semantic_ref=str(
                 row.get("logical_id")
@@ -383,6 +613,18 @@ class HumanReviewService:
             field=field,
             relation=relation,
             candidate_value=str(candidate_value) if candidate_value is not None else None,
+            confirmed_value=confirmed_value,
+            decision_id=(
+                self._confirmation_decision_id(
+                    row,
+                    decision=decision,
+                    field=str(field),
+                    evidence_fingerprint=evidence_fingerprint,
+                    confirmed_value=confirmed_value,
+                )
+                if decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}
+                else None
+            ),
             target=target_data,
             decision=decision,
             created_at=datetime.now(timezone.utc),
@@ -402,8 +644,16 @@ class HumanReviewService:
         row["human_review"] = current
         row["verification_state"] = "HUMAN_VERIFIED"
 
-    def _apply_one(self, result: dict[str, Any], decision: ReviewDecision) -> bool:
-        row = self._find_row(result, decision.page, decision.physical_refs)
+    def _apply_one(
+        self,
+        result: dict[str, Any],
+        decision: ReviewDecision,
+        *,
+        row_override: dict[str, Any] | None = None,
+        parent_override: dict[str, Any] | None = None,
+        allow_invalidated_reaffirmation: bool = False,
+    ) -> bool:
+        row = row_override or self._find_row(result, decision.page, decision.physical_refs)
         if row is None:
             return False
         parent_refs = decision.target.get("parent_physical_refs")
@@ -412,6 +662,8 @@ class HumanReviewService:
             field=decision.field,
             candidate_value=decision.candidate_value,
             parent_refs=parent_refs,
+            decision=decision.decision,
+            confirmed_value=decision.confirmed_value,
         )
         if expected != decision.evidence_fingerprint:
             return False
@@ -425,6 +677,12 @@ class HumanReviewService:
                 return False
         if decision.decision == REJECT_DECISION:
             rejected = list(row.get("human_rejected_candidates") or [])
+            if any(
+                isinstance(item, Mapping)
+                and item.get("decision_key") == decision.decision_key
+                for item in rejected
+            ):
+                return True
             rejected.append({
                 "field": decision.field,
                 "candidate_value": decision.candidate_value,
@@ -434,6 +692,67 @@ class HumanReviewService:
             })
             row["human_rejected_candidates"] = rejected
             return True
+        if decision.decision in {CONFIRM_FIELD_VALUE_DECISION, CONFIRM_FIELD_ABSENT_DECISION}:
+            field = str(decision.field or "")
+            current_value = str(row.get(field, "") or "")
+            if decision.decision == CONFIRM_FIELD_VALUE_DECISION:
+                if not current_value.strip() or current_value != str(decision.confirmed_value or ""):
+                    return False
+                records = row.get("human_verified_field_values")
+                records = dict(records) if isinstance(records, Mapping) else {}
+                existing = records.get(field)
+                if isinstance(existing, Mapping) and existing.get("decision_key") == decision.decision_key:
+                    return True
+                records[field] = {
+                    "value": current_value,
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "decision_id": decision.decision_id,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                    "provenance": "human",
+                }
+                row["human_verified_field_values"] = records
+                confirmed = list(row.get("human_verified_fields") or [])
+                if field not in confirmed:
+                    confirmed.append(field)
+                row["human_verified_fields"] = confirmed
+                row["status"] = "review"
+                self._mark_human(row, {
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "field": field,
+                    "confirmed_value": current_value,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                })
+            else:
+                if current_value.strip():
+                    return False
+                if field not in missing_critical_fields(row) and not human_confirmed_absence_applies(row, field):
+                    return False
+                records = row.get("human_confirmed_absent_fields")
+                records = dict(records) if isinstance(records, Mapping) else {}
+                existing = records.get(field)
+                if isinstance(existing, Mapping) and existing.get("decision_key") == decision.decision_key:
+                    return True
+                records[field] = {
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "decision_id": decision.decision_id,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                    "provenance": "human",
+                }
+                row["human_confirmed_absent_fields"] = records
+                row["status"] = "review"
+                self._mark_human(row, {
+                    "decision": decision.decision,
+                    "decision_key": decision.decision_key,
+                    "field": field,
+                    "evidence_fingerprint": decision.evidence_fingerprint,
+                })
+            refresh_review_state(row)
+            if not critical_blockers_for_row(row) and row.get("row_type") not in {"section", "system", "skip"}:
+                row["status"] = "verified"
+            return True
         if decision.decision == FIELD_DECISION:
             candidate = self._candidate(row, decision.field)
             value = str(candidate.get("value_candidate") or "") if candidate else ""
@@ -442,12 +761,60 @@ class HumanReviewService:
             field = str(decision.field)
             current = str(row.get(field) or "").strip()
             if current and current != value:
-                return False
+                records = row.get("human_verified_field_values")
+                records = dict(records) if isinstance(records, Mapping) else {}
+                existing = records.get(field)
+                if (
+                    not isinstance(existing, Mapping)
+                    or existing.get("decision_key") == decision.decision_key
+                ):
+                    stale_record = dict(existing) if isinstance(existing, Mapping) else {}
+                    stale_record.update({
+                        "value": value,
+                        "decision": decision.decision,
+                        "decision_key": decision.decision_key,
+                        "evidence_fingerprint": decision.evidence_fingerprint,
+                        "provenance": "human",
+                        "invalidated": True,
+                    })
+                    records[field] = stale_record
+                    row["human_verified_field_values"] = records
+                if not human_verified_value_applies(row, field):
+                    row["status"] = "review"
+                    refresh_review_state(row)
+                return True
+            records = row.get("human_verified_field_values")
+            records = dict(records) if isinstance(records, Mapping) else {}
+            existing = records.get(field)
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("decision_key") == decision.decision_key
+                and existing.get("invalidated")
+                and not allow_invalidated_reaffirmation
+            ):
+                row["status"] = "review"
+                refresh_review_state(row)
+                return True
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("decision_key") == decision.decision_key
+                and not existing.get("invalidated")
+                and str(existing.get("value", "")) == value
+            ):
+                return True
             row[field] = value
             edited = list(row.get("edited_fields") or [])
             if field not in edited:
                 edited.append(field)
             row["edited_fields"] = edited
+            records[field] = {
+                "value": value,
+                "decision": decision.decision,
+                "decision_key": decision.decision_key,
+                "evidence_fingerprint": decision.evidence_fingerprint,
+                "provenance": "human",
+            }
+            row["human_verified_field_values"] = records
             confirmed = list(row.get("human_verified_fields") or [])
             if field not in confirmed:
                 confirmed.append(field)
@@ -467,7 +834,7 @@ class HumanReviewService:
         if decision.decision == RELATION_DECISION:
             if str(row.get("row_type") or "") != "semantic_review":
                 return False
-            parent = self._find_row(result, decision.page, parent_refs)
+            parent = parent_override or self._find_row(result, decision.page, parent_refs)
             if parent is None or parent is row:
                 return False
             if str(parent.get("row_type") or "") not in {"item", "component", "item_candidate"}:
@@ -476,7 +843,6 @@ class HumanReviewService:
             if not fragment:
                 return False
             parent_name = str(parent.get("name") or "").strip()
-            parent["name"] = f"{parent_name} {fragment}".strip()
             relations = list(parent.get("human_verified_relations") or [])
             relation_record = {
                 "relation": decision.relation,
@@ -485,7 +851,14 @@ class HumanReviewService:
                 "fragment": fragment,
                 "decision_key": decision.decision_key,
             }
-            relations.append(relation_record)
+            already_related = any(
+                isinstance(item, Mapping)
+                and item.get("decision_key") == decision.decision_key
+                for item in relations
+            )
+            if not already_related:
+                parent["name"] = f"{parent_name} {fragment}".strip()
+                relations.append(relation_record)
             parent["human_verified_relations"] = relations
             self._mark_human(parent, {
                 "decision": decision.decision,
@@ -510,11 +883,142 @@ class HumanReviewService:
         return False
 
     def apply_decision(self, result: Mapping[str, Any], decision: ReviewDecision) -> dict[str, Any]:
+        self.metrics["full_result_copies"] += 1
         updated = _detached_review_copy(result)
         if decision.document_fingerprint != str(updated.get("document_fingerprint") or decision.document_fingerprint):
             return updated
-        self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        self._apply_one(
+            updated, decision, allow_invalidated_reaffirmation=True
+        )
+        return recalculate_page_safety(updated, metrics=self.metrics)
+
+    def apply_decision_incremental(
+        self, result: dict[str, Any], decision: ReviewDecision
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], set[int], bool]:
+        """Apply one decision to a freshly loaded canonical JSON projection.
+
+        Only the decision's row (and a bounded continuation parent) are
+        detached. OCR metadata is shared unchanged with the original row so
+        review policy can update the projection without rewriting OCR evidence.
+        The caller must hold the per-document mutation lock.
+        """
+        if decision.document_fingerprint != str(
+            result.get("document_fingerprint") or decision.document_fingerprint
+        ):
+            return result, [], set(), False
+        row_index = self._find_row_index(result, decision.page, decision.physical_refs)
+        if row_index is None:
+            return result, [], set(), False
+        indexes = {row_index}
+        parent_index = None
+        if decision.decision == RELATION_DECISION:
+            parent_index = self._find_row_index(
+                result,
+                decision.page,
+                decision.target.get("parent_physical_refs"),
+            )
+            if parent_index is None or parent_index == row_index:
+                return result, [], set(), False
+            indexes.add(parent_index)
+
+        original_rows = result.get("rows") or []
+        rows = list(original_rows)
+        original_by_index = {index: original_rows[index] for index in indexes}
+        for index in indexes:
+            row_copy = _detached_review_copy(original_rows[index])
+            rows[index] = row_copy
+        self.metrics["review_rows_detached"] += len(indexes)
+        updated = dict(result)
+        updated["rows"] = rows
+        if decision.decision == RELATION_DECISION:
+            applied = self._apply_one(
+                updated,
+                decision,
+                row_override=rows[row_index],
+                parent_override=rows[parent_index],
+                allow_invalidated_reaffirmation=True,
+            )
+        else:
+            applied = self._apply_one(
+                updated,
+                decision,
+                row_override=rows[row_index],
+                allow_invalidated_reaffirmation=True,
+            )
+        if not applied:
+            return result, [], set(), False
+
+        # Projection refresh may update derived flags under ocr_metadata. Keep
+        # the exact source evidence object from the canonical row unchanged.
+        for index in indexes:
+            rows[index]["ocr_metadata"] = original_by_index[index].get("ocr_metadata")
+
+        changed_indexes = [
+            index for index in indexes if rows[index] != original_by_index[index]
+        ]
+        if not changed_indexes:
+            return result, [], set(), True
+        changed_rows = [rows[index] for index in changed_indexes]
+        affected_pages = {
+            int(row.get("page") or decision.page) for row in changed_rows
+        }
+        updated["document_fingerprint"] = decision.document_fingerprint
+        recalculate_page_safety(
+            updated,
+            metrics=self.metrics,
+            pages=affected_pages,
+            copy_result=False,
+            refresh_summary=False,
+        )
+        updated["summary"] = self._summary_after_row_changes(
+            result.get("summary"),
+            [original_by_index[index] for index in changed_indexes],
+            changed_rows,
+            rows,
+            result.get("errors") or [],
+        )
+        return updated, changed_rows, affected_pages, True
+
+    @staticmethod
+    def _summary_after_row_changes(
+        summary: Any,
+        old_rows: list[dict[str, Any]],
+        new_rows: list[dict[str, Any]],
+        all_rows: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not isinstance(summary, Mapping) or not {
+            "total_rows", "status_counts", "type_counts", "page_errors",
+            "unresolved_critical", "critical_rows", "review_rows", "ready_rows",
+        }.issubset(summary):
+            return SpecificationRowAssembler.summary(all_rows, errors)
+        updated = dict(summary)
+        status_counts = dict(summary.get("status_counts") or {})
+        type_counts = dict(summary.get("type_counts") or {})
+        unresolved = int(summary.get("unresolved_critical") or 0)
+        critical_rows = int(summary.get("critical_rows") or 0)
+        review_rows = int(summary.get("review_rows") or 0)
+        ready_rows = int(summary.get("ready_rows") or 0)
+        for row, delta in [*((row, -1) for row in old_rows), *((row, 1) for row in new_rows)]:
+            status = str(row.get("status") or "")
+            row_type = str(row.get("row_type") or "")
+            status_counts[status] = status_counts.get(status, 0) + delta
+            type_counts[row_type] = type_counts.get(row_type, 0) + delta
+            unresolved += delta * critical_field_count(row)
+            critical_rows += delta * int(bool(critical_blockers_for_row(row)))
+            review_rows += delta * int(row_requires_review(row))
+            ready_rows += delta * int(row_is_ready(row))
+        updated["status_counts"] = {
+            key: count for key, count in status_counts.items() if count > 0
+        }
+        updated["type_counts"] = {
+            key: count for key, count in type_counts.items() if count > 0
+        }
+        updated["unresolved_critical"] = max(0, unresolved)
+        updated["critical_rows"] = max(0, critical_rows)
+        updated["review_rows"] = max(0, review_rows)
+        updated["ready_rows"] = max(0, ready_rows)
+        return updated
 
     def apply_saved_decisions(
         self,
@@ -522,26 +1026,93 @@ class HumanReviewService:
         decisions: list[ReviewDecision],
         document_fingerprint: str,
     ) -> dict[str, Any]:
+        self.metrics["full_result_copies"] += 1
         updated = _detached_review_copy(result)
         updated["document_fingerprint"] = document_fingerprint
+        legacy_projection = (
+            result.get("review_projection_version") != REVIEW_PROJECTION_VERSION
+        )
         for decision in sorted(decisions, key=lambda item: item.created_at):
             if decision.document_fingerprint != document_fingerprint:
                 continue
+            self.metrics["review_decisions_replayed"] += 1
             self._apply_one(updated, decision)
-        return recalculate_page_safety(updated)
+        if legacy_projection:
+            for row in updated.get("rows") or []:
+                legacy_fields = row.get("human_verified_fields")
+                legacy_fields = (
+                    [str(field) for field in legacy_fields if str(field).strip()]
+                    if isinstance(legacy_fields, (list, tuple, set))
+                    else []
+                )
+                human_review = row.get("human_review")
+                if (
+                    isinstance(human_review, Mapping)
+                    and human_review.get("decision") == FIELD_DECISION
+                    and human_review.get("field")
+                ):
+                    legacy_fields.append(str(human_review["field"]))
+                unresolved = {
+                    field for field in legacy_fields
+                    if not human_verified_value_applies(row, field)
+                }
+                if not unresolved:
+                    continue
+                remaining = [
+                    field for field in legacy_fields
+                    if field not in unresolved
+                ]
+                if remaining:
+                    row["human_verified_fields"] = list(dict.fromkeys(remaining))
+                else:
+                    row.pop("human_verified_fields", None)
+                if row.get("status") == "verified":
+                    row["status"] = "review"
+                refresh_review_state(row)
+        updated["review_projection_version"] = REVIEW_PROJECTION_VERSION
+        return recalculate_page_safety(updated, metrics=self.metrics)
 
 
-def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
+def recalculate_page_safety(
+    result: Mapping[str, Any],
+    *,
+    metrics: dict[str, int] | None = None,
+    pages: set[int] | None = None,
+    copy_result: bool = True,
+    refresh_summary: bool = True,
+) -> dict[str, Any]:
     """Rebuild page safety counters from the post-review canonical view."""
-    updated = _detached_review_copy(result)
+    if copy_result:
+        if metrics is not None:
+            metrics["full_result_copies"] += 1
+        updated = _detached_review_copy(result)
+    else:
+        updated = result
+        if not isinstance(updated, dict):
+            raise TypeError("Canonical result must be a mutable dictionary")
     rows = list(updated.get("rows") or [])
     statuses = dict(updated.get("page_statuses") or {})
+    affected_pages = {int(page) for page in pages} if pages is not None else None
+    rows_by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            row_page = int(row.get("page") or 0)
+        except (TypeError, ValueError):
+            continue
+        if affected_pages is None or row_page in affected_pages:
+            rows_by_page.setdefault(row_page, []).append(row)
     for page_key, original in statuses.items():
         if not isinstance(original, Mapping):
             continue
         page = int(original.get("page") or page_key)
-        page_rows = [row for row in rows if int(row.get("page") or 0) == page]
-        diagnostics = dict(original.get("diagnostics") or {})
+        if affected_pages is not None and page not in affected_pages:
+            continue
+        if metrics is not None:
+            metrics["page_safety_pages_recalculated"] += 1
+        if not copy_result:
+            original = _detached_review_copy(original)
+        page_rows = rows_by_page.get(page, [])
+        diagnostics = _detached_review_copy(original.get("diagnostics") or {})
         # Page status diagnostics are intentionally compact and do not carry
         # the original reconstruction object.  Rehydrate the contract inputs
         # from the serialized status before recalculating human-resolved
@@ -636,11 +1207,14 @@ def recalculate_page_safety(result: Mapping[str, Any]) -> dict[str, Any]:
         })
         statuses[str(page)] = page_status.as_dict()
     updated["page_statuses"] = statuses
-    updated["summary"] = SpecificationRowAssembler.summary(rows, updated.get("errors") or [])
+    if refresh_summary:
+        updated["summary"] = SpecificationRowAssembler.summary(rows, updated.get("errors") or [])
     return updated
 
 
 __all__ = [
+    "CONFIRM_FIELD_ABSENT_DECISION",
+    "CONFIRM_FIELD_VALUE_DECISION",
     "DECISIONS",
     "FIELD_DECISION",
     "HumanReviewService",
