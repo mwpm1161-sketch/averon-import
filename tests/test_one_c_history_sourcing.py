@@ -12,12 +12,21 @@ from averon_import.core.unit_normalization import normalize_sourcing_unit_family
 from averon_import.services.one_c_history.read_model import OneCHistoryReadError
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.one_c_history.xlsx_import import ParsedEvent, ParsedWorkbook
-from averon_import.services.sourcing.models import MatchDecision, ProductIntent
+from averon_import.services.sourcing.models import (
+    MatchDecision,
+    Offer,
+    ProductIntent,
+    SourcingSourceMode,
+)
 from averon_import.services.sourcing.providers.one_c_history import (
     HistoryMatchOutcome,
+    HistorySafeMatchBasis,
     OneCHistoryProvider,
+    normalize_exact_source_name,
     normalize_product_search_text,
 )
+from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy
+from averon_import.services.sourcing.service import SourcingService
 
 
 def _event(
@@ -271,6 +280,7 @@ def test_exact_article_match_with_compatible_unit_and_price_is_safe(tmp_path):
     result = provider.lookup(_intent())
 
     assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert result.safe_basis == HistorySafeMatchBasis.EXACT_ARTICLE
     assert result.selected_offer is not None
     assert result.match_results[0].decision == MatchDecision.MATCH
     assert result.selected_offer.data_provenance["source"] == "one_c_history"
@@ -421,7 +431,7 @@ def test_conflicting_required_attribute_cannot_be_safe(tmp_path):
 def test_likely_match_is_never_safe(tmp_path):
     _, provider = _provider(tmp_path, [_event(article="")])
 
-    result = provider.lookup(_intent(article="", model="Насос тестовый"))
+    result = provider.lookup(_intent(article=""))
 
     assert result.outcome == HistoryMatchOutcome.REVIEW
     assert result.selected_offer is None
@@ -435,6 +445,145 @@ def test_name_only_exact_support_is_never_safe(tmp_path):
 
     assert result.outcome == HistoryMatchOutcome.REVIEW
     assert result.selected_offer is None
+
+
+def test_conservative_exact_source_name_normalizer_preserves_punctuation_and_order():
+    assert normalize_exact_source_name("\u00a0Клапан   DN50  ") == "клапан dn50"
+    assert normalize_exact_source_name("Ёлка × 2") == "елка × 2"
+    assert normalize_exact_source_name("Клапан DN50") != normalize_exact_source_name("Клапан DN 50")
+    assert normalize_exact_source_name("Клапан A/B") != normalize_exact_source_name("Клапан A-B")
+    assert normalize_exact_source_name("Клапан DN50 M-500") != normalize_exact_source_name("Клапан M-500 DN50")
+
+
+def test_exact_source_name_unit_with_specification_token_is_safe_and_keeps_unknown_currency(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(name="Клапан M-500", article="ART-001", currency=None),
+    ])
+    source = _intent(name="Клапан M-500", article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert result.safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
+    assert result.selected_offer is not None
+    assert result.selected_offer.currency == ""
+    assert result.selected_offer.availability is None
+    assert result.selected_offer.url == ""
+
+
+def test_exact_source_name_unit_allows_only_case_and_whitespace_variation(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="  КЛАПАН   M-500  ", article="")])
+    source = _intent(name="Клапан M-500", article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert result.safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
+
+
+def test_exact_source_name_punctuation_difference_stays_review(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="Клапан DN-50", article="")])
+    source = _intent(name="Клапан DN50", article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.safe_basis is None
+
+
+@pytest.mark.parametrize(("first_code", "second_code"), [("001", "002"), (None, None)])
+def test_duplicate_exact_name_unit_across_canonical_items_stays_review(tmp_path, first_code, second_code):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="item:1", item_code=first_code, name="Клапан DN50", article="", row=2, group_number=1),
+        _event(item_id="item:2", item_code=second_code, name="Клапан DN50", article="", row=3, group_number=2),
+    ])
+    source = _intent(name="Клапан DN50", article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.safe_basis is None
+
+
+def test_loose_punctuation_collision_blocks_otherwise_unique_exact_name(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="item:1", item_code="001", name="Клапан DN50", article="", row=2, group_number=1),
+        _event(item_id="item:2", item_code="002", name="Клапан-DN50", article="ART-2", row=3, group_number=2),
+    ])
+    source = _intent(name="Клапан DN50", article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+
+
+def test_ai_only_article_cannot_create_article_safe_basis_or_rescue_generic_name(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="Кабель", article="ART-001")])
+    source = _intent(name="Кабель", article="")
+    resolved = _intent(name="Кабель", article="ART-001")
+
+    result = provider.lookup(resolved, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.safe_basis is None
+
+
+def test_ai_only_article_does_not_change_independent_exact_name_basis(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="Клапан M-500", article="ART-001")])
+    source = _intent(name="Клапан M-500", article="")
+    resolved = _intent(name="Клапан M-500", article="ART-001")
+
+    result = provider.lookup(resolved, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert result.safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
+
+
+def test_ai_only_preferred_attribute_cannot_satisfy_name_specificity_guard(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="Кабель", article="")])
+    source = _intent(name="Кабель", article="")
+    resolved = source.model_copy(update={
+        "preferred_attributes": {"material": "медь"},
+        "evidence": {"attribute_origins": {"material": "ai_inferred"}},
+    })
+
+    result = provider.lookup(resolved, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.safe_basis is None
+
+
+def test_source_article_mismatch_cannot_be_rescued_by_exact_name(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="Клапан DN50", article="ART-001")])
+    source = _intent(name="Клапан DN50", article="ART-999")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.safe_basis is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "when"),
+    [("price", "0", "2026-08-01"), ("price", "12.50", ""), ("price", "12.50", "2099-01-01")],
+)
+def test_exact_article_zero_price_missing_or_future_date_cannot_be_safe(tmp_path, field, value, when):
+    kwargs = {field: value, "when": when}
+    _, provider = _provider(tmp_path, [_event(**kwargs)])
+
+    result = provider.lookup(_intent())
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.safe_basis is None
+
+
+def test_exact_name_model_conflict_and_required_attribute_conflict_stay_review(tmp_path):
+    _, provider = _provider(tmp_path, [_event(name="Клапан M-500", article="", characteristic="Сталь")])
+    model_source = _intent(name="Клапан M-500", article="", model="M-999")
+    required_source = _intent(name="Клапан M-500", article="", required={"characteristic": "Латунь"})
+
+    assert provider.lookup(model_source, source_intent=model_source).outcome == HistoryMatchOutcome.REVIEW
+    assert provider.lookup(required_source, source_intent=required_source).outcome == HistoryMatchOutcome.REVIEW
 
 
 def test_match_with_incompatible_history_unit_requires_review(tmp_path):
@@ -726,4 +875,288 @@ def test_conservative_search_normalization_preserves_identifier_punctuation_and_
 
 def test_history_provider_is_not_registered_in_current_sourcing_runtime():
     source = (Path(__file__).resolve().parents[1] / "averon_import" / "services" / "sourcing" / "runtime.py").read_text(encoding="utf-8")
-    assert "one_c_history" not in source
+    provider_map = source.split("providers: dict[str, SourcingProvider] = {", 1)[1].split("\n    }", 1)[0]
+    assert "OneCHistoryProvider" not in provider_map
+    assert "one_c_history_provider=(" in source
+
+
+class _CountingLiveProvider:
+    key = "stub_live"
+    label = "Поставщик для теста"
+    cache_policy = SourcingProviderCachePolicy(cache_search_results=True)
+
+    def __init__(self, *, fail=False):
+        self.stats_calls = 0
+        self.search_calls = 0
+        self.fail = fail
+
+    def stats(self):
+        self.stats_calls += 1
+        return {"reachable": True, "catalog_version": "live-v1", "item_count": 1}
+
+    def search(self, intent, *, limit=20):
+        self.search_calls += 1
+        if self.fail:
+            raise ValueError("synthetic provider failure")
+        title = intent.normalized_name or "Тестовое предложение"
+        return [Offer(
+            offer_id=f"live:{intent.source_row_id}",
+            provider=self.key,
+            title=title,
+            article=intent.article,
+            manufacturer=intent.manufacturer,
+            price=Decimal("10"),
+            currency="RUB",
+            price_unit=intent.unit or "шт",
+        )][:limit]
+
+
+def _routed_service(tmp_path, events=None, *, live=None):
+    repository = OneCHistoryRepository(tmp_path / "data")
+    if events is not None:
+        _activate(repository, events)
+    history_provider = OneCHistoryProvider(repository)
+    live_provider = live or _CountingLiveProvider()
+    return (
+        SourcingService(
+            {live_provider.key: live_provider},
+            default_provider=live_provider.key,
+            one_c_history_provider=history_provider,
+        ),
+        repository,
+        history_provider,
+        live_provider,
+    )
+
+
+def _row(name, *, source_id="row-1", code="", unit="шт", quantity="1"):
+    return {
+        "id": source_id,
+        "source_row_id": source_id,
+        "row_type": "item",
+        "name": name,
+        "code": code,
+        "unit": unit,
+        "quantity": quantity,
+    }
+
+
+def test_provider_only_default_is_identical_and_never_touches_history(tmp_path, monkeypatch):
+    service, repository, history_provider, live = _routed_service(tmp_path, [_event()])
+    monkeypatch.setattr(history_provider, "lookup", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("history lookup")))
+    monkeypatch.setattr(repository, "catalog_version", lambda: (_ for _ in ()).throw(AssertionError("history read")))
+    row = _row("Насос тестовый", code="ART-001")
+
+    old_result = service.search_row(row, ai_rerank=False)
+    default_result = service.search_row_routed(row, ai_rerank=False)
+    explicit_result = service.search_row_routed(row, source_mode=SourcingSourceMode.PROVIDER_ONLY, ai_rerank=False)
+
+    assert default_result.route is None
+    assert explicit_result.route is None
+    assert default_result.recommended_offer.offer_id == old_result.recommended_offer.offer_id
+    assert explicit_result.recommended_offer.offer_id == old_result.recommended_offer.offer_id
+    assert live.search_calls == 3
+    assert live.stats_calls == 3
+
+
+def test_one_c_then_provider_safe_history_row_skips_provider_network(tmp_path):
+    service, _, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Клапан M-500", article="", currency=None)],
+    )
+
+    result = service.search_row_routed(
+        _row("Клапан M-500"),
+        source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+        ai_rerank=False,
+    )
+
+    assert result.route.final_source_kind == "historical_purchase"
+    assert result.route.history_safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
+    assert result.route.history_outcome == "SAFE_MATCH"
+    assert result.recommended_offer.provider == "one_c_history"
+    assert live.stats_calls == 0
+    assert live.search_calls == 0
+
+
+def test_provider_only_cached_result_cannot_satisfy_one_c_only(tmp_path):
+    service, _, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Клапан M-500", article="", currency=None)],
+    )
+    row = _row("Клапан M-500")
+    live_result = service.search_row(row, ai_rerank=False)
+
+    history_result = service.search_row_routed(row, source_mode="one_c_only", ai_rerank=False)
+
+    assert live_result.recommended_offer.provider == live.key
+    assert history_result.recommended_offer.provider == "one_c_history"
+    assert history_result.route.final_source_kind == "historical_purchase"
+    assert live.search_calls == 1
+    assert live.stats_calls == 1
+
+
+def test_one_c_then_provider_review_falls_back_once_without_mixing_history_candidates(tmp_path):
+    service, _, _, live = _routed_service(tmp_path, [_event(name="Кабель", article="")])
+
+    result = service.search_row_routed(
+        _row("Кабель"),
+        source_mode="one_c_then_provider",
+        ai_rerank=False,
+    )
+
+    assert result.route.history_outcome == "REVIEW"
+    assert result.route.fallback_called is True
+    assert result.route.final_source_kind == "provider"
+    assert all(offer.provider == live.key for offer in result.offers)
+    assert live.stats_calls == 1
+    assert live.search_calls == 1
+
+
+@pytest.mark.parametrize("failure", ["no_match", "unavailable"])
+def test_one_c_then_provider_no_match_or_unavailable_falls_back_once(tmp_path, failure):
+    service, repository, _, live = _routed_service(tmp_path, [_event()])
+    row = _row("Принципиально иной материал")
+    if failure == "unavailable":
+        repository.database_path.write_bytes(b"not a sqlite snapshot")
+
+    result = service.search_row_routed(
+        row,
+        source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+        ai_rerank=False,
+    )
+
+    assert result.route.fallback_called is True
+    assert result.route.history_outcome == ("UNAVAILABLE" if failure == "unavailable" else "NO_MATCH")
+    assert live.stats_calls == 1
+    assert live.search_calls == 1
+
+
+def test_one_c_then_provider_failure_does_not_resurrect_review_candidate(tmp_path):
+    live = _CountingLiveProvider(fail=True)
+    service, _, _, live = _routed_service(tmp_path, [_event(name="Кабель", article="")], live=live)
+
+    result = service.search_row_routed(
+        _row("Кабель"),
+        source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+        ai_rerank=False,
+    )
+
+    assert result.route.history_outcome == "REVIEW"
+    assert result.recommended_offer is None
+    assert result.offers == []
+    assert result.review_candidate is None
+    assert live.stats_calls == 1
+    assert live.search_calls == 1
+
+
+def test_one_c_only_review_and_unavailable_never_call_live_provider(tmp_path):
+    service, repository, _, live = _routed_service(tmp_path, [_event(name="Кабель", article="")])
+    review = service.search_row_routed(_row("Кабель"), source_mode="one_c_only", ai_rerank=False)
+
+    assert review.route.final_source_kind == "history_review"
+    assert review.recommended_offer is None
+    assert review.offers
+    assert any(notice.code == "ONE_C_HISTORY_REVIEW" for notice in review.notices)
+    assert live.stats_calls == 0 and live.search_calls == 0
+
+    no_match = service.search_row_routed(
+        _row("Совсем другая позиция"),
+        source_mode="one_c_only",
+        ai_rerank=False,
+    )
+    assert no_match.route.final_source_kind == "none"
+    assert any(notice.code == "ONE_C_HISTORY_NOT_FOUND" for notice in no_match.notices)
+    assert live.stats_calls == 0 and live.search_calls == 0
+
+    repository.database_path.write_bytes(b"not a sqlite snapshot")
+    unavailable = service.search_row_routed(_row("Кабель"), source_mode="one_c_only", ai_rerank=False)
+    assert unavailable.route.final_source_kind == "none"
+    assert unavailable.offers == []
+    assert any(notice.code == "ONE_C_HISTORY_UNAVAILABLE" for notice in unavailable.notices)
+    assert live.stats_calls == 0 and live.search_calls == 0
+
+
+def test_one_c_only_safe_never_calls_live_provider(tmp_path):
+    service, _, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Клапан M-500", article="", currency=None)],
+    )
+
+    result = service.search_row_routed(_row("Клапан M-500"), source_mode="one_c_only", ai_rerank=False)
+
+    assert result.route.final_source_kind == "historical_purchase"
+    assert result.recommended_offer.provider == "one_c_history"
+    assert live.stats_calls == 0 and live.search_calls == 0
+
+
+def test_mixed_project_falls_back_per_row_and_keeps_historical_amount_out_of_live_totals(tmp_path, monkeypatch):
+    service, repository, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Клапан M-500", article="", currency=None)],
+    )
+    snapshot_reads = 0
+    read_snapshot = repository.read_catalog_snapshot
+
+    def counted_snapshot_read():
+        nonlocal snapshot_reads
+        snapshot_reads += 1
+        return read_snapshot()
+
+    monkeypatch.setattr(repository, "read_catalog_snapshot", counted_snapshot_read)
+    understand_calls = 0
+    real_understand = service._understand_row_result_with_cache
+
+    def counted_understand(row):
+        nonlocal understand_calls
+        understand_calls += 1
+        return real_understand(row)
+
+    monkeypatch.setattr(service, "_understand_row_result_with_cache", counted_understand)
+    rows = [
+        _row("Клапан M-500", source_id="history", quantity="99"),
+        _row("Лампа", source_id="fallback", quantity="2"),
+    ]
+
+    result = service.search_project_routed(rows, source_mode="one_c_then_provider")
+
+    assert understand_calls == 2
+    assert live.stats_calls == 1
+    assert live.search_calls == 1
+    assert snapshot_reads == 1
+    assert result.positions_history_matched == 1
+    assert result.positions_provider_matched == 1
+    assert result.positions_fallback_called == 1
+    assert result.positions_matched == 2
+    assert result.confirmed_totals == {"RUB": Decimal("20")}
+    assert result.results[0].recommended_offer.currency == ""
+    assert result.results[0].route.final_source_kind == "historical_purchase"
+    assert result.results[1].route.final_source_kind == "provider"
+
+
+def test_search_intent_routing_requires_explicit_source_intent(tmp_path):
+    service, _, _, _ = _routed_service(tmp_path)
+
+    with pytest.raises(ValueError, match="исходная строка"):
+        service.search_intent_routed(_intent(), source_mode="one_c_only")
+
+
+def test_routed_lookup_observes_active_snapshot_version_after_activation(tmp_path):
+    service, repository, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Клапан M-500", article="", currency=None)],
+    )
+    first = service.search_row_routed(_row("Клапан M-500"), source_mode="one_c_only", ai_rerank=False)
+    first_version = first.route.history_catalog_version
+    _activate(
+        repository,
+        [_event(name="Клапан M-501", article="", currency=None)],
+        source_sha="7" * 64,
+        fingerprint="8" * 64,
+    )
+
+    second = service.search_row_routed(_row("Клапан M-501"), source_mode="one_c_only", ai_rerank=False)
+
+    assert second.route.final_source_kind == "historical_purchase"
+    assert second.route.history_catalog_version != first_version
+    assert live.stats_calls == 0 and live.search_calls == 0

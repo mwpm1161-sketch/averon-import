@@ -768,3 +768,25 @@ def test_file_response_construction_failure_releases_document_lease(monkeypatch)
     assert registry.active_operations(document_id) == 0
     assert registry.begin_delete(document_id) is True
     registry.cancel_delete(document_id)
+
+
+def test_sourcing_request_modes_default_to_provider_only_and_intent_route_rejects_history(auth_client):
+    from averon_import import main
+
+    assert main.SourcingRowRequest(row={}).source_mode.value == "provider_only"
+    assert main.SourcingProjectRequest(rows=[]).source_mode.value == "provider_only"
+    response = auth_client.post(
+        "/api/sourcing/search-intent",
+        headers=_headers("averon"),
+        json={
+            "intent": {
+                "source_row_id": "row-1",
+                "source_text": "Клапан",
+                "normalized_name": "Клапан",
+            },
+            "source_mode": "one_c_only",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "исходную строку" in response.json()["detail"]

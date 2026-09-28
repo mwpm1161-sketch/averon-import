@@ -27,6 +27,35 @@ class SourcingNotice(SourcingModel):
     user_visible: bool = True
 
 
+class SourcingSourceMode(str, Enum):
+    PROVIDER_ONLY = "provider_only"
+    ONE_C_ONLY = "one_c_only"
+    ONE_C_THEN_PROVIDER = "one_c_then_provider"
+
+
+class HistorySafeMatchBasis(str, Enum):
+    EXACT_ARTICLE = "EXACT_ARTICLE"
+    EXACT_SOURCE_NAME_UNIT = "EXACT_SOURCE_NAME_UNIT"
+
+
+class SourcingRouteMetadata(SourcingModel):
+    source_mode: SourcingSourceMode
+    final_source_kind: Literal["historical_purchase", "provider", "history_review", "none"]
+    history_outcome: Literal["SAFE_MATCH", "REVIEW", "NO_MATCH", "UNAVAILABLE"] = "NO_MATCH"
+    history_safe_basis: HistorySafeMatchBasis | None = None
+    history_reason_code: str = Field(default="", max_length=100)
+    history_catalog_version: str = Field(default="", max_length=100)
+    history_candidate_count: int = Field(default=0, ge=0)
+    history_selected_event_id: str = Field(default="", max_length=180)
+    history_purchase_date: str = Field(default="", max_length=40)
+    history_age_days: int | None = Field(default=None, ge=0)
+    fallback_called: bool = False
+    fallback_provider_key: str = Field(default="", max_length=100)
+    fallback_provider_label: str = Field(default="", max_length=180)
+    fallback_catalog_version: str = Field(default="", max_length=120)
+    routing_policy_revision: str = Field(default="one-c-routing-v1", max_length=80)
+
+
 class SourcingProviderCapabilities(SourcingModel):
     """Immutable, request-independent provider contract metadata."""
 
@@ -260,6 +289,7 @@ class SourcingResult(SourcingModel):
     notices: list[SourcingNotice] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
     ai_mode: str = "fallback"
+    route: SourcingRouteMetadata | None = None
 
 
 class ProjectSourcingResult(SourcingModel):
@@ -275,6 +305,13 @@ class ProjectSourcingResult(SourcingModel):
     positions_alternatives: int = 0
     positions_review: int = 0
     positions_without_offers: int = 0
+    source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
+    positions_history_matched: int = 0
+    positions_provider_matched: int = 0
+    positions_fallback_called: int = 0
+    positions_history_review: int = 0
+    positions_history_no_match: int = 0
+    positions_history_unavailable: int = 0
     confirmed_total: Decimal | None = None
     confirmed_totals: dict[str, Decimal] = Field(default_factory=dict)
     confirmed_currency: str | None = None

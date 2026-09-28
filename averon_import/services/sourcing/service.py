@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
+from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Any, Callable
@@ -16,13 +17,22 @@ from averon_import.services.sourcing.matching import (
 from averon_import.services.sourcing.models import (
     MatchDecision,
     ProductIntent,
+    ProductUnderstandingProvenance,
     ProductUnderstandingResult,
     ProjectSourcingResult,
     SourcingRankingResult,
     SourcingNotice,
     SourcingProviderRuntimeState,
     SourcingResult,
+    SourcingRouteMetadata,
+    SourcingSourceMode,
     dedupe_sourcing_notices,
+)
+from averon_import.services.sourcing.providers.one_c_history import (
+    HistoryLookupResult,
+    HistoryMatchOutcome,
+    OneCHistoryProvider,
+    _valid_purchase_date,
 )
 from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
@@ -60,12 +70,14 @@ class SourcingService:
         ai: SourcingAIService | None = None,
         matcher: OfferMatcher | None = None,
         cache: SourcingCache | None = None,
+        one_c_history_provider: OneCHistoryProvider | None = None,
     ):
         self.providers = providers
         self.default_provider = default_provider
         self.ai = ai or SourcingAIService()
         self.matcher = matcher or OfferMatcher()
         self.cache = cache or SourcingCache()
+        self.one_c_history_provider = one_c_history_provider
 
     def provider(self, key: str | None = None) -> SourcingProvider:
         selected = key or self.default_provider
@@ -146,6 +158,455 @@ class SourcingService:
             notices=list(understanding.notices),
             understanding=understanding,
             ai_rerank=ai_rerank,
+            catalog_version=catalog_version,
+        )
+
+    def search_row_routed(
+        self,
+        row: dict[str, Any],
+        *,
+        source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY,
+        provider_key: str | None = None,
+        limit: int = 20,
+        ai_rerank: bool = True,
+    ) -> SourcingResult:
+        mode = SourcingSourceMode(source_mode)
+        if mode == SourcingSourceMode.PROVIDER_ONLY:
+            return self.search_row(
+                row,
+                provider_key=provider_key,
+                limit=limit,
+                ai_rerank=ai_rerank,
+            )
+        understanding = self.understand_row_result(row)
+        return self._route_understanding(
+            understanding,
+            source_mode=mode,
+            provider_key=provider_key,
+            limit=limit,
+            ai_rerank=ai_rerank,
+        )
+
+    def search_intent_routed(
+        self,
+        intent: ProductIntent,
+        *,
+        source_intent: ProductIntent | None = None,
+        source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY,
+        provider_key: str | None = None,
+        limit: int = 20,
+        ai_rerank: bool = True,
+    ) -> SourcingResult:
+        mode = SourcingSourceMode(source_mode)
+        if mode != SourcingSourceMode.PROVIDER_ONLY and source_intent is None:
+            raise ValueError("Для поиска по истории требуется исходная строка")
+        if mode == SourcingSourceMode.PROVIDER_ONLY:
+            return self.search_intent(
+                intent,
+                provider_key=provider_key,
+                limit=limit,
+                ai_rerank=ai_rerank,
+            )
+        understanding = ProductUnderstandingResult(
+            baseline_intent=source_intent,
+            resolved_intent=intent,
+            provenance=ProductUnderstandingProvenance(
+                provider="trusted_source_intent",
+                parser_revision="routing-explicit-source-v1",
+            ),
+        )
+        return self._route_understanding(
+            understanding,
+            source_mode=mode,
+            provider_key=provider_key,
+            limit=limit,
+            ai_rerank=ai_rerank,
+        )
+
+    def _history_lookup(
+        self,
+        understanding: ProductUnderstandingResult,
+        *,
+        limit: int,
+    ) -> HistoryLookupResult:
+        if self.one_c_history_provider is None:
+            return HistoryLookupResult(
+                HistoryMatchOutcome.NO_MATCH,
+                False,
+                reason_code="history_unavailable",
+            )
+        try:
+            return self.one_c_history_provider.lookup(
+                understanding.resolved_intent,
+                source_intent=understanding.baseline_intent,
+                limit=limit,
+            )
+        except Exception:
+            # History is a fail-closed routing signal; provider fallback may
+            # still proceed, but no exception detail is exposed.
+            return HistoryLookupResult(
+                HistoryMatchOutcome.NO_MATCH,
+                False,
+                reason_code="history_unavailable",
+            )
+
+    def _route_understanding(
+        self,
+        understanding: ProductUnderstandingResult,
+        *,
+        source_mode: SourcingSourceMode,
+        provider_key: str | None,
+        limit: int,
+        ai_rerank: bool,
+        history_lookup: HistoryLookupResult | None = None,
+        fallback_context: dict[str, Any] | None = None,
+    ) -> SourcingResult:
+        lookup = history_lookup or self._history_lookup(understanding, limit=limit)
+        history_outcome = (
+            lookup.outcome.value if lookup.available else "UNAVAILABLE"
+        )
+        if lookup.outcome == HistoryMatchOutcome.SAFE_MATCH and lookup.selected_offer is not None:
+            offer = lookup.selected_offer
+            purchase_date = str(offer.data_provenance.get("purchase_date") or "")
+            parsed_date = _valid_purchase_date(purchase_date)
+            age_days = (datetime.now(timezone.utc).date() - parsed_date).days if parsed_date else None
+            route = SourcingRouteMetadata(
+                source_mode=source_mode,
+                final_source_kind="historical_purchase",
+                history_outcome="SAFE_MATCH",
+                history_safe_basis=lookup.safe_basis,
+                history_reason_code=lookup.reason_code,
+                history_catalog_version=lookup.catalog_version,
+                history_candidate_count=len(lookup.candidates),
+                history_selected_event_id=str(offer.data_provenance.get("selected_event_id") or "")[:180],
+                history_purchase_date=purchase_date,
+                history_age_days=age_days,
+            )
+            return SourcingResult(
+                intent=understanding.resolved_intent,
+                understanding=understanding,
+                recommended_offer=offer,
+                offers=list(lookup.candidates),
+                match_results=list(lookup.match_results),
+                warnings=list(understanding.warnings),
+                notices=dedupe_sourcing_notices([
+                    *understanding.notices,
+                    _history_notice("ONE_C_HISTORY_USED"),
+                ]),
+                timings={},
+                ai_mode=self._current_ai_mode(understanding),
+                route=route,
+            )
+
+        if source_mode == SourcingSourceMode.ONE_C_ONLY:
+            has_candidates = bool(lookup.candidates)
+            final_kind = "history_review" if has_candidates else "none"
+            route = SourcingRouteMetadata(
+                source_mode=source_mode,
+                final_source_kind=final_kind,
+                history_outcome=history_outcome,
+                history_reason_code=lookup.reason_code or "history_unavailable",
+                history_catalog_version=lookup.catalog_version,
+                history_candidate_count=len(lookup.candidates),
+            )
+            if has_candidates:
+                notice = _history_notice("ONE_C_HISTORY_REVIEW")
+                review_matches = list(lookup.match_results)
+                return SourcingResult(
+                    intent=understanding.resolved_intent,
+                    understanding=understanding,
+                    recommended_offer=None,
+                    review_candidate=next(
+                        (item for item in review_matches if item.decision == MatchDecision.REVIEW),
+                        None,
+                    ),
+                    offers=list(lookup.candidates),
+                    match_results=review_matches,
+                    warnings=list(understanding.warnings),
+                    notices=dedupe_sourcing_notices([*understanding.notices, notice]),
+                    ai_mode=self._current_ai_mode(understanding),
+                    route=route,
+                )
+            notice_code = (
+                "ONE_C_HISTORY_UNAVAILABLE" if history_outcome == "UNAVAILABLE"
+                else "ONE_C_HISTORY_REVIEW" if history_outcome == "REVIEW"
+                else "ONE_C_HISTORY_NOT_FOUND"
+            )
+            return SourcingResult(
+                intent=understanding.resolved_intent,
+                understanding=understanding,
+                warnings=list(understanding.warnings),
+                notices=dedupe_sourcing_notices([
+                    *understanding.notices,
+                    _history_notice(notice_code),
+                ]),
+                ai_mode=self._current_ai_mode(understanding),
+                route=route,
+            )
+
+        # one_c_then_provider falls back on every non-SAFE outcome. History
+        # review candidates never enter the live provider's offers or ranking.
+        history_notice_code = (
+            "ONE_C_HISTORY_UNAVAILABLE" if history_outcome == "UNAVAILABLE"
+            else "ONE_C_HISTORY_REVIEW" if history_outcome == "REVIEW"
+            else "ONE_C_FALLBACK_USED"
+        )
+        fallback_notice = _history_notice(history_notice_code)
+        context = fallback_context if fallback_context is not None else {}
+        if not context.get("initialized"):
+            context["initialized"] = True
+            try:
+                context["provider"] = self.provider(provider_key)
+                context["stats_calls"] = int(context.get("stats_calls", 0)) + 1
+                context["catalog_version"] = self._project_catalog_version(context["provider"])
+            except Exception as exc:
+                context["error"] = exc
+        provider = context.get("provider")
+        catalog_version = context.get("catalog_version")
+        provider_error = context.get("error")
+        warnings = list(understanding.warnings)
+        notices = dedupe_sourcing_notices([*understanding.notices, fallback_notice])
+        if provider_error is not None:
+            result = self._provider_failure_result(
+                understanding.resolved_intent,
+                understanding,
+                warnings,
+                notices,
+                _as_provider_error(provider_error),
+            )
+        else:
+            result = self.search_intent(
+                understanding.resolved_intent,
+                provider_key=provider_key,
+                limit=limit,
+                warnings=warnings,
+                notices=notices,
+                understanding=understanding,
+                ai_rerank=ai_rerank,
+                catalog_version=catalog_version,
+            )
+        route = SourcingRouteMetadata(
+            source_mode=source_mode,
+            final_source_kind="provider",
+            history_outcome=history_outcome,
+            history_reason_code=lookup.reason_code or "history_unavailable",
+            history_catalog_version=lookup.catalog_version,
+            history_candidate_count=len(lookup.candidates),
+            fallback_called=True,
+            fallback_provider_key=provider.key if provider is not None else "",
+            fallback_provider_label=provider.label if provider is not None else "",
+            fallback_catalog_version=catalog_version or "",
+        )
+        return result.model_copy(update={"route": route})
+
+    def search_project_routed(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY,
+        provider_key: str | None = None,
+        limit: int = 20,
+        progress: Callable[[int, int, str], None] | None = None,
+        telemetry: Callable[[dict[str, Any]], None] | None = None,
+        ai_rerank: bool = False,
+    ) -> ProjectSourcingResult:
+        mode = SourcingSourceMode(source_mode)
+        if mode == SourcingSourceMode.PROVIDER_ONLY:
+            # Keep the established provider-only execution path intact.
+            return self.search_project(
+                rows,
+                provider_key=provider_key,
+                limit=limit,
+                progress=progress,
+                telemetry=telemetry,
+                ai_rerank=ai_rerank,
+            )
+
+        eligible = [
+            dict(row) for row in rows
+            if row.get("selected", True) is not False
+            and row.get("row_type") in {"item", "component", "item_candidate"}
+        ]
+        total = len(eligible)
+        started_project = time.perf_counter()
+        if progress:
+            progress(0, total, "Проверяем историю закупок 1С")
+        results: list[SourcingResult] = []
+        warnings: list[str] = []
+        notices: list[SourcingNotice] = []
+        confirmed_totals: dict[str, Decimal] = {}
+        alternative_totals: dict[str, Decimal] = {}
+        matched = alternatives = review = without = 0
+        history_matched = provider_matched = fallback_called = history_review = history_no_match = history_unavailable = 0
+        matched_unpriced = alternative_unpriced = unit_confirmation = unresolved = 0
+        understanding_time = history_time = retrieval_time = matching_time = ranking_time = 0.0
+        understanding_cache_hits = search_cache_hits = 0
+        fallback_context: dict[str, Any] = {"initialized": False, "stats_calls": 0}
+        for index, row in enumerate(eligible):
+            label = _project_row_label(row)
+            if progress:
+                progress(index, total, f"Анализируем позицию {index + 1} из {total}: {label}")
+            understanding_started = time.perf_counter()
+            understanding, understanding_cache_hit = self._understand_row_result_with_cache(row)
+            understanding_time += time.perf_counter() - understanding_started
+            if understanding_cache_hit:
+                understanding_cache_hits += 1
+            lookup_started = time.perf_counter()
+            lookup = self._history_lookup(understanding, limit=limit)
+            history_time += time.perf_counter() - lookup_started
+            if lookup.outcome == HistoryMatchOutcome.REVIEW:
+                history_review += 1
+            elif not lookup.available:
+                history_unavailable += 1
+            elif lookup.outcome == HistoryMatchOutcome.NO_MATCH:
+                history_no_match += 1
+            result = self._route_understanding(
+                understanding,
+                source_mode=mode,
+                provider_key=provider_key,
+                limit=limit,
+                ai_rerank=ai_rerank,
+                history_lookup=lookup,
+                fallback_context=fallback_context,
+            )
+            results.append(result)
+            warnings.extend(result.warnings)
+            notices.extend(result.notices)
+            route = result.route
+            if route is not None and route.fallback_called:
+                fallback_called += 1
+            if result.timings.get("search_cache_hit"):
+                search_cache_hits += 1
+            else:
+                retrieval_time += result.timings.get("retrieval_s", 0.0)
+                matching_time += result.timings.get("matching_s", 0.0)
+                ranking_time += result.timings.get("ai_rank_s", 0.0)
+
+            best = result.recommended_offer
+            decision = "WITHOUT_OFFERS"
+            decision_match = None
+            historical_safe = bool(route and route.final_source_kind == "historical_purchase")
+            if historical_safe:
+                matched += 1
+                history_matched += 1
+                decision = "HISTORY_SAFE_MATCH"
+            elif not result.offers:
+                without += 1
+                unresolved += 1
+            elif best is None:
+                decision = "REVIEW"
+                review += 1
+                unresolved += 1
+            else:
+                decision_match = next(
+                    (item.decision for item in result.match_results if item.offer.offer_id == best.offer_id),
+                    MatchDecision.REVIEW,
+                )
+                decision = decision_match.value
+                if decision_match == MatchDecision.ALTERNATIVE:
+                    alternatives += 1
+                elif decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                    matched += 1
+                    provider_matched += 1
+                else:
+                    review += 1
+                    unresolved += 1
+                quantity = _trusted_quantity(row)
+                if quantity is None:
+                    warnings.append(f"{result.intent.source_row_id}: quantity requires confirmation")
+                    notices.append(SourcingNotice(
+                        code="QUANTITY_REQUIRES_CONFIRMATION",
+                        message="Для одной или нескольких позиций требуется подтвердить количество.",
+                    ))
+                elif best.price is not None and best.currency:
+                    target = (
+                        confirmed_totals
+                        if decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
+                        else alternative_totals
+                        if decision_match == MatchDecision.ALTERNATIVE
+                        else None
+                    )
+                    if target is not None:
+                        if _units_compatible(row.get("unit"), best.price_unit):
+                            target[best.currency] = target.get(best.currency, Decimal("0")) + best.price * quantity
+                        else:
+                            unit_confirmation += 1
+                            notices.append(SourcingNotice(
+                                code="PRICE_UNIT_REQUIRES_CONFIRMATION",
+                                message="Для одной или нескольких позиций требуется проверить единицу цены поставщика.",
+                            ))
+                elif decision_match in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                    matched_unpriced += 1
+                elif decision_match == MatchDecision.ALTERNATIVE:
+                    alternative_unpriced += 1
+            if telemetry:
+                telemetry(_row_telemetry(
+                    row,
+                    understanding,
+                    understanding_cache_hit,
+                    result,
+                    decision,
+                    decision_match,
+                    current_ai_mode=str(self.ai.cache_identity().get("mode") or "fallback"),
+                ))
+            if progress:
+                progress(index + 1, total, f"Готово {index + 1} из {total}: {label}")
+
+        confirmed_currencies = sorted(confirmed_totals)
+        alternative_currencies = sorted(alternative_totals)
+        if len(confirmed_currencies) > 1 or len(alternative_currencies) > 1:
+            warnings.append("В проекте несколько валют; итог не суммировался в одну сумму")
+            notices.append(SourcingNotice(
+                code="MULTIPLE_CURRENCIES",
+                message="В проекте несколько валют; итоговые суммы показаны раздельно и не суммируются.",
+            ))
+        confirmed_total = confirmed_totals[confirmed_currencies[0]] if len(confirmed_currencies) == 1 else None
+        alternative_total = alternative_totals[alternative_currencies[0]] if len(alternative_currencies) == 1 else None
+        provider = fallback_context.get("provider")
+        catalog_version = str(fallback_context.get("catalog_version") or "")
+        return ProjectSourcingResult(
+            positions_total=total,
+            positions_processed=len(results),
+            positions_matched=matched,
+            positions_alternatives=alternatives,
+            positions_review=review,
+            positions_without_offers=without,
+            source_mode=mode,
+            positions_history_matched=history_matched,
+            positions_provider_matched=provider_matched,
+            positions_fallback_called=fallback_called,
+            positions_history_review=history_review,
+            positions_history_no_match=history_no_match,
+            positions_history_unavailable=history_unavailable,
+            confirmed_total=confirmed_total,
+            confirmed_totals=confirmed_totals,
+            confirmed_currency=confirmed_currencies[0] if len(confirmed_currencies) == 1 else None,
+            alternative_total=alternative_total,
+            alternative_totals=alternative_totals,
+            alternative_currency=alternative_currencies[0] if len(alternative_currencies) == 1 else None,
+            matched_unpriced_count=matched_unpriced,
+            alternative_unpriced_count=alternative_unpriced,
+            unit_confirmation_count=unit_confirmation,
+            unresolved_count=unresolved,
+            estimated_total=confirmed_total,
+            currency=confirmed_currencies[0] if len(confirmed_currencies) == 1 else None,
+            estimated_totals=confirmed_totals,
+            warnings=list(dict.fromkeys(warnings)),
+            notices=dedupe_sourcing_notices(notices),
+            results=results,
+            timings={
+                "total_s": round(time.perf_counter() - started_project, 6),
+                "understanding_s": round(understanding_time, 6),
+                "history_lookup_s": round(history_time, 6),
+                "retrieval_s": round(retrieval_time, 6),
+                "matching_s": round(matching_time, 6),
+                "ai_rank_s": round(ranking_time, 6),
+                "understanding_cache_hits": float(understanding_cache_hits),
+                "search_cache_hits": float(search_cache_hits),
+                "provider_stats_calls": float(fallback_context.get("stats_calls", 0)),
+            },
+            provider_key=provider.key if provider is not None else "",
+            provider_label=provider.label if provider is not None else "",
             catalog_version=catalog_version,
         )
 
@@ -616,6 +1077,21 @@ def _safe_provider_warning(exc: ValueError) -> str:
     return f"Ошибка поиска: {message}"
 
 
+def _history_notice(code: str) -> SourcingNotice:
+    messages = {
+        "ONE_C_HISTORY_USED": "Использована историческая закупка 1С; текущая доступность не подтверждена.",
+        "ONE_C_FALLBACK_USED": "В истории 1С нет безопасно подтверждённого совпадения; выполнен поиск у выбранного поставщика.",
+        "ONE_C_HISTORY_UNAVAILABLE": "История закупок 1С недоступна.",
+        "ONE_C_HISTORY_REVIEW": "В истории 1С найдены варианты, требующие проверки.",
+        "ONE_C_HISTORY_NOT_FOUND": "В истории 1С не найдено подходящей позиции.",
+    }
+    return SourcingNotice(
+        code=code,
+        severity="info" if code in {"ONE_C_HISTORY_USED", "ONE_C_FALLBACK_USED"} else "warning",
+        message=messages.get(code, "Состояние истории закупок 1С требует проверки."),
+    )
+
+
 def _as_provider_error(exc: Exception) -> SourcingProviderError:
     if isinstance(exc, SourcingProviderError):
         return exc
@@ -694,6 +1170,7 @@ def _row_telemetry(
         "missing_attributes": list(match.missing_attributes) if match else [],
         "conflicting_attributes": list(match.conflicting_attributes) if match else [],
         "preferred_differences": preferred,
+        "route": result.route.model_dump(mode="json") if result.route is not None else None,
     }
 
 

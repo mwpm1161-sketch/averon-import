@@ -17,8 +17,10 @@ from averon_import.services.sourcing.providers.demo_store_http import DemoStoreH
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
 from averon_import.services.sourcing.providers.lemana_b2b import LemanaB2BProvider
 from averon_import.services.sourcing.providers.etm_ipro import EtmIproProvider
+from averon_import.services.sourcing.providers.one_c_history import OneCHistoryProvider
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.service import SourcingService
+from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.secrets import YANDEX_AI_API_KEY, resolve_secret
 
 
@@ -79,12 +81,15 @@ class SourcingRuntime:
     repository: CatalogRepository
     providers: dict[str, SourcingProvider]
     service: SourcingService
+    one_c_history_provider: OneCHistoryProvider | None = None
 
 
 def create_sourcing_runtime(
     data_dir: Path,
     settings_service: Any,
     secret_store: Any,
+    *,
+    one_c_history_repository: OneCHistoryRepository | None = None,
 ) -> SourcingRuntime:
     """Build the current sourcing providers and service from owned dependencies."""
 
@@ -121,9 +126,15 @@ def create_sourcing_runtime(
         default_provider=default_provider,
         ai=SourcingAIService(create_sourcing_ai_transport(settings_service, secret_store)),
         cache=SourcingCache(data_root / "sourcing" / "cache.json"),
+        one_c_history_provider=(
+            OneCHistoryProvider(one_c_history_repository)
+            if one_c_history_repository is not None
+            else None
+        ),
     )
     return SourcingRuntime(
         repository=repository,
         providers=providers,
         service=sourcing_service,
+        one_c_history_provider=sourcing_service.one_c_history_provider,
     )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 import re
@@ -23,6 +23,7 @@ from averon_import.services.one_c_history.read_model import (
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.sourcing.matching import OfferMatcher
 from averon_import.services.sourcing.models import (
+    HistorySafeMatchBasis,
     MatchDecision,
     MatchResult,
     Offer,
@@ -56,6 +57,8 @@ class HistoryLookupResult:
     candidates: tuple[Offer, ...] = ()
     match_results: tuple[MatchResult, ...] = ()
     reason_code: str = ""
+    safe_basis: HistorySafeMatchBasis | None = None
+    catalog_version: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +86,37 @@ def normalize_product_search_text(value: object) -> str:
 
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
     return " ".join(text.replace("×", "x").replace("х", "x").split())
+
+
+def normalize_exact_source_name(value: object) -> str:
+    """Exact source-name key; punctuation, token order, and model characters stay significant."""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
+    return " ".join(text.replace("\u00a0", " ").split())
+
+
+def _loose_name_collision_key(value: object) -> str:
+    """Negative-only diagnostic key used to reject punctuation/spacing collisions."""
+
+    return re.sub(r"[\W_]+", "", normalize_exact_source_name(value))
+
+
+_SPECIFICATION_TOKEN_RE = re.compile(
+    r"(?:\b(?:dn|pn|ip)\s*\d+[a-zа-я0-9-]*\b"
+    r"|\b[a-zа-я]{1,8}\s+\d+(?:[-/.]\d+)*[a-zа-я0-9-]*\b"
+    r"|\b[a-zа-я]{1,8}[-/]\d+(?:[-/.]\d+)*[a-zа-я0-9-]*\b"
+    r"|\b\d+[-/.]\d+(?:[-/.]\d+)*[a-zа-я0-9-]*\b"
+    r"|\b\d+(?:[xх×]\d+)+(?:\s*(?:мм|см|м|в|а|квт|кг))?\b)",
+    re.IGNORECASE,
+)
+
+
+def _valid_purchase_date(value: str) -> date | None:
+    try:
+        parsed = date.fromisoformat(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed <= datetime.now(timezone.utc).date() else None
 
 
 def _matcher_article_key(value: object) -> str:
@@ -279,9 +313,16 @@ class OneCHistoryProvider:
         offers, _, _ = self._retrieve(projection, intent, bounded)
         return offers
 
-    def lookup(self, intent: ProductIntent, *, limit: int = 20) -> HistoryLookupResult:
-        """Retrieve history and explicitly classify only deterministic safe evidence."""
+    def lookup(
+        self,
+        intent: ProductIntent,
+        *,
+        source_intent: ProductIntent | None = None,
+        limit: int = 20,
+    ) -> HistoryLookupResult:
+        """Retrieve with the resolved intent and prove SAFE only from source-owned evidence."""
 
+        source_intent = source_intent or intent
         bounded = _bounded_limit(limit)
         if bounded == 0:
             return HistoryLookupResult(HistoryMatchOutcome.NO_MATCH, True, reason_code="limit_zero")
@@ -299,29 +340,131 @@ class OneCHistoryProvider:
         if not offers:
             return HistoryLookupResult(
                 HistoryMatchOutcome.NO_MATCH, True, reason_code="no_candidates",
+                catalog_version=projection.version,
             )
         matches = self.matcher.match(intent, offers)
-        deterministic_matches = [match for match in matches if match.decision == MatchDecision.MATCH]
-        if len(deterministic_matches) != 1:
+        source_matches = self.matcher.match(source_intent, offers)
+        match_by_offer = {match.offer.offer_id: match for match in matches}
+        source_match_by_offer = {match.offer.offer_id: match for match in source_matches}
+
+        # A source-owned article is authoritative: if present, no name-only path
+        # may rescue an article mismatch or unresolved strict article match.
+        if normalize_product_search_text(source_intent.article):
+            deterministic_matches = [match for match in matches if match.decision == MatchDecision.MATCH]
+            if len(deterministic_matches) != 1:
+                return HistoryLookupResult(
+                    HistoryMatchOutcome.REVIEW,
+                    True,
+                    candidates=tuple(offers),
+                    match_results=tuple(matches),
+                    reason_code="ambiguous_or_non_strict_evidence",
+                    catalog_version=projection.version,
+                )
+            selected = deterministic_matches[0]
+            selected_retrieval = next(
+                (candidate for candidate in retrieved if candidate.indexed.item.item_id == selected.offer.source_item_id),
+                None,
+            )
+            source_match = source_match_by_offer.get(selected.offer.offer_id)
+            if (
+                source_match is None
+                or not self._safe_match(
+                    source_intent,
+                    source_match,
+                    selected_retrieval,
+                    top_score_tie_count=top_score_tie_count,
+                    projection=projection,
+                )
+                or not self._safe_match(
+                    intent,
+                    selected,
+                    selected_retrieval,
+                    top_score_tie_count=top_score_tie_count,
+                    projection=projection,
+                )
+            ):
+                return HistoryLookupResult(
+                    HistoryMatchOutcome.REVIEW,
+                    True,
+                    candidates=tuple(offers),
+                    match_results=tuple(matches),
+                    reason_code="history_requires_review",
+                    catalog_version=projection.version,
+                )
+            return HistoryLookupResult(
+                HistoryMatchOutcome.SAFE_MATCH,
+                True,
+                selected_offer=selected.offer,
+                candidates=tuple(offers),
+                match_results=tuple(matches),
+                reason_code="unique_deterministic_historical_evidence",
+                safe_basis=HistorySafeMatchBasis.EXACT_ARTICLE,
+                catalog_version=projection.version,
+            )
+
+        exact_name_key = normalize_exact_source_name(source_intent.normalized_name)
+        source_unit_family = normalize_unit_family(source_intent.unit)
+        name_candidates = [
+            candidate for candidate in retrieved
+            if exact_name_key
+            and normalize_exact_source_name(candidate.variant.item_name) == exact_name_key
+            and source_unit_family is not None
+            and normalize_unit_family(candidate.variant.raw_unit) == source_unit_family
+            and candidate.indexed.selected_price_event is not None
+            and normalize_unit_family(candidate.indexed.selected_price_event.raw_unit) == source_unit_family
+        ]
+        strict_item_ids = {
+            item.item.item_id
+            for item in projection.items
+            if any(
+                normalize_exact_source_name(variant.item_name) == exact_name_key
+                and normalize_unit_family(variant.raw_unit) == source_unit_family
+                for variant in item.searchable_variants
+            )
+        } if exact_name_key and source_unit_family else set()
+        loose_name_key = _loose_name_collision_key(source_intent.normalized_name)
+        loose_collision = any(
+            item.item.item_id not in strict_item_ids
+            and any(
+                _loose_name_collision_key(variant.item_name) == loose_name_key
+                and normalize_unit_family(variant.raw_unit) == source_unit_family
+                for variant in item.searchable_variants
+            )
+            for item in projection.items
+        ) if loose_name_key and source_unit_family else False
+
+        if len(name_candidates) != 1 or len(strict_item_ids) != 1 or loose_collision:
             return HistoryLookupResult(
                 HistoryMatchOutcome.REVIEW,
                 True,
                 candidates=tuple(offers),
                 match_results=tuple(matches),
-                reason_code="ambiguous_or_non_strict_evidence",
+                reason_code=(
+                    "ambiguous_exact_name_identity"
+                    if len(name_candidates) > 1 or len(strict_item_ids) != 1 or loose_collision
+                    else "exact_name_not_retrieved"
+                ),
+                catalog_version=projection.version,
             )
-
-        selected = deterministic_matches[0]
-        selected_retrieval = next(
-            (candidate for candidate in retrieved if candidate.indexed.item.item_id == selected.offer.source_item_id),
-            None,
-        )
-        if not self._safe_match(
-            intent,
-            selected,
-            selected_retrieval,
-            top_score_tie_count=top_score_tie_count,
-            projection=projection,
+        selected_retrieval = name_candidates[0]
+        selected = match_by_offer.get(f"one_c_history:{selected_retrieval.indexed.item.item_id}")
+        source_match = source_match_by_offer.get(f"one_c_history:{selected_retrieval.indexed.item.item_id}")
+        if (
+            selected is None
+            or source_match is None
+            or selected.decision not in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
+            or source_match.decision not in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}
+            or not self._safe_name_match(
+                source_intent,
+                intent,
+                selected,
+                source_match,
+                selected_retrieval,
+                top_score_tie_count=top_score_tie_count,
+                projection=projection,
+                strict_item_ids=strict_item_ids,
+                loose_collision=loose_collision,
+            )
         ):
             return HistoryLookupResult(
                 HistoryMatchOutcome.REVIEW,
@@ -329,6 +472,7 @@ class OneCHistoryProvider:
                 candidates=tuple(offers),
                 match_results=tuple(matches),
                 reason_code="history_requires_review",
+                catalog_version=projection.version,
             )
         return HistoryLookupResult(
             HistoryMatchOutcome.SAFE_MATCH,
@@ -336,7 +480,9 @@ class OneCHistoryProvider:
             selected_offer=selected.offer,
             candidates=tuple(offers),
             match_results=tuple(matches),
-            reason_code="unique_deterministic_historical_evidence",
+            reason_code="unique_exact_source_name_unit_evidence",
+            safe_basis=HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT,
+            catalog_version=projection.version,
         )
 
     def _retrieve(
@@ -481,7 +627,9 @@ class OneCHistoryProvider:
             return False
         if provenance.get("effective_unit_price_gross") != event.effective_unit_price_gross:
             return False
-        if not event.price_usable or not event.numeric_values_valid or offer.price is None or offer.price < 0:
+        if not event.price_usable or not event.numeric_values_valid or offer.price is None or offer.price <= 0:
+            return False
+        if _valid_purchase_date(event.document_date) is None:
             return False
         intent_family = normalize_unit_family(intent.unit)
         variant_family = normalize_unit_family(retrieved.variant.raw_unit)
@@ -513,10 +661,119 @@ class OneCHistoryProvider:
             return False
         return True
 
+    @staticmethod
+    def _safe_name_match(
+        source_intent: ProductIntent,
+        resolved_intent: ProductIntent,
+        resolved_match: MatchResult,
+        source_match: MatchResult,
+        retrieved: _RetrievedItem,
+        *,
+        top_score_tie_count: int,
+        projection: _Projection,
+        strict_item_ids: set[str],
+        loose_collision: bool,
+    ) -> bool:
+        if top_score_tie_count != 1 or loose_collision or len(strict_item_ids) != 1:
+            return False
+        if resolved_match.conflicting_attributes or resolved_match.missing_attributes:
+            return False
+        if source_match.conflicting_attributes or source_match.missing_attributes:
+            return False
+        item = retrieved.indexed.item
+        variant = retrieved.variant
+        event = retrieved.indexed.selected_price_event
+        if (
+            item.integrity_conflicts
+            or not item.provenance_valid
+            or not variant.provenance_valid
+            or event is None
+            or not event.provenance_valid
+            or not event.numeric_values_valid
+            or not event.price_usable
+            or event.effective_unit_price_gross is None
+            or not event.effective_unit_price_gross.is_finite()
+            or event.effective_unit_price_gross <= 0
+            or resolved_match.offer.price is None
+            or resolved_match.offer.price != event.effective_unit_price_gross
+            or resolved_match.offer.provider != "one_c_history"
+            or resolved_match.offer.source_item_id != item.item_id
+            or normalize_exact_source_name(resolved_match.offer.title)
+            != normalize_exact_source_name(source_intent.normalized_name)
+            or event.item_id != item.item_id
+            or _valid_purchase_date(event.document_date) is None
+        ):
+            return False
+        expected_provenance = {
+            "source": "one_c_history",
+            "source_kind": "historical_purchase",
+            "snapshot_version": projection.version,
+            "history_item_id": item.item_id,
+            "selected_event_id": event.event_id,
+            "effective_unit_price_gross": event.effective_unit_price_gross,
+            "unit_family": normalize_unit_family(event.raw_unit),
+        }
+        if any(resolved_match.offer.data_provenance.get(key) != value for key, value in expected_provenance.items()):
+            return False
+        source_family = normalize_unit_family(source_intent.unit)
+        variant_family = normalize_unit_family(variant.raw_unit)
+        event_family = normalize_unit_family(event.raw_unit)
+        if (
+            source_family is None
+            or variant_family is None
+            or event_family is None
+            or len({source_family, variant_family, event_family}) != 1
+        ):
+            return False
+
+        # No source-owned required technical fact may be unresolved or AI-only.
+        origins = source_intent.evidence.get("attribute_origins", {})
+        if not isinstance(origins, dict):
+            origins = {}
+        if any(str(origins.get(key) or "").casefold() == "ai_inferred" for key in source_intent.required_attributes):
+            return False
+
+        if not OneCHistoryProvider._has_source_specificity(
+            source_intent,
+            source_match,
+            variant,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _has_source_specificity(
+        source_intent: ProductIntent,
+        source_match: MatchResult,
+        variant: OneCHistoryVariant,
+    ) -> bool:
+        source_model = normalize_exact_source_name(source_intent.model)
+        candidate_models = {
+            normalize_exact_source_name(value)
+            for value in (variant.characteristic, variant.item_name, variant.article)
+            if normalize_exact_source_name(value)
+        }
+        if source_model and source_model in candidate_models:
+            return True
+        source_manufacturer = normalize_exact_source_name(source_intent.manufacturer)
+        if source_manufacturer and source_manufacturer == normalize_exact_source_name(variant.manufacturer):
+            return True
+        origins = source_intent.evidence.get("attribute_origins", {})
+        if not isinstance(origins, dict):
+            origins = {}
+        source_required = {
+            key for key in source_intent.required_attributes
+            if str(origins.get(key) or "").casefold() != "ai_inferred"
+        }
+        if source_required and source_required.issubset(set(source_match.matched_attributes)):
+            return True
+        return bool(_SPECIFICATION_TOKEN_RE.search(normalize_exact_source_name(source_intent.normalized_name)))
+
 
 __all__ = [
     "HistoryLookupResult",
     "HistoryMatchOutcome",
     "OneCHistoryProvider",
     "normalize_product_search_text",
+    "normalize_exact_source_name",
 ]

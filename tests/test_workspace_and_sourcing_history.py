@@ -405,6 +405,25 @@ def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp
         "missing_attributes": [],
         "conflicting_attributes": [],
         "preferred_differences": [],
+        "route": {
+            "source_mode": "one_c_then_provider",
+            "final_source_kind": "provider",
+            "history_outcome": "REVIEW",
+            "history_safe_basis": None,
+            "history_reason_code": "history_requires_review",
+            "history_catalog_version": "1c-test",
+            "history_candidate_count": 1,
+            "history_selected_event_id": "",
+            "history_purchase_date": "",
+            "history_age_days": None,
+            "fallback_called": True,
+            "fallback_provider_key": "demo_store_http",
+            "fallback_provider_label": "Demo Store",
+            "fallback_catalog_version": "demo-v1",
+            "routing_policy_revision": "one-c-routing-v1",
+            "candidate_offers": [{"contract": "must not persist"}],
+            "server_path": "C:\\private\\data",
+        },
         "raw_qwen_payload": {"api_key": "secret"},
     }]
 
@@ -422,6 +441,7 @@ def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp
             catalog_version="3",
             result=base_result,
             row_telemetry=telemetry,
+            source_mode="one_c_then_provider",
         )
 
     records = history.list_records()
@@ -432,6 +452,13 @@ def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp
     assert "raw_qwen_payload" not in stored_text
     assert "api_key" not in stored_text
     assert "secret" not in stored_text
+    stored_record = history.get(run_ids[-1])
+    assert stored_record["source_mode"] == "one_c_then_provider"
+    assert stored_record["rows"][0]["route"]["history_outcome"] == "REVIEW"
+    assert stored_record["rows"][0]["route"]["fallback_called"] is True
+    assert "candidate_offers" not in stored_text
+    assert "server_path" not in stored_text
+    assert "private" not in stored_text
     assert all("rows" not in item for item in history.list_public())
 
 

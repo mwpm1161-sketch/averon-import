@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from pydantic import ConfigDict, ValidationError
@@ -17,6 +18,7 @@ from averon_import.services.sourcing.product_understanding import SourcingAIServ
 from averon_import.services.sourcing.providers.base import normalize_provider_runtime_state
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.sourcing.runtime import create_sourcing_runtime
+from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.app_settings import AppSettingsService
 from averon_import.services.secrets import MemorySecretStore
 
@@ -428,6 +430,29 @@ def test_runtime_factory_public_config_keeps_shape_and_does_not_expose_secrets(
     assert "authorization" not in encoded
     assert "secret" not in encoded
     assert "token" not in encoded
+
+
+def test_runtime_uses_the_application_owned_history_repository_without_registering_it_as_live_provider(tmp_path):
+    settings = AppSettingsService(tmp_path / "settings")
+    history_repository = OneCHistoryRepository(tmp_path / "data")
+
+    runtime = create_sourcing_runtime(
+        tmp_path / "data",
+        settings,
+        MemorySecretStore(),
+        one_c_history_repository=history_repository,
+    )
+
+    assert runtime.one_c_history_provider is runtime.service.one_c_history_provider
+    assert runtime.one_c_history_provider.repository is history_repository
+    assert "one_c_history" not in runtime.providers
+
+    main_source = (
+        Path(__file__).resolve().parents[1]
+        / "averon_import"
+        / "main.py"
+    ).read_text(encoding="utf-8")
+    assert main_source.count("one_c_history_repository=one_c_history_repository") == 2
 
 
 def test_runtime_factory_does_not_change_local_search_semantics(tmp_path):

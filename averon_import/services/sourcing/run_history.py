@@ -15,6 +15,7 @@ _SAFE_DECISIONS = {
     "ALTERNATIVE",
     "REVIEW",
     "WITHOUT_OFFERS",
+    "HISTORY_SAFE_MATCH",
 }
 
 
@@ -43,6 +44,7 @@ class SourcingRunHistory:
         catalog_version: str,
         result: Any,
         row_telemetry: list[dict[str, Any]],
+        source_mode: str = "provider_only",
     ) -> dict[str, Any]:
         payload = _result_dict(result)
         record = {
@@ -51,6 +53,7 @@ class SourcingRunHistory:
             "created_at": str(created_at),
             "completed_at": str(completed_at),
             "status": "completed",
+            "source_mode": _safe_text(source_mode, 40),
             "provider_key": _safe_text(provider_key, 100),
             "provider_label": _safe_text(provider_label, 180),
             "catalog_version": _safe_text(catalog_version, 120),
@@ -60,6 +63,12 @@ class SourcingRunHistory:
             "positions_alternatives": _safe_int(payload.get("positions_alternatives")),
             "positions_review": _safe_int(payload.get("positions_review")),
             "positions_without_offers": _safe_int(payload.get("positions_without_offers")),
+            "positions_history_matched": _safe_int(payload.get("positions_history_matched")),
+            "positions_provider_matched": _safe_int(payload.get("positions_provider_matched")),
+            "positions_fallback_called": _safe_int(payload.get("positions_fallback_called")),
+            "positions_history_review": _safe_int(payload.get("positions_history_review")),
+            "positions_history_no_match": _safe_int(payload.get("positions_history_no_match")),
+            "positions_history_unavailable": _safe_int(payload.get("positions_history_unavailable")),
             "confirmed_total": payload.get("confirmed_total"),
             "confirmed_totals": _safe_mapping(payload.get("confirmed_totals")),
             "confirmed_currency": _safe_optional_text(payload.get("confirmed_currency"), 16),
@@ -87,6 +96,7 @@ class SourcingRunHistory:
         progress_current: int,
         progress_total: int,
         exc: Exception,
+        source_mode: str = "provider_only",
     ) -> dict[str, Any]:
         category, message = _safe_error(exc)
         record = {
@@ -95,6 +105,7 @@ class SourcingRunHistory:
             "created_at": str(created_at),
             "completed_at": None,
             "status": "failed",
+            "source_mode": _safe_text(source_mode, 40),
             "provider_key": _safe_text(provider_key, 100),
             "provider_label": _safe_text(provider_label, 180),
             "catalog_version": _safe_text(catalog_version, 120),
@@ -197,6 +208,8 @@ def _sanitize_row(value: dict[str, Any]) -> dict[str, Any]:
     provenance = value.get("understanding_provenance")
     if not isinstance(provenance, dict):
         provenance = {}
+    route_value = value.get("route")
+    route = route_value if isinstance(route_value, dict) else {}
     return {
         "source_row_id": _safe_text(value.get("source_row_id"), 160),
         "source_page": _safe_int_or_none(value.get("source_page")),
@@ -219,6 +232,23 @@ def _sanitize_row(value: dict[str, Any]) -> dict[str, Any]:
         "missing_attributes": _safe_text_list(value.get("missing_attributes")),
         "conflicting_attributes": _safe_text_list(value.get("conflicting_attributes")),
         "preferred_differences": _safe_text_list(value.get("preferred_differences")),
+        **({"route": {
+            "source_mode": _safe_text(route.get("source_mode"), 40),
+            "final_source_kind": _safe_text(route.get("final_source_kind"), 40),
+            "history_outcome": _safe_text(route.get("history_outcome"), 24),
+            "history_safe_basis": _safe_optional_text(route.get("history_safe_basis"), 40),
+            "history_reason_code": _safe_text(route.get("history_reason_code"), 100),
+            "history_catalog_version": _safe_text(route.get("history_catalog_version"), 100),
+            "history_candidate_count": _safe_int(route.get("history_candidate_count")),
+            "history_selected_event_id": _safe_optional_text(route.get("history_selected_event_id"), 180),
+            "history_purchase_date": _safe_optional_text(route.get("history_purchase_date"), 40),
+            "history_age_days": _safe_int_or_none(route.get("history_age_days")),
+            "fallback_called": bool(route.get("fallback_called")),
+            "fallback_provider_key": _safe_text(route.get("fallback_provider_key"), 100),
+            "fallback_provider_label": _safe_text(route.get("fallback_provider_label"), 180),
+            "fallback_catalog_version": _safe_text(route.get("fallback_catalog_version"), 120),
+            "routing_policy_revision": _safe_text(route.get("routing_policy_revision"), 80),
+        }} if route else {}),
         **({"match": {
             "matched_attributes": _safe_text_list(match.get("matched_attributes")),
             "missing_attributes": _safe_text_list(match.get("missing_attributes")),

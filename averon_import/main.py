@@ -119,7 +119,7 @@ from averon_import.services.sourcing.demo_catalog import (
     DEMO_CATALOG_NOTICE,
     DEMO_CATALOG_SOURCE,
 )
-from averon_import.services.sourcing.models import ProductIntent
+from averon_import.services.sourcing.models import ProductIntent, SourcingSourceMode
 from averon_import.services.sourcing.runtime import create_sourcing_runtime
 from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.workspace import WorkspaceService, validate_document_id
@@ -178,7 +178,12 @@ coordinator = ProcessingCoordinator(
     settings_service=app_settings_service,
     providers={"cloud": yandex_vision_provider},
 )
-sourcing_runtime = create_sourcing_runtime(DATA_DIR, app_settings_service, secret_store)
+sourcing_runtime = create_sourcing_runtime(
+    DATA_DIR,
+    app_settings_service,
+    secret_store,
+    one_c_history_repository=one_c_history_repository,
+)
 # Compatibility aliases for endpoints and integrations that historically used
 # these module-level objects directly.
 sourcing_repository = sourcing_runtime.repository
@@ -294,7 +299,12 @@ def _rebuild_sourcing_runtime() -> None:
     """Rebind sourcing dependencies after settings or secret changes."""
 
     global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
-    sourcing_runtime = create_sourcing_runtime(DATA_DIR, app_settings_service, secret_store)
+    sourcing_runtime = create_sourcing_runtime(
+        DATA_DIR,
+        app_settings_service,
+        secret_store,
+        one_c_history_repository=one_c_history_repository,
+    )
     sourcing_repository = sourcing_runtime.repository
     sourcing_provider = sourcing_runtime.providers["local_catalog"]
     demo_store_provider = sourcing_runtime.providers["demo_store_http"]
@@ -1777,6 +1787,7 @@ class SourcingRowRequest(BaseModel):
     row: dict[str, Any]
     provider: str | None = None
     limit: int = 20
+    source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
 
 
 class SourcingIntentRequest(BaseModel):
@@ -1785,6 +1796,7 @@ class SourcingIntentRequest(BaseModel):
     intent: ProductIntent
     provider: str | None = None
     limit: int = 20
+    source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
 
 
 class SourcingProjectRequest(BaseModel):
@@ -1793,6 +1805,7 @@ class SourcingProjectRequest(BaseModel):
     rows: list[dict[str, Any]]
     provider: str | None = None
     limit: int = 20
+    source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
 
 
 def _sourcing_payload(value: Any) -> Any:
@@ -1961,8 +1974,9 @@ def sourcing_understand(request: SourcingRowRequest):
 @app.post("/api/sourcing/search", dependencies=[Depends(require_authenticated)])
 def sourcing_search(request: SourcingRowRequest):
     try:
-        result = sourcing_service.search_row(
+        result = sourcing_service.search_row_routed(
             request.row,
+            source_mode=request.source_mode,
             provider_key=request.provider,
             limit=max(1, min(request.limit, 100)),
         )
@@ -1973,6 +1987,11 @@ def sourcing_search(request: SourcingRowRequest):
 
 @app.post("/api/sourcing/search-intent", dependencies=[Depends(require_authenticated)])
 def sourcing_search_intent(request: SourcingIntentRequest):
+    if request.source_mode != SourcingSourceMode.PROVIDER_ONLY:
+        raise HTTPException(
+            400,
+            "Поиск по истории требует исходную строку; используйте /api/sourcing/search.",
+        )
     try:
         result = sourcing_service.search_intent(
             request.intent,
@@ -1989,9 +2008,15 @@ def _submit_sourcing_project_job(
     *,
     provider_key: str | None,
     limit: int,
+    source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY,
     document_id: str | None = None,
 ):
-    provider = sourcing_service.provider(provider_key)
+    source_mode = SourcingSourceMode(source_mode)
+    provider = (
+        sourcing_service.provider(provider_key)
+        if source_mode == SourcingSourceMode.PROVIDER_ONLY
+        else None
+    )
     history = None
     run_id = None
     created_at = datetime.now(timezone.utc).isoformat()
@@ -2016,16 +2041,28 @@ def _submit_sourcing_project_job(
             progress(current, total, message)
 
         try:
-            catalog_version = sourcing_service._project_catalog_version(provider)
-            result = sourcing_service.search_project(
-                rows,
-                provider_key=provider_key,
-                limit=limit,
-                progress=tracked_progress,
-                telemetry=telemetry.append,
-                catalog_version=catalog_version,
-                ai_rerank=False,
-            )
+            if source_mode == SourcingSourceMode.PROVIDER_ONLY:
+                catalog_version = sourcing_service._project_catalog_version(provider)
+                result = sourcing_service.search_project(
+                    rows,
+                    provider_key=provider_key,
+                    limit=limit,
+                    progress=tracked_progress,
+                    telemetry=telemetry.append,
+                    catalog_version=catalog_version,
+                    ai_rerank=False,
+                )
+            else:
+                result = sourcing_service.search_project_routed(
+                    rows,
+                    source_mode=source_mode,
+                    provider_key=provider_key,
+                    limit=limit,
+                    progress=tracked_progress,
+                    telemetry=telemetry.append,
+                    ai_rerank=False,
+                )
+                catalog_version = result.catalog_version or "unknown"
             payload = _sourcing_payload(result)
             if history is not None and run_id is not None:
                 completed_at = datetime.now(timezone.utc).isoformat()
@@ -2034,9 +2071,10 @@ def _submit_sourcing_project_job(
                     document_id=document_id or "",
                     created_at=created_at,
                     completed_at=completed_at,
-                    provider_key=payload.get("provider_key") or provider.key,
-                    provider_label=payload.get("provider_label") or provider.label,
+                    provider_key=payload.get("provider_key") or (provider.key if provider is not None else ""),
+                    provider_label=payload.get("provider_label") or (provider.label if provider is not None else ""),
                     catalog_version=payload.get("catalog_version") or catalog_version,
+                    source_mode=source_mode.value,
                     result=result,
                     row_telemetry=telemetry,
                 )
@@ -2050,13 +2088,14 @@ def _submit_sourcing_project_job(
                     run_id=run_id,
                     document_id=document_id or "",
                     created_at=created_at,
-                    provider_key=provider.key,
-                    provider_label=provider.label,
+                    provider_key=provider.key if provider is not None else "",
+                    provider_label=provider.label if provider is not None else "",
                     catalog_version=catalog_version,
                     positions_total=eligible_total,
                     progress_current=progress_state["current"],
                     progress_total=progress_state["total"],
                     exc=exc,
+                    source_mode=source_mode.value,
                 )
             raise
 
@@ -2069,7 +2108,12 @@ def sourcing_search_all(request: SourcingProjectRequest):
     rows = [dict(row) for row in request.rows]
     provider_key = request.provider
     limit = max(1, min(request.limit, 100))
-    return _submit_sourcing_project_job(rows, provider_key=provider_key, limit=limit)
+    return _submit_sourcing_project_job(
+        rows,
+        provider_key=provider_key,
+        limit=limit,
+        source_mode=request.source_mode,
+    )
 
 
 def _ensure_document(document_id: str) -> None:
@@ -2208,6 +2252,7 @@ def document_sourcing_search_all(document_id: str, request: SourcingProjectReque
         rows,
         provider_key=request.provider,
         limit=max(1, min(request.limit, 100)),
+        source_mode=request.source_mode,
         document_id=document_id,
     )
 
