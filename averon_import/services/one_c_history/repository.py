@@ -184,6 +184,7 @@ class OneCHistoryRepository:
             "supplier_missing_count": parsed.supplier_missing_count,
             "unusable_price_count": parsed.unusable_price_count,
             "repeated_display_label_count": parsed.repeated_display_label_count,
+            "normalized_display_collision_count": parsed.normalized_display_collision_count,
             "warning_count": len(parsed.warnings),
             "skipped_row_count": parsed.skipped_row_count,
             "warnings": parsed.warnings,

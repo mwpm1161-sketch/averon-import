@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, getcontext, localcontext, setcontext
 import io
 import json
 from pathlib import Path
@@ -20,6 +20,7 @@ from averon_import.services.one_c_history.repository import OneCHistoryRepositor
 from averon_import.services.one_c_history.service import OneCHistoryImportService
 from averon_import.services.one_c_history.xlsx_import import (
     OneCImportError,
+    EFFECTIVE_UNIT_PRICE_PRECISION,
     _parse_decimal,
     detect_workbook,
     parse_workbook,
@@ -216,6 +217,94 @@ def test_decimal_parser_rejects_unbounded_exponents():
     assert _parse_decimal("1e999999") is None
 
 
+def test_effective_unit_price_is_context_independent_and_preserves_source_values(tmp_path):
+    path = tmp_path / "decimal-context.xlsx"
+    _xlsx_bytes(
+        path,
+        rows=[
+            ["Расходный материал, кг", None, None, None, None, None, None, None, None],
+            [None, "10.12", 3, "30.35", datetime(2026, 7, 1), "Поступление №1", "Контрагент", None, None],
+        ],
+    )
+    detected = detect_workbook(path)
+    original_context = getcontext().copy()
+    serialized_results = []
+    try:
+        for context in (Context(prec=4, rounding=ROUND_DOWN), Context(prec=80, rounding=ROUND_UP)):
+            setcontext(context)
+            parsed = parse_workbook(
+                path, filename="decimal-context.xlsx", file_sha256="1" * 64,
+                sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+                headers=detected["headers"], layout_type=detected["layout_type"],
+                field_mapping=detected["field_mapping"],
+                item_name_parse_strategy=detected["item_name_parse_strategy"],
+            )
+            event = parsed.events[0]
+            serialized_results.append(event.effective_unit_price_gross)
+            assert event.quantity == "3"
+            assert event.amount_gross == "30.35"
+            assert event.reported_unit_price_gross == "10.12"
+            with localcontext(Context(prec=EFFECTIVE_UNIT_PRICE_PRECISION)):
+                expected = Decimal("30.35") / Decimal("3")
+            assert Decimal(event.effective_unit_price_gross) == expected
+            with localcontext(Context(prec=60)):
+                assert Decimal(event.effective_unit_price_gross).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                ) == Decimal("10.12")
+        assert serialized_results[0] == serialized_results[1]
+        assert len(Decimal(serialized_results[0]).as_tuple().digits) == EFFECTIVE_UNIT_PRICE_PRECISION
+    finally:
+        setcontext(original_context)
+
+
+def test_effective_unit_price_handles_terminating_quotient(tmp_path):
+    path = tmp_path / "terminating-price.xlsx"
+    _xlsx_bytes(
+        path,
+        rows=[
+            ["Кабель, м", None, None, None, None, None, None, None, None],
+            [None, "0.13", 8, "1", datetime(2026, 7, 1), "Поступление №1", "Контрагент", None, None],
+        ],
+    )
+    detected = detect_workbook(path)
+    parsed = parse_workbook(
+        path, filename="terminating-price.xlsx", file_sha256="2" * 64,
+        sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+        headers=detected["headers"], layout_type=detected["layout_type"],
+        field_mapping=detected["field_mapping"],
+        item_name_parse_strategy=detected["item_name_parse_strategy"],
+    )
+    assert parsed.events[0].effective_unit_price_gross == "0.125"
+
+
+def test_display_repeat_metric_preserves_punctuation_and_normalizes_case_whitespace(tmp_path):
+    path = tmp_path / "display-repeat-keys.xlsx"
+    _xlsx_bytes(
+        path,
+        rows=[
+            ["Датчик-А, шт", None, None, None, None, None, None, None, None],
+            [None, 1, 1, 1, datetime(2026, 7, 1), "Поступление №1", None, None, None],
+            ["Датчик А, шт", None, None, None, None, None, None, None, None],
+            [None, 1, 1, 1, datetime(2026, 7, 2), "Поступление №2", None, None, None],
+            ["  Крепёж B, шт", None, None, None, None, None, None, None, None],
+            [None, 1, 1, 1, datetime(2026, 7, 3), "Поступление №3", None, None, None],
+            ["крепёж   b, шт", None, None, None, None, None, None, None, None],
+            [None, 1, 1, 1, datetime(2026, 7, 4), "Поступление №4", None, None, None],
+        ],
+    )
+    detected = detect_workbook(path)
+    parsed = parse_workbook(
+        path, filename="display-repeat-keys.xlsx", file_sha256="3" * 64,
+        sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+        headers=detected["headers"], layout_type=detected["layout_type"],
+        field_mapping=detected["field_mapping"],
+        item_name_parse_strategy=detected["item_name_parse_strategy"],
+    )
+    assert parsed.repeated_display_label_count == 1
+    assert parsed.normalized_display_collision_count == 2
+    assert parsed.group_count == parsed.item_count == 4
+
+
 def test_current_unit_vocabulary_has_conservative_normalization():
     expected = {"шт": "piece", "кг": "kilogram", "м": "meter", "м2": "square_meter", "л": "litre", "Пар": "pair", "м3": "cubic_meter", "компл": "set", "пог. м": "meter", "упак": "pack", "г": "gram", "боб": "bobbin", "т": "tonne", "мл": "millilitre"}
     assert {unit: normalize_unit_family(unit) for unit in expected} == expected
@@ -312,6 +401,7 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
     assert parsed.period_start == "2026-06-23"
     assert parsed.period_end == "2026-09-22"
     assert parsed.repeated_display_label_count == 26
+    assert parsed.normalized_display_collision_count == 26
     assert parsed.events[0].item_name.startswith("Повторяющаяся группа")
     assert parsed.events[0].reported_unit_price_gross == "10.12"
 
@@ -333,9 +423,11 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
         effective = Decimal(event.effective_unit_price_gross)
         amount = Decimal(event.amount_gross)
         quantity = Decimal(event.quantity)
-        assert effective == amount / quantity
-        assert effective.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == reported
-        assert abs(effective - reported) <= Decimal("0.005")
+        with localcontext(Context(prec=EFFECTIVE_UNIT_PRICE_PRECISION)):
+            assert effective == amount / quantity
+        with localcontext(Context(prec=60)):
+            assert effective.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == reported
+            assert abs(effective - reported) <= Decimal("0.005")
 
 
 def test_group_level_identity_and_descriptive_facts_are_inherited_by_detail_events(tmp_path):

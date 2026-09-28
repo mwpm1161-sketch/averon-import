@@ -4,7 +4,7 @@ from collections import Counter
 import copy
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 import hashlib
 import json
 import os
@@ -32,6 +32,7 @@ MAX_HEADER_SCAN_ROWS = 50
 MAX_HEADER_LENGTH = 512
 MAX_PREVIEW_ROWS = 12
 MAX_WARNING_EXAMPLES = 5
+EFFECTIVE_UNIT_PRICE_PRECISION = 50
 
 FIELD_ALIASES = {
     "item_code": {"кодноменклатуры", "номенклатурныйкод", "номерноменклатуры", "номеркодноменклатуры", "номенклатурныйномер", "itemcode", "nomenclaturenumber", "1citemcode"},
@@ -134,6 +135,7 @@ class ParsedWorkbook:
     unusable_price_count: int
     missing_code_count: int
     repeated_display_label_count: int
+    normalized_display_collision_count: int
     code_conflict_count: int
     skipped_row_count: int
     warnings: list[dict]
@@ -158,6 +160,7 @@ class ParsedWorkbook:
             "unusable_price_count": self.unusable_price_count,
             "missing_code_count": self.missing_code_count,
             "repeated_display_label_count": self.repeated_display_label_count,
+            "normalized_display_collision_count": self.normalized_display_collision_count,
             "code_conflict_count": self.code_conflict_count,
             "skipped_row_count": self.skipped_row_count,
             "document_type_counts": self.document_type_counts,
@@ -191,6 +194,22 @@ class ParsedWorkbook:
 def _header_key(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
     return re.sub(r"[^a-zа-я0-9]+", "", text)
+
+
+def _display_repeat_key(value: object) -> str:
+    """Normalize case and whitespace while preserving meaningful punctuation."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return " ".join(text.split())
+
+
+def _effective_unit_price(amount: Decimal | None, quantity: Decimal | None, reported_price: Decimal | None) -> Decimal | None:
+    if amount is None or quantity is None or quantity <= 0:
+        return reported_price
+    # Use an isolated, explicit context so application code cannot change the
+    # persisted 50-significant-digit representation by mutating getcontext().
+    context = Context(prec=EFFECTIVE_UNIT_PRICE_PRECISION, rounding=ROUND_HALF_EVEN)
+    with localcontext(context):
+        return amount / quantity
 
 
 def header_signature(headers: list[str]) -> str:
@@ -669,7 +688,10 @@ def _parse_decimal(value: object) -> Decimal | None:
 def _decimal_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
-    return format(value.normalize(), "f")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
 
 
 def _date_value(value: object) -> str | None:
@@ -787,7 +809,8 @@ def parse_workbook(
         events: list[ParsedEvent] = []
         current_item: _GroupContext | None = None
         item_keys: set[str] = set()
-        labels_by_group: Counter[str] = Counter()
+        labels_by_group: Counter[tuple[str, str]] = Counter()
+        normalized_labels_by_group: Counter[tuple[str, str]] = Counter()
         codes_by_key: dict[str, dict[str, str | None]] = {}
         unit_values: set[str] = set()
         identity_issues: list[dict] = []
@@ -826,7 +849,9 @@ def parse_workbook(
                         if unit:
                             unit_values.add(unit)
                         if not raw_group_code:
-                            labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
+                            if name:
+                                labels_by_group[(_display_repeat_key(name), _display_repeat_key(unit))] += 1
+                                normalized_labels_by_group[(_header_key(name), _header_key(unit))] += 1
                         group_optional = {
                             field: _cell_value(_mapped(row, group_mapping, field))
                             for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization")
@@ -896,7 +921,9 @@ def parse_workbook(
                 group_num = group_count
                 raw_group_label = raw_name
                 if not code:
-                    labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
+                    if name:
+                        labels_by_group[(_display_repeat_key(name), _display_repeat_key(unit))] += 1
+                        normalized_labels_by_group[(_header_key(name), _header_key(unit))] += 1
                 optional = {
                     field: _cell_value(_mapped(row, event_mapping, field))
                     for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
@@ -961,7 +988,7 @@ def parse_workbook(
             quantity = _parse_decimal(raw_quantity)
             reported_price = _parse_decimal(raw_price)
             amount = _parse_decimal(raw_amount)
-            effective_price = amount / quantity if amount is not None and quantity is not None and quantity > 0 else reported_price
+            effective_price = _effective_unit_price(amount, quantity, reported_price)
             document_reference = _cell_value(_mapped(row, event_mapping, "document_reference")) or ""
             document_type = _document_type_value(_mapped(row, event_mapping, "document_type"), document_reference)
             date_value = _date_value(_mapped(row, event_mapping, "document_date"))
@@ -995,6 +1022,7 @@ def parse_workbook(
 
         workbook.close()
         repeated_display_labels = sum(1 for count in labels_by_group.values() if count > 1)
+        normalized_display_collisions = sum(1 for count in normalized_labels_by_group.values() if count > 1)
         missing_code_count = sum(1 for event in events if event.item_code is None)
         supplier_missing_count = sum(1 for event in events if not event.counterparty)
         distinct_counterparty_count = len({event.counterparty for event in events if event.counterparty})
@@ -1047,7 +1075,9 @@ def parse_workbook(
             document_type_counts=bounded_type_counts, document_type_other_event_count=other_type_event_count,
             supplier_missing_count=supplier_missing_count,
             unusable_price_count=unusable_price_count, missing_code_count=missing_code_count,
-            repeated_display_label_count=repeated_display_labels, code_conflict_count=code_conflict_count,
+            repeated_display_label_count=repeated_display_labels,
+            normalized_display_collision_count=normalized_display_collisions,
+            code_conflict_count=code_conflict_count,
             skipped_row_count=skipped_row_count,
             warnings=warnings,
         )
