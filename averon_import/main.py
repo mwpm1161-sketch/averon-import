@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from typing import Any, Literal
@@ -207,6 +208,19 @@ def _submit_document_job(document_id: str, run):
 
     try:
         return job_service.submit(leased_run)
+    except Exception:
+        release()
+        raise
+
+
+def document_file_response(document_id: str, path: Path, **kwargs) -> FileResponse:
+    """Keep a workspace leased until its file response has finished sending."""
+    try:
+        release = document_activity_registry.acquire(document_id)
+    except DocumentUnavailable as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    try:
+        return FileResponse(path, background=BackgroundTask(release), **kwargs)
     except Exception:
         release()
         raise
@@ -923,10 +937,13 @@ def delete_document_workspace(document_id: str):
     except OSError as exc:
         document_activity_registry.finish_delete(document_id)
         logger.exception("Workspace tombstone requires administrator cleanup: %s", tombstone)
-        raise HTTPException(
-            500,
-            "Документ удалён из списка, но не удалось полностью очистить его файлы. Обратитесь к администратору.",
-        ) from exc
+        content = {
+            "detail": "Документ удалён из списка, но не удалось полностью очистить его файлы.",
+            "error": {"code": "DOCUMENT_REMOVED_CLEANUP_PENDING", "deleted": True},
+        }
+        if freed_bytes is not None:
+            content["freed_bytes"] = freed_bytes
+        return JSONResponse(status_code=500, content=content)
     document_activity_registry.finish_delete(document_id)
     return {"deleted": True, "document_id": document_id, "freed_bytes": freed_bytes}
 
@@ -968,7 +985,7 @@ def page_image(document_id: str, page_number: int, dpi: int = 110):
             pdf_service.render_page_to_path(
                 workspace.pdf_path, page_number, cache, dpi=dpi
             )
-        return FileResponse(cache, media_type="image/png")
+        return document_file_response(document_id, cache, media_type="image/png")
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
 
@@ -1458,7 +1475,8 @@ def export(
     finally:
         if temporary_output is not None:
             _best_effort_unlink(temporary_output)
-    return FileResponse(
+    return document_file_response(
+        document_id,
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename,

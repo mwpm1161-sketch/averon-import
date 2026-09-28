@@ -1335,6 +1335,17 @@ async function deleteSelectedDocument() {
     const size = bytes(result?.freed_bytes);
     toast(`Документ удалён · освобождено ${size || "размер неизвестен"}`, "success");
   } catch (error) {
+    if (error?.code === "DOCUMENT_REMOVED_CLEANUP_PENDING") {
+      clearDeletedCurrentDocument(target.documentId, {notify:false});
+      $("#delete-document-modal").close();
+      state.pendingDocumentDelete = null;
+      await loadRecentDocuments().catch(() => {
+        state.recentDocuments = state.recentDocuments.filter((item) => item.document_id !== target.documentId);
+        renderRecentDocuments();
+      });
+      toast("Документ удалён, но часть файлов не удалось очистить. Сообщите администратору.", "warning");
+      return;
+    }
     if (error?.documentDeleted) {
       $("#delete-document-modal").close();
       state.pendingDocumentDelete = null;

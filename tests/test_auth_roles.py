@@ -641,10 +641,105 @@ def test_failed_recursive_cleanup_returns_safe_error_and_keeps_tombstone_hidden(
     )
 
     assert response.status_code == 500
-    assert response.json() == {
-        "detail": "Документ удалён из списка, но не удалось полностью очистить его файлы. Обратитесь к администратору."
+    payload = response.json()
+    assert payload["detail"] == "Документ удалён из списка, но не удалось полностью очистить его файлы."
+    assert payload["error"] == {
+        "code": "DOCUMENT_REMOVED_CLEANUP_PENDING",
+        "deleted": True,
     }
+    assert isinstance(payload["freed_bytes"], int)
     assert "private path detail" not in response.text
+    assert str(service.tombstones_dir) not in response.text
     assert not root.exists()
     assert service.list_recent() == []
     assert len(list(service.tombstones_dir.iterdir())) == 1
+
+
+def test_page_file_response_holds_document_lease_through_delivery(monkeypatch, tmp_path):
+    from averon_import import main
+    from averon_import.services.document_lifecycle import DocumentActivityRegistry
+    from averon_import.services.workspace import WorkspaceService
+
+    service = WorkspaceService(tmp_path / "data")
+    document_id = uuid.uuid4().hex
+    (service.documents_dir / document_id).mkdir()
+    workspace = service.get(document_id)
+    service.write_json(workspace.metadata_path, {"document_id": document_id, "page_count": 1})
+    (workspace.pages_dir / "page-1-110.png").write_bytes(b"png")
+    registry = DocumentActivityRegistry()
+    monkeypatch.setattr(main, "workspace_service", service)
+    monkeypatch.setattr(main, "document_activity_registry", registry)
+
+    response = main.page_image(document_id, 1, dpi=110)
+
+    assert response.background is not None
+    assert registry.active_operations(document_id) == 1
+    assert registry.begin_delete(document_id) is False
+    asyncio.run(response.background())
+    assert registry.active_operations(document_id) == 0
+    assert registry.begin_delete(document_id) is True
+    registry.cancel_delete(document_id)
+
+
+def test_export_file_response_holds_document_lease_through_delivery(monkeypatch, tmp_path):
+    from averon_import import main
+    from averon_import.core.schemas import ExportRequest
+    from averon_import.services.auth import CurrentUser, Role
+    from averon_import.services.document_lifecycle import DocumentActivityRegistry
+    from averon_import.services.workspace import WorkspaceService
+
+    service = WorkspaceService(tmp_path / "data")
+    document_id = uuid.uuid4().hex
+    (service.documents_dir / document_id).mkdir()
+    workspace = service.get(document_id)
+    service.write_json(workspace.result_path, {
+        "revision": 7,
+        "review_projection_version": main.REVIEW_PROJECTION_VERSION,
+        "review_ledger_revision": 0,
+        "rows": [],
+        "page_statuses": {},
+    })
+    registry = DocumentActivityRegistry()
+
+    class StubExportService:
+        def export(self, *, output_path, **_kwargs):
+            output_path.write_bytes(b"xlsx")
+            return output_path
+
+    monkeypatch.setattr(main, "workspace_service", service)
+    monkeypatch.setattr(main, "document_activity_registry", registry)
+    monkeypatch.setattr(main, "export_service", StubExportService())
+
+    response = main.export(
+        document_id,
+        ExportRequest(columns=["name"], rows=[], expected_revision=7),
+        CurrentUser("admin", Role.ADMIN),
+    )
+
+    assert response.background is not None
+    assert registry.active_operations(document_id) == 1
+    assert registry.begin_delete(document_id) is False
+    asyncio.run(response.background())
+    assert registry.active_operations(document_id) == 0
+    assert registry.begin_delete(document_id) is True
+    registry.cancel_delete(document_id)
+
+
+def test_file_response_construction_failure_releases_document_lease(monkeypatch):
+    from averon_import import main
+    from averon_import.services.document_lifecycle import DocumentActivityRegistry
+
+    registry = DocumentActivityRegistry()
+    document_id = uuid.uuid4().hex
+    monkeypatch.setattr(main, "document_activity_registry", registry)
+
+    def fail_response(*_args, **_kwargs):
+        raise RuntimeError("response construction failed")
+
+    monkeypatch.setattr(main, "FileResponse", fail_response)
+    with pytest.raises(RuntimeError, match="response construction failed"):
+        main.document_file_response(document_id, Path("unused"))
+
+    assert registry.active_operations(document_id) == 0
+    assert registry.begin_delete(document_id) is True
+    registry.cancel_delete(document_id)

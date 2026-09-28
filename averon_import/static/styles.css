@@ -244,7 +244,7 @@ button { cursor: pointer; }
 .about-box { margin-top:20px; border-top:1px solid var(--line); padding-top:17px; }.about-box b { font-size:13px; }.about-box p { color:var(--muted); font-size:11px; }
 .toast-root { position:fixed; top:18px; right:18px; z-index:999; display:grid; gap:8px; }
 .toast { min-width:280px; max-width:430px; padding:12px 14px; background:#17191d; color:#fff; border-radius:11px; box-shadow:0 12px 30px rgba(0,0,0,.2); font-size:12px; animation:toast-in .2s ease; }
-.toast.error { background:#9f2d26; }.toast.success { background:#17613c; }
+.toast.error { background:#9f2d26; }.toast.success { background:#17613c; }.toast.warning { background:#8b5a0a; }
 @keyframes toast-in { from { opacity:0; transform:translateY(-7px); } }
 @media (prefers-reduced-motion: reduce) {
   .logout-utility-button,.button.support-action { transition:none; }
