@@ -6,11 +6,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import threading
 from typing import Any
+import unicodedata
 
+from averon_import.core.unit_normalization import normalize_unit_family
 from averon_import.services.one_c_history.models import ImportProfile, utc_now
 from averon_import.services.one_c_history.read_model import (
     OneCHistoryCatalogSnapshot,
@@ -236,6 +239,15 @@ class OneCHistoryRepository:
         except (TypeError, ValueError, OverflowError):
             return 0, False
 
+    @staticmethod
+    def _identity_fact_key(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+        return re.sub(r"[^a-zа-я0-9]+", "", normalized)
+
+    @staticmethod
+    def _item_code_key(value: str) -> str:
+        return unicodedata.normalize("NFKC", value).strip()
+
     def read_catalog_snapshot(self) -> OneCHistoryCatalogSnapshot | None:
         """Read one consistent immutable projection while activation is excluded."""
 
@@ -258,7 +270,7 @@ class OneCHistoryRepository:
                     "ORDER BY item_id,item_name,variant_id"
                 ).fetchall()
                 event_rows = connection.execute(
-                    "SELECT event_id,item_id,document_date,document_type,counterparty,"
+                    "SELECT event_id,item_id,item_code,item_name,document_date,document_type,counterparty,"
                     "quantity_decimal,reported_unit_price_gross_decimal,"
                     "effective_unit_price_gross_decimal,amount_gross_decimal,price_usable,"
                     "price_basis,raw_unit,unit_family,source_row,optional_facts_json "
@@ -281,10 +293,25 @@ class OneCHistoryRepository:
                         except (TypeError, ValueError, OverflowError):
                             group_valid = False
                     projected_facts: dict[str, str] = {}
+                    fact_keys: dict[str, str] = {}
                     for field in ("article", "manufacturer", "characteristic"):
                         text, valid = self._source_text(facts.get(field))
                         facts_valid = facts_valid and valid
                         projected_facts[field] = text
+                        fact_keys[field] = self._identity_fact_key(text)
+                    integrity_conflicts: set[str] = set()
+                    if not facts_valid:
+                        integrity_conflicts.add("malformed_descriptive_provenance")
+                    canonical_code_key = self._item_code_key(source_code)
+                    if (not code_valid) or (source_code and not canonical_code_key):
+                        integrity_conflicts.add("item_code_conflict")
+                    canonical_family = normalize_unit_family(raw_unit)
+                    if canonical_family:
+                        known_unit_families = {canonical_family}
+                    else:
+                        known_unit_families = set()
+                    if (canonical_family or family) and family != (canonical_family or ""):
+                        integrity_conflicts.add("unit_family_provenance_invalid")
                     if not item_id or item_id in item_payload or not display_name:
                         raise OneCHistoryReadError("История закупок недоступна")
                     item_payload[item_id] = {
@@ -299,6 +326,12 @@ class OneCHistoryRepository:
                         "variants": [],
                         "events": [],
                         "valid": all((id_valid, name_valid, unit_valid, quality_valid, code_valid, family_valid, facts_valid, group_valid)),
+                        "integrity_conflicts": integrity_conflicts,
+                        "known_unit_families": known_unit_families,
+                        "descriptive_values": {
+                            field: {fact_key} if fact_key else set()
+                            for field, fact_key in fact_keys.items()
+                        },
                     }
 
                 for row in variant_rows:
@@ -309,18 +342,58 @@ class OneCHistoryRepository:
                     source_row, source_row_valid = self._source_row(row["first_source_row"])
                     values = [entry[0] for entry in texts]
                     valid = item_valid and source_row_valid and all(entry[1] for entry in texts)
-                    if not values[0] or not values[1]:
+                    required_variant_fields_present = bool(values[0] and values[1] and values[2])
+                    if not required_variant_fields_present or not source_row_valid:
                         valid = False
+                        item_payload[item_id]["integrity_conflicts"].add("missing_variant_provenance")
+                    if not all(entry[1] for entry in texts):
+                        item_payload[item_id]["integrity_conflicts"].add("malformed_descriptive_provenance")
+                    variant_family = normalize_unit_family(values[2])
+                    declared_variant_family = values[3]
+                    if variant_family:
+                        item_payload[item_id]["known_unit_families"].add(variant_family)
+                    if (variant_family or declared_variant_family) and declared_variant_family != (variant_family or ""):
+                        item_payload[item_id]["integrity_conflicts"].add("unit_family_provenance_invalid")
+                    for field, value in zip(("article", "manufacturer", "characteristic"), values[4:7]):
+                        fact_key = self._identity_fact_key(value)
+                        if fact_key:
+                            item_payload[item_id]["descriptive_values"][field].add(fact_key)
                     item_payload[item_id]["variants"].append(OneCHistoryVariant(
                         variant_id=values[0], item_name=values[1], raw_unit=values[2],
                         unit_family=values[3] or None, article=values[4], manufacturer=values[5],
                         characteristic=values[6], first_source_row=source_row, provenance_valid=valid,
                     ))
+                for payload in item_payload.values():
+                    if not payload["variants"]:
+                        payload["integrity_conflicts"].add("missing_variant_provenance")
 
                 for row in event_rows:
                     item_id, item_valid = self._source_text(row["item_id"])
                     if item_id not in item_payload:
                         raise OneCHistoryReadError("История закупок недоступна")
+                    event_code, event_code_valid = self._source_text(row["item_code"])
+                    event_name, event_name_valid = self._source_text(row["item_name"])
+                    payload = item_payload[item_id]
+                    canonical_code = payload["source_item_code"]
+                    canonical_code_key = self._item_code_key(canonical_code)
+                    code_consistent = True
+                    if not event_code_valid:
+                        payload["integrity_conflicts"].add("item_code_conflict")
+                        code_consistent = False
+                    elif canonical_code_key:
+                        event_code_key = self._item_code_key(event_code)
+                        if not event_code_key:
+                            payload["integrity_conflicts"].add("missing_event_item_code")
+                            code_consistent = False
+                        elif canonical_code_key != event_code_key:
+                            payload["integrity_conflicts"].add("item_code_conflict")
+                            code_consistent = False
+                    elif event_code:
+                        # A weak identity never acquires a code from one of its events.
+                        payload["integrity_conflicts"].add("item_code_conflict")
+                        code_consistent = False
+                    if not event_name:
+                        payload["integrity_conflicts"].add("missing_variant_provenance")
                     string_fields = ("event_id", "document_date", "document_type", "counterparty", "price_basis", "raw_unit", "unit_family")
                     text_pairs = {field: self._source_text(row[field]) for field in string_fields}
                     numeric_pairs = [self._decimal(row[field]) for field in (
@@ -328,9 +401,32 @@ class OneCHistoryRepository:
                         "effective_unit_price_gross_decimal", "amount_gross_decimal",
                     )]
                     optional_facts, optional_valid = self._json_object(row["optional_facts_json"])
+                    if not optional_valid:
+                        payload["integrity_conflicts"].add("malformed_descriptive_provenance")
                     currency, currency_valid = self._source_text(optional_facts.get("currency"))
+                    event_fact_keys: dict[str, str] = {}
+                    event_facts_valid = True
+                    for field in ("article", "manufacturer", "characteristic"):
+                        fact, fact_valid = self._source_text(optional_facts.get(field))
+                        event_facts_valid = event_facts_valid and fact_valid
+                        event_fact_keys[field] = self._identity_fact_key(fact)
+                        if event_fact_keys[field]:
+                            payload["descriptive_values"][field].add(event_fact_keys[field])
+                    if not event_facts_valid:
+                        payload["integrity_conflicts"].add("malformed_descriptive_provenance")
+                    event_unit = text_pairs["raw_unit"][0]
+                    event_family = normalize_unit_family(event_unit)
+                    declared_event_family = text_pairs["unit_family"][0]
+                    if event_family:
+                        payload["known_unit_families"].add(event_family)
+                    if (event_family or declared_event_family) and declared_event_family != (event_family or ""):
+                        payload["integrity_conflicts"].add("unit_family_provenance_invalid")
                     source_row, source_row_valid = self._source_row(row["source_row"])
-                    event_valid = item_valid and source_row_valid and optional_valid and currency_valid and all(pair[1] for pair in text_pairs.values())
+                    event_valid = (
+                        item_valid and event_code_valid and event_name_valid and bool(event_name)
+                        and code_consistent and source_row_valid and optional_valid and currency_valid
+                        and event_facts_valid and all(pair[1] for pair in text_pairs.values())
+                    )
                     event_id = text_pairs["event_id"][0]
                     if not event_id:
                         event_valid = False
@@ -370,6 +466,18 @@ class OneCHistoryRepository:
                 ):
                     raise OneCHistoryReadError("История закупок недоступна")
 
+                for payload in item_payload.values():
+                    if len(payload["known_unit_families"]) > 1:
+                        payload["integrity_conflicts"].add("unit_family_conflict")
+                    conflict_codes = {
+                        "article": "article_conflict",
+                        "manufacturer": "manufacturer_conflict",
+                        "characteristic": "characteristic_conflict",
+                    }
+                    for field, code in conflict_codes.items():
+                        if len(payload["descriptive_values"][field]) > 1:
+                            payload["integrity_conflicts"].add(code)
+
                 items = tuple(
                     OneCHistoryItem(
                         item_id=payload["item_id"],
@@ -385,6 +493,7 @@ class OneCHistoryRepository:
                         variants=tuple(payload["variants"]),
                         events=tuple(payload["events"]),
                         provenance_valid=payload["valid"],
+                        integrity_conflicts=tuple(sorted(payload["integrity_conflicts"])),
                     )
                     for payload in item_payload.values()
                 )

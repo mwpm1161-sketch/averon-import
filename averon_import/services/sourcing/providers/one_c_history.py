@@ -227,7 +227,9 @@ class OneCHistoryProvider:
                     manufacturer=item.manufacturer,
                     characteristic=item.characteristic,
                     first_source_row=0,
-                    provenance_valid=item.provenance_valid,
+                    # A canonical summary is useful for REVIEW retrieval, but
+                    # it cannot replace missing descriptive-variant provenance.
+                    provenance_valid=False,
                 ),
             )
             variants = tuple(sorted(variants, key=lambda variant: (variant.first_source_row, variant.variant_id)))
@@ -458,6 +460,8 @@ class OneCHistoryProvider:
         provenance = offer.data_provenance
         item = retrieved.indexed.item
         event = retrieved.indexed.selected_price_event
+        if item.integrity_conflicts:
+            return False
         expected_provenance = {
             "source": "one_c_history",
             "source_kind": "historical_purchase",
@@ -480,8 +484,14 @@ class OneCHistoryProvider:
         if not event.price_usable or not event.numeric_values_valid or offer.price is None or offer.price < 0:
             return False
         intent_family = normalize_unit_family(intent.unit)
+        variant_family = normalize_unit_family(retrieved.variant.raw_unit)
         history_family = normalize_unit_family(event.raw_unit)
-        if intent_family is None or history_family is None or intent_family != history_family:
+        if (
+            intent_family is None
+            or variant_family is None
+            or history_family is None
+            or len({intent_family, variant_family, history_family}) != 1
+        ):
             return False
         intent_article = normalize_product_search_text(intent.article)
         offer_article = normalize_product_search_text(offer.article)

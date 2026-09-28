@@ -45,7 +45,7 @@ def _event(
         item_code=item_code,
         item_name=name,
         raw_unit=unit,
-        unit_family={"шт": "piece", "кг": "kilogram", "г": "gram", "мл": "millilitre"}.get(unit),
+        unit_family=normalize_unit_family(unit),
         identity_quality="stable_code_present" if item_code else "degraded_missing_stable_code",
         group_number=group_number,
         source_row=row,
@@ -274,6 +274,129 @@ def test_exact_article_match_with_compatible_unit_and_price_is_safe(tmp_path):
     assert result.selected_offer is not None
     assert result.match_results[0].decision == MatchDecision.MATCH
     assert result.selected_offer.data_provenance["source"] == "one_c_history"
+
+
+def test_conflicting_variant_and_price_event_units_cannot_be_safe(tmp_path):
+    events = [
+        _event(unit="шт", row=2, when="2026-06-01", price="10", reported="10", amount="20"),
+        _event(unit="кг", row=3, when="2026-08-01", price="18", reported="18", amount="36"),
+    ]
+    repository, provider = _provider(tmp_path, events)
+
+    result = provider.lookup(_intent(unit="кг"))
+    snapshot_item = repository.read_catalog_snapshot().items[0]
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert result.candidates[0].price_unit == "кг"
+    retrieved = provider._retrieve(provider._projection, _intent(unit="кг"), 20)[1][0]
+    assert retrieved.variant.raw_unit == "шт"
+    assert retrieved.indexed.selected_price_event.raw_unit == "кг"
+    assert "unit_family_conflict" in snapshot_item.integrity_conflicts
+
+
+def test_whole_item_unit_conflict_blocks_when_matched_variant_and_latest_event_agree(tmp_path):
+    events = [
+        _event(name="Насос тестовый", article="", unit="шт", row=2, when="2026-06-01", price="10", reported="10", amount="20"),
+        _event(name="Насос тестовый", article="ART-001", unit="кг", row=3, when="2026-08-01", price="18", reported="18", amount="36"),
+    ]
+    repository, provider = _provider(tmp_path, events)
+
+    result = provider.lookup(_intent(unit="кг"))
+    snapshot_item = repository.read_catalog_snapshot().items[0]
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert result.candidates[0].article == "ART-001"
+    assert result.candidates[0].price_unit == "кг"
+    assert result.match_results[0].decision == MatchDecision.MATCH
+    retrieved = provider._retrieve(provider._projection, _intent(unit="кг"), 20)[1][0]
+    assert retrieved.variant.raw_unit == "кг"
+    assert retrieved.indexed.selected_price_event.raw_unit == "кг"
+    assert "unit_family_conflict" in snapshot_item.integrity_conflicts
+
+
+def test_event_code_mismatch_with_canonical_stable_code_cannot_be_safe(tmp_path):
+    events = [
+        _event(item_code="001", row=2, when="2026-06-01", price="10", reported="10", amount="20"),
+        _event(item_code="002", row=3, when="2026-08-01", price="18", reported="18", amount="36"),
+    ]
+    repository, provider = _provider(tmp_path, events)
+
+    result = provider.lookup(_intent())
+    snapshot_item = repository.read_catalog_snapshot().items[0]
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert "item_code_conflict" in snapshot_item.integrity_conflicts
+    assert all(offer.data_provenance.get("source_item_code") != "002" for offer in result.candidates)
+
+
+def test_missing_descriptive_variants_remain_review_only(tmp_path):
+    repository, provider = _provider(tmp_path, [
+        _event(),
+        _event(
+            item_id="code:002", item_code="002", name="Клапан контрольный",
+            article="VALVE-002", row=3,
+        ),
+    ])
+    connection = repository._connect()
+    try:
+        connection.execute(
+            "DELETE FROM nomenclature_descriptive_variants WHERE item_id = ?",
+            ("code:001",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = provider.lookup(_intent())
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert len(result.candidates) == 1
+    damaged_item = next(item for item in provider._projection.items if item.item.item_id == "code:001")
+    assert "missing_variant_provenance" in damaged_item.item.integrity_conflicts
+    assert damaged_item.searchable_variants[0].provenance_valid is False
+    valid_result = provider.lookup(_intent(name="Клапан контрольный", article="VALVE-002"))
+    assert valid_result.outcome == HistoryMatchOutcome.SAFE_MATCH
+
+
+def test_same_family_unit_aliases_across_intent_variant_and_event_can_be_safe(tmp_path):
+    events = [
+        _event(unit="штука", row=2, when="2026-06-01", price="10", reported="10", amount="20"),
+        _event(unit="шт", row=3, when="2026-08-01", price="18", reported="18", amount="36"),
+    ]
+    _, provider = _provider(tmp_path, events)
+
+    result = provider.lookup(_intent(unit="штуки"))
+
+    assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert result.selected_offer is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "first_value", "second_value", "conflict_code"),
+    [
+        ("article", "ART-001", "ART-002", "article_conflict"),
+        ("manufacturer", "Maker A", "Maker B", "manufacturer_conflict"),
+        ("characteristic", "сталь", "латунь", "characteristic_conflict"),
+    ],
+)
+def test_phase1_stable_code_description_conflicts_block_safe_match(
+    tmp_path, field, first_value, second_value, conflict_code,
+):
+    first = _event(row=2, when="2026-06-01", **{field: first_value})
+    second = _event(row=3, when="2026-08-01", **{field: second_value})
+    repository, provider = _provider(tmp_path, [first, second])
+
+    intent_article = second_value if field == "article" else "ART-001"
+    result = provider.lookup(_intent(article=intent_article))
+    snapshot_item = repository.read_catalog_snapshot().items[0]
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert conflict_code in snapshot_item.integrity_conflicts
 
 
 def test_exact_article_and_resolved_required_attribute_can_be_safe(tmp_path):

@@ -59,6 +59,7 @@ class OneCHistoryItem:
     variants: tuple[OneCHistoryVariant, ...]
     events: tuple[OneCHistoryEvent, ...]
     provenance_valid: bool = True
+    integrity_conflicts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
