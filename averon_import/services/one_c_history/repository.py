@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -11,6 +12,13 @@ import threading
 from typing import Any
 
 from averon_import.services.one_c_history.models import ImportProfile, utc_now
+from averon_import.services.one_c_history.read_model import (
+    OneCHistoryCatalogSnapshot,
+    OneCHistoryEvent,
+    OneCHistoryItem,
+    OneCHistoryReadError,
+    OneCHistoryVariant,
+)
 from averon_import.services.one_c_history.xlsx_import import PARSER_VERSION, ParsedWorkbook
 
 
@@ -132,17 +140,262 @@ class OneCHistoryRepository:
     def active_metadata(self) -> dict | None:
         if not self.database_path.is_file():
             return None
-        connection: sqlite3.Connection | None = None
+        with self._lock:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                rows = connection.execute("SELECT key, value FROM import_metadata").fetchall()
+                metadata = {str(row["key"]): json.loads(row["value"]) for row in rows}
+                return metadata or None
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                return None
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    @staticmethod
+    def _metadata_and_version(connection: sqlite3.Connection) -> tuple[dict[str, Any], str]:
         try:
-            connection = self._connect()
-            rows = connection.execute("SELECT key, value FROM import_metadata").fetchall()
-            metadata = {str(row["key"]): json.loads(row["value"]) for row in rows}
-            return metadata or None
-        except (OSError, sqlite3.Error, ValueError, TypeError):
+            rows = connection.execute(
+                "SELECT key, value FROM import_metadata "
+                "WHERE key IN ('sha256','semantic_import_fingerprint','item_count','event_count')"
+            ).fetchall()
+            values = {str(row["key"]): json.loads(row["value"]) for row in rows}
+            source_sha = values.get("sha256")
+            semantic_fingerprint = values.get("semantic_import_fingerprint")
+            if not (
+                isinstance(source_sha, str)
+                and len(source_sha) == 64
+                and all(char in "0123456789abcdef" for char in source_sha.casefold())
+                and isinstance(semantic_fingerprint, str)
+                and len(semantic_fingerprint) == 64
+                and all(char in "0123456789abcdef" for char in semantic_fingerprint.casefold())
+            ):
+                raise ValueError("missing snapshot identity")
+            if any(type(values.get(key)) is not int or values[key] < 0 for key in ("item_count", "event_count")):
+                raise ValueError("invalid snapshot counts")
+            identity = f"{source_sha.casefold()}:{semantic_fingerprint.casefold()}".encode("ascii")
+            version = "1c-" + hashlib.sha256(identity).hexdigest()[:24]
+            return values, version
+        except (sqlite3.Error, ValueError, TypeError, UnicodeError) as exc:
+            raise OneCHistoryReadError("История закупок недоступна") from exc
+
+    def catalog_version(self) -> str | None:
+        """Return a deterministic version for the active snapshot, or None if absent."""
+
+        if not self.database_path.is_file():
             return None
-        finally:
-            if connection is not None:
-                connection.close()
+        with self._lock:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                _, version = self._metadata_and_version(connection)
+                return version
+            except OneCHistoryReadError:
+                raise
+            except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+                raise OneCHistoryReadError("История закупок недоступна") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    @staticmethod
+    def _json_object(value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else None
+        except (ValueError, TypeError):
+            return {}, False
+        return (parsed, True) if isinstance(parsed, dict) else ({}, False)
+
+    @staticmethod
+    def _decimal(value: Any) -> tuple[Decimal | None, bool]:
+        if value is None:
+            return None, True
+        if not isinstance(value, str):
+            return None, False
+        if value == "":
+            return None, True
+        try:
+            parsed = Decimal(str(value))
+            return (parsed, parsed.is_finite()) if parsed.is_finite() else (None, False)
+        except (InvalidOperation, TypeError, ValueError):
+            return None, False
+
+    @staticmethod
+    def _source_text(value: Any) -> tuple[str, bool]:
+        if value is None:
+            return "", True
+        if isinstance(value, str):
+            return value, True
+        return "", False
+
+    @staticmethod
+    def _source_row(value: Any) -> tuple[int, bool]:
+        try:
+            return int(value), True
+        except (TypeError, ValueError, OverflowError):
+            return 0, False
+
+    def read_catalog_snapshot(self) -> OneCHistoryCatalogSnapshot | None:
+        """Read one consistent immutable projection while activation is excluded."""
+
+        if not self.database_path.is_file():
+            return None
+        with self._lock:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                metadata, version = self._metadata_and_version(connection)
+                item_rows = connection.execute(
+                    "SELECT item_id,source_item_code,display_name,raw_unit,unit_family,"
+                    "identity_quality,group_number,descriptive_facts_json "
+                    "FROM nomenclature_items ORDER BY item_id"
+                ).fetchall()
+                variant_rows = connection.execute(
+                    "SELECT variant_id,item_id,item_name,raw_unit,unit_family,article,"
+                    "manufacturer,characteristic,first_source_row "
+                    "FROM nomenclature_descriptive_variants "
+                    "ORDER BY item_id,item_name,variant_id"
+                ).fetchall()
+                event_rows = connection.execute(
+                    "SELECT event_id,item_id,document_date,document_type,counterparty,"
+                    "quantity_decimal,reported_unit_price_gross_decimal,"
+                    "effective_unit_price_gross_decimal,amount_gross_decimal,price_usable,"
+                    "price_basis,raw_unit,unit_family,source_row,optional_facts_json "
+                    "FROM purchase_events ORDER BY item_id,document_date DESC,source_row DESC,event_id DESC"
+                ).fetchall()
+
+                item_payload: dict[str, dict[str, Any]] = {}
+                for row in item_rows:
+                    item_id, id_valid = self._source_text(row["item_id"])
+                    display_name, name_valid = self._source_text(row["display_name"])
+                    raw_unit, unit_valid = self._source_text(row["raw_unit"])
+                    identity_quality, quality_valid = self._source_text(row["identity_quality"])
+                    source_code, code_valid = self._source_text(row["source_item_code"])
+                    family, family_valid = self._source_text(row["unit_family"])
+                    facts, facts_valid = self._json_object(row["descriptive_facts_json"])
+                    group_number, group_valid = (None, True)
+                    if row["group_number"] is not None:
+                        try:
+                            group_number = int(row["group_number"])
+                        except (TypeError, ValueError, OverflowError):
+                            group_valid = False
+                    projected_facts: dict[str, str] = {}
+                    for field in ("article", "manufacturer", "characteristic"):
+                        text, valid = self._source_text(facts.get(field))
+                        facts_valid = facts_valid and valid
+                        projected_facts[field] = text
+                    if not item_id or item_id in item_payload or not display_name:
+                        raise OneCHistoryReadError("История закупок недоступна")
+                    item_payload[item_id] = {
+                        "item_id": item_id,
+                        "source_item_code": source_code,
+                        "display_name": display_name,
+                        "raw_unit": raw_unit,
+                        "unit_family": family or None,
+                        "identity_quality": identity_quality,
+                        "group_number": group_number,
+                        "facts": projected_facts,
+                        "variants": [],
+                        "events": [],
+                        "valid": all((id_valid, name_valid, unit_valid, quality_valid, code_valid, family_valid, facts_valid, group_valid)),
+                    }
+
+                for row in variant_rows:
+                    item_id, item_valid = self._source_text(row["item_id"])
+                    if item_id not in item_payload:
+                        raise OneCHistoryReadError("История закупок недоступна")
+                    texts = [self._source_text(row[key]) for key in ("variant_id", "item_name", "raw_unit", "unit_family", "article", "manufacturer", "characteristic")]
+                    source_row, source_row_valid = self._source_row(row["first_source_row"])
+                    values = [entry[0] for entry in texts]
+                    valid = item_valid and source_row_valid and all(entry[1] for entry in texts)
+                    if not values[0] or not values[1]:
+                        valid = False
+                    item_payload[item_id]["variants"].append(OneCHistoryVariant(
+                        variant_id=values[0], item_name=values[1], raw_unit=values[2],
+                        unit_family=values[3] or None, article=values[4], manufacturer=values[5],
+                        characteristic=values[6], first_source_row=source_row, provenance_valid=valid,
+                    ))
+
+                for row in event_rows:
+                    item_id, item_valid = self._source_text(row["item_id"])
+                    if item_id not in item_payload:
+                        raise OneCHistoryReadError("История закупок недоступна")
+                    string_fields = ("event_id", "document_date", "document_type", "counterparty", "price_basis", "raw_unit", "unit_family")
+                    text_pairs = {field: self._source_text(row[field]) for field in string_fields}
+                    numeric_pairs = [self._decimal(row[field]) for field in (
+                        "quantity_decimal", "reported_unit_price_gross_decimal",
+                        "effective_unit_price_gross_decimal", "amount_gross_decimal",
+                    )]
+                    optional_facts, optional_valid = self._json_object(row["optional_facts_json"])
+                    currency, currency_valid = self._source_text(optional_facts.get("currency"))
+                    source_row, source_row_valid = self._source_row(row["source_row"])
+                    event_valid = item_valid and source_row_valid and optional_valid and currency_valid and all(pair[1] for pair in text_pairs.values())
+                    event_id = text_pairs["event_id"][0]
+                    if not event_id:
+                        event_valid = False
+                    date_text = text_pairs["document_date"][0]
+                    try:
+                        if date_text:
+                            datetime.fromisoformat(date_text)
+                    except ValueError:
+                        event_valid = False
+                    price_usable = row["price_usable"] == 1 and all(pair[1] for pair in numeric_pairs)
+                    if price_usable and numeric_pairs[2][0] is None:
+                        price_usable = False
+                    item_payload[item_id]["events"].append(OneCHistoryEvent(
+                        event_id=event_id,
+                        item_id=item_id,
+                        document_date=date_text,
+                        document_type=text_pairs["document_type"][0],
+                        counterparty=text_pairs["counterparty"][0],
+                        quantity=numeric_pairs[0][0],
+                        reported_unit_price_gross=numeric_pairs[1][0],
+                        effective_unit_price_gross=numeric_pairs[2][0],
+                        amount_gross=numeric_pairs[3][0],
+                        price_usable=price_usable,
+                        price_basis=text_pairs["price_basis"][0],
+                        raw_unit=text_pairs["raw_unit"][0],
+                        unit_family=text_pairs["unit_family"][0] or None,
+                        currency=currency,
+                        source_row=source_row,
+                        provenance_valid=event_valid,
+                        numeric_values_valid=all(pair[1] for pair in numeric_pairs),
+                    ))
+
+                expected_items = metadata.get("item_count")
+                expected_events = metadata.get("event_count")
+                if (isinstance(expected_items, int) and expected_items != len(item_payload)) or (
+                    isinstance(expected_events, int) and expected_events != len(event_rows)
+                ):
+                    raise OneCHistoryReadError("История закупок недоступна")
+
+                items = tuple(
+                    OneCHistoryItem(
+                        item_id=payload["item_id"],
+                        source_item_code=payload["source_item_code"],
+                        display_name=payload["display_name"],
+                        raw_unit=payload["raw_unit"],
+                        unit_family=payload["unit_family"],
+                        identity_quality=payload["identity_quality"],
+                        group_number=payload["group_number"],
+                        article=payload["facts"]["article"],
+                        manufacturer=payload["facts"]["manufacturer"],
+                        characteristic=payload["facts"]["characteristic"],
+                        variants=tuple(payload["variants"]),
+                        events=tuple(payload["events"]),
+                        provenance_valid=payload["valid"],
+                    )
+                    for payload in item_payload.values()
+                )
+                return OneCHistoryCatalogSnapshot(version=version, items=items)
+            except OneCHistoryReadError:
+                raise
+            except Exception as exc:
+                raise OneCHistoryReadError("История закупок недоступна") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
 
     def public_status(self) -> dict:
         status = self._read_json(self.status_path, {})
