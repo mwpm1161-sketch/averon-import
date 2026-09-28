@@ -20,7 +20,7 @@ const state = {
   aiProvider: "off",
   reviewFilter: "",
   settings: null,
-  oneCHistory: {status:null, preview:null, analysisReady:false, busy:false},
+  oneCHistory: {status:null, preview:null, analysisReady:false, busy:false, requestGeneration:0},
   sourcing: {row: null, result: null, projectFilter: "all"},
   sourcingHealth: null,
   currentUser: null,
@@ -172,6 +172,7 @@ function readCsrfCookie() {
 }
 
 function clearProtectedMemory() {
+  clearOneCHistoryProtectedState();
   cancelDocumentNavigation();
   state.config = null;
   state.document = null;
@@ -218,6 +219,53 @@ function clearProtectedMemory() {
   if (logoutButton) logoutButton.disabled = false;
   clearProtectedUi();
   document.body.classList.remove("manual-mode");
+}
+
+function clearOneCHistoryProtectedState() {
+  const generation = (state.oneCHistory?.requestGeneration || 0) + 1;
+  state.oneCHistory = {status:null, preview:null, analysisReady:false, busy:false, requestGeneration:generation};
+  const file = $("#one-c-history-file");
+  if (file) file.value = "";
+  const status = $("#one-c-history-status");
+  if (status) { status.textContent = "История ещё не импортирована."; status.className = "mode-status"; }
+  const summary = $("#one-c-history-summary");
+  if (summary) { summary.textContent = ""; summary.className = "mode-status"; }
+  const sample = $("#one-c-history-sample");
+  if (sample) sample.replaceChildren();
+  ["#one-c-history-group-mappings", "#one-c-history-mappings"].forEach((selector) => {
+    const container = $(selector);
+    if (container) container.replaceChildren();
+  });
+  const previewPanel = $("#one-c-history-preview-panel");
+  if (previewPanel) previewPanel.hidden = true;
+  const sheet = $("#one-c-history-sheet");
+  if (sheet) sheet.replaceChildren();
+  ["#one-c-history-header-row", "#one-c-history-group-header-row"].forEach((selector) => {
+    const input = $(selector);
+    if (input) input.value = "";
+  });
+  const importButton = $("#one-c-history-import");
+  if (importButton) importButton.disabled = true;
+  const layout = $("#one-c-history-layout");
+  if (layout) layout.value = "hierarchical_grouped";
+  const nameStrategy = $("#one-c-history-name-strategy");
+  if (nameStrategy) nameStrategy.value = "none";
+  const previewButton = $("#one-c-history-preview");
+  if (previewButton) previewButton.disabled = false;
+  const profile = $("#one-c-history-profile");
+  if (profile) { profile.replaceChildren(new Option("Автоматически определить", "")); profile.value = ""; }
+  const profileUpdate = $("#one-c-history-profile-update");
+  if (profileUpdate) { profileUpdate.replaceChildren(new Option("Создать новый", "")); profileUpdate.value = ""; }
+  const profileName = $("#one-c-history-profile-name");
+  if (profileName) profileName.value = "";
+  const saveProfile = $("#one-c-history-save-profile");
+  if (saveProfile) saveProfile.checked = false;
+}
+
+function isCurrentOneCHistoryRequest(generation) {
+  return state.oneCHistory.requestGeneration === generation
+    && state.authState === "authenticated"
+    && String(state.currentUser?.role || "").toLowerCase() === "admin";
 }
 
 function cancelDocumentNavigation() {
@@ -772,6 +820,11 @@ async function boot() {
       if (generation !== state.authGeneration) return;
       const authMode = ["session", "trusted_proxy", "local_dev"].includes(currentUser?.auth_mode) ? currentUser.auth_mode : null;
       if (!authMode || !currentUser?.username) throw new ApiError("Сервис авторизации временно недоступен", {status:503});
+      const previousUser = state.currentUser;
+      if (previousUser && (
+        previousUser.username !== currentUser.username
+        || String(previousUser.role || "").toLowerCase() !== String(currentUser.role || "").toLowerCase()
+      )) clearOneCHistoryProtectedState();
       state.currentUser = currentUser;
       state.authMode = authMode;
       state.authState = "authenticated";
@@ -915,11 +968,14 @@ function formatOneCHistoryDate(value) {
 }
 
 async function loadOneCHistoryStatus() {
+  const generation = state.oneCHistory.requestGeneration;
   try {
     const status = await api("/api/admin/one-c-history");
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     state.oneCHistory.status = status;
     renderOneCHistoryStatus();
   } catch (error) {
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     const node = $("#one-c-history-status");
     node.textContent = `Не удалось загрузить состояние истории: ${error.message}`;
     node.className = "mode-status warning";
@@ -955,10 +1011,17 @@ function renderOneCHistoryStatus() {
   }
 }
 
-function renderOneCHistoryMapping(headers, mapping = {}) {
-  const container = $("#one-c-history-mappings");
+function renderOneCHistoryMapping(headers, mapping = {}, containerSelector = "#one-c-history-mappings") {
+  const container = $(containerSelector);
+  if (!container) return;
   container.replaceChildren();
-  ONE_C_HISTORY_FIELDS.forEach(([field, label, recommended]) => {
+  const groupFields = new Set(["item_code", "item_name", "unit", "article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization"]);
+  const fields = containerSelector === "#one-c-history-group-mappings"
+    ? ONE_C_HISTORY_FIELDS.filter(([field]) => groupFields.has(field))
+    : state.oneCHistory.preview?.layout_type === "hierarchical_grouped"
+      ? ONE_C_HISTORY_FIELDS.filter(([field]) => field !== "item_name")
+      : ONE_C_HISTORY_FIELDS;
+  fields.forEach(([field, label, recommended]) => {
     const wrapper = document.createElement("label");
     wrapper.className = `one-c-history-map${recommended ? " recommended" : ""}`;
     const title = document.createElement("span");
@@ -976,9 +1039,9 @@ function renderOneCHistoryMapping(headers, mapping = {}) {
   });
 }
 
-function oneCHistoryMappingPayload() {
+function oneCHistoryMappingPayload(containerSelector = "#one-c-history-mappings") {
   const mapping = {};
-  $$("#one-c-history-mappings select").forEach((select) => {
+  $$(`${containerSelector} select`).forEach((select) => {
     mapping[select.dataset.oneCHistoryField] = select.value === "" ? null : Number(select.value);
   });
   return mapping;
@@ -993,9 +1056,15 @@ function renderOneCHistoryPreview(preview) {
   (preview.sheet_names || [preview.sheet_name]).forEach((name) => sheet.add(new Option(name, name)));
   sheet.value = preview.sheet_name;
   $("#one-c-history-header-row").value = preview.header_row;
+  $("#one-c-history-group-header-row").value = preview.group_header_row || "";
   $("#one-c-history-layout").value = preview.layout_type;
   $("#one-c-history-name-strategy").value = preview.item_name_parse_strategy || "none";
-  renderOneCHistoryMapping(preview.headers, preview.field_mapping || {});
+  const grouped = preview.layout_type === "hierarchical_grouped";
+  $("#one-c-history-group-mappings").hidden = !grouped;
+  $("#one-c-history-group-heading").hidden = !grouped;
+  $("#one-c-history-group-hint").hidden = !grouped;
+  renderOneCHistoryMapping(preview.group_headers || preview.headers, preview.group_field_mapping || {}, "#one-c-history-group-mappings");
+  renderOneCHistoryMapping(preview.headers, preview.event_field_mapping || preview.field_mapping || {});
   renderOneCHistorySummary(preview);
 }
 
@@ -1006,7 +1075,8 @@ function renderOneCHistorySummary(preview) {
     warningLines.unshift("В отчёте не выгружен код номенклатуры. История будет импортирована, но идентификация одинаковых позиций будет менее надёжной.");
   }
   const lines = [];
-  if (summary.event_count !== undefined && summary.missing_code_count === 0 && preview.field_mapping?.item_code !== null && preview.field_mapping?.item_code !== undefined) {
+  const identityMapping = preview.layout_type === "hierarchical_grouped" ? preview.group_field_mapping : preview.field_mapping;
+  if (summary.event_count !== undefined && summary.missing_code_count === 0 && identityMapping?.item_code !== null && identityMapping?.item_code !== undefined) {
     lines.push("В сопоставлении обнаружен стабильный код номенклатуры; он используется как каноническая идентичность.");
   }
   if (summary.event_count !== undefined) {
@@ -1029,6 +1099,7 @@ function renderOneCHistorySummary(preview) {
 }
 
 async function startOneCHistoryPreview() {
+  const generation = state.oneCHistory.requestGeneration;
   const file = $("#one-c-history-file").files?.[0];
   if (!file) { toast("Выберите отчёт XLSX", "error"); return; }
   state.oneCHistory.busy = true;
@@ -1041,34 +1112,55 @@ async function startOneCHistoryPreview() {
     form.append("file", file);
     if ($("#one-c-history-profile").value) form.append("profile_id", $("#one-c-history-profile").value);
     const preview = await api("/api/admin/one-c-history/previews", {method:"POST", body:form});
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     renderOneCHistoryPreview(preview);
   } catch (error) {
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     setOneCHistoryMessage(error.message, "warning");
     toast(error.message, "error");
   } finally {
-    state.oneCHistory.busy = false;
+    if (isCurrentOneCHistoryRequest(generation)) state.oneCHistory.busy = false;
   }
 }
 
 async function inspectOneCHistorySheet() {
   const preview = state.oneCHistory.preview;
   if (!preview) return;
+  const generation = state.oneCHistory.requestGeneration;
   try {
     const sheetName = $("#one-c-history-sheet").value;
     const headerRow = Number($("#one-c-history-header-row").value) || null;
-    const query = headerRow ? `?header_row=${encodeURIComponent(headerRow)}` : "";
+    const groupHeaderRow = Number($("#one-c-history-group-header-row").value) || null;
+    const queryParams = new URLSearchParams();
+    if (headerRow) queryParams.set("event_header_row", String(headerRow));
+    if (groupHeaderRow) queryParams.set("group_header_row", String(groupHeaderRow));
+    const queryString = queryParams.toString();
+    const query = queryString ? `?${queryString}` : "";
     const result = await api(`/api/admin/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/sheets/${encodeURIComponent(sheetName)}${query}`);
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     preview.sheet_name = sheetName;
     preview.header_row = result.header_row;
+    preview.group_header_row = result.group_header_row;
+    preview.event_header_row = result.event_header_row;
     preview.headers = result.headers;
+    preview.group_headers = result.group_headers;
     preview.field_mapping = result.field_mapping;
+    preview.group_field_mapping = result.group_field_mapping;
+    preview.event_field_mapping = result.event_field_mapping;
     preview.layout_type = result.layout_type || preview.layout_type;
     $("#one-c-history-header-row").value = result.header_row;
+    $("#one-c-history-group-header-row").value = result.group_header_row || "";
     $("#one-c-history-layout").value = preview.layout_type;
-    renderOneCHistoryMapping(result.headers, result.field_mapping);
+    const grouped = preview.layout_type === "hierarchical_grouped";
+    $("#one-c-history-group-mappings").hidden = !grouped;
+    $("#one-c-history-group-heading").hidden = !grouped;
+    $("#one-c-history-group-hint").hidden = !grouped;
+    renderOneCHistoryMapping(result.group_headers || result.headers, result.group_field_mapping || {}, "#one-c-history-group-mappings");
+    renderOneCHistoryMapping(result.headers, result.event_field_mapping || result.field_mapping);
     state.oneCHistory.analysisReady = false;
     renderOneCHistorySummary({...preview, mapping_required:true, summary:{warnings:[]}, sample:[]});
   } catch (error) {
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     setOneCHistoryMessage(error.message, "warning");
   }
 }
@@ -1076,6 +1168,7 @@ async function inspectOneCHistorySheet() {
 async function analyzeOneCHistoryMapping() {
   const preview = state.oneCHistory.preview;
   if (!preview) return;
+  const generation = state.oneCHistory.requestGeneration;
   state.oneCHistory.busy = true;
   state.oneCHistory.analysisReady = false;
   $("#one-c-history-import").disabled = true;
@@ -1085,19 +1178,25 @@ async function analyzeOneCHistoryMapping() {
       body:JSON.stringify({
         sheet_name:$("#one-c-history-sheet").value,
         header_row:Number($("#one-c-history-header-row").value),
+        group_header_row:Number($("#one-c-history-group-header-row").value) || null,
+        event_header_row:Number($("#one-c-history-header-row").value),
         layout_type:$("#one-c-history-layout").value,
         field_mapping:oneCHistoryMappingPayload(),
+        group_field_mapping:oneCHistoryMappingPayload("#one-c-history-group-mappings"),
+        event_field_mapping:oneCHistoryMappingPayload(),
         item_name_parse_strategy:$("#one-c-history-name-strategy").value,
       }),
     });
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     renderOneCHistoryPreview(analyzed);
     state.oneCHistory.analysisReady = true;
     $("#one-c-history-import").disabled = false;
   } catch (error) {
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     setOneCHistoryMessage(error.message, "warning");
     toast(error.message, "error");
   } finally {
-    state.oneCHistory.busy = false;
+    if (isCurrentOneCHistoryRequest(generation)) state.oneCHistory.busy = false;
   }
 }
 
@@ -1109,6 +1208,7 @@ async function importOneCHistory() {
   const profileName = $("#one-c-history-profile-name").value.trim();
   if (saveProfile && !profileId && !profileName) { toast("Укажите название нового профиля", "error"); return; }
   if (!window.confirm("Импортировать этот отчёт и заменить активный снимок истории закупок 1С?")) return;
+  const generation = state.oneCHistory.requestGeneration;
   state.oneCHistory.busy = true;
   $("#one-c-history-import").disabled = true;
   try {
@@ -1118,24 +1218,30 @@ async function importOneCHistory() {
         preview_id:preview.preview_id,
         sheet_name:$("#one-c-history-sheet").value,
         header_row:Number($("#one-c-history-header-row").value),
+        group_header_row:Number($("#one-c-history-group-header-row").value) || null,
+        event_header_row:Number($("#one-c-history-header-row").value),
         layout_type:$("#one-c-history-layout").value,
         field_mapping:oneCHistoryMappingPayload(),
+        group_field_mapping:oneCHistoryMappingPayload("#one-c-history-group-mappings"),
+        event_field_mapping:oneCHistoryMappingPayload(),
         item_name_parse_strategy:$("#one-c-history-name-strategy").value,
         save_profile:saveProfile,
         profile_id:saveProfile ? profileId : null,
         profile_name:profileName || null,
       }),
     });
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     toast(result.idempotent ? "Этот XLSX уже является активной историей" : "История закупок 1С заменена", "success");
     state.oneCHistory.preview = null;
     state.oneCHistory.analysisReady = false;
     $("#one-c-history-preview-panel").hidden = true;
     await loadOneCHistoryStatus();
   } catch (error) {
+    if (!isCurrentOneCHistoryRequest(generation)) return;
     setOneCHistoryMessage(error.message, "warning");
     toast(error.message, "error");
   } finally {
-    state.oneCHistory.busy = false;
+    if (isCurrentOneCHistoryRequest(generation)) state.oneCHistory.busy = false;
   }
 }
 
@@ -4272,11 +4378,24 @@ function setupEvents() {
   $("#one-c-history-preview").addEventListener("click",startOneCHistoryPreview);
   $("#one-c-history-analyze").addEventListener("click",analyzeOneCHistoryMapping);
   $("#one-c-history-import").addEventListener("click",importOneCHistory);
-  $("#one-c-history-sheet").addEventListener("change",() => { $("#one-c-history-header-row").value = ""; inspectOneCHistorySheet(); });
+  $("#one-c-history-sheet").addEventListener("change",() => {
+    $("#one-c-history-header-row").value = "";
+    $("#one-c-history-group-header-row").value = "";
+    inspectOneCHistorySheet();
+  });
   $("#one-c-history-header-row").addEventListener("change",inspectOneCHistorySheet);
-  ["#one-c-history-layout", "#one-c-history-name-strategy", "#one-c-history-mappings"].forEach((selector) => {
+  $("#one-c-history-group-header-row").addEventListener("change",inspectOneCHistorySheet);
+  ["#one-c-history-layout", "#one-c-history-name-strategy", "#one-c-history-mappings", "#one-c-history-group-mappings"].forEach((selector) => {
     $(selector).addEventListener("change",() => {
       if (!state.oneCHistory.preview) return;
+      if (selector === "#one-c-history-layout") {
+        state.oneCHistory.preview.layout_type = $(selector).value;
+        const grouped = $(selector).value === "hierarchical_grouped";
+        $("#one-c-history-group-mappings").hidden = !grouped;
+        $("#one-c-history-group-heading").hidden = !grouped;
+        $("#one-c-history-group-hint").hidden = !grouped;
+        renderOneCHistoryMapping(state.oneCHistory.preview.headers, state.oneCHistory.preview.event_field_mapping || state.oneCHistory.preview.field_mapping || {});
+      }
       state.oneCHistory.analysisReady = false;
       $("#one-c-history-import").disabled = true;
       setOneCHistoryMessage("Сопоставление изменено. Проверьте предпросмотр перед импортом.", "warning");

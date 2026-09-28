@@ -378,9 +378,15 @@ async def inspect_one_c_history_sheet(
     preview_id: str,
     sheet_name: str,
     header_row: int | None = Query(default=None, ge=1, le=50),
+    group_header_row: int | None = Query(default=None, ge=1, le=50),
+    event_header_row: int | None = Query(default=None, ge=1, le=50),
 ):
     try:
-        return await one_c_history_service.inspect_preview_sheet(preview_id, sheet_name, header_row)
+        return await one_c_history_service.inspect_preview_sheet(
+            preview_id, sheet_name, header_row,
+            group_header_row=group_header_row,
+            event_header_row=event_header_row,
+        )
     except OneCImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

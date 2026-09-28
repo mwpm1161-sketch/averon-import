@@ -27,7 +27,7 @@ from averon_import.services.one_c_history.xlsx_import import (
     ParsedWorkbook,
     detect_workbook,
     header_signature,
-    inspect_sheet,
+    inspect_sheet_mapping,
     parse_workbook,
 )
 
@@ -38,7 +38,7 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class _PendingPreview:
-    def __init__(self, *, preview_id: str, path: Path, filename: str, file_sha256: str, file_size_bytes: int, detected: dict, profile_id: str | None, expires_at: float, mapping_required: bool):
+    def __init__(self, *, preview_id: str, path: Path, filename: str, file_sha256: str, file_size_bytes: int, detected: dict, profile_id: str | None, profile_revision: int | None, profile_mapping_key: str | None, expires_at: float, mapping_required: bool):
         self.preview_id = preview_id
         self.path = path
         self.filename = filename
@@ -46,6 +46,8 @@ class _PendingPreview:
         self.file_size_bytes = file_size_bytes
         self.detected = detected
         self.profile_id = profile_id
+        self.profile_revision = profile_revision
+        self.profile_mapping_key = profile_mapping_key
         self.expires_at = expires_at
         self.created_at = time.monotonic()
         self.mapping_required = mapping_required
@@ -147,6 +149,7 @@ class OneCHistoryImportService:
             detected = await asyncio.to_thread(detect_workbook, path)
             file_sha256 = digest.hexdigest()
             selected_profile: ImportProfile | None = None
+            profile_revision: int | None = None
             incompatible_profile = False
             if profile_id:
                 selected_profile = self.repository.profile(profile_id)
@@ -168,12 +171,29 @@ class OneCHistoryImportService:
             if selected_profile:
                 detected["layout_type"] = selected_profile.layout_type
                 detected["header_row"] = selected_profile.header_row
-                detected["field_mapping"] = {key: selected_profile.field_mapping.get(key) for key in FIELD_NAMES}
+                detected["group_header_row"] = selected_profile.group_header_row or (
+                    selected_profile.header_row if selected_profile.layout_type == "hierarchical_grouped" else None
+                )
+                detected["event_header_row"] = selected_profile.event_header_row or selected_profile.header_row
+                detected["group_field_mapping"] = {
+                    key: (selected_profile.group_field_mapping or selected_profile.field_mapping).get(key)
+                    for key in FIELD_NAMES
+                }
+                detected["event_field_mapping"] = {
+                    key: (selected_profile.event_field_mapping or selected_profile.field_mapping).get(key)
+                    for key in FIELD_NAMES
+                }
+                detected["field_mapping"] = dict(detected["event_field_mapping"])
                 detected["item_name_parse_strategy"] = selected_profile.item_name_parse_strategy
-            preview_mapping = detected["field_mapping"]
-            mapping_required = incompatible_profile or preview_mapping.get("item_name") is None or not any(
-                preview_mapping.get(name) is not None
+                profile_revision = selected_profile.revision
+            group_mapping = detected["group_field_mapping"]
+            event_mapping = detected["event_field_mapping"]
+            mapping_required = incompatible_profile or (
+                (group_mapping.get("item_name") is None if detected["layout_type"] == "hierarchical_grouped" else event_mapping.get("item_name") is None)
+                or not any(
+                event_mapping.get(name) is not None
                 for name in ("quantity", "reported_unit_price_gross", "amount_gross")
+                )
             )
             parsed = None
             if not mapping_required:
@@ -186,8 +206,15 @@ class OneCHistoryImportService:
                     header_row=detected["header_row"],
                     headers=detected["headers"],
                     layout_type=detected["layout_type"],
-                    field_mapping=preview_mapping,
+                    field_mapping=event_mapping,
                     item_name_parse_strategy=detected["item_name_parse_strategy"],
+                    group_header_row=detected.get("group_header_row"),
+                    event_header_row=detected.get("event_header_row"),
+                    group_headers=detected.get("group_headers"),
+                    group_field_mapping=group_mapping,
+                    event_field_mapping=event_mapping,
+                    group_header_signature=detected.get("group_header_signature"),
+                    event_header_signature=detected.get("event_header_signature"),
                 )
             preview_id = uuid.uuid4().hex
             with self._lock:
@@ -200,6 +227,8 @@ class OneCHistoryImportService:
                     file_size_bytes=size,
                     detected=detected,
                     profile_id=selected_profile.profile_id if selected_profile else None,
+                    profile_revision=profile_revision,
+                    profile_mapping_key=self._analysis_key(detected) if selected_profile else None,
                     expires_at=time.monotonic() + PREVIEW_TTL_SECONDS,
                     mapping_required=mapping_required,
                 )
@@ -230,6 +259,13 @@ class OneCHistoryImportService:
             "header_row": detected["header_row"],
             "layout_type": detected["layout_type"],
             "field_mapping": detected["field_mapping"],
+            "group_header_row": detected.get("group_header_row"),
+            "event_header_row": detected.get("event_header_row"),
+            "group_headers": detected.get("group_headers", []),
+            "group_field_mapping": detected.get("group_field_mapping", {}),
+            "event_field_mapping": detected.get("event_field_mapping", detected["field_mapping"]),
+            "group_header_signature": detected.get("group_header_signature"),
+            "event_header_signature": detected.get("event_header_signature"),
             "item_name_parse_strategy": detected["item_name_parse_strategy"],
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -251,10 +287,17 @@ class OneCHistoryImportService:
                 "sheet_names": detected["sheet_names"],
                 "sheet_name": detected["sheet_name"],
                 "header_row": detected["header_row"],
+                "group_header_row": detected.get("group_header_row"),
+                "event_header_row": detected.get("event_header_row"),
                 "headers": detected["headers"],
+                "group_headers": detected.get("group_headers", []),
                 "header_signature": detected["header_signature"],
+                "group_header_signature": detected.get("group_header_signature"),
+                "event_header_signature": detected.get("event_header_signature"),
                 "layout_type": detected["layout_type"],
                 "field_mapping": detected["field_mapping"],
+                "group_field_mapping": detected.get("group_field_mapping", {}),
+                "event_field_mapping": detected.get("event_field_mapping", detected["field_mapping"]),
                 "item_name_parse_strategy": detected["item_name_parse_strategy"],
                 "mapping_profile_id": record.profile_id,
                 "profile_mapping_required": record.mapping_required,
@@ -264,7 +307,15 @@ class OneCHistoryImportService:
                 "sample": parsed.sample()[:MAX_PREVIEW_ROWS] if parsed is not None else [],
             }
 
-    async def inspect_preview_sheet(self, preview_id: str, sheet_name: str, header_row: int | None = None) -> dict:
+    async def inspect_preview_sheet(
+        self,
+        preview_id: str,
+        sheet_name: str,
+        header_row: int | None = None,
+        *,
+        group_header_row: int | None = None,
+        event_header_row: int | None = None,
+    ) -> dict:
         with self._lock:
             self._prune_previews()
             record = self._pending.get(preview_id)
@@ -272,15 +323,23 @@ class OneCHistoryImportService:
             raise OneCImportError("Предпросмотр истёк или уже использован. Загрузите файл повторно.")
         acquired = await asyncio.to_thread(record.analysis_lock.acquire)
         try:
-            result = await asyncio.to_thread(inspect_sheet, record.path, sheet_name, header_row)
-            selected_row, headers, mapping, layout_type = result
+            result = await asyncio.to_thread(
+                inspect_sheet_mapping,
+                record.path,
+                sheet_name,
+                group_header_row=group_header_row,
+                event_header_row=event_header_row or header_row,
+            )
             return {
                 "sheet_names": record.detected["sheet_names"],
                 "sheet_name": sheet_name,
-                "header_row": selected_row,
-                "headers": headers,
-                "field_mapping": mapping,
-                "layout_type": layout_type,
+                **{key: result[key] for key in (
+                    "header_row", "group_header_row", "event_header_row", "headers",
+                    "group_headers", "field_mapping", "group_field_mapping",
+                    "event_field_mapping", "group_header_signature",
+                    "event_header_signature", "header_signature", "layout_type",
+                    "item_name_parse_strategy",
+                )},
             }
         finally:
             if acquired:
@@ -294,22 +353,58 @@ class OneCHistoryImportService:
             raise OneCImportError("Предпросмотр истёк или уже использован. Загрузите файл повторно.")
         acquired = await asyncio.to_thread(record.analysis_lock.acquire)
         try:
-            header_row, headers, _, _ = await asyncio.to_thread(
-                inspect_sheet, record.path, request.sheet_name, request.header_row
+            structure = await asyncio.to_thread(
+                inspect_sheet_mapping,
+                record.path,
+                request.sheet_name,
+                group_header_row=request.group_header_row,
+                event_header_row=request.event_header_row or request.header_row,
             )
+            header_row = structure["header_row"]
+            headers = structure["headers"]
             if len(headers) > 100:
                 raise OneCImportError("В листе XLSX слишком много столбцов.")
             mapping = {field: request.field_mapping.get(field) for field in FIELD_NAMES}
-            if any(index is not None and index >= len(headers) for index in mapping.values()):
+            if request.layout_type == "hierarchical_grouped":
+                group_headers = structure["group_headers"] or headers
+                group_mapping_source = request.group_field_mapping or request.field_mapping
+                event_mapping_source = request.event_field_mapping or request.field_mapping
+                group_mapping = {field: group_mapping_source.get(field) for field in FIELD_NAMES}
+                event_mapping = {field: event_mapping_source.get(field) for field in FIELD_NAMES}
+                group_row = request.group_header_row or structure.get("group_header_row") or header_row
+                event_row = request.event_header_row or header_row
+            else:
+                group_headers = []
+                group_mapping = {field: None for field in FIELD_NAMES}
+                event_mapping = mapping
+                group_row = None
+                event_row = header_row
+            if any(index is not None and index >= len(headers) for index in event_mapping.values()):
                 raise OneCImportError("Сопоставление содержит столбец вне заголовков.")
+            if any(index is not None and index >= len(group_headers) for index in group_mapping.values()):
+                raise OneCImportError("Сопоставление полей группы содержит столбец вне заголовков.")
+            group_signature = header_signature(group_headers) if group_headers else None
+            event_signature = header_signature(headers)
+            combined_signature = (
+                hashlib.sha256(json.dumps([group_signature, event_signature], separators=(",", ":")).encode()).hexdigest()
+                if group_row is not None and group_row != event_row
+                else event_signature
+            )
             detected = dict(record.detected)
             detected.update({
                 "sheet_name": request.sheet_name,
                 "header_row": header_row,
                 "headers": headers,
-                "header_signature": header_signature(headers),
+                "group_header_row": group_row,
+                "event_header_row": event_row,
+                "group_headers": group_headers,
+                "group_header_signature": group_signature,
+                "event_header_signature": event_signature,
+                "header_signature": combined_signature,
                 "layout_type": request.layout_type,
-                "field_mapping": mapping,
+                "field_mapping": event_mapping,
+                "group_field_mapping": group_mapping,
+                "event_field_mapping": event_mapping,
                 "item_name_parse_strategy": request.item_name_parse_strategy,
             })
             parsed = await asyncio.to_thread(
@@ -318,11 +413,18 @@ class OneCHistoryImportService:
                 filename=record.filename,
                 file_sha256=record.file_sha256,
                 sheet_name=request.sheet_name,
-                header_row=header_row,
+                header_row=event_row,
                 headers=headers,
                 layout_type=request.layout_type,
-                field_mapping=mapping,
+                field_mapping=event_mapping,
                 item_name_parse_strategy=request.item_name_parse_strategy,
+                group_header_row=group_row,
+                event_header_row=event_row,
+                group_headers=group_headers,
+                group_field_mapping=group_mapping,
+                event_field_mapping=event_mapping,
+                group_header_signature=group_signature,
+                event_header_signature=event_signature,
             )
             record.detected = detected
             record.mapping_required = False
@@ -345,22 +447,48 @@ class OneCHistoryImportService:
         await asyncio.to_thread(pending.analysis_lock.acquire)
         file_sha256 = pending.file_sha256
         staging: Path | None = None
+        committed = False
+        post_commit_warnings: list[str] = []
         try:
             detected = pending.detected
-            mapping = {field: request.field_mapping.get(field) for field in FIELD_NAMES}
+            legacy_mapping = {field: request.field_mapping.get(field) for field in FIELD_NAMES}
+            has_role_mappings = bool(request.group_field_mapping or request.event_field_mapping)
+            if has_role_mappings:
+                group_mapping = {field: request.group_field_mapping.get(field) for field in FIELD_NAMES}
+                event_mapping = {field: request.event_field_mapping.get(field) for field in FIELD_NAMES}
+            elif legacy_mapping == detected.get("field_mapping"):
+                group_mapping = dict(detected.get("group_field_mapping", {}))
+                event_mapping = dict(detected.get("event_field_mapping", detected["field_mapping"]))
+            else:
+                group_mapping = dict(legacy_mapping)
+                event_mapping = dict(legacy_mapping)
+            group_row = request.group_header_row if request.group_header_row is not None else detected.get("group_header_row")
+            event_row = request.event_header_row if request.event_header_row is not None else detected.get("event_header_row", detected["header_row"])
+            mapping = event_mapping
             if request.sheet_name not in (None, detected["sheet_name"]) or request.header_row not in (None, detected["header_row"]):
                 raise OneCImportError("Сначала обновите предпросмотр для выбранного листа и строки заголовков.")
+            if group_row != detected.get("group_header_row") or event_row != detected.get("event_header_row", detected["header_row"]):
+                raise OneCImportError("Сначала обновите предпросмотр для выбранных строк заголовков.")
             requested_config = dict(detected)
             requested_config.update({
                 "layout_type": request.layout_type,
                 "field_mapping": mapping,
+                "group_field_mapping": group_mapping,
+                "event_field_mapping": event_mapping,
+                "group_header_row": group_row,
+                "event_header_row": event_row,
                 "item_name_parse_strategy": request.item_name_parse_strategy,
             })
             if pending.mapping_required or pending.analysis_key != self._analysis_key(requested_config):
                 raise OneCImportError("Сначала обновите предпросмотр для выбранного сопоставления.")
-            if any(index is not None and index >= len(detected["headers"]) for index in mapping.values()):
+            if any(index is not None and index >= len(detected["headers"]) for index in event_mapping.values()):
                 raise OneCImportError("Сопоставление содержит столбец вне заголовков.")
-            profile_id = request.profile_id if request.save_profile else pending.profile_id
+            if any(index is not None and index >= len(detected.get("group_headers", detected["headers"])) for index in group_mapping.values()):
+                raise OneCImportError("Сопоставление полей группы содержит столбец вне заголовков.")
+            profile_id = request.profile_id if request.save_profile else (
+                pending.profile_id if pending.profile_mapping_key == pending.analysis_key else None
+            )
+            profile_revision = pending.profile_revision if profile_id == pending.profile_id else None
             if request.save_profile:
                 profile_name = (request.profile_name or "").strip()
                 if not profile_name and profile_id:
@@ -368,6 +496,9 @@ class OneCHistoryImportService:
                         profile_id=uuid.uuid4().hex, name="Импорт 1С", layout_type=request.layout_type,
                         sheet_name=detected["sheet_name"], header_row=detected["header_row"],
                         field_mapping={key: value for key, value in mapping.items() if value is not None},
+                        group_header_row=group_row, event_header_row=event_row,
+                        group_field_mapping={key: value for key, value in group_mapping.items() if value is not None},
+                        event_field_mapping={key: value for key, value in event_mapping.items() if value is not None},
                         item_name_parse_strategy=request.item_name_parse_strategy,
                         header_signature=detected["header_signature"], parser_version=PARSER_VERSION,
                     )).name
@@ -382,12 +513,17 @@ class OneCHistoryImportService:
                     sheet_name=detected["sheet_name"],
                     header_row=detected["header_row"],
                     field_mapping={key: value for key, value in mapping.items() if value is not None},
+                    group_header_row=group_row,
+                    event_header_row=event_row,
+                    group_field_mapping={key: value for key, value in group_mapping.items() if value is not None},
+                    event_field_mapping={key: value for key, value in event_mapping.items() if value is not None},
                     item_name_parse_strategy=request.item_name_parse_strategy,
                     header_signature=detected["header_signature"],
                     parser_version=PARSER_VERSION,
                 )
                 profile = self.repository.save_profile(profile)
                 profile_id = profile.profile_id
+                profile_revision = profile.revision
 
             parsed: ParsedWorkbook = await asyncio.to_thread(
                 parse_workbook,
@@ -395,11 +531,18 @@ class OneCHistoryImportService:
                 filename=pending.filename,
                 file_sha256=file_sha256,
                 sheet_name=detected["sheet_name"],
-                header_row=detected["header_row"],
+                header_row=event_row or detected["header_row"],
                 headers=detected["headers"],
                 layout_type=request.layout_type,
                 field_mapping=mapping,
                 item_name_parse_strategy=request.item_name_parse_strategy,
+                group_header_row=group_row,
+                event_header_row=event_row,
+                group_headers=detected.get("group_headers", []),
+                group_field_mapping=group_mapping,
+                event_field_mapping=event_mapping,
+                group_header_signature=detected.get("group_header_signature"),
+                event_header_signature=detected.get("event_header_signature"),
             )
             active = self.repository.active_metadata()
             if active and active.get("sha256") == file_sha256:
@@ -413,28 +556,96 @@ class OneCHistoryImportService:
 
             with self._import_lock:
                 self.repository.record_attempt("building", file_sha256=file_sha256)
+                provenance_body = {
+                    "profile_id": profile_id,
+                    "profile_revision": profile_revision,
+                    "layout_type": request.layout_type,
+                    "group_header_row": group_row,
+                    "event_header_row": event_row,
+                    "group_field_mapping": group_mapping,
+                    "event_field_mapping": event_mapping,
+                    "field_mapping": mapping,
+                    "item_name_parse_strategy": request.item_name_parse_strategy,
+                    "group_header_signature": detected.get("group_header_signature"),
+                    "event_header_signature": detected.get("event_header_signature"),
+                    "header_signature": detected["header_signature"],
+                    "parser_version": PARSER_VERSION,
+                }
+                provenance = {
+                    **provenance_body,
+                    "fingerprint": hashlib.sha256(json.dumps(
+                        provenance_body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")).hexdigest(),
+                }
                 staging = await asyncio.to_thread(
-                    self.repository.build_staging_snapshot, parsed, profile_id=profile_id
+                    self.repository.build_staging_snapshot, parsed,
+                    profile_id=profile_id, mapping_provenance=provenance,
                 )
-                self.repository.activate(staging)
+                post_commit_warnings.extend(self.repository.activate(staging))
+                committed = True
                 staging = None
-            self.repository.record_attempt("succeeded", file_sha256=file_sha256, warning_count=len(parsed.warnings))
+            try:
+                self.repository.record_attempt("succeeded", file_sha256=file_sha256, warning_count=len(parsed.warnings))
+            except Exception:
+                post_commit_warnings.append("Снимок активирован, но статус попытки импорта не удалось обновить.")
+            try:
+                active_metadata = self.repository.active_metadata()
+            except Exception:
+                active_metadata = None
+                post_commit_warnings.append("Снимок активирован, но его статус не удалось прочитать.")
             return {
                 "status": "succeeded",
                 "idempotent": False,
-                "active_import": self.repository.active_metadata(),
+                "active_import": active_metadata,
                 "profile_id": profile_id,
+                "warnings": post_commit_warnings,
             }
         except OneCImportError as exc:
-            self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_VALIDATION_FAILED")
+            if committed:
+                try:
+                    active_metadata = self.repository.active_metadata()
+                except Exception:
+                    active_metadata = None
+                return {
+                    "status": "succeeded", "idempotent": False,
+                    "active_import": active_metadata, "profile_id": pending.profile_id,
+                    "warnings": [*post_commit_warnings, "Снимок активирован; завершение служебного учёта потребовало проверки."],
+                }
+            try:
+                self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_VALIDATION_FAILED")
+            except Exception:
+                pass
             raise
         except Exception as exc:
-            self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_FAILED")
-            raise OneCImportError("Не удалось активировать историю закупок. Предыдущий снимок сохранён.") from exc
+            if committed:
+                try:
+                    active_metadata = self.repository.active_metadata()
+                except Exception:
+                    active_metadata = None
+                try:
+                    self.repository.record_attempt("succeeded_with_warning", file_sha256=file_sha256, warning_count=len(parsed.warnings))
+                except Exception:
+                    pass
+                return {
+                    "status": "succeeded", "idempotent": False, "active_import": active_metadata,
+                    "profile_id": pending.profile_id,
+                    "warnings": [*post_commit_warnings, "Снимок активирован; служебное обновление после фиксации завершилось с ошибкой."],
+                }
+            try:
+                self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_FAILED")
+            except Exception:
+                pass
+            raise OneCImportError("Не удалось активировать историю закупок. Текущий снимок не изменён.") from exc
         finally:
-            pending.path.unlink(missing_ok=True)
+            try:
+                pending.path.unlink(missing_ok=True)
+            except OSError:
+                pass
             if staging is not None:
-                staging.unlink(missing_ok=True)
+                try:
+                    staging.unlink(missing_ok=True)
+                except OSError:
+                    pass
             pending.analysis_lock.release()
 
 

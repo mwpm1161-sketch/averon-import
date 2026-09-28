@@ -474,12 +474,15 @@
         <div id="one-c-history-preview-panel" hidden>
           <div class="one-c-history-controls">
             <label><span class="field-label">Лист</span><select class="select" id="one-c-history-sheet"></select></label>
-            <label><span class="field-label">Строка заголовка</span><input class="input" id="one-c-history-header-row" type="number" min="1" max="50"></label>
+            <label><span class="field-label">Строка заголовка событий</span><input class="input" id="one-c-history-header-row" type="number" min="1" max="50"></label>
+            <label><span class="field-label">Строка заголовка группы</span><input class="input" id="one-c-history-group-header-row" type="number" min="1" max="50"></label>
             <label><span class="field-label">Структура отчёта</span><select class="select" id="one-c-history-layout"><option value="hierarchical_grouped">Иерархические группы</option><option value="flat">Плоский отчёт</option></select></label>
             <label><span class="field-label">Разбор единицы из названия</span><select class="select" id="one-c-history-name-strategy"><option value="none">Не разбирать</option><option value="comma_suffix_unit">Суффикс после запятой</option><option value="comma_or_parentheses">Запятая или скобки</option></select></label>
           </div>
-          <h4>Сопоставление полей</h4>
-          <p class="hint">Код номенклатуры настоятельно рекомендуется. Без него одинаковые названия сохраняются как отдельные неоднозначные группы.</p>
+          <h4 id="one-c-history-group-heading">Сопоставление полей группы</h4>
+          <p class="hint" id="one-c-history-group-hint">Код номенклатуры настоятельно рекомендуется. Без него одинаковые названия сохраняются как отдельные неоднозначные группы.</p>
+          <div id="one-c-history-group-mappings" class="one-c-history-mappings"></div>
+          <h4>Сопоставление событий</h4>
           <div id="one-c-history-mappings" class="one-c-history-mappings"></div>
           <label class="one-c-history-save-profile"><input type="checkbox" id="one-c-history-save-profile"> Сохранить или обновить профиль</label>
           <div class="one-c-history-controls">

@@ -91,6 +91,17 @@ class ParsedEvent:
     source_facts: dict[str, str | None]
 
 
+@dataclass(frozen=True)
+class _GroupContext:
+    item_code: str | None
+    item_name: str
+    raw_unit: str
+    group_number: int
+    raw_label: str
+    optional_facts: dict[str, str | None]
+    source_facts: dict[str, str | None]
+
+
 @dataclass
 class ParsedWorkbook:
     filename: str
@@ -101,6 +112,13 @@ class ParsedWorkbook:
     header_signature: str
     layout_type: str
     field_mapping: dict[str, int | None]
+    group_header_row: int | None
+    event_header_row: int | None
+    group_headers: list[str]
+    group_field_mapping: dict[str, int | None]
+    event_field_mapping: dict[str, int | None]
+    group_header_signature: str | None
+    event_header_signature: str
     item_name_parse_strategy: str
     events: list[ParsedEvent]
     item_count: int
@@ -125,6 +143,8 @@ class ParsedWorkbook:
             "sheet_name": self.sheet_name,
             "header_row": self.header_row,
             "layout_type": self.layout_type,
+            "group_header_row": self.group_header_row,
+            "event_header_row": self.event_header_row,
             "period_start": self.period_start,
             "period_end": self.period_end,
             "item_count": self.item_count,
@@ -318,8 +338,109 @@ def _fallback_header(sheet) -> tuple[int, list[str], dict[str, int | None]]:
     return best[1], best[2], {key: None for key in FIELD_NAMES}
 
 
-def inspect_sheet(path: Path, sheet_name: str, header_row: int | None = None) -> tuple[int, list[str], dict[str, int | None], str]:
-    """Return bounded header metadata for a selected workbook sheet."""
+def _header_values(sheet, row_number: int) -> list[str]:
+    values = next(sheet.iter_rows(min_row=row_number, max_row=row_number, values_only=True), ())
+    headers = [str(value).strip() if value is not None else "" for value in values]
+    if any(len(value) > MAX_HEADER_LENGTH for value in headers):
+        raise OneCImportError("Заголовок XLSX превышает допустимую длину.")
+    return headers[:MAX_COLUMNS]
+
+
+def _detect_two_level_header(sheet) -> dict | None:
+    """Detect an adjacent group-label/event-header pair within the bounded scan."""
+    last_row = min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0)
+    candidates = []
+    for group_row in range(1, last_row):
+        event_row = group_row + 1
+        group_headers = _header_values(sheet, group_row)
+        event_headers = _header_values(sheet, event_row)
+        group_mapping = _header_mapping(group_headers)
+        event_mapping = _header_mapping(event_headers)
+        core_count = sum(event_mapping.get(field) is not None for field in (
+            "quantity", "reported_unit_price_gross", "amount_gross",
+        ))
+        context_count = sum(event_mapping.get(field) is not None for field in (
+            "document_date", "document_reference", "counterparty", "contract",
+        ))
+        if group_mapping.get("item_name") is None or core_count < 2 or context_count < 1:
+            continue
+        # A group label row and the event header row have separate roles. Do not
+        # mistake a normal one-row flat header for a pair with item_name repeated.
+        if event_mapping.get("item_name") is not None:
+            continue
+        score = sum(index is not None for index in event_mapping.values()) + core_count * 4 + context_count
+        candidates.append((score, -group_row, {
+            "layout_type": "hierarchical_grouped",
+            "header_row": event_row,
+            "group_header_row": group_row,
+            "event_header_row": event_row,
+            "headers": event_headers,
+            "group_headers": group_headers,
+            "field_mapping": event_mapping,
+            "group_field_mapping": group_mapping,
+            "event_field_mapping": event_mapping,
+            "item_name_parse_strategy": "comma_suffix_unit" if group_mapping.get("unit") is None else "none",
+        }))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _detect_sheet_structure(sheet) -> dict:
+    two_level = _detect_two_level_header(sheet)
+    if two_level is not None:
+        group_headers = two_level["group_headers"]
+        event_headers = two_level["headers"]
+        two_level["group_header_signature"] = header_signature(group_headers)
+        two_level["event_header_signature"] = header_signature(event_headers)
+        combined = json.dumps(
+            [two_level["group_header_signature"], two_level["event_header_signature"]], separators=(",", ":")
+        )
+        two_level["header_signature"] = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+        return two_level
+
+    try:
+        header_row, headers, mapping = _detect_header(sheet)
+    except OneCImportError:
+        header_row, headers, mapping = _fallback_header(sheet)
+    layout_type = _infer_layout(sheet, header_row, mapping)
+    if layout_type == "hierarchical_grouped":
+        group_row = event_row = header_row
+        group_headers = headers
+        group_mapping = dict(mapping)
+        event_mapping = dict(mapping)
+        group_sig = header_signature(group_headers)
+    else:
+        group_row = event_row = None
+        group_headers = []
+        group_mapping = {key: None for key in FIELD_NAMES}
+        event_mapping = dict(mapping)
+        group_sig = None
+    return {
+        "layout_type": layout_type,
+        "header_row": header_row,
+        "group_header_row": group_row,
+        "event_header_row": event_row,
+        "headers": headers,
+        "group_headers": group_headers,
+        "field_mapping": mapping,
+        "group_field_mapping": group_mapping,
+        "event_field_mapping": event_mapping,
+        "group_header_signature": group_sig,
+        "event_header_signature": header_signature(headers),
+        "header_signature": header_signature(headers),
+        "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
+    }
+
+
+def inspect_sheet_mapping(
+    path: Path,
+    sheet_name: str,
+    *,
+    group_header_row: int | None = None,
+    event_header_row: int | None = None,
+) -> dict:
+    """Return role-specific, bounded headers and mappings for a selected sheet."""
     workbook, normalized = _open_workbook(path)
     try:
         if sheet_name not in workbook.sheetnames:
@@ -327,28 +448,74 @@ def inspect_sheet(path: Path, sheet_name: str, header_row: int | None = None) ->
         sheet = workbook[sheet_name]
         if (sheet.max_column or 0) > MAX_COLUMNS or (sheet.max_row or 0) > MAX_ROWS + MAX_HEADER_SCAN_ROWS:
             raise OneCImportError("Размер листа XLSX превышает допустимые пределы.")
-        if header_row is None:
-            try:
-                selected_row, headers, mapping = _detect_header(sheet)
-            except OneCImportError:
-                selected_row, headers, mapping = _fallback_header(sheet)
-            return selected_row, headers, mapping, _infer_layout(sheet, selected_row, mapping)
-        if header_row > min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0):
-            raise OneCImportError("Строка заголовка выходит за допустимый диапазон.")
-        values = next(sheet.iter_rows(min_row=header_row, max_row=header_row, values_only=True), ())
-        headers = [str(value).strip() if value is not None else "" for value in values]
-        if any(len(value) > MAX_HEADER_LENGTH for value in headers):
-            raise OneCImportError("Заголовок XLSX превышает допустимую длину.")
-        while headers and not headers[-1]:
-            headers.pop()
-        if not headers or len(headers) > MAX_COLUMNS:
-            raise OneCImportError("В выбранной строке заголовков нет допустимых столбцов.")
-        mapping = _header_mapping(headers)
-        return header_row, headers, mapping, _infer_layout(sheet, header_row, mapping)
+        if group_header_row is None and event_header_row is None:
+            return {**_detect_sheet_structure(sheet), "sheet_names": list(workbook.sheetnames), "sheet_name": sheet_name}
+
+        selected_event_row = event_header_row or group_header_row
+        if selected_event_row is None or selected_event_row > min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0):
+            raise OneCImportError("Строка заголовков выходит за допустимый диапазон.")
+        automatic = _detect_two_level_header(sheet)
+        if automatic and selected_event_row == automatic["event_header_row"] and group_header_row in (None, automatic["group_header_row"]):
+            structure = automatic
+        elif group_header_row is not None and group_header_row != selected_event_row:
+            if group_header_row > min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0):
+                raise OneCImportError("Строка заголовков группы выходит за допустимый диапазон.")
+            group_headers = _header_values(sheet, group_header_row)
+            event_headers = _header_values(sheet, selected_event_row)
+            group_mapping = _header_mapping(group_headers)
+            event_mapping = _header_mapping(event_headers)
+            group_signature = header_signature(group_headers)
+            event_signature = header_signature(event_headers)
+            combined = hashlib.sha256(json.dumps([group_signature, event_signature], separators=(",", ":")).encode()).hexdigest()
+            structure = {
+                "layout_type": "hierarchical_grouped", "header_row": selected_event_row,
+                "group_header_row": group_header_row, "event_header_row": selected_event_row,
+                "headers": event_headers, "group_headers": group_headers,
+                "field_mapping": event_mapping, "group_field_mapping": group_mapping,
+                "event_field_mapping": event_mapping, "group_header_signature": group_signature,
+                "event_header_signature": event_signature, "header_signature": combined,
+                "item_name_parse_strategy": "comma_suffix_unit" if group_mapping.get("unit") is None else "none",
+            }
+        else:
+            headers = _header_values(sheet, selected_event_row)
+            while headers and not headers[-1]:
+                headers.pop()
+            mapping = _header_mapping(headers)
+            layout = _infer_layout(sheet, selected_event_row, mapping)
+            if layout == "hierarchical_grouped":
+                group_row = event_row = selected_event_row
+                group_headers = headers
+                group_mapping = dict(mapping)
+                event_mapping = dict(mapping)
+                group_signature = header_signature(group_headers)
+            else:
+                group_row = event_row = None
+                group_headers = []
+                group_mapping = {key: None for key in FIELD_NAMES}
+                event_mapping = dict(mapping)
+                group_signature = None
+            structure = {
+                "layout_type": layout, "header_row": selected_event_row,
+                "group_header_row": group_row, "event_header_row": event_row,
+                "headers": headers, "group_headers": group_headers,
+                "field_mapping": mapping, "group_field_mapping": group_mapping,
+                "event_field_mapping": event_mapping, "group_header_signature": group_signature,
+                "event_header_signature": header_signature(headers), "header_signature": header_signature(headers),
+                "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
+            }
+        return {**structure, "sheet_names": list(workbook.sheetnames), "sheet_name": sheet_name}
     finally:
         workbook.close()
         if normalized:
             normalized.unlink(missing_ok=True)
+
+
+def inspect_sheet(path: Path, sheet_name: str, header_row: int | None = None) -> tuple[int, list[str], dict[str, int | None], str]:
+    """Compatibility wrapper for callers that only need a single row mapping."""
+    structure = inspect_sheet_mapping(path, sheet_name, event_header_row=header_row)
+    return (
+        structure["header_row"], structure["headers"], structure["field_mapping"], structure["layout_type"],
+    )
 
 
 def _cell_value(value: object) -> str | None:
@@ -365,6 +532,37 @@ def _has_mapped_value(row: tuple, mapping: dict[str, int | None], fields: tuple[
         (index := mapping.get(field)) is not None and index < len(row) and _cell_value(row[index]) is not None
         for field in fields
     )
+
+
+def _row_has_event_evidence(
+    row: tuple,
+    group_mapping: dict[str, int | None],
+    event_mapping: dict[str, int | None],
+) -> bool:
+    present_fields = [
+        field for field in EVENT_FIELDS
+        if (index := event_mapping.get(field)) is not None
+        and index < len(row) and _cell_value(row[index]) is not None
+    ]
+    if not present_fields:
+        return False
+    group_identity_columns = {
+        index for field in ("item_name", "item_code", "unit", "article", "manufacturer", "characteristic")
+        if (index := group_mapping.get(field)) is not None
+    }
+    if any(event_mapping[field] not in group_identity_columns for field in present_fields):
+        return True
+    price_index = event_mapping.get("reported_unit_price_gross")
+    if price_index is None or price_index >= len(row):
+        return False
+    value = row[price_index]
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        return _parse_decimal(value) is not None
+    text = _cell_value(value)
+    if text is None:
+        return False
+    scalar = text.replace("\u00a0", "").replace("\u202f", "").replace(" ", "")
+    return bool(re.fullmatch(r"[+-]?(?:(?:\d+(?:[.,]\d*)?)|(?:[.,]\d+))(?:[eE][+-]?\d+)?", scalar))
 
 
 def _infer_layout(sheet, header_row: int, mapping: dict[str, int | None]) -> str:
@@ -393,34 +591,26 @@ def detect_workbook(path: Path) -> dict:
             if (sheet.max_column or 0) > MAX_COLUMNS or (sheet.max_row or 0) > MAX_ROWS + MAX_HEADER_SCAN_ROWS:
                 continue
             try:
-                row, headers, mapping = _detect_header(sheet)
+                structure = _detect_sheet_structure(sheet)
             except OneCImportError:
-                try:
-                    row, headers, mapping = _fallback_header(sheet)
-                except OneCImportError:
-                    continue
-            score = sum(index is not None for index in mapping.values())
-            candidates.append((sheet_name, row, headers, mapping, sheet, score))
+                continue
+            score = sum(index is not None for index in structure["event_field_mapping"].values())
+            score += sum(index is not None for index in structure["group_field_mapping"].values())
+            candidates.append((sheet_name, structure, sheet, score))
         if not candidates:
             raise OneCImportError("В книге нет листа с заголовками для ручного сопоставления.")
         tdsheet = next((candidate for candidate in candidates if candidate[0].casefold() == "tdsheet"), None)
-        recognized = [candidate for candidate in candidates if candidate[5] > 0]
-        selected = tdsheet or (max(recognized, key=lambda candidate: candidate[5]) if recognized else candidates[0])
-        sheet_name, header_row, headers, mapping, sheet, _score = selected
-        if len(headers) > MAX_COLUMNS or (sheet.max_column or 0) > MAX_COLUMNS:
+        recognized = [candidate for candidate in candidates if candidate[3] > 0]
+        selected = tdsheet or (max(recognized, key=lambda candidate: candidate[3]) if recognized else candidates[0])
+        sheet_name, structure, sheet, _score = selected
+        if len(structure["headers"]) > MAX_COLUMNS or (sheet.max_column or 0) > MAX_COLUMNS:
             raise OneCImportError("В листе XLSX слишком много столбцов.")
-        if (sheet.max_row or 0) > MAX_ROWS + header_row:
+        if (sheet.max_row or 0) > MAX_ROWS + structure["header_row"]:
             raise OneCImportError("В листе XLSX слишком много строк.")
-        layout = _infer_layout(sheet, header_row, mapping)
         return {
             "sheet_names": sheets,
             "sheet_name": sheet_name,
-            "header_row": header_row,
-            "headers": headers,
-            "header_signature": header_signature(headers),
-            "layout_type": layout,
-            "field_mapping": mapping,
-            "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
+            **structure,
         }
     finally:
         workbook.close()
@@ -548,16 +738,38 @@ def parse_workbook(
     layout_type: str,
     field_mapping: dict[str, int | None],
     item_name_parse_strategy: str,
+    group_header_row: int | None = None,
+    event_header_row: int | None = None,
+    group_headers: list[str] | None = None,
+    group_field_mapping: dict[str, int | None] | None = None,
+    event_field_mapping: dict[str, int | None] | None = None,
+    group_header_signature: str | None = None,
+    event_header_signature: str | None = None,
 ) -> ParsedWorkbook:
     if layout_type not in {"hierarchical_grouped", "flat"}:
         raise OneCImportError("Неизвестный тип структуры отчёта.")
     if not headers or len(headers) > MAX_COLUMNS:
         raise OneCImportError("В XLSX нет допустимых заголовков.")
-    if any(index is not None and index >= len(headers) for index in field_mapping.values()):
+    event_mapping = {
+        key: (event_field_mapping or field_mapping).get(key)
+        for key in FIELD_NAMES
+    }
+    group_mapping = {
+        key: (group_field_mapping or field_mapping).get(key)
+        for key in FIELD_NAMES
+    } if layout_type == "hierarchical_grouped" else {key: None for key in FIELD_NAMES}
+    group_header_row = group_header_row or (header_row if layout_type == "hierarchical_grouped" else None)
+    event_header_row = event_header_row or header_row
+    group_headers = group_headers or (headers if layout_type == "hierarchical_grouped" else [])
+    if any(index is not None and index >= len(headers) for index in event_mapping.values()):
         raise OneCImportError("Сопоставление содержит столбец вне заголовков.")
-    if field_mapping.get("item_name") is None:
+    if layout_type == "hierarchical_grouped" and any(
+        index is not None and index >= len(group_headers) for index in group_mapping.values()
+    ):
+        raise OneCImportError("Сопоставление полей группы содержит столбец вне заголовков.")
+    if (group_mapping if layout_type == "hierarchical_grouped" else event_mapping).get("item_name") is None:
         raise OneCImportError("Сопоставьте поле «Наименование номенклатуры».")
-    if not any(field_mapping.get(name) is not None for name in ("quantity", "reported_unit_price_gross", "amount_gross")):
+    if not any(event_mapping.get(name) is not None for name in ("quantity", "reported_unit_price_gross", "amount_gross")):
         raise OneCImportError("Сопоставьте хотя бы одно поле: количество, цена или сумма.")
 
     workbook, normalized = _open_workbook(path)
@@ -567,12 +779,13 @@ def parse_workbook(
         sheet = workbook[sheet_name]
         if (sheet.max_column or 0) > MAX_COLUMNS or len(headers) > MAX_COLUMNS:
             raise OneCImportError("В листе XLSX слишком много столбцов.")
-        if (sheet.max_row or 0) > MAX_ROWS + header_row:
+        first_data_row = event_header_row + 1
+        if (sheet.max_row or 0) > MAX_ROWS + first_data_row:
             raise OneCImportError("В листе XLSX слишком много строк.")
         physical_row_count = sheet.max_row or 0
 
         events: list[ParsedEvent] = []
-        current_item: tuple[str, str, str, str, int, str] | None = None
+        current_item: _GroupContext | None = None
         item_keys: set[str] = set()
         labels_by_group: Counter[str] = Counter()
         codes_by_key: dict[str, dict[str, str | None]] = {}
@@ -585,7 +798,7 @@ def parse_workbook(
         skipped_row_count = 0
 
         for row_number, cells in enumerate(
-            sheet.iter_rows(min_row=header_row + 1, values_only=False), start=header_row + 1
+            sheet.iter_rows(min_row=first_data_row, values_only=False), start=first_data_row
         ):
             observed_rows += 1
             if observed_rows > MAX_ROWS:
@@ -596,49 +809,82 @@ def parse_workbook(
             if any(cell.data_type == "f" for cell in cells):
                 raise OneCImportError("Формулы в исходном отчёте не поддерживаются. Сохраните значения без формул.")
 
-            raw_name = _cell_value(_mapped(row, field_mapping, "item_name")) or ""
-            raw_unit_cell = _cell_value(_mapped(row, field_mapping, "unit")) or ""
-            item_code_value = _cell_value(_mapped(row, field_mapping, "item_code"))
-            if item_code_value and re.fullmatch(r"[-+]?\d+\.0+", item_code_value):
-                item_code_value = item_code_value.split(".", 1)[0]
-            event_present = _has_mapped_value(row, field_mapping, EVENT_FIELDS)
-            has_identity_fields = bool(raw_name or item_code_value)
-
             if layout_type == "hierarchical_grouped":
-                if has_identity_fields and not event_present:
-                    group_count += 1
-                    name, unit = _split_name_unit(raw_name, raw_unit_cell, item_name_parse_strategy)
-                    if unit:
-                        unit_values.add(unit)
-                    if not item_code_value:
-                        labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
-                    current_item = ("", item_code_value or "", name, unit, group_count, raw_name)
-                    continue
-                if has_identity_fields:
-                    name, unit = _split_name_unit(raw_name, raw_unit_cell, item_name_parse_strategy)
-                    if raw_name:
+                # In grouped reports, group and event headers have independent
+                # meanings. In particular, the same physical column can hold
+                # an item label on a group row and a price on event rows.
+                event_present = _row_has_event_evidence(row, group_mapping, event_mapping)
+                if not event_present:
+                    raw_group_name = _cell_value(_mapped(row, group_mapping, "item_name")) or ""
+                    raw_group_code = _cell_value(_mapped(row, group_mapping, "item_code"))
+                    if raw_group_code and re.fullmatch(r"[-+]?\d+\.0+", raw_group_code):
+                        raw_group_code = raw_group_code.split(".", 1)[0]
+                    if raw_group_name or raw_group_code:
+                        raw_group_unit = _cell_value(_mapped(row, group_mapping, "unit")) or ""
+                        name, unit = _split_name_unit(raw_group_name, raw_group_unit, item_name_parse_strategy)
+                        group_count += 1
                         if unit:
                             unit_values.add(unit)
-                        group_count += 1
-                        if not item_code_value:
+                        if not raw_group_code:
                             labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
-                        current_item = ("", item_code_value or "", name, unit, group_count, raw_name)
-                if not event_present:
-                    skipped_row_count += 1
-                    continue
-                if current_item is None:
-                    if not has_identity_fields:
-                        current_item = ("", "", "", "", row_number, "")
-                        group_count += 1
+                        group_optional = {
+                            field: _cell_value(_mapped(row, group_mapping, field))
+                            for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization")
+                        }
+                        group_source = {
+                            f"group_{field}": _cell_value(_mapped(row, group_mapping, field))
+                            for field in FIELD_NAMES if group_mapping.get(field) is not None
+                        }
+                        current_item = _GroupContext(
+                            item_code=raw_group_code,
+                            item_name=name,
+                            raw_unit=unit,
+                            group_number=group_count,
+                            raw_label=raw_group_name,
+                            optional_facts=group_optional,
+                            source_facts=group_source,
+                        )
                     else:
-                        current_item = ("", item_code_value or "", raw_name, raw_unit_cell, row_number, raw_name)
-                        group_count += 1
-                _, group_code, current_name, current_unit, group_number, raw_group_label = current_item
-                code = item_code_value or group_code or None
-                name = current_name or raw_name
-                unit = current_unit or raw_unit_cell
-                group_num: int | None = group_number
+                        skipped_row_count += 1
+                    continue
+
+                if current_item is None or not (current_item.item_name or current_item.item_code):
+                    raise OneCImportError(
+                        f"Строка {row_number}: найдено событие закупки без предшествующей группы номенклатуры."
+                    )
+                raw_event_code = _cell_value(_mapped(row, event_mapping, "item_code"))
+                if raw_event_code and re.fullmatch(r"[-+]?\d+\.0+", raw_event_code):
+                    raw_event_code = raw_event_code.split(".", 1)[0]
+                if current_item.item_code and raw_event_code and current_item.item_code != raw_event_code:
+                    identity_issues.append({"code": "group_event_code_conflict", "source_row": row_number})
+                # Item identity comes only from the group row. An event-row
+                # code is retained below as source provenance, never promoted
+                # into a new canonical item identity.
+                code = current_item.item_code or None
+                name = current_item.item_name
+                unit = current_item.raw_unit or (_cell_value(_mapped(row, event_mapping, "unit")) or "")
+                group_num: int | None = current_item.group_number
+                raw_group_label = current_item.raw_label
+                row_optional = {
+                    field: _cell_value(_mapped(row, event_mapping, field))
+                    for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
+                }
+                optional = {
+                    field: row_optional.get(field) or current_item.optional_facts.get(field)
+                    for field in row_optional
+                }
+                source_facts = dict(current_item.source_facts)
+                source_facts.update({
+                    field: _cell_value(_mapped(row, event_mapping, field))
+                    for field in FIELD_NAMES if event_mapping.get(field) is not None
+                })
             else:
+                event_present = _has_mapped_value(row, event_mapping, EVENT_FIELDS)
+                raw_name = _cell_value(_mapped(row, event_mapping, "item_name")) or ""
+                raw_unit_cell = _cell_value(_mapped(row, event_mapping, "unit")) or ""
+                item_code_value = _cell_value(_mapped(row, event_mapping, "item_code"))
+                if item_code_value and re.fullmatch(r"[-+]?\d+\.0+", item_code_value):
+                    item_code_value = item_code_value.split(".", 1)[0]
                 if not event_present:
                     skipped_row_count += 1
                     continue
@@ -651,6 +897,23 @@ def parse_workbook(
                 raw_group_label = raw_name
                 if not code:
                     labels_by_group[f"{_header_key(name)}|{_header_key(unit)}"] += 1
+                optional = {
+                    field: _cell_value(_mapped(row, event_mapping, field))
+                    for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
+                }
+                source_facts = {
+                    field: _cell_value(_mapped(row, event_mapping, field))
+                    for field in FIELD_NAMES if event_mapping.get(field) is not None
+                }
+
+            if layout_type == "hierarchical_grouped":
+                raw_unit_cell = _cell_value(_mapped(row, event_mapping, "unit")) or ""
+                if name and not unit and raw_unit_cell:
+                    name, unit = _split_name_unit(name, raw_unit_cell, item_name_parse_strategy)
+                if unit:
+                    unit_values.add(unit)
+            if raw_group_label:
+                source_facts["raw_item_label"] = raw_group_label
 
             if name and not unit and item_name_parse_strategy != "none":
                 name, unit = _split_name_unit(name, unit, item_name_parse_strategy)
@@ -661,7 +924,7 @@ def parse_workbook(
                 current_description = {
                     "unit": unit,
                     **{
-                        field: _cell_value(_mapped(row, field_mapping, field))
+                        field: optional.get(field)
                         for field in ("article", "manufacturer", "characteristic")
                     },
                 }
@@ -692,31 +955,21 @@ def parse_workbook(
                     item_key = "weak:" + hashlib.sha256(f"{identity_material}|row:{row_number}".encode("utf-8")).hexdigest()
                 quality = "missing_stable_code" if name else "missing_item_identity"
 
-            raw_quantity = _mapped(row, field_mapping, "quantity")
-            raw_price = _mapped(row, field_mapping, "reported_unit_price_gross")
-            raw_amount = _mapped(row, field_mapping, "amount_gross")
+            raw_quantity = _mapped(row, event_mapping, "quantity")
+            raw_price = _mapped(row, event_mapping, "reported_unit_price_gross")
+            raw_amount = _mapped(row, event_mapping, "amount_gross")
             quantity = _parse_decimal(raw_quantity)
             reported_price = _parse_decimal(raw_price)
             amount = _parse_decimal(raw_amount)
             effective_price = amount / quantity if amount is not None and quantity is not None and quantity > 0 else reported_price
-            source_facts = {
-                field: _cell_value(_mapped(row, field_mapping, field))
-                for field in FIELD_NAMES if field_mapping.get(field) is not None
-            }
-            if raw_group_label or raw_name:
-                source_facts["raw_item_label"] = raw_group_label or raw_name
-            document_reference = _cell_value(_mapped(row, field_mapping, "document_reference")) or ""
-            document_type = _document_type_value(_mapped(row, field_mapping, "document_type"), document_reference)
-            date_value = _date_value(_mapped(row, field_mapping, "document_date"))
+            document_reference = _cell_value(_mapped(row, event_mapping, "document_reference")) or ""
+            document_type = _document_type_value(_mapped(row, event_mapping, "document_type"), document_reference)
+            date_value = _date_value(_mapped(row, event_mapping, "document_date"))
             if date_value:
                 event_dates.append(date_value)
             if document_type:
                 type_counts[document_type] += 1
             item_keys.add(item_key)
-            optional = {
-                field: _cell_value(_mapped(row, field_mapping, field))
-                for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
-            }
             events.append(ParsedEvent(
                 item_key=item_key,
                 item_code=code,
@@ -729,8 +982,8 @@ def parse_workbook(
                 document_date=date_value,
                 document_type=document_type,
                 document_reference=document_reference,
-                counterparty=_cell_value(_mapped(row, field_mapping, "counterparty")) or "",
-                contract=_cell_value(_mapped(row, field_mapping, "contract")) or "",
+                counterparty=_cell_value(_mapped(row, event_mapping, "counterparty")) or "",
+                contract=_cell_value(_mapped(row, event_mapping, "contract")) or "",
                 quantity=_decimal_text(quantity),
                 reported_unit_price_gross=_decimal_text(reported_price),
                 effective_unit_price_gross=_decimal_text(effective_price),
@@ -762,12 +1015,28 @@ def parse_workbook(
             warnings.append({"code": "events_without_usable_price", "count": unusable_price_count, "message": "События без цены или суммы сохраняются без пригодной цены."})
         if code_conflict_count:
             warnings.append({"code": "stable_code_identity_conflict", "count": code_conflict_count, "message": "У одного кода обнаружены различные описательные данные или единицы; факты сохранены для проверки."})
+        group_event_code_conflicts = sum(issue["code"] == "group_event_code_conflict" for issue in identity_issues)
+        if group_event_code_conflicts:
+            warnings.append({"code": "group_event_code_conflict", "count": group_event_code_conflicts, "message": "Код из строки события отличается от кода группы; для идентичности сохранён код группы, оба исходных значения оставлены в provenance."})
         if not events:
             raise OneCImportError("В выбранной структуре не найдены строки событий закупки.")
         return ParsedWorkbook(
             filename=Path(filename).name[:255], file_sha256=file_sha256, sheet_name=sheet_name,
-            header_row=header_row, headers=headers, header_signature=header_signature(headers),
-            layout_type=layout_type, field_mapping=field_mapping,
+            header_row=header_row, headers=headers,
+            header_signature=(
+                hashlib.sha256(json.dumps([
+                    group_header_signature or header_signature(group_headers),
+                    event_header_signature or header_signature(headers),
+                ], separators=(",", ":")).encode()).hexdigest()
+                if layout_type == "hierarchical_grouped" and group_header_row != event_header_row
+                else header_signature(headers)
+            ),
+            layout_type=layout_type, field_mapping=event_mapping,
+            group_header_row=group_header_row, event_header_row=event_header_row,
+            group_headers=list(group_headers), group_field_mapping=group_mapping,
+            event_field_mapping=event_mapping,
+            group_header_signature=group_header_signature or (header_signature(group_headers) if group_headers else None),
+            event_header_signature=event_header_signature or header_signature(headers),
             item_name_parse_strategy=item_name_parse_strategy, events=events,
             item_count=len(item_keys), group_count=group_count,
             physical_row_count=physical_row_count,

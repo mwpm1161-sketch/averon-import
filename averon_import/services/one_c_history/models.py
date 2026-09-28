@@ -30,13 +30,18 @@ class ImportProfile(BaseModel):
     sheet_name: str = Field(min_length=1, max_length=128)
     header_row: int = Field(ge=1, le=50)
     field_mapping: dict[str, int] = Field(default_factory=dict)
+    group_header_row: int | None = Field(default=None, ge=1, le=50)
+    event_header_row: int | None = Field(default=None, ge=1, le=50)
+    group_field_mapping: dict[str, int] = Field(default_factory=dict)
+    event_field_mapping: dict[str, int] = Field(default_factory=dict)
     item_name_parse_strategy: Literal["none", "comma_suffix_unit", "comma_or_parentheses"] = "none"
     header_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
     parser_version: int = Field(ge=1)
+    revision: int = Field(default=1, ge=1)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
 
-    @field_validator("field_mapping")
+    @field_validator("field_mapping", "group_field_mapping", "event_field_mapping")
     @classmethod
     def validate_mapping(cls, value: dict[str, int]) -> dict[str, int]:
         if any(name not in FIELD_NAMES or type(index) is not int or index < 0 for name, index in value.items()):
@@ -50,14 +55,18 @@ class ImportMappingRequest(BaseModel):
     preview_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     sheet_name: str | None = Field(default=None, min_length=1, max_length=128)
     header_row: int | None = Field(default=None, ge=1, le=50)
+    group_header_row: int | None = Field(default=None, ge=1, le=50)
+    event_header_row: int | None = Field(default=None, ge=1, le=50)
     layout_type: Literal["hierarchical_grouped", "flat"]
-    field_mapping: dict[str, int | None]
+    field_mapping: dict[str, int | None] = Field(default_factory=dict)
+    group_field_mapping: dict[str, int | None] = Field(default_factory=dict)
+    event_field_mapping: dict[str, int | None] = Field(default_factory=dict)
     item_name_parse_strategy: Literal["none", "comma_suffix_unit", "comma_or_parentheses"] = "none"
     save_profile: bool = False
     profile_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     profile_name: str | None = Field(default=None, min_length=1, max_length=100)
 
-    @field_validator("field_mapping")
+    @field_validator("field_mapping", "group_field_mapping", "event_field_mapping")
     @classmethod
     def validate_mapping(cls, value: dict[str, int | None]) -> dict[str, int | None]:
         if any(name not in FIELD_NAMES or (index is not None and (type(index) is not int or index < 0)) for name, index in value.items()):
@@ -70,11 +79,15 @@ class PreviewMappingRequest(BaseModel):
 
     sheet_name: str = Field(min_length=1, max_length=128)
     header_row: int = Field(ge=1, le=50)
+    group_header_row: int | None = Field(default=None, ge=1, le=50)
+    event_header_row: int | None = Field(default=None, ge=1, le=50)
     layout_type: Literal["hierarchical_grouped", "flat"]
-    field_mapping: dict[str, int | None]
+    field_mapping: dict[str, int | None] = Field(default_factory=dict)
+    group_field_mapping: dict[str, int | None] = Field(default_factory=dict)
+    event_field_mapping: dict[str, int | None] = Field(default_factory=dict)
     item_name_parse_strategy: Literal["none", "comma_suffix_unit", "comma_or_parentheses"] = "none"
 
-    @field_validator("field_mapping")
+    @field_validator("field_mapping", "group_field_mapping", "event_field_mapping")
     @classmethod
     def validate_mapping(cls, value: dict[str, int | None]) -> dict[str, int | None]:
         if any(name not in FIELD_NAMES or (index is not None and (type(index) is not int or index < 0)) for name, index in value.items()):

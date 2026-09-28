@@ -90,7 +90,11 @@ class OneCHistoryRepository:
             if previous is None and len(existing) >= self.max_profiles:
                 raise ValueError("Достигнут лимит сохранённых профилей импорта.")
             if previous:
-                profile = profile.model_copy(update={"created_at": previous.created_at, "updated_at": utc_now()})
+                profile = profile.model_copy(update={
+                    "created_at": previous.created_at,
+                    "updated_at": utc_now(),
+                    "revision": previous.revision + 1,
+                })
             existing[profile.profile_id] = profile
             self._atomic_json(
                 self.profiles_path,
@@ -144,7 +148,13 @@ class OneCHistoryRepository:
             "profiles": [item.model_dump(mode="json") for item in self.profiles()],
         }
 
-    def build_staging_snapshot(self, parsed: ParsedWorkbook, *, profile_id: str | None) -> Path:
+    def build_staging_snapshot(
+        self,
+        parsed: ParsedWorkbook,
+        *,
+        profile_id: str | None,
+        mapping_provenance: dict | None = None,
+    ) -> Path:
         staging = self.root / f".history-{parsed.file_sha256[:12]}-{os.getpid()}-{threading.get_ident()}.staging.sqlite3"
         staging.unlink(missing_ok=True)
         metadata = {
@@ -175,6 +185,7 @@ class OneCHistoryRepository:
             "document_type_other_event_count": parsed.document_type_other_event_count,
             "layout_type": parsed.layout_type,
             "header_signature": parsed.header_signature,
+            "mapping_provenance": mapping_provenance or {},
         }
         connection: sqlite3.Connection | None = None
         try:
@@ -328,15 +339,26 @@ class OneCHistoryRepository:
                 sidecar.unlink(missing_ok=True)
             raise
 
-    def activate(self, staging: Path) -> None:
+    def activate(self, staging: Path) -> list[str]:
         with self._lock:
             os.replace(staging, self.database_path)
-            if os.name != "nt":
-                directory_fd = os.open(self.root, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+            warnings = []
+            try:
+                self._fsync_directory()
+            except Exception:
+                # os.replace is the commit point. A durability bookkeeping
+                # failure after it must never be reported as if old data won.
+                warnings.append("Не удалось подтвердить синхронизацию каталога после активации снимка.")
+            return warnings
+
+    def _fsync_directory(self) -> None:
+        if os.name == "nt":
+            return
+        directory_fd = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 __all__ = ["OneCHistoryRepository"]

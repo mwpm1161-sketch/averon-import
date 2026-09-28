@@ -195,7 +195,13 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "TDSheet"
-    sheet.append(HIERARCHICAL_HEADERS + ["Дополнительное поле", "Примечание"])
+    for index in range(1, 9):
+        sheet.append([f"Параметр отчёта {index}"])
+    sheet.append(["Номенклатура, ед. изм."])
+    sheet.merge_cells("A9:K9")
+    sheet.append(["Цена с НДС", None, None, "Количество", "Сумма с НДС", "Дата", "Документ прихода", None, None, "Контрагент", "Договор"])
+    sheet.merge_cells("A10:C10")
+    sheet.merge_cells("G10:I10")
     event_index = 0
 
     for group_index in range(3066):
@@ -206,7 +212,10 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
         else:
             item_label = f"Номенклатура {group_index}"
             unit = units[group_index % len(units)]
+        group_row = sheet.max_row + 1
         sheet.append([f"{item_label}, {unit}"] + [None] * 10)
+        if group_index < 3:
+            sheet.merge_cells(start_row=group_row, start_column=1, end_row=group_row, end_column=11)
         event_count_for_group = 1458 if group_index == 3065 else 1
         for _ in range(event_count_for_group):
             if event_index < 4081:
@@ -229,14 +238,15 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
                 price, quantity, amount = "10.12", 3, "30.35"
             else:
                 price, quantity, amount = "10.12", 1, "10.12"
+            detail_row = sheet.max_row + 1
             sheet.append([
-                None, price, quantity, amount, event_date, reference,
-                counterparty, None, None, None, None,
+                price, None, None, quantity, amount, event_date, reference,
+                None, None, counterparty, None,
             ])
+            if event_index < 5:
+                sheet.merge_cells(start_row=detail_row, start_column=1, end_row=detail_row, end_column=3)
+                sheet.merge_cells(start_row=detail_row, start_column=7, end_row=detail_row, end_column=9)
             event_index += 1
-
-    for padding_index in range(9):
-        sheet.append([None] * 10 + [f"section-{padding_index}"])
     workbook.save(path)
 
     detected = detect_workbook(path)
@@ -245,9 +255,18 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
         sheet_name=detected["sheet_name"], header_row=detected["header_row"], headers=detected["headers"],
         layout_type=detected["layout_type"], field_mapping=detected["field_mapping"],
         item_name_parse_strategy=detected["item_name_parse_strategy"],
+        group_header_row=detected["group_header_row"], event_header_row=detected["event_header_row"],
+        group_headers=detected["group_headers"], group_field_mapping=detected["group_field_mapping"],
+        event_field_mapping=detected["event_field_mapping"],
+        group_header_signature=detected["group_header_signature"],
+        event_header_signature=detected["event_header_signature"],
     )
 
     assert parsed.physical_row_count == 7599
+    assert detected["group_header_row"] == 9 and detected["event_header_row"] == 10
+    assert detected["group_field_mapping"]["item_name"] == 0
+    assert detected["event_field_mapping"]["reported_unit_price_gross"] == 0
+    assert detected["event_field_mapping"]["quantity"] == 3
     assert parsed.group_count == 3066
     assert len(parsed.events) == 4523
     assert parsed.document_type_counts == {
@@ -260,6 +279,8 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
     assert parsed.period_start == "2026-06-23"
     assert parsed.period_end == "2026-09-22"
     assert parsed.repeated_display_label_count == 26
+    assert parsed.events[0].item_name.startswith("Повторяющаяся группа")
+    assert parsed.events[0].reported_unit_price_gross == "10.12"
 
     advances = [event for event in parsed.events if event.document_type == "Авансовый отчет"]
     corrections = [event for event in parsed.events if event.document_type == "Корректировка поступления"]
@@ -282,6 +303,206 @@ def test_synthetic_tdsheet_acceptance_profile_and_price_rounding(tmp_path):
         assert effective == amount / quantity
         assert effective.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == reported
         assert abs(effective - reported) <= Decimal("0.005")
+
+
+def test_group_level_identity_and_descriptive_facts_are_inherited_by_detail_events(tmp_path):
+    path = tmp_path / "group-facts.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "TDSheet"
+    sheet.append(["Номенклатура", "Код номенклатуры", "Артикул", "Цена", "Количество", "Сумма", "Дата", "Документ"])
+    sheet.append(["Цена с НДС", "Код номенклатуры", "Артикул", "Количество", "Сумма с НДС", "Дата", "Документ прихода"])
+    sheet.append(["Позиция, м", "00123", "ART-9", None, None, None, None, None])
+    sheet.append(["4.5", None, None, 2, "9", datetime(2026, 6, 1), "Поступление товаров и услуг №1"])
+    workbook.save(path)
+
+    detected = detect_workbook(path)
+    parsed = parse_workbook(
+        path, filename="group-facts.xlsx", file_sha256="f" * 64,
+        sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+        headers=detected["headers"], layout_type=detected["layout_type"],
+        field_mapping=detected["field_mapping"],
+        item_name_parse_strategy=detected["item_name_parse_strategy"],
+        group_header_row=detected["group_header_row"], event_header_row=detected["event_header_row"],
+        group_headers=detected["group_headers"], group_field_mapping=detected["group_field_mapping"],
+        event_field_mapping=detected["event_field_mapping"],
+    )
+
+    event = parsed.events[0]
+    assert event.item_name == "Позиция"
+    assert event.item_code == "00123"
+    assert event.optional_facts["article"] == "ART-9"
+    assert event.source_facts["group_item_code"] == "00123"
+    assert event.source_facts["group_article"] == "ART-9"
+    assert event.reported_unit_price_gross == "4.5"
+
+    service = _make_service(tmp_path / "service")
+    preview = asyncio.run(service.create_preview(_upload(path.read_bytes())))
+    assert preview["mapping_required"] is False
+    request = ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=preview["sheet_name"],
+        header_row=preview["header_row"], group_header_row=preview["group_header_row"],
+        event_header_row=preview["event_header_row"], layout_type=preview["layout_type"],
+        field_mapping=preview["field_mapping"],
+        group_field_mapping=preview["group_field_mapping"],
+        event_field_mapping=preview["event_field_mapping"],
+        item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )
+    result = asyncio.run(service.import_confirmed(request))
+    assert result["status"] == "succeeded"
+    with sqlite3.connect(service.repository.database_path) as connection:
+        stored = connection.execute(
+            "SELECT item_code,item_name,reported_unit_price_gross_decimal,optional_facts_json,source_facts_json FROM purchase_events"
+        ).fetchone()
+    assert stored[0] == "00123" and stored[1] == "Позиция"
+    assert stored[2] == "4.5"
+    assert json.loads(stored[3])["article"] == "ART-9"
+    assert json.loads(stored[4])["group_item_code"] == "00123"
+
+
+def test_hierarchical_event_without_group_fails_closed(tmp_path):
+    path = tmp_path / "orphan-event.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "TDSheet"
+    sheet.append(["Номенклатура, ед. изм."])
+    sheet.merge_cells("A1:K1")
+    sheet.append(["Цена с НДС", None, None, "Количество", "Сумма с НДС", "Дата", "Документ прихода", None, None, "Контрагент", "Договор"])
+    sheet.merge_cells("A2:C2")
+    sheet.merge_cells("G2:I2")
+    sheet.append(["12", None, None, 1, "12", datetime(2026, 6, 1), "Поступление №1", None, None, "Поставщик", None])
+    sheet.merge_cells("A3:C3")
+    sheet.merge_cells("G3:I3")
+    workbook.save(path)
+    detected = detect_workbook(path)
+
+    with pytest.raises(OneCImportError, match="без предшествующей группы"):
+        parse_workbook(
+            path, filename="orphan-event.xlsx", file_sha256="0" * 64,
+            sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+            headers=detected["headers"], layout_type=detected["layout_type"],
+            field_mapping=detected["field_mapping"],
+            item_name_parse_strategy=detected["item_name_parse_strategy"],
+            group_header_row=detected["group_header_row"], event_header_row=detected["event_header_row"],
+            group_headers=detected["group_headers"], group_field_mapping=detected["group_field_mapping"],
+            event_field_mapping=detected["event_field_mapping"],
+        )
+
+
+def test_active_snapshot_keeps_immutable_mapping_profile_revision(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _xlsx_bytes(tmp_path / "profiled.xlsx", rows=_hierarchical_rows())
+    _preview, result = asyncio.run(_import_preview(service, payload, save_profile=True, profile_name="Исходный профиль"))
+    profile = service.repository.profile(result["profile_id"])
+    active = service.repository.active_metadata()
+    provenance = active["mapping_provenance"]
+
+    assert profile.revision == 1
+    assert provenance["profile_id"] == profile.profile_id
+    assert provenance["profile_revision"] == 1
+    assert provenance["fingerprint"]
+    assert provenance["layout_type"] == "hierarchical_grouped"
+    assert provenance["group_field_mapping"]
+    assert provenance["event_field_mapping"]
+
+    updated = service.repository.save_profile(profile.model_copy(update={"name": "Переименованный профиль"}))
+    assert updated.revision == 2
+    assert service.repository.delete_profile(profile.profile_id) is True
+    assert service.repository.active_metadata()["mapping_provenance"] == provenance
+
+
+def test_manually_changed_mapping_does_not_claim_an_unmodified_saved_profile(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _xlsx_bytes(tmp_path / "profiled.xlsx", rows=_hierarchical_rows())
+    asyncio.run(_import_preview(service, payload, save_profile=True, profile_name="Профиль"))
+    changed_rows = _hierarchical_rows()
+    changed_rows[1][1] = "11.00"
+    changed_payload = _xlsx_bytes(tmp_path / "profiled-updated.xlsx", rows=changed_rows)
+    preview = asyncio.run(service.create_preview(_upload(changed_payload)))
+    changed_mapping = dict(preview["field_mapping"])
+    changed_mapping["counterparty"] = None
+    analyzed = asyncio.run(service.analyze_preview(preview["preview_id"], PreviewMappingRequest(
+        sheet_name=preview["sheet_name"], header_row=preview["header_row"],
+        layout_type=preview["layout_type"], field_mapping=changed_mapping,
+        item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )))
+    result = asyncio.run(service.import_confirmed(ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=analyzed["sheet_name"],
+        header_row=analyzed["header_row"], layout_type=analyzed["layout_type"],
+        field_mapping=analyzed["field_mapping"],
+        item_name_parse_strategy=analyzed["item_name_parse_strategy"],
+    )))
+
+    provenance = result["active_import"]["mapping_provenance"]
+    assert provenance["profile_id"] is None
+    assert provenance["profile_revision"] is None
+    assert provenance["event_field_mapping"]["counterparty"] is None
+
+
+def test_activation_replace_failure_keeps_previous_snapshot(tmp_path, monkeypatch):
+    service = _make_service(tmp_path)
+    first_payload = _xlsx_bytes(tmp_path / "first.xlsx", rows=_hierarchical_rows())
+    _first_preview, first = asyncio.run(_import_preview(service, first_payload))
+    old_bytes = service.repository.database_path.read_bytes()
+    second_rows = _hierarchical_rows()
+    second_rows[1][1] = "99.00"
+    second_payload = _xlsx_bytes(tmp_path / "second.xlsx", rows=second_rows)
+    original_replace = __import__("os").replace
+
+    def fail_snapshot_replace(source, destination):
+        if Path(destination) == service.repository.database_path:
+            raise OSError("injected replace failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr("averon_import.services.one_c_history.repository.os.replace", fail_snapshot_replace)
+    with pytest.raises(OneCImportError, match="Текущий снимок не изменён"):
+        asyncio.run(_import_preview(service, second_payload))
+
+    assert service.repository.database_path.read_bytes() == old_bytes
+    assert service.repository.active_metadata()["sha256"] == first["active_import"]["sha256"]
+
+
+def test_post_replace_directory_sync_failure_reports_committed_snapshot(tmp_path, monkeypatch):
+    service = _make_service(tmp_path)
+    first_payload = _xlsx_bytes(tmp_path / "first.xlsx", rows=_hierarchical_rows())
+    _first_preview, first = asyncio.run(_import_preview(service, first_payload))
+    second_rows = _hierarchical_rows()
+    second_rows[1][1] = "77.00"
+    second_payload = _xlsx_bytes(tmp_path / "second.xlsx", rows=second_rows)
+
+    def fail_directory_sync():
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(service.repository, "_fsync_directory", fail_directory_sync)
+    _preview, result = asyncio.run(_import_preview(service, second_payload))
+
+    assert result["status"] == "succeeded"
+    assert result["active_import"]["sha256"] != first["active_import"]["sha256"]
+    assert result["warnings"]
+    assert service.repository.active_metadata()["sha256"] == result["active_import"]["sha256"]
+
+
+def test_status_bookkeeping_failure_after_replace_does_not_claim_old_snapshot(tmp_path, monkeypatch):
+    service = _make_service(tmp_path)
+    first_payload = _xlsx_bytes(tmp_path / "first.xlsx", rows=_hierarchical_rows())
+    _first_preview, first = asyncio.run(_import_preview(service, first_payload))
+    second_rows = _hierarchical_rows()
+    second_rows[1][1] = "88.00"
+    second_payload = _xlsx_bytes(tmp_path / "second.xlsx", rows=second_rows)
+    original_record = service.repository.record_attempt
+
+    def fail_success_status(status, **kwargs):
+        if status == "succeeded":
+            raise OSError("injected status bookkeeping failure")
+        return original_record(status, **kwargs)
+
+    monkeypatch.setattr(service.repository, "record_attempt", fail_success_status)
+    _preview, result = asyncio.run(_import_preview(service, second_payload))
+
+    assert result["status"] == "succeeded"
+    assert result["active_import"]["sha256"] != first["active_import"]["sha256"]
+    assert result["active_import"]["sha256"] == service.repository.active_metadata()["sha256"]
+    assert result["warnings"]
 
 
 def test_preview_is_bounded_path_free_and_deletes_temp_after_success(tmp_path):
