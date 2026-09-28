@@ -69,3 +69,15 @@ def test_one_c_history_ui_only_loads_on_open_or_explicit_action_and_does_not_per
     assert "localStorage" not in code
     assert "sessionStorage" not in code
     assert not re.search(r"loadOneCHistoryStatus\(\);\s*\n\s*boot", code)
+
+
+def test_one_c_history_ui_surfaces_post_commit_warnings_as_success():
+    script = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    start = script.index("async function importOneCHistory()")
+    end = script.index("async function", start + 10)
+    import_code = script[start:end]
+
+    assert "Array.isArray(result.warnings)" in import_code
+    assert "result.status === \"succeeded\"" in import_code
+    assert "postCommitWarnings.join(\" \")" in import_code
+    assert 'toast(`${importMessage}${warningSuffix}`, "success")' in import_code

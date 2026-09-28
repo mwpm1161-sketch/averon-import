@@ -71,14 +71,18 @@ class OneCHistoryRepository:
     def profile(self, profile_id: str) -> ImportProfile | None:
         return next((item for item in self.profiles() if item.profile_id == profile_id), None)
 
-    def compatible_profile(self, *, sheet_name: str, signature: str) -> ImportProfile | None:
-        candidates = [
+    def compatible_profiles(self, *, sheet_name: str, signature: str) -> list[ImportProfile]:
+        return [
             item for item in self.profiles()
             if item.sheet_name == sheet_name
             and item.header_signature == signature
             and item.parser_version == PARSER_VERSION
         ]
-        return candidates[0] if candidates else None
+
+    def compatible_profile(self, *, sheet_name: str, signature: str) -> ImportProfile | None:
+        """Return a profile only when compatibility identifies exactly one choice."""
+        candidates = self.compatible_profiles(sheet_name=sheet_name, signature=signature)
+        return candidates[0] if len(candidates) == 1 else None
 
     def profiles_for_sheet(self, sheet_name: str) -> list[ImportProfile]:
         return [item for item in self.profiles() if item.sheet_name == sheet_name]
@@ -154,6 +158,7 @@ class OneCHistoryRepository:
         *,
         profile_id: str | None,
         mapping_provenance: dict | None = None,
+        semantic_import_fingerprint: str,
     ) -> Path:
         staging = self.root / f".history-{parsed.file_sha256[:12]}-{os.getpid()}-{threading.get_ident()}.staging.sqlite3"
         staging.unlink(missing_ok=True)
@@ -166,6 +171,7 @@ class OneCHistoryRepository:
             "imported_at": datetime.now(timezone.utc).isoformat(),
             "parser_version": PARSER_VERSION,
             "mapping_profile_id": profile_id,
+            "semantic_import_fingerprint": semantic_import_fingerprint,
             "identity_quality": "stable_code_present" if parsed.missing_code_count == 0 else "degraded_missing_stable_code",
             "price_basis": "gross_including_vat",
             "item_count": parsed.item_count,

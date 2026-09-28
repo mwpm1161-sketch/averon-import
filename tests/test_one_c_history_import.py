@@ -44,6 +44,39 @@ def _xlsx_bytes(path: Path, *, headers=HIERARCHICAL_HEADERS, rows=(), sheet_name
     return path.read_bytes()
 
 
+def _flat_xlsx_bytes(path: Path, *, shift=0, sheet_name="TDSheet", name="Шайба") -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = sheet_name
+    for _ in range(shift):
+        sheet.append(["Отчёт о закупках"])
+    sheet.append(["Код номенклатуры", "Наименование", "Ед. изм.", "Количество", "Цена с НДС", "Сумма с НДС", "Контрагент"])
+    sheet.append(["001", name, "шт", 2, 3, 6, "Поставщик"])
+    workbook.save(path)
+    return path.read_bytes()
+
+
+def _two_level_xlsx_bytes(path: Path, *, shift=0) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "TDSheet"
+    sheet.cell(row=1, column=1, value="Отчёт о закупках")
+    group_row = 9 + shift
+    for row_number, values in (
+        (group_row, ["Номенклатура, ед. изм.", "Код номенклатуры", "Ед. изм.", None, None, None, None]),
+        (group_row + 1, ["Цена с НДС", "Количество", "Сумма с НДС", "Дата документа", "Документ прихода", "Контрагент", "Договор"]),
+        (group_row + 2, ["Шайба", "0001", "шт", None, None, None, None]),
+        (group_row + 3, [3, 2, 6, datetime(2026, 9, 1), "Поступление №1", "Поставщик", "Договор"]),
+        (group_row + 4, [None, None, None, None, None, None, None]),
+        (group_row + 5, [4, 3, 12, datetime(2026, 9, 2), "Поступление №2", "Поставщик", "Договор"]),
+    ):
+        for column, value in enumerate(values, start=1):
+            if value is not None:
+                sheet.cell(row=row_number, column=column, value=value)
+    workbook.save(path)
+    return path.read_bytes()
+
+
 def _hierarchical_rows(*, second_quantity=1):
     return [
         ["Прокладка, кг", None, None, None, None, None, None, None, None],
@@ -541,9 +574,214 @@ def test_same_sha_is_idempotent_and_profiles_survive_snapshot_replacement(tmp_pa
     )
     second = asyncio.run(service.import_confirmed(second_request))
     assert second["idempotent"] is True
+    assert first["active_import"]["semantic_import_fingerprint"] == second["active_import"]["semantic_import_fingerprint"]
     service.repository.database_path.unlink()
     assert service.repository.profile(profile_id).name == "Основной отчёт"
     assert first_preview["sha256"] == second_preview["sha256"]
+
+
+def test_same_sha_with_changed_event_mapping_rebuilds_snapshot(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _flat_xlsx_bytes(tmp_path / "flat.xlsx")
+    _first_preview, first = asyncio.run(_import_preview(service, payload))
+    first_fingerprint = first["active_import"]["semantic_import_fingerprint"]
+
+    preview = asyncio.run(service.create_preview(_upload(payload)))
+    changed_mapping = dict(preview["event_field_mapping"])
+    changed_mapping["counterparty"] = None
+    analyzed = asyncio.run(service.analyze_preview(preview["preview_id"], PreviewMappingRequest(
+        sheet_name=preview["sheet_name"], header_row=preview["header_row"],
+        layout_type="flat", field_mapping=changed_mapping,
+        item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )))
+    second = asyncio.run(service.import_confirmed(ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=analyzed["sheet_name"],
+        header_row=analyzed["header_row"], layout_type=analyzed["layout_type"],
+        field_mapping=analyzed["field_mapping"],
+        item_name_parse_strategy=analyzed["item_name_parse_strategy"],
+    )))
+
+    assert second["status"] == "succeeded" and second["idempotent"] is False
+    assert second["active_import"]["sha256"] == first["active_import"]["sha256"]
+    assert second["active_import"]["semantic_import_fingerprint"] != first_fingerprint
+    assert second["active_import"]["mapping_provenance"]["event_field_mapping"]["counterparty"] is None
+
+
+def test_same_sha_with_changed_group_mapping_rebuilds_snapshot(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _two_level_xlsx_bytes(tmp_path / "grouped.xlsx")
+    _first_preview, first = asyncio.run(_import_preview(service, payload))
+    first_fingerprint = first["active_import"]["semantic_import_fingerprint"]
+
+    preview = asyncio.run(service.create_preview(_upload(payload)))
+    changed_group_mapping = dict(preview["group_field_mapping"])
+    changed_group_mapping["characteristic"] = 0
+    analyzed = asyncio.run(service.analyze_preview(preview["preview_id"], PreviewMappingRequest(
+        sheet_name=preview["sheet_name"], header_row=preview["header_row"],
+        group_header_row=preview["group_header_row"], event_header_row=preview["event_header_row"],
+        layout_type="hierarchical_grouped", field_mapping=preview["event_field_mapping"],
+        group_field_mapping=changed_group_mapping, event_field_mapping=preview["event_field_mapping"],
+        item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )))
+    second = asyncio.run(service.import_confirmed(ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=analyzed["sheet_name"],
+        header_row=analyzed["header_row"], group_header_row=analyzed["group_header_row"],
+        event_header_row=analyzed["event_header_row"], layout_type=analyzed["layout_type"],
+        field_mapping=analyzed["field_mapping"], group_field_mapping=analyzed["group_field_mapping"],
+        event_field_mapping=analyzed["event_field_mapping"],
+        item_name_parse_strategy=analyzed["item_name_parse_strategy"],
+    )))
+
+    assert second["status"] == "succeeded" and second["idempotent"] is False
+    assert second["active_import"]["sha256"] == first["active_import"]["sha256"]
+    assert second["active_import"]["semantic_import_fingerprint"] != first_fingerprint
+    assert second["active_import"]["mapping_provenance"]["group_field_mapping"]["characteristic"] == 0
+
+
+def test_same_sha_with_another_selected_sheet_rebuilds_snapshot(tmp_path):
+    path = tmp_path / "two-flat-sheets.xlsx"
+    workbook = Workbook()
+    first_sheet = workbook.active
+    first_sheet.title = "TDSheet"
+    headers = ["Код номенклатуры", "Наименование", "Ед. изм.", "Количество", "Цена с НДС", "Сумма с НДС", "Контрагент"]
+    first_sheet.append(headers)
+    first_sheet.append(["001", "Шайба", "шт", 2, 3, 6, "Поставщик"])
+    second_sheet = workbook.create_sheet("Другой лист")
+    second_sheet.append(headers)
+    second_sheet.append(["002", "Гайка", "шт", 4, 5, 20, "Поставщик 2"])
+    workbook.save(path)
+    payload = path.read_bytes()
+    service = _make_service(tmp_path / "store")
+    _first_preview, first = asyncio.run(_import_preview(service, payload))
+    first_fingerprint = first["active_import"]["semantic_import_fingerprint"]
+
+    preview = asyncio.run(service.create_preview(_upload(payload)))
+    inspected = asyncio.run(service.inspect_preview_sheet(preview["preview_id"], "Другой лист"))
+    analyzed = asyncio.run(service.analyze_preview(preview["preview_id"], PreviewMappingRequest(
+        sheet_name=inspected["sheet_name"], header_row=inspected["header_row"],
+        layout_type="flat", field_mapping=inspected["field_mapping"],
+        item_name_parse_strategy=inspected["item_name_parse_strategy"],
+    )))
+    second = asyncio.run(service.import_confirmed(ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=analyzed["sheet_name"],
+        header_row=analyzed["header_row"], layout_type=analyzed["layout_type"],
+        field_mapping=analyzed["field_mapping"],
+        item_name_parse_strategy=analyzed["item_name_parse_strategy"],
+    )))
+
+    assert second["status"] == "succeeded" and second["idempotent"] is False
+    assert second["active_import"]["sha256"] == first["active_import"]["sha256"]
+    assert second["active_import"]["sheet_name"] == "Другой лист"
+    assert second["active_import"]["semantic_import_fingerprint"] != first_fingerprint
+
+
+def test_profile_rename_does_not_change_semantic_idempotency(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _flat_xlsx_bytes(tmp_path / "profiled.xlsx")
+    _preview, first = asyncio.run(_import_preview(service, payload, save_profile=True, profile_name="Профиль"))
+    profile = service.repository.profile(first["profile_id"])
+    renamed = service.repository.save_profile(profile.model_copy(update={"name": "Новое имя"}))
+    assert renamed.revision == profile.revision + 1
+
+    preview = asyncio.run(service.create_preview(_upload(payload)))
+    second = asyncio.run(service.import_confirmed(ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=preview["sheet_name"],
+        header_row=preview["header_row"], layout_type=preview["layout_type"],
+        field_mapping=preview["field_mapping"], item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )))
+
+    assert preview["mapping_profile_id"] == profile.profile_id
+    assert second["idempotent"] is True
+    assert second["active_import"]["semantic_import_fingerprint"] == first["active_import"]["semantic_import_fingerprint"]
+
+
+def test_saved_two_level_profile_uses_shifted_current_header_rows(tmp_path):
+    service = _make_service(tmp_path)
+    original = _two_level_xlsx_bytes(tmp_path / "original.xlsx")
+    original_preview, first = asyncio.run(_import_preview(service, original, save_profile=True, profile_name="Двухуровневый"))
+    assert original_preview["group_header_row"] == 9
+    assert original_preview["event_header_row"] == 10
+
+    shifted = _two_level_xlsx_bytes(tmp_path / "shifted.xlsx", shift=1)
+    preview = asyncio.run(service.create_preview(_upload(shifted)))
+
+    assert preview["mapping_profile_id"] == first["profile_id"]
+    assert preview["mapping_required"] is False
+    assert preview["group_header_row"] == 10
+    assert preview["event_header_row"] == 11
+    assert preview["summary"]["group_count"] == 1
+    assert preview["summary"]["event_count"] == 2
+    assert preview["sample"][0]["source_row"] == 13
+    assert preview["sample"][0]["item_name"] == "Шайба"
+    assert preview["sample"][0]["item_code_present"] is True
+
+
+def test_saved_flat_profile_uses_shifted_current_header_row(tmp_path):
+    service = _make_service(tmp_path)
+    original = _flat_xlsx_bytes(tmp_path / "flat-original.xlsx")
+    _preview, first = asyncio.run(_import_preview(service, original, save_profile=True, profile_name="Плоский"))
+    shifted = _flat_xlsx_bytes(tmp_path / "flat-shifted.xlsx", shift=1)
+
+    preview = asyncio.run(service.create_preview(_upload(shifted)))
+
+    assert preview["mapping_profile_id"] == first["profile_id"]
+    assert preview["mapping_required"] is False
+    assert preview["header_row"] == 2
+    assert preview["summary"]["event_count"] == 1
+    assert preview["sample"][0]["source_row"] == 3
+
+
+def test_conflicting_compatible_profiles_require_explicit_selection(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _flat_xlsx_bytes(tmp_path / "flat.xlsx")
+    _preview, imported = asyncio.run(_import_preview(service, payload, save_profile=True, profile_name="Первый"))
+    original_profile = service.repository.profile(imported["profile_id"])
+    changed_mapping = {key: value for key, value in original_profile.field_mapping.items() if key != "counterparty"}
+    conflicting_profile = original_profile.model_copy(update={
+        "profile_id": "a" * 32,
+        "name": "Другой вариант",
+        "field_mapping": changed_mapping,
+        "event_field_mapping": changed_mapping,
+        "revision": 1,
+    })
+    service.repository.save_profile(conflicting_profile)
+
+    preview = asyncio.run(service.create_preview(_upload(payload)))
+
+    assert preview["mapping_required"] is True
+    assert preview["mapping_profile_id"] is None
+    assert preview["summary"]["warnings"][0]["code"] == "multiple_compatible_profiles"
+    assert preview["summary"]["warnings"][0]["message"] == "Найдено несколько совместимых профилей. Выберите профиль импорта."
+
+    explicitly_selected = asyncio.run(service.create_preview(_upload(payload), profile_id=conflicting_profile.profile_id))
+    assert explicitly_selected["mapping_required"] is False
+    assert explicitly_selected["mapping_profile_id"] == conflicting_profile.profile_id
+
+
+def test_identical_compatible_profiles_do_not_invent_profile_provenance(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _flat_xlsx_bytes(tmp_path / "flat.xlsx")
+    _preview, imported = asyncio.run(_import_preview(service, payload, save_profile=True, profile_name="Первый"))
+    original_profile = service.repository.profile(imported["profile_id"])
+    duplicate = original_profile.model_copy(update={
+        "profile_id": "b" * 32,
+        "name": "Дубликат",
+        "revision": 1,
+    })
+    service.repository.save_profile(duplicate)
+
+    changed_payload = _flat_xlsx_bytes(tmp_path / "flat-updated.xlsx", name="Гайка")
+    preview = asyncio.run(service.create_preview(_upload(changed_payload)))
+    result = asyncio.run(service.import_confirmed(ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=preview["sheet_name"],
+        header_row=preview["header_row"], layout_type=preview["layout_type"],
+        field_mapping=preview["field_mapping"], item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )))
+
+    assert preview["mapping_required"] is False
+    assert preview["mapping_profile_id"] is None
+    assert result["profile_id"] is None
+    assert result["active_import"]["mapping_provenance"]["profile_id"] is None
 
 
 def test_changed_headers_require_remapping_and_preview_can_analyze_new_mapping(tmp_path):

@@ -1231,7 +1231,12 @@ async function importOneCHistory() {
       }),
     });
     if (!isCurrentOneCHistoryRequest(generation)) return;
-    toast(result.idempotent ? "Этот XLSX уже является активной историей" : "История закупок 1С заменена", "success");
+    const importMessage = result.idempotent ? "Этот XLSX уже является активной историей" : "История закупок 1С заменена";
+    const postCommitWarnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
+    const warningSuffix = result.status === "succeeded" && postCommitWarnings.length
+      ? `, но есть предупреждение: ${postCommitWarnings.join(" ")}`
+      : "";
+    toast(`${importMessage}${warningSuffix}`, "success");
     state.oneCHistory.preview = null;
     state.oneCHistory.analysisReady = false;
     $("#one-c-history-preview-panel").hidden = true;

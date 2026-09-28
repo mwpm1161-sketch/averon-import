@@ -38,7 +38,7 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class _PendingPreview:
-    def __init__(self, *, preview_id: str, path: Path, filename: str, file_sha256: str, file_size_bytes: int, detected: dict, profile_id: str | None, profile_revision: int | None, profile_mapping_key: str | None, expires_at: float, mapping_required: bool):
+    def __init__(self, *, preview_id: str, path: Path, filename: str, file_sha256: str, file_size_bytes: int, detected: dict, profile_id: str | None, profile_revision: int | None, profile_mapping_key: str | None, expires_at: float, mapping_required: bool, profile_selection_required: bool = False):
         self.preview_id = preview_id
         self.path = path
         self.filename = filename
@@ -51,6 +51,7 @@ class _PendingPreview:
         self.expires_at = expires_at
         self.created_at = time.monotonic()
         self.mapping_required = mapping_required
+        self.profile_selection_required = profile_selection_required
         self.analysis_key: str | None = None
         self.analysis_lock = threading.Lock()
 
@@ -149,46 +150,62 @@ class OneCHistoryImportService:
             detected = await asyncio.to_thread(detect_workbook, path)
             file_sha256 = digest.hexdigest()
             selected_profile: ImportProfile | None = None
+            profile_to_apply: ImportProfile | None = None
             profile_revision: int | None = None
             incompatible_profile = False
+            profile_selection_required = False
             if profile_id:
-                selected_profile = self.repository.profile(profile_id)
-                if selected_profile is None:
+                requested_profile = self.repository.profile(profile_id)
+                if requested_profile is None:
                     raise OneCImportError("Профиль импорта не найден.")
                 incompatible_profile = not (
-                    selected_profile.sheet_name == detected["sheet_name"]
-                    and selected_profile.header_signature == detected["header_signature"]
-                    and selected_profile.parser_version == PARSER_VERSION
+                    requested_profile.sheet_name == detected["sheet_name"]
+                    and requested_profile.header_signature == detected["header_signature"]
+                    and requested_profile.parser_version == PARSER_VERSION
                 )
                 if incompatible_profile:
-                    selected_profile = None
+                    requested_profile = None
+                else:
+                    selected_profile = requested_profile
+                    profile_to_apply = requested_profile
             else:
-                selected_profile = self.repository.compatible_profile(
+                compatible_profiles = self.repository.compatible_profiles(
                     sheet_name=detected["sheet_name"], signature=detected["header_signature"]
                 )
-                incompatible_profile = bool(self.repository.profiles_for_sheet(detected["sheet_name"]) and selected_profile is None)
+                if len(compatible_profiles) == 1:
+                    selected_profile = profile_to_apply = compatible_profiles[0]
+                elif compatible_profiles:
+                    semantic_keys = {self._profile_semantic_key(profile) for profile in compatible_profiles}
+                    if len(semantic_keys) == 1:
+                        # The mapping is unambiguous, but no individual profile
+                        # was explicitly selected, so do not claim provenance.
+                        profile_to_apply = compatible_profiles[0]
+                    else:
+                        profile_selection_required = True
+                else:
+                    incompatible_profile = bool(self.repository.profiles_for_sheet(detected["sheet_name"]))
 
-            if selected_profile:
-                detected["layout_type"] = selected_profile.layout_type
-                detected["header_row"] = selected_profile.header_row
-                detected["group_header_row"] = selected_profile.group_header_row or (
-                    selected_profile.header_row if selected_profile.layout_type == "hierarchical_grouped" else None
+            if profile_to_apply:
+                detected["layout_type"] = profile_to_apply.layout_type
+                detected["group_field_mapping"] = (
+                    {
+                        key: (profile_to_apply.group_field_mapping or profile_to_apply.field_mapping).get(key)
+                        for key in FIELD_NAMES
+                    }
+                    if profile_to_apply.layout_type == "hierarchical_grouped"
+                    else {key: None for key in FIELD_NAMES}
                 )
-                detected["event_header_row"] = selected_profile.event_header_row or selected_profile.header_row
-                detected["group_field_mapping"] = {
-                    key: (selected_profile.group_field_mapping or selected_profile.field_mapping).get(key)
-                    for key in FIELD_NAMES
-                }
                 detected["event_field_mapping"] = {
-                    key: (selected_profile.event_field_mapping or selected_profile.field_mapping).get(key)
+                    key: (profile_to_apply.event_field_mapping or profile_to_apply.field_mapping).get(key)
                     for key in FIELD_NAMES
                 }
                 detected["field_mapping"] = dict(detected["event_field_mapping"])
-                detected["item_name_parse_strategy"] = selected_profile.item_name_parse_strategy
+                detected["item_name_parse_strategy"] = profile_to_apply.item_name_parse_strategy
+            if selected_profile:
                 profile_revision = selected_profile.revision
             group_mapping = detected["group_field_mapping"]
             event_mapping = detected["event_field_mapping"]
-            mapping_required = incompatible_profile or (
+            mapping_required = profile_selection_required or incompatible_profile or (
                 (group_mapping.get("item_name") is None if detected["layout_type"] == "hierarchical_grouped" else event_mapping.get("item_name") is None)
                 or not any(
                 event_mapping.get(name) is not None
@@ -231,6 +248,7 @@ class OneCHistoryImportService:
                     profile_mapping_key=self._analysis_key(detected) if selected_profile else None,
                     expires_at=time.monotonic() + PREVIEW_TTL_SECONDS,
                     mapping_required=mapping_required,
+                    profile_selection_required=profile_selection_required,
                 )
                 record = self._pending[preview_id]
                 retained = True
@@ -270,10 +288,58 @@ class OneCHistoryImportService:
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
+    @staticmethod
+    def _normalized_mapping(mapping: dict | None) -> dict[str, int | None]:
+        return {field: mapping.get(field) if mapping else None for field in FIELD_NAMES}
+
+    @classmethod
+    def _profile_semantic_key(cls, profile: ImportProfile) -> str:
+        event_mapping = profile.event_field_mapping or profile.field_mapping
+        group_mapping = profile.group_field_mapping or profile.field_mapping
+        payload = {
+            "layout_type": profile.layout_type,
+            "group_field_mapping": cls._normalized_mapping(group_mapping) if profile.layout_type == "hierarchical_grouped" else None,
+            "event_field_mapping": cls._normalized_mapping(event_mapping),
+            "item_name_parse_strategy": profile.item_name_parse_strategy,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def _semantic_import_fingerprint(cls, detected: dict) -> str:
+        layout_type = detected["layout_type"]
+        event_mapping = cls._normalized_mapping(
+            detected.get("event_field_mapping", detected.get("field_mapping"))
+        )
+        group_mapping = (
+            cls._normalized_mapping(detected.get("group_field_mapping"))
+            if layout_type == "hierarchical_grouped" else None
+        )
+        payload = {
+            "sheet_name": detected["sheet_name"],
+            "layout_type": layout_type,
+            "group_header_row": detected.get("group_header_row") if layout_type == "hierarchical_grouped" else None,
+            "event_header_row": detected.get("event_header_row") or detected.get("header_row"),
+            "group_field_mapping": group_mapping,
+            "event_field_mapping": event_mapping,
+            "flat_field_mapping": event_mapping if layout_type == "flat" else None,
+            "item_name_parse_strategy": detected["item_name_parse_strategy"],
+            "group_header_signature": detected.get("group_header_signature") if layout_type == "hierarchical_grouped" else None,
+            "event_header_signature": detected.get("event_header_signature") or detected.get("header_signature"),
+            "parser_version": PARSER_VERSION,
+        }
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def _preview_payload(self, record: _PendingPreview, parsed: ParsedWorkbook | None, size: int | None = None) -> dict:
         detected = record.detected
         warnings = list(parsed.warnings) if parsed is not None else []
-        if record.mapping_required:
+        if record.profile_selection_required:
+            warnings.insert(0, {
+                "code": "multiple_compatible_profiles",
+                "count": 1,
+                "message": "Найдено несколько совместимых профилей. Выберите профиль импорта.",
+            })
+        elif record.mapping_required:
             warnings.insert(0, {
                 "code": "mapping_required",
                 "count": 1,
@@ -428,6 +494,7 @@ class OneCHistoryImportService:
             )
             record.detected = detected
             record.mapping_required = False
+            record.profile_selection_required = False
             record.analysis_key = self._analysis_key(detected)
             return self._preview_payload(record, parsed)
         finally:
@@ -544,8 +611,13 @@ class OneCHistoryImportService:
                 group_header_signature=detected.get("group_header_signature"),
                 event_header_signature=detected.get("event_header_signature"),
             )
+            semantic_import_fingerprint = self._semantic_import_fingerprint(requested_config)
             active = self.repository.active_metadata()
-            if active and active.get("sha256") == file_sha256:
+            if (
+                active
+                and active.get("sha256") == file_sha256
+                and active.get("semantic_import_fingerprint") == semantic_import_fingerprint
+            ):
                 self.repository.record_attempt("already_active", file_sha256=file_sha256, warning_count=len(parsed.warnings))
                 return {
                     "status": "already_active",
@@ -580,6 +652,7 @@ class OneCHistoryImportService:
                 staging = await asyncio.to_thread(
                     self.repository.build_staging_snapshot, parsed,
                     profile_id=profile_id, mapping_provenance=provenance,
+                    semantic_import_fingerprint=semantic_import_fingerprint,
                 )
                 post_commit_warnings.extend(self.repository.activate(staging))
                 committed = True
