@@ -21,7 +21,7 @@ from averon_import.services.sourcing.models import (
     SuggestionResolution,
     SourcingResult,
 )
-from averon_import.services.sourcing.run_history import SourcingRunHistory
+from averon_import.services.sourcing.run_history import SourcingRunHistory, _sanitize_row
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.workspace import WorkspaceService
 
@@ -417,6 +417,7 @@ def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp
             "history_purchase_date": "",
             "history_age_days": None,
             "fallback_called": True,
+            "fallback_status": "error",
             "fallback_provider_key": "demo_store_http",
             "fallback_provider_label": "Demo Store",
             "fallback_catalog_version": "demo-v1",
@@ -456,10 +457,20 @@ def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp
     assert stored_record["source_mode"] == "one_c_then_provider"
     assert stored_record["rows"][0]["route"]["history_outcome"] == "REVIEW"
     assert stored_record["rows"][0]["route"]["fallback_called"] is True
+    assert stored_record["rows"][0]["route"]["fallback_status"] == "error"
     assert "candidate_offers" not in stored_text
     assert "server_path" not in stored_text
     assert "private" not in stored_text
     assert all("rows" not in item for item in history.list_public())
+
+
+def test_sourcing_run_history_fallback_status_is_bounded_to_known_values():
+    for value in ("not_called", "completed", "error"):
+        sanitized = _sanitize_row({"route": {"fallback_status": value}})
+        assert sanitized["route"]["fallback_status"] == value
+
+    untrusted = _sanitize_row({"route": {"fallback_status": "error with path C:\\private"}})
+    assert untrusted["route"]["fallback_status"] == "not_called"
 
 
 def test_failed_sourcing_run_is_safe_and_has_progress(tmp_path):

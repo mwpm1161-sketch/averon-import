@@ -471,6 +471,61 @@ def test_exact_source_name_unit_with_specification_token_is_safe_and_keeps_unkno
     assert result.selected_offer.url == ""
 
 
+@pytest.mark.parametrize("name", [
+    "Кабель 1",
+    "Насос 2",
+    "Труба 20",
+    "Позиция 1",
+    "Материал 5",
+])
+def test_generic_word_number_name_is_not_specific_enough_for_safe_history(name, tmp_path):
+    _, provider = _provider(tmp_path, [_event(name=name, article="")])
+    source = _intent(name=name, article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+
+
+@pytest.mark.parametrize("name", [
+    "Клапан DN50",
+    "Клапан DN 50",
+    "Клапан PN16",
+    "Светильник IP65",
+    "Цемент М-500",
+    "Шпунт AZ-13-770",
+    "Насос 32-80",
+    "Кабель 5x6",
+    "Кабель 5×6",
+    "Кабель 5х6",
+])
+def test_strong_engineering_specification_tokens_can_establish_safe_name_basis(name, tmp_path):
+    _, provider = _provider(tmp_path, [_event(name=name, article="")])
+    source = _intent(name=name, article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert result.safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
+
+
+def test_rdf_number_needs_separately_source_owned_model_for_name_specificity(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(name="Регулятор RDF 310", article="", characteristic="RDF 310"),
+    ])
+    source_without_model = _intent(name="Регулятор RDF 310", article="")
+    source_with_model = _intent(name="Регулятор RDF 310", article="", model="RDF 310")
+
+    without_model = provider.lookup(source_without_model, source_intent=source_without_model)
+    with_model = provider.lookup(source_with_model, source_intent=source_with_model)
+
+    assert without_model.outcome == HistoryMatchOutcome.REVIEW
+    assert without_model.selected_offer is None
+    assert with_model.outcome == HistoryMatchOutcome.SAFE_MATCH
+    assert with_model.safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
+
+
 def test_exact_source_name_unit_allows_only_case_and_whitespace_variation(tmp_path):
     _, provider = _provider(tmp_path, [_event(name="  КЛАПАН   M-500  ", article="")])
     source = _intent(name="Клапан M-500", article="")
@@ -885,19 +940,25 @@ class _CountingLiveProvider:
     label = "Поставщик для теста"
     cache_policy = SourcingProviderCachePolicy(cache_search_results=True)
 
-    def __init__(self, *, fail=False):
+    def __init__(self, *, fail=False, stats_fail=False, empty=False):
         self.stats_calls = 0
         self.search_calls = 0
         self.fail = fail
+        self.stats_fail = stats_fail
+        self.empty = empty
 
     def stats(self):
         self.stats_calls += 1
+        if self.stats_fail:
+            raise ValueError("synthetic provider health failure")
         return {"reachable": True, "catalog_version": "live-v1", "item_count": 1}
 
     def search(self, intent, *, limit=20):
         self.search_calls += 1
         if self.fail:
             raise ValueError("synthetic provider failure")
+        if self.empty:
+            return []
         title = intent.normalized_name or "Тестовое предложение"
         return [Offer(
             offer_id=f"live:{intent.source_row_id}",
@@ -972,6 +1033,8 @@ def test_one_c_then_provider_safe_history_row_skips_provider_network(tmp_path):
     )
 
     assert result.route.final_source_kind == "historical_purchase"
+    assert result.route.fallback_called is False
+    assert result.route.fallback_status == "not_called"
     assert result.route.history_safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
     assert result.route.history_outcome == "SAFE_MATCH"
     assert result.recommended_offer.provider == "one_c_history"
@@ -1007,10 +1070,59 @@ def test_one_c_then_provider_review_falls_back_once_without_mixing_history_candi
 
     assert result.route.history_outcome == "REVIEW"
     assert result.route.fallback_called is True
+    assert result.route.fallback_status == "completed"
     assert result.route.final_source_kind == "provider"
     assert all(offer.provider == live.key for offer in result.offers)
     assert live.stats_calls == 1
     assert live.search_calls == 1
+
+
+def test_one_c_then_provider_completed_empty_search_is_not_a_provider_error(tmp_path):
+    live = _CountingLiveProvider(empty=True)
+    service, _, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Кабель", article="")],
+        live=live,
+    )
+
+    result = service.search_row_routed(
+        _row("Кабель"),
+        source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+        ai_rerank=False,
+    )
+
+    assert result.offers == []
+    assert result.recommended_offer is None
+    assert result.route.fallback_called is True
+    assert result.route.fallback_status == "completed"
+    assert result.route.final_source_kind == "provider"
+    assert live.stats_calls == 1
+    assert live.search_calls == 1
+
+
+def test_one_c_then_provider_stats_failure_has_error_status_and_no_history_candidate(tmp_path):
+    live = _CountingLiveProvider(stats_fail=True)
+    service, _, _, live = _routed_service(
+        tmp_path,
+        [_event(name="Кабель", article="")],
+        live=live,
+    )
+
+    result = service.search_row_routed(
+        _row("Кабель"),
+        source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+        ai_rerank=False,
+    )
+
+    assert result.route.history_outcome == "REVIEW"
+    assert result.route.fallback_called is True
+    assert result.route.fallback_status == "error"
+    assert result.route.final_source_kind == "none"
+    assert result.recommended_offer is None
+    assert result.offers == []
+    assert result.review_candidate is None
+    assert live.stats_calls == 1
+    assert live.search_calls == 0
 
 
 @pytest.mark.parametrize("failure", ["no_match", "unavailable"])
@@ -1046,6 +1158,9 @@ def test_one_c_then_provider_failure_does_not_resurrect_review_candidate(tmp_pat
     assert result.recommended_offer is None
     assert result.offers == []
     assert result.review_candidate is None
+    assert result.route.fallback_called is True
+    assert result.route.fallback_status == "error"
+    assert result.route.final_source_kind == "none"
     assert live.stats_calls == 1
     assert live.search_calls == 1
 
@@ -1055,6 +1170,8 @@ def test_one_c_only_review_and_unavailable_never_call_live_provider(tmp_path):
     review = service.search_row_routed(_row("Кабель"), source_mode="one_c_only", ai_rerank=False)
 
     assert review.route.final_source_kind == "history_review"
+    assert review.route.fallback_called is False
+    assert review.route.fallback_status == "not_called"
     assert review.recommended_offer is None
     assert review.offers
     assert any(notice.code == "ONE_C_HISTORY_REVIEW" for notice in review.notices)
@@ -1066,12 +1183,16 @@ def test_one_c_only_review_and_unavailable_never_call_live_provider(tmp_path):
         ai_rerank=False,
     )
     assert no_match.route.final_source_kind == "none"
+    assert no_match.route.fallback_called is False
+    assert no_match.route.fallback_status == "not_called"
     assert any(notice.code == "ONE_C_HISTORY_NOT_FOUND" for notice in no_match.notices)
     assert live.stats_calls == 0 and live.search_calls == 0
 
     repository.database_path.write_bytes(b"not a sqlite snapshot")
     unavailable = service.search_row_routed(_row("Кабель"), source_mode="one_c_only", ai_rerank=False)
     assert unavailable.route.final_source_kind == "none"
+    assert unavailable.route.fallback_called is False
+    assert unavailable.route.fallback_status == "not_called"
     assert unavailable.offers == []
     assert any(notice.code == "ONE_C_HISTORY_UNAVAILABLE" for notice in unavailable.notices)
     assert live.stats_calls == 0 and live.search_calls == 0
@@ -1086,6 +1207,7 @@ def test_one_c_only_safe_never_calls_live_provider(tmp_path):
     result = service.search_row_routed(_row("Клапан M-500"), source_mode="one_c_only", ai_rerank=False)
 
     assert result.route.final_source_kind == "historical_purchase"
+    assert result.route.fallback_status == "not_called"
     assert result.recommended_offer.provider == "one_c_history"
     assert live.stats_calls == 0 and live.search_calls == 0
 

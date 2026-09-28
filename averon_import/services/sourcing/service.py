@@ -385,9 +385,11 @@ class SourcingService:
                 ai_rerank=ai_rerank,
                 catalog_version=catalog_version,
             )
+        fallback_failed = bool(result.timings.get("provider_error"))
         route = SourcingRouteMetadata(
             source_mode=source_mode,
-            final_source_kind="provider",
+            final_source_kind="none" if fallback_failed else "provider",
+            fallback_status="error" if fallback_failed else "completed",
             history_outcome=history_outcome,
             history_reason_code=lookup.reason_code or "history_unavailable",
             history_catalog_version=lookup.catalog_version,

@@ -17,6 +17,7 @@ _SAFE_DECISIONS = {
     "WITHOUT_OFFERS",
     "HISTORY_SAFE_MATCH",
 }
+_SAFE_FALLBACK_STATUSES = {"not_called", "completed", "error"}
 
 
 class SourcingRunHistory:
@@ -244,6 +245,7 @@ def _sanitize_row(value: dict[str, Any]) -> dict[str, Any]:
             "history_purchase_date": _safe_optional_text(route.get("history_purchase_date"), 40),
             "history_age_days": _safe_int_or_none(route.get("history_age_days")),
             "fallback_called": bool(route.get("fallback_called")),
+            "fallback_status": _safe_fallback_status(route.get("fallback_status")),
             "fallback_provider_key": _safe_text(route.get("fallback_provider_key"), 100),
             "fallback_provider_label": _safe_text(route.get("fallback_provider_label"), 180),
             "fallback_catalog_version": _safe_text(route.get("fallback_catalog_version"), 120),
@@ -327,6 +329,11 @@ def _safe_text_list(value: Any) -> list[str]:
 def _safe_decision(value: Any) -> str:
     decision = _safe_text(value, 40).upper()
     return decision if decision in _SAFE_DECISIONS else "REVIEW"
+
+
+def _safe_fallback_status(value: Any) -> str:
+    status = _safe_text(value, 24)
+    return status if status in _SAFE_FALLBACK_STATUSES else "not_called"
 
 
 def _safe_error(exc: Exception) -> tuple[str, str]:

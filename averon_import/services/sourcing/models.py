@@ -41,6 +41,7 @@ class HistorySafeMatchBasis(str, Enum):
 class SourcingRouteMetadata(SourcingModel):
     source_mode: SourcingSourceMode
     final_source_kind: Literal["historical_purchase", "provider", "history_review", "none"]
+    fallback_status: Literal["not_called", "completed", "error"] = "not_called"
     history_outcome: Literal["SAFE_MATCH", "REVIEW", "NO_MATCH", "UNAVAILABLE"] = "NO_MATCH"
     history_safe_basis: HistorySafeMatchBasis | None = None
     history_reason_code: str = Field(default="", max_length=100)

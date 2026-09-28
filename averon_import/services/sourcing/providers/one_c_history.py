@@ -103,7 +103,6 @@ def _loose_name_collision_key(value: object) -> str:
 
 _SPECIFICATION_TOKEN_RE = re.compile(
     r"(?:\b(?:dn|pn|ip)\s*\d+[a-zа-я0-9-]*\b"
-    r"|\b[a-zа-я]{1,8}\s+\d+(?:[-/.]\d+)*[a-zа-я0-9-]*\b"
     r"|\b[a-zа-я]{1,8}[-/]\d+(?:[-/.]\d+)*[a-zа-я0-9-]*\b"
     r"|\b\d+[-/.]\d+(?:[-/.]\d+)*[a-zа-я0-9-]*\b"
     r"|\b\d+(?:[xх×]\d+)+(?:\s*(?:мм|см|м|в|а|квт|кг))?\b)",
