@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 APP_NAME = "Averon Import"
-APP_VERSION = "1.0.0-rc8"
+APP_VERSION = "1.0.0-rc9"
 DEVELOPER = "Андриянов Степан Владимирович - НВСС"
 
 PROCESSING_MODES = ("local", "cloud", "hybrid")

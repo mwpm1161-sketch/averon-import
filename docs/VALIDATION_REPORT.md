@@ -104,3 +104,21 @@ Tesseract пытался открыть файл вида `tessdata_best"/rus.tr
 - распознано 22 строки, ошибок страницы — 0;
 - каталог моделей намеренно размещался в пути с пробелами и кириллицей;
 - первая позиция распознана как «Воздуховод 1000×700 из оцинкованной стали толщ. 0,7 мм».
+
+
+## Validation — 1.0.0-rc9 pilot candidate
+
+Проверки candidate выполнены в Windows developer environment. Production, tag и server не изменялись.
+
+- Account/auth/capabilities: **85 passed**.
+- Human Review confirmations and absence: **56 passed**.
+- 1C import, ownership, activity/concurrency and UI: **59 passed**.
+- 1C sourcing, sourcing UI/runtime, jobs and workspace history: **261 passed**.
+- Release tooling: **4 passed**.
+- Full pytest: **1314 passed, 3 failed, 2 skipped**. Единственные сбои — известные environment-dependent тесты `test_local_profile_resolves_tesseract_adapter`, `test_settings_processing_mode_influences_resolver` и `test_local_mode_rejects_cloud_llm_combination`; в этом окружении системный Tesseract намеренно отсутствует.
+- `python -m compileall averon_import`: **PASS**.
+- `node --check averon_import/static/app.js`: **PASS**.
+- `node tests/js/one_c_history_lifecycle.cjs averon_import/static/app.js`: **PASS**; выполнен USER/ADMIN lifecycle regression на реальных функциях `app.js`.
+- Release builder `--verify`: **PASS**, archive manifest и состав проверены, 141 packaged files.
+- Повторная release build в отдельный output: **PASS**; ZIP SHA-256 двух архивов совпал, внешние manifests идентичны.
+- `git diff --check`: **PASS**.

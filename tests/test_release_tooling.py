@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 from averon_import import __version__
+from averon_import.core.constants import APP_VERSION
 from scripts.build_release import (
     MANIFEST_NAME,
     build_release,
@@ -114,3 +115,7 @@ def test_built_archive_and_manifest_cover_the_same_files(tmp_path: Path) -> None
 def test_metadata_version_matches_human_runtime_version() -> None:
     metadata_version = read_project_version(ROOT)
     assert metadata_version.replace("-", "") == __version__.replace("-", "")
+    assert APP_VERSION == __version__
+    assert f"# Averon Import {__version__}" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert (ROOT / "START_HERE.txt").read_text(encoding="utf-8").startswith(f"AVERON IMPORT {__version__}")
+    assert f"Averon Import {__version__}" in (ROOT / "docs" / "USER_GUIDE.md").read_text(encoding="utf-8")
