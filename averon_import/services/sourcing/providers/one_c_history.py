@@ -36,11 +36,19 @@ from averon_import.services.sourcing.providers.base import SourcingProviderCache
 
 _MAX_PROVIDER_LIMIT = 50
 _MIN_FUZZY_SCORE = 58
+_COMPANY_DEFAULT_HISTORY_CURRENCY = "RUB"
 _MATCHER_ARTICLE_TRANSLATION = str.maketrans({
     "а": "a", "в": "v", "е": "e", "з": "z", "и": "i", "к": "k",
     "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
     "с": "s", "т": "t", "у": "u", "х": "x", "э": "e",
 })
+
+
+def _effective_history_currency(source_currency: str | None) -> tuple[str, str]:
+    """Resolve currency for the sourcing offer without mutating source history."""
+    if source_currency is not None and source_currency.strip():
+        return source_currency, "source"
+    return _COMPANY_DEFAULT_HISTORY_CURRENCY, "company_default"
 
 
 class HistoryMatchOutcome(str, Enum):
@@ -547,6 +555,8 @@ class OneCHistoryProvider:
         raw_unit = event.raw_unit if event is not None else (variant.raw_unit or item.raw_unit)
         unit_family = normalize_unit_family(raw_unit)
         selected_price = event.effective_unit_price_gross if event is not None else None
+        source_currency = event.currency if event is not None else None
+        currency, currency_basis = _effective_history_currency(source_currency)
         provenance = {
             "source": "one_c_history",
             "source_kind": "historical_purchase",
@@ -563,6 +573,7 @@ class OneCHistoryProvider:
             "price_basis": event.price_basis if event is not None else "",
             "reported_unit_price_gross": event.reported_unit_price_gross if event is not None else None,
             "effective_unit_price_gross": selected_price,
+            "currency_basis": currency_basis,
             "unit_family": unit_family,
         }
         attributes = {}
@@ -579,7 +590,7 @@ class OneCHistoryProvider:
             manufacturer=manufacturer,
             brand="",
             price=selected_price,
-            currency=event.currency if event is not None else "",
+            currency=currency,
             price_unit=raw_unit,
             availability=None,
             availability_text="Текущая доступность неизвестна; это историческая закупка.",

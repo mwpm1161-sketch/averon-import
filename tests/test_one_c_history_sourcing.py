@@ -455,8 +455,8 @@ def test_conservative_exact_source_name_normalizer_preserves_punctuation_and_ord
     assert normalize_exact_source_name("Клапан DN50 M-500") != normalize_exact_source_name("Клапан M-500 DN50")
 
 
-def test_exact_source_name_unit_with_specification_token_is_safe_and_keeps_unknown_currency(tmp_path):
-    _, provider = _provider(tmp_path, [
+def test_exact_source_name_unit_with_specification_token_is_safe_and_uses_company_currency_default(tmp_path):
+    repository, provider = _provider(tmp_path, [
         _event(name="Клапан M-500", article="ART-001", currency=None),
     ])
     source = _intent(name="Клапан M-500", article="")
@@ -466,7 +466,9 @@ def test_exact_source_name_unit_with_specification_token_is_safe_and_keeps_unkno
     assert result.outcome == HistoryMatchOutcome.SAFE_MATCH
     assert result.safe_basis == HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT
     assert result.selected_offer is not None
-    assert result.selected_offer.currency == ""
+    assert result.selected_offer.currency == "RUB"
+    assert result.selected_offer.data_provenance["currency_basis"] == "company_default"
+    assert repository.read_catalog_snapshot().items[0].events[0].currency == ""
     assert result.selected_offer.availability is None
     assert result.selected_offer.url == ""
 
@@ -710,7 +712,7 @@ def test_multiple_equally_strong_article_matches_are_ambiguous(tmp_path):
     assert len([match for match in result.match_results if match.decision == MatchDecision.MATCH]) == 2
 
 
-def test_historical_offer_never_claims_live_availability_or_url_and_does_not_invent_currency(tmp_path):
+def test_historical_offer_never_claims_live_availability_or_url_and_uses_company_currency_default(tmp_path):
     _, provider = _provider(tmp_path, [_event(currency=None)])
 
     offer = provider.search(_intent())[0]
@@ -718,15 +720,49 @@ def test_historical_offer_never_claims_live_availability_or_url_and_does_not_inv
     assert offer.availability is None
     assert "неизвестна" in offer.availability_text.casefold()
     assert offer.url == ""
-    assert offer.currency == ""
+    assert offer.currency == "RUB"
+    assert offer.data_provenance["currency_basis"] == "company_default"
 
 
-def test_source_currency_is_preserved_and_price_fields_remain_decimal(tmp_path):
+@pytest.mark.parametrize(
+    ("source_currency", "effective_currency", "currency_basis"),
+    [
+        (None, "RUB", "company_default"),
+        ("", "RUB", "company_default"),
+        ("RUB", "RUB", "source"),
+        ("rub", "RUB", "source"),
+        ("USD", "USD", "source"),
+    ],
+)
+def test_currency_policy_is_applied_to_offer_without_reimport_or_source_mutation(
+    tmp_path, monkeypatch, source_currency, effective_currency, currency_basis
+):
+    repository, provider = _provider(tmp_path, [_event(currency=source_currency)])
+    active_version = repository.catalog_version()
+    source_snapshot = repository.read_catalog_snapshot()
+    source_event_currency = source_snapshot.items[0].events[0].currency
+
+    def reject_reactivation(*_args, **_kwargs):
+        pytest.fail("currency policy must use the active snapshot without rebuilding it")
+
+    monkeypatch.setattr(repository, "activate", reject_reactivation)
+
+    offer = provider.search(_intent())[0]
+
+    assert source_event_currency == (source_currency or "")
+    assert repository.read_catalog_snapshot().items[0].events[0].currency == source_event_currency
+    assert repository.catalog_version() == active_version
+    assert offer.currency == effective_currency
+    assert offer.data_provenance["currency_basis"] == currency_basis
+
+
+def test_source_currency_is_normalized_and_price_fields_remain_decimal(tmp_path):
     _, provider = _provider(tmp_path, [_event(currency="usd")])
 
     offer = provider.search(_intent())[0]
 
     assert offer.currency == "USD"
+    assert offer.data_provenance["currency_basis"] == "source"
     assert offer.price == Decimal("12.50")
     assert offer.data_provenance["reported_unit_price_gross"] == Decimal("12.50")
     assert offer.data_provenance["effective_unit_price_gross"] == Decimal("12.50")
@@ -1291,8 +1327,9 @@ def test_mixed_project_falls_back_per_row_and_keeps_historical_amount_out_of_liv
     assert result.positions_fallback_called == 1
     assert result.positions_matched == 2
     assert result.confirmed_totals == {"RUB": Decimal("20")}
-    assert result.results[0].recommended_offer.currency == ""
+    assert result.results[0].recommended_offer.currency == "RUB"
     assert result.results[0].route.final_source_kind == "historical_purchase"
+    assert result.results[0].route.routing_policy_revision == "one-c-routing-v2"
     assert result.results[1].route.final_source_kind == "provider"
 
 

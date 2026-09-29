@@ -421,7 +421,7 @@ def test_sourcing_run_history_persists_sanitized_detail_and_reuses_retention(tmp
             "fallback_provider_key": "demo_store_http",
             "fallback_provider_label": "Demo Store",
             "fallback_catalog_version": "demo-v1",
-            "routing_policy_revision": "one-c-routing-v1",
+            "routing_policy_revision": "one-c-routing-v2",
             "candidate_offers": [{"contract": "must not persist"}],
             "server_path": "C:\\private\\data",
         },

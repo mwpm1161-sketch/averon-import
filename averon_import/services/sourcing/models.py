@@ -54,7 +54,7 @@ class SourcingRouteMetadata(SourcingModel):
     fallback_provider_key: str = Field(default="", max_length=100)
     fallback_provider_label: str = Field(default="", max_length=180)
     fallback_catalog_version: str = Field(default="", max_length=120)
-    routing_policy_revision: str = Field(default="one-c-routing-v1", max_length=80)
+    routing_policy_revision: str = Field(default="one-c-routing-v2", max_length=80)
 
 
 class SourcingProviderCapabilities(SourcingModel):

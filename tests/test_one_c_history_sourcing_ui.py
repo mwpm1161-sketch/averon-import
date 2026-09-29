@@ -64,11 +64,15 @@ def test_history_results_are_distinct_from_live_provider_offers_and_totals():
     route_copy = app.split("function sourcingRouteExplanation", 1)[1].split("function renderSourcingRouteExplanation", 1)[0]
     result_renderer = app.split("function renderSourcingResult", 1)[1].split("async function openSourcingForRow", 1)[0]
     project_renderer = app.split("function renderProjectResultRow", 1)[1].split("function renderProjectSourcingList", 1)[0]
+    price_renderer = app.split("function historicalOfferPrice", 1)[1].split("function historicalOfferDate", 1)[0]
 
     assert "История 1С" in historical
     assert "Дата закупки:" in historical and "Контрагент:" in historical
     assert "Текущая доступность не подтверждена." in historical
     assert "Валюта в истории не указана" in app
+    assert "formatMoney(amount, currency)" in price_renderer
+    assert "return currency" in price_renderer
+    assert "Валюта в истории не указана" in price_renderer
     assert "history_purchase_date" in app.split("function historicalOfferDate", 1)[1].split("function historicalOfferCounterparty", 1)[0]
     assert "role=\"status\"" in app
     assert "В истории 1С нет безопасно подтверждённого совпадения, а поиск у поставщика завершился ошибкой." in route_copy
