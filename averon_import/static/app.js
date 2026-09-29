@@ -298,7 +298,7 @@ function clearOneCHistoryProtectedState() {
 function isCurrentOneCHistoryRequest(generation) {
   return state.oneCHistory.requestGeneration === generation
     && state.authState === "authenticated"
-    && String(state.currentUser?.role || "").toLowerCase() === "admin";
+    && state.currentUser?.capabilities?.one_c_history_import === true;
 }
 
 function cancelDocumentNavigation() {

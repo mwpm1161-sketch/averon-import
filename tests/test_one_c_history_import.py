@@ -7,6 +7,8 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import zipfile
 from xml.etree import ElementTree as ET
 
@@ -778,6 +780,84 @@ def test_preview_ownership_busy_retry_profile_permission_and_actor_audit(tmp_pat
     assert audit[-1]["outcome"] == "already_active"
     active = service.repository.active_metadata()
     assert "user_id" not in active and "username" not in active
+
+
+def test_two_concurrent_final_imports_fail_fast_and_second_preview_retries_safely(tmp_path):
+    service = _make_service(tmp_path)
+    registry = OneCHistoryActivityRegistry()
+    service.activity_registry = registry
+    payload = _flat_xlsx_bytes(tmp_path / "shared-import.xlsx")
+
+    async def prepare():
+        await _import_preview(
+            service,
+            _flat_xlsx_bytes(tmp_path / "previous-active.xlsx", name="Предыдущая история"),
+        )
+        previous_active = service.repository.active_metadata()
+        first = await service.create_preview(_upload(payload), owner_key="user:first")
+        second = await service.create_preview(_upload(payload), owner_key="user:second")
+
+        def request_for(preview):
+            return ImportMappingRequest(
+                preview_id=preview["preview_id"],
+                sheet_name=preview["sheet_name"],
+                header_row=preview["header_row"],
+                group_header_row=preview.get("group_header_row"),
+                event_header_row=preview.get("event_header_row"),
+                layout_type=preview["layout_type"],
+                field_mapping=preview["field_mapping"],
+                group_field_mapping=preview.get("group_field_mapping") or {},
+                event_field_mapping=preview.get("event_field_mapping") or {},
+                item_name_parse_strategy=preview["item_name_parse_strategy"],
+            )
+
+        return previous_active, first, second, request_for(first), request_for(second)
+
+    previous_active, first_preview, second_preview, first_request, second_request = asyncio.run(prepare())
+    build_entered = Event()
+    allow_build = Event()
+    original_build = service.repository.build_staging_snapshot
+
+    def blocked_build(*args, **kwargs):
+        build_entered.set()
+        if not allow_build.wait(timeout=10):
+            raise TimeoutError("test did not release the staged import")
+        return original_build(*args, **kwargs)
+
+    service.repository.build_staging_snapshot = blocked_build
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_future = pool.submit(
+            lambda: asyncio.run(service.import_confirmed(first_request, owner_key="user:first"))
+        )
+        try:
+            assert build_entered.wait(timeout=10), "first import did not enter staging while holding its writer lease"
+            assert registry.status()["update_in_progress"] is True
+            still_active = service.repository.active_metadata()
+            assert still_active["sha256"] == previous_active["sha256"]
+            with pytest.raises(OneCHistoryActivityConflict) as competing:
+                asyncio.run(service.import_confirmed(second_request, owner_key="user:second"))
+            assert competing.value.code == "ONE_C_HISTORY_UPDATE_IN_PROGRESS"
+            assert second_preview["preview_id"] in service._pending
+            second_pending = service._pending[second_preview["preview_id"]]
+            assert second_pending.path.is_file()
+            assert second_pending.analysis_key == service._analysis_key(second_pending.detected)
+        finally:
+            allow_build.set()
+        first_result = first_future.result(timeout=20)
+
+    assert first_result["status"] == "succeeded"
+    assert registry.status()["replacement_allowed"] is True
+    assert service.repository.active_metadata()["sha256"] != previous_active["sha256"]
+    active_version = service.repository.catalog_version()
+    retry_result = asyncio.run(service.import_confirmed(second_request, owner_key="user:second"))
+    assert retry_result["status"] == "already_active"
+    assert retry_result["idempotent"] is True
+    assert second_preview["preview_id"] not in service._pending
+    assert service.repository.catalog_version() == active_version
+    assert first_preview["preview_id"] not in service._pending
+    with sqlite3.connect(service.repository.database_path) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM purchase_events").fetchone()[0] == 1
 
 
 def test_preview_bounds_are_per_owner_and_global_without_cross_user_eviction(tmp_path):

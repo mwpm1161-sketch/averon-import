@@ -1,5 +1,7 @@
 from pathlib import Path
 import re
+import shutil
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,3 +155,19 @@ def test_one_c_history_ui_surfaces_post_commit_warnings_as_success():
     assert "result.status === \"succeeded\"" in import_code
     assert "postCommitWarnings.join(\" \")" in import_code
     assert 'toast(`${importMessage}${warningSuffix}`, "success")' in import_code
+
+
+def test_user_and_admin_one_c_history_request_lifecycle_runs_actual_javascript():
+    node = shutil.which("node")
+    assert node, "Node.js is required for the 1C UI lifecycle regression test"
+    harness = ROOT / "tests" / "js" / "one_c_history_lifecycle.cjs"
+    app = ROOT / "averon_import" / "static" / "app.js"
+    completed = subprocess.run(
+        [node, str(harness), str(app)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "PASS: capability-scoped 1C request lifecycle" in completed.stdout

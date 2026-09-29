@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +40,73 @@ def test_activity_registry_allows_shared_readers_and_fails_fast_for_writer_and_n
     assert competing.value.code == "ONE_C_HISTORY_UPDATE_IN_PROGRESS"
     writer.release()
     assert registry.status()["replacement_allowed"] is True
+
+
+def test_threaded_sourcing_readers_hold_shared_leases_at_the_same_time():
+    registry = OneCHistoryActivityRegistry()
+    start = Barrier(3)
+    acquired = Barrier(3)
+    release = Event()
+
+    def reader():
+        start.wait(timeout=5)
+        lease = registry.acquire_sourcing()
+        try:
+            acquired.wait(timeout=5)
+            assert release.wait(timeout=5)
+        finally:
+            lease.release()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        readers = [pool.submit(reader) for _ in range(2)]
+        start.wait(timeout=5)
+        acquired.wait(timeout=5)
+        assert registry.status()["active_sourcing_count"] == 2
+        with pytest.raises(OneCHistoryActivityConflict) as in_use:
+            registry.try_begin_update()
+        assert in_use.value.code == "ONE_C_HISTORY_IN_USE"
+        release.set()
+        for future in readers:
+            future.result(timeout=5)
+
+    assert registry.status()["active_sourcing_count"] == 0
+    assert registry.status()["replacement_allowed"] is True
+
+
+def test_threaded_reader_and_writer_attempts_fail_fast_while_update_lease_is_held():
+    registry = OneCHistoryActivityRegistry()
+    writer = registry.try_begin_update()
+    start = Barrier(3)
+
+    def attempt(operation):
+        start.wait(timeout=5)
+        try:
+            lease = operation()
+        except OneCHistoryActivityConflict as exc:
+            return exc.code
+        else:
+            lease.release()
+            return "unexpectedly-admitted"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reader = pool.submit(attempt, registry.acquire_sourcing)
+        second_writer = pool.submit(attempt, registry.try_begin_update)
+        start.wait(timeout=5)
+        assert {reader.result(timeout=5), second_writer.result(timeout=5)} == {
+            "ONE_C_HISTORY_UPDATING",
+            "ONE_C_HISTORY_UPDATE_IN_PROGRESS",
+        }
+
+    writer.release()
+    reader = registry.acquire_sourcing()
+    reader.release()
+    next_writer = registry.try_begin_update()
+    next_writer.release()
+    assert registry.status() == {
+        "active_sourcing_count": 0,
+        "update_in_progress": False,
+        "replacement_allowed": True,
+    }
 
 
 def _main_for_test(monkeypatch, tmp_path):
