@@ -1047,6 +1047,41 @@ def test_one_c_then_provider_safe_history_row_skips_provider_network(tmp_path):
     assert live.search_calls == 0
 
 
+@pytest.mark.parametrize(
+    "requested_period_start",
+    ["2026-09-22", "2026-08-30", "2026-06-29", "2026-03-29"],
+    ids=["7-days", "1-month", "3-months", "6-months"],
+)
+def test_historical_routing_has_no_age_cutoff_for_user_selected_periods(tmp_path, requested_period_start):
+    # Vary the snapshot's actual range while keeping the same current purchase
+    # event. The selected display period is metadata only and must not change
+    # SAFE_MATCH routing or impose a fixed freshness cutoff.
+    service, repository, _, live = _routed_service(
+        tmp_path,
+        [
+            _event(row=2, when=requested_period_start, price_usable=False, price=None, reported=None, amount=None),
+            _event(row=3, when="2026-09-29"),
+        ],
+    )
+    snapshot = repository.read_catalog_snapshot()
+    snapshot_events = [event for item in snapshot.items for event in item.events] if snapshot else []
+    actual_period_start = min(event.document_date for event in snapshot_events) if snapshot_events else None
+
+    result = service.search_row_routed(
+        _row("Насос тестовый", code="ART-001"),
+        source_mode="one_c_then_provider",
+        ai_rerank=False,
+    )
+
+    assert snapshot is not None
+    assert actual_period_start == requested_period_start
+    assert result.route.final_source_kind == "historical_purchase"
+    assert result.route.history_purchase_date == "2026-09-29"
+    assert result.route.history_age_days == 0
+    assert result.route.fallback_called is False
+    assert live.stats_calls == 0 and live.search_calls == 0
+
+
 def test_provider_only_cached_result_cannot_satisfy_one_c_only(tmp_path):
     service, _, _, live = _routed_service(
         tmp_path,

@@ -471,7 +471,8 @@ def test_project_review_candidate_cards_reuse_generic_offer_renderer():
     app_js = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     detail = app_js.split("function renderProjectItemDetails", 1)[1].split("function bindSourcingFilters", 1)[0]
 
-    assert "candidates.map((candidate) => renderOfferCard(candidate, true, intent))" in detail
+    assert "renderOfferCard(candidate, true, intent)" in detail
+    assert "renderHistoricalOfferCard(candidate, {compact:true, route})" in detail
     assert "Открыть у поставщика ↗" not in detail
     assert "provider === \"etm_ipro\"" not in detail
 

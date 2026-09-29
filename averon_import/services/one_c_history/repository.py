@@ -202,6 +202,67 @@ class OneCHistoryRepository:
                 if connection is not None:
                     connection.close()
 
+    def sourcing_status(self) -> dict[str, Any]:
+        """Return only safe aggregate facts for authenticated sourcing UI."""
+
+        unavailable = {
+            "available": False,
+            "catalog_version": None,
+            "period_start": None,
+            "period_end": None,
+            "imported_at": None,
+            "item_count": 0,
+            "event_count": 0,
+            "usable_price_event_count": 0,
+        }
+        if not self.database_path.is_file():
+            return unavailable
+        connection: sqlite3.Connection | None = None
+        with self._lock:
+            try:
+                connection = self._connect()
+                rows = connection.execute("SELECT key, value FROM import_metadata").fetchall()
+                metadata = {str(row["key"]): json.loads(row["value"]) for row in rows}
+                if not metadata:
+                    return unavailable
+                identity, version = self._metadata_and_version(connection)
+                usable_count = metadata.get("usable_price_event_count")
+                if type(usable_count) is not int or usable_count < 0:
+                    return unavailable
+
+                def safe_date(value: Any) -> str | None:
+                    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                        return None
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError:
+                        return None
+                    return value
+
+                imported_at = metadata.get("imported_at")
+                if not isinstance(imported_at, str) or len(imported_at) > 40:
+                    imported_at = None
+                else:
+                    try:
+                        datetime.fromisoformat(imported_at.replace("Z", "+00:00"))
+                    except ValueError:
+                        imported_at = None
+                return {
+                    "available": True,
+                    "catalog_version": version,
+                    "period_start": safe_date(metadata.get("period_start")),
+                    "period_end": safe_date(metadata.get("period_end")),
+                    "imported_at": imported_at,
+                    "item_count": identity["item_count"],
+                    "event_count": identity["event_count"],
+                    "usable_price_event_count": usable_count,
+                }
+            except (OSError, sqlite3.Error, ValueError, TypeError, UnicodeError, OneCHistoryReadError):
+                return unavailable
+            finally:
+                if connection is not None:
+                    connection.close()
+
     @staticmethod
     def _json_object(value: Any) -> tuple[dict[str, Any], bool]:
         try:

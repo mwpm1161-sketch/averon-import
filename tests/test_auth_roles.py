@@ -198,6 +198,34 @@ def test_one_c_history_status_is_available_to_admin_only(auth_client):
     assert admin.json()["profiles"] == []
 
 
+def test_sourcing_history_status_is_authenticated_and_safe_for_users(auth_client, monkeypatch):
+    from averon_import import main
+
+    allowed = {
+        "available", "catalog_version", "period_start", "period_end", "imported_at",
+        "item_count", "event_count", "usable_price_event_count",
+    }
+    status = {
+        "available": True,
+        "catalog_version": "v1",
+        "period_start": "2026-06-23",
+        "period_end": "2026-09-22",
+        "imported_at": "2026-09-23T10:00:00+00:00",
+        "item_count": 3,
+        "event_count": 5,
+        "usable_price_event_count": 4,
+    }
+    monkeypatch.setattr(main.one_c_history_repository, "sourcing_status", lambda: status)
+
+    assert auth_client.get("/api/sourcing/history-status").status_code == 401
+    response = auth_client.get("/api/sourcing/history-status", headers=_headers("colleague"))
+
+    assert response.status_code == 200
+    assert response.json() == status
+    assert set(response.json()) == allowed
+    assert auth_client.get("/api/admin/one-c-history", headers=_headers("colleague")).status_code == 403
+
+
 def test_admin_provider_maintenance_endpoints_remain_available(auth_client, monkeypatch):
     from averon_import import main
 

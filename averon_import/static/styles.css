@@ -332,8 +332,22 @@ button { cursor: pointer; }
 .sourcing-modal { width:min(920px,calc(100vw - 32px)); }
 .sourcing-card { width:min(920px,calc(100vw - 32px)); max-width:calc(100vw - 32px); box-sizing:border-box; }
 .sourcing-content { min-height:160px; }
+.sourcing-mode-controls { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:6px 14px; min-width:0; max-width:100%; margin:0 0 14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:10px; background:#f8fafc; }
+.sourcing-mode-field { display:grid; gap:4px; min-width:0; }
+.sourcing-mode-field .field-label { margin:0; }
+.sourcing-mode-field select { width:100%; min-width:0; max-width:100%; }
+.sourcing-mode-status { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:4px 10px; min-width:0; }
+.sourcing-mode-status p { margin:0; color:#64748b; font-size:11px; line-height:1.4; overflow-wrap:anywhere; }
+.sourcing-mode-status .button { padding:5px 7px; font-size:11px; }
+.sourcing-mode-change-note { grid-column:1 / -1; margin:0; color:#475569; font-size:11px; }
 .sourcing-run-meta { display:flex; flex-wrap:wrap; gap:7px 16px; margin-bottom:14px; padding:10px 12px; border:1px solid #dbe4ee; border-radius:10px; background:#f8fafc; color:#64748b; font-size:11px; }
 .sourcing-run-meta b { color:#334155; }
+.sourcing-route-coverage { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(190px,100%),1fr)); gap:9px; margin:-8px 0 12px; }
+.sourcing-route-coverage > div { min-width:0; padding:10px 12px; border:1px solid #dbe4ee; border-radius:10px; background:#fff; }
+.sourcing-route-coverage small { display:block; margin-bottom:4px; color:#64748b; overflow-wrap:anywhere; }
+.sourcing-route-coverage b { color:#0f172a; }
+.sourcing-history-totals-note,.sourcing-route-explanation { margin:8px 0 12px; color:#475569; font-size:12px; line-height:1.45; }
+.sourcing-route-explanation { padding:9px 11px; border-left:3px solid #94a3b8; background:#f8fafc; }
 .intent-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; padding:16px; border:1px solid var(--line); border-radius:14px; background:#f8fafc; }
 .intent-summary small, .sourcing-project-summary small { display:block; color:#64748b; margin-bottom:5px; }
 .intent-summary b { display:block; color:#0f172a; }
@@ -352,6 +366,7 @@ button { cursor: pointer; }
 .understanding-suggestions > small { flex-basis:100%; color:#9a3412; }
 .offer-card { padding:18px; border-radius:16px; border:1px solid #dbe4ee; background:#fff; box-shadow:0 10px 25px rgba(15,23,42,.06); margin:12px 0 20px; }
 .offer-card.recommended { border-color:#7dd3fc; background:linear-gradient(135deg,#f0f9ff,#fff); }
+.historical-offer-card.recommended { border-color:#cbd5e1; background:#f8fafc; }
 .offer-card-heading { display:flex; align-items:flex-start; gap:10px; margin-bottom:12px; }
 .offer-card-heading b { min-width:0; font-size:16px; overflow-wrap:anywhere; }
 .offer-price { font-size:25px; font-weight:700; color:#0f172a; margin-bottom:12px; }
@@ -430,8 +445,15 @@ button { cursor: pointer; }
   .intent-summary, .sourcing-project-summary, .offer-grid, .understanding-resolved { grid-template-columns:1fr; }
   .understanding-heading { flex-direction:column; }
   .sourcing-card { width:calc(100vw - 32px); }
+  .sourcing-mode-controls { grid-template-columns:minmax(0,1fr); align-items:stretch; }
+  .sourcing-mode-status { justify-content:space-between; }
+  .sourcing-route-coverage { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .manual-entry-prompt { align-items:flex-start; flex-direction:column; }.manual-entry-prompt .button { margin-left:0; }
   .manual-workspace { padding:14px; }.manual-toolbar .spacer { display:none; }
+}
+
+@media (max-width:420px) {
+  .sourcing-route-coverage { grid-template-columns:minmax(0,1fr); }
 }
 
 .export-reportable-error { display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; margin-top:10px; padding:13px 14px; border:1px solid #ead9ad; border-radius:11px; background:#fff9e9; color:#624d21; }

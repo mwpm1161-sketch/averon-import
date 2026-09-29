@@ -536,6 +536,46 @@ def test_active_snapshot_keeps_immutable_mapping_profile_revision(tmp_path):
     assert service.repository.active_metadata()["mapping_provenance"] == provenance
 
 
+def test_sourcing_status_is_an_allowlisted_aggregate_projection(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _xlsx_bytes(tmp_path / "private-source-name.xlsx", rows=_hierarchical_rows())
+    asyncio.run(_import_preview(service, payload, filename="private-source-name.xlsx"))
+
+    status = service.repository.sourcing_status()
+
+    assert set(status) == {
+        "available", "catalog_version", "period_start", "period_end", "imported_at",
+        "item_count", "event_count", "usable_price_event_count",
+    }
+    assert status["available"] is True
+    assert status["period_start"] == "2026-06-23"
+    assert status["period_end"] == "2026-09-22"
+    assert status["event_count"] == 3
+    assert status["item_count"] == 3
+    assert status["catalog_version"]
+    assert status["imported_at"]
+    assert all("private-source-name" not in str(value) for value in status.values())
+
+
+def test_sourcing_status_without_snapshot_has_stable_unavailable_shape(tmp_path):
+    repository = _make_service(tmp_path).repository
+    status = repository.sourcing_status()
+
+    assert status == {
+        "available": False,
+        "catalog_version": None,
+        "period_start": None,
+        "period_end": None,
+        "imported_at": None,
+        "item_count": 0,
+        "event_count": 0,
+        "usable_price_event_count": 0,
+    }
+
+    repository.database_path.write_bytes(b"not a valid sqlite snapshot")
+    assert repository.sourcing_status() == status
+
+
 def test_manually_changed_mapping_does_not_claim_an_unmodified_saved_profile(tmp_path):
     service = _make_service(tmp_path)
     payload = _xlsx_bytes(tmp_path / "profiled.xlsx", rows=_hierarchical_rows())

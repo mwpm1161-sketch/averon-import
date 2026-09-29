@@ -1823,6 +1823,11 @@ def sourcing_providers():
     return sourcing_service.public_config()
 
 
+@app.get("/api/sourcing/history-status", dependencies=[Depends(require_authenticated)])
+def sourcing_history_status():
+    return one_c_history_repository.sourcing_status()
+
+
 @app.post("/api/sourcing/providers/lemana_b2b/sync", dependencies=[Depends(require_admin)])
 def sync_lemana_b2b():
     provider = sourcing_service.provider("lemana_b2b")

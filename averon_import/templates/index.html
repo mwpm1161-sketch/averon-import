@@ -370,10 +370,15 @@
     </div>
   </dialog>
 
-  <dialog class="modal sourcing-modal" id="sourcing-modal">
-    <div class="modal-card sourcing-card">
-      <div class="modal-header"><div><span class="eyebrow">Каталог предложений</span><h2>Подбор предложений</h2><p id="sourcing-subtitle">Сопоставление по распознанным характеристикам</p></div><button class="icon-button" id="close-sourcing" aria-label="Закрыть">×</button></div>
-      <div id="sourcing-content" class="sourcing-content"><p class="hint">Выберите позицию, чтобы начать поиск.</p></div>
+    <dialog class="modal sourcing-modal" id="sourcing-modal">
+      <div class="modal-card sourcing-card">
+        <div class="modal-header"><div><span class="eyebrow">Каталог предложений</span><h2>Подбор предложений</h2><p id="sourcing-subtitle">Сопоставление по распознанным характеристикам</p></div><button class="icon-button" id="close-sourcing" aria-label="Закрыть">×</button></div>
+        <section class="sourcing-mode-controls" aria-label="Источник подбора">
+          <label class="sourcing-mode-field" for="sourcing-source-mode"><span class="field-label">Источник подбора</span><select class="select" id="sourcing-source-mode"><option value="one_c_then_provider">История 1С → поставщик</option><option value="one_c_only">Только история 1С</option><option value="provider_only">Только поставщик</option></select></label>
+          <div class="sourcing-mode-status"><p id="sourcing-history-status" role="status">Проверяем доступность истории 1С…</p><button class="button text" type="button" id="sourcing-history-refresh">Обновить статус</button></div>
+          <p id="sourcing-mode-change-note" class="sourcing-mode-change-note" role="status" hidden>Режим изменён. Запустите подбор повторно, чтобы применить.</p>
+        </section>
+        <div id="sourcing-content" class="sourcing-content"><p class="hint">Выберите позицию, чтобы начать поиск.</p></div>
     </div>
   </dialog>
 
