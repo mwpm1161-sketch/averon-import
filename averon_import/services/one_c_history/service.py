@@ -19,6 +19,7 @@ from averon_import.services.one_c_history.models import (
     PreviewMappingRequest,
 )
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
+from averon_import.services.one_c_history.activity import OneCHistoryActivityConflict, OneCHistoryActivityRegistry
 from averon_import.services.one_c_history.xlsx_import import (
     MAX_PREVIEW_ROWS,
     MAX_UPLOAD_BYTES,
@@ -33,12 +34,14 @@ from averon_import.services.one_c_history.xlsx_import import (
 
 
 PREVIEW_TTL_SECONDS = 20 * 60
-MAX_PENDING_PREVIEWS = 3
+MAX_PENDING_PREVIEWS = 3  # Compatibility name for the per-user limit.
+MAX_PENDING_PREVIEWS_PER_USER = 3
+MAX_PENDING_PREVIEWS_TOTAL = 20
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class _PendingPreview:
-    def __init__(self, *, preview_id: str, path: Path, filename: str, file_sha256: str, file_size_bytes: int, detected: dict, profile_id: str | None, profile_revision: int | None, profile_mapping_key: str | None, expires_at: float, mapping_required: bool, profile_selection_required: bool = False):
+    def __init__(self, *, preview_id: str, path: Path, filename: str, file_sha256: str, file_size_bytes: int, detected: dict, profile_id: str | None, profile_revision: int | None, profile_mapping_key: str | None, expires_at: float, mapping_required: bool, owner_key: str | None = None, profile_selection_required: bool = False):
         self.preview_id = preview_id
         self.path = path
         self.filename = filename
@@ -51,6 +54,7 @@ class _PendingPreview:
         self.expires_at = expires_at
         self.created_at = time.monotonic()
         self.mapping_required = mapping_required
+        self.owner_key = owner_key
         self.profile_selection_required = profile_selection_required
         self.analysis_key: str | None = None
         self.analysis_lock = threading.Lock()
@@ -59,7 +63,7 @@ class _PendingPreview:
 class OneCHistoryImportService:
     """Coordinates bounded previews and atomic activation of 1C history snapshots."""
 
-    def __init__(self, repository: OneCHistoryRepository):
+    def __init__(self, repository: OneCHistoryRepository, activity_registry: OneCHistoryActivityRegistry | None = None):
         self.repository = repository
         self.temp_root = repository.root / ".pending"
         self.temp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -70,6 +74,7 @@ class OneCHistoryImportService:
         self._pending: dict[str, _PendingPreview] = {}
         self._lock = threading.RLock()
         self._import_lock = threading.Lock()
+        self.activity_registry = activity_registry or OneCHistoryActivityRegistry()
         self._remove_stale_temp_files(include_normalized=True)
 
     def _remove_stale_temp_files(self, *, include_normalized: bool = False) -> None:
@@ -85,7 +90,7 @@ class OneCHistoryImportService:
             except OSError:
                 continue
 
-    def _prune_previews(self) -> None:
+    def _prune_previews(self, owner_key: str | None = None) -> None:
         now = time.monotonic()
         expired = [key for key, value in self._pending.items() if value.expires_at <= now]
         for key in expired:
@@ -97,19 +102,18 @@ class OneCHistoryImportService:
                 record.path.unlink(missing_ok=True)
             finally:
                 record.analysis_lock.release()
-        if len(self._pending) >= MAX_PENDING_PREVIEWS:
-            oldest = sorted(self._pending.items(), key=lambda item: item[1].created_at)
-            excess = len(self._pending) - MAX_PENDING_PREVIEWS + 1
-            removed = 0
-            for key, record in oldest:
-                if removed >= excess:
-                    break
+        if owner_key is not None:
+            owner_previews = sorted(
+                ((key, value) for key, value in self._pending.items() if value.owner_key == owner_key),
+                key=lambda item: item[1].created_at,
+            )
+            while len(owner_previews) >= MAX_PENDING_PREVIEWS_PER_USER:
+                key, record = owner_previews.pop(0)
                 if not record.analysis_lock.acquire(blocking=False):
-                    continue
+                    raise OneCImportError("Достигнут предел подготовленных отчётов. Завершите текущую проверку и повторите загрузку.")
                 try:
                     self._pending.pop(key, None)
                     record.path.unlink(missing_ok=True)
-                    removed += 1
                 finally:
                     record.analysis_lock.release()
         self._remove_stale_temp_files()
@@ -124,7 +128,7 @@ class OneCHistoryImportService:
             raise OneCImportError("Имя файла слишком длинное.")
         return cleaned or "report.xlsx"
 
-    async def create_preview(self, upload: UploadFile, *, profile_id: str | None = None) -> dict:
+    async def create_preview(self, upload: UploadFile, *, profile_id: str | None = None, owner_key: str | None = None) -> dict:
         path: Path | None = None
         retained = False
         preview_id: str | None = None
@@ -132,6 +136,9 @@ class OneCHistoryImportService:
             filename = self._safe_filename(upload.filename)
             with self._lock:
                 self._prune_previews()
+                owner_count = sum(item.owner_key == owner_key for item in self._pending.values())
+                if len(self._pending) >= MAX_PENDING_PREVIEWS_TOTAL and owner_count < MAX_PENDING_PREVIEWS_PER_USER:
+                    raise OneCImportError("Слишком много подготовленных отчётов. Повторите загрузку позже.")
             fd, temp_name = tempfile.mkstemp(prefix="pending-", suffix=".xlsx", dir=self.temp_root)
             path = Path(temp_name)
             digest = hashlib.sha256()
@@ -235,7 +242,9 @@ class OneCHistoryImportService:
                 )
             preview_id = uuid.uuid4().hex
             with self._lock:
-                self._prune_previews()
+                self._prune_previews(owner_key)
+                if len(self._pending) >= MAX_PENDING_PREVIEWS_TOTAL:
+                    raise OneCImportError("Слишком много подготовленных отчётов. Повторите загрузку позже.")
                 self._pending[preview_id] = _PendingPreview(
                     preview_id=preview_id,
                     path=path,
@@ -248,6 +257,7 @@ class OneCHistoryImportService:
                     profile_mapping_key=self._analysis_key(detected) if selected_profile else None,
                     expires_at=time.monotonic() + PREVIEW_TTL_SECONDS,
                     mapping_required=mapping_required,
+                    owner_key=owner_key,
                     profile_selection_required=profile_selection_required,
                 )
                 record = self._pending[preview_id]
@@ -381,11 +391,12 @@ class OneCHistoryImportService:
         *,
         group_header_row: int | None = None,
         event_header_row: int | None = None,
+        owner_key: str | None = None,
     ) -> dict:
         with self._lock:
             self._prune_previews()
             record = self._pending.get(preview_id)
-        if record is None:
+        if record is None or record.owner_key != owner_key:
             raise OneCImportError("Предпросмотр истёк или уже использован. Загрузите файл повторно.")
         acquired = await asyncio.to_thread(record.analysis_lock.acquire)
         try:
@@ -411,11 +422,11 @@ class OneCHistoryImportService:
             if acquired:
                 record.analysis_lock.release()
 
-    async def analyze_preview(self, preview_id: str, request: PreviewMappingRequest) -> dict:
+    async def analyze_preview(self, preview_id: str, request: PreviewMappingRequest, *, owner_key: str | None = None) -> dict:
         with self._lock:
             self._prune_previews()
             record = self._pending.get(preview_id)
-        if record is None:
+        if record is None or record.owner_key != owner_key:
             raise OneCImportError("Предпросмотр истёк или уже использован. Загрузите файл повторно.")
         acquired = await asyncio.to_thread(record.analysis_lock.acquire)
         try:
@@ -501,20 +512,56 @@ class OneCHistoryImportService:
             if acquired:
                 record.analysis_lock.release()
 
-    def _consume_preview(self, preview_id: str) -> _PendingPreview:
+    def _get_preview(self, preview_id: str, owner_key: str | None) -> _PendingPreview:
         with self._lock:
             self._prune_previews()
-            record = self._pending.pop(preview_id, None)
-        if record is None:
-            raise OneCImportError("Предпросмотр истёк или уже использован. Загрузите файл повторно.")
+            record = self._pending.get(preview_id)
+            if record is None or record.owner_key != owner_key:
+                raise OneCImportError("Предпросмотр истёк или уже использован. Загрузите файл повторно.")
+            if not record.analysis_lock.acquire(blocking=False):
+                raise OneCHistoryActivityConflict(
+                    "ONE_C_HISTORY_UPDATE_IN_PROGRESS",
+                    "Этот предпросмотр уже обрабатывается. Повторите позже.",
+                    active_sourcing_count=int(self.activity_registry.status()["active_sourcing_count"]),
+                )
         return record
 
-    async def import_confirmed(self, request: ImportMappingRequest) -> dict:
-        pending = self._consume_preview(request.preview_id)
-        await asyncio.to_thread(pending.analysis_lock.acquire)
+    def _extend_preview_ttl(self, preview_id: str, pending: _PendingPreview) -> None:
+        with self._lock:
+            if self._pending.get(preview_id) is pending:
+                pending.expires_at = time.monotonic() + PREVIEW_TTL_SECONDS
+
+    async def import_confirmed(
+        self,
+        request: ImportMappingRequest,
+        *,
+        owner_key: str | None = None,
+        actor: dict[str, str | None] | None = None,
+        can_manage_profiles: bool = True,
+    ) -> dict:
+        if request.save_profile and not can_manage_profiles:
+            raise PermissionError("Недостаточно прав для сохранения профиля импорта.")
+        try:
+            pending = self._get_preview(request.preview_id, owner_key)
+        except OneCHistoryActivityConflict as exc:
+            if actor:
+                self.repository.record_attempt(exc.code, actor=actor)
+            raise
+        try:
+            update_lease = self.activity_registry.try_begin_update()
+        except OneCHistoryActivityConflict as exc:
+            self._extend_preview_ttl(request.preview_id, pending)
+            pending.analysis_lock.release()
+            if actor:
+                self.repository.record_attempt(exc.code, actor=actor)
+            raise
+        except Exception:
+            pending.analysis_lock.release()
+            raise
         file_sha256 = pending.file_sha256
         staging: Path | None = None
         committed = False
+        terminal = False
         post_commit_warnings: list[str] = []
         try:
             detected = pending.detected
@@ -618,7 +665,11 @@ class OneCHistoryImportService:
                 and active.get("sha256") == file_sha256
                 and active.get("semantic_import_fingerprint") == semantic_import_fingerprint
             ):
-                self.repository.record_attempt("already_active", file_sha256=file_sha256, warning_count=len(parsed.warnings))
+                self.repository.record_attempt(
+                    "already_active", file_sha256=file_sha256, warning_count=len(parsed.warnings),
+                    actor=actor, resulting_catalog_version=self.repository.catalog_version(),
+                )
+                terminal = True
                 return {
                     "status": "already_active",
                     "idempotent": True,
@@ -658,7 +709,10 @@ class OneCHistoryImportService:
                 committed = True
                 staging = None
             try:
-                self.repository.record_attempt("succeeded", file_sha256=file_sha256, warning_count=len(parsed.warnings))
+                self.repository.record_attempt(
+                    "succeeded", file_sha256=file_sha256, warning_count=len(parsed.warnings),
+                    actor=actor, resulting_catalog_version=self.repository.catalog_version(),
+                )
             except Exception:
                 post_commit_warnings.append("Снимок активирован, но статус попытки импорта не удалось обновить.")
             try:
@@ -666,6 +720,7 @@ class OneCHistoryImportService:
             except Exception:
                 active_metadata = None
                 post_commit_warnings.append("Снимок активирован, но его статус не удалось прочитать.")
+            terminal = True
             return {
                 "status": "succeeded",
                 "idempotent": False,
@@ -674,29 +729,45 @@ class OneCHistoryImportService:
                 "warnings": post_commit_warnings,
             }
         except OneCImportError as exc:
+            terminal = True
             if committed:
                 try:
                     active_metadata = self.repository.active_metadata()
                 except Exception:
                     active_metadata = None
+                try:
+                    self.repository.record_attempt(
+                        "succeeded_with_warning", file_sha256=file_sha256,
+                        warning_count=len(parsed.warnings), actor=actor,
+                        resulting_catalog_version=self.repository.catalog_version(),
+                    )
+                except Exception:
+                    pass
                 return {
                     "status": "succeeded", "idempotent": False,
                     "active_import": active_metadata, "profile_id": pending.profile_id,
                     "warnings": [*post_commit_warnings, "Снимок активирован; завершение служебного учёта потребовало проверки."],
                 }
             try:
-                self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_VALIDATION_FAILED")
+                self.repository.record_attempt(
+                    "failed", file_sha256=file_sha256, error_code="IMPORT_VALIDATION_FAILED", actor=actor,
+                )
             except Exception:
                 pass
             raise
         except Exception as exc:
+            terminal = True
             if committed:
                 try:
                     active_metadata = self.repository.active_metadata()
                 except Exception:
                     active_metadata = None
                 try:
-                    self.repository.record_attempt("succeeded_with_warning", file_sha256=file_sha256, warning_count=len(parsed.warnings))
+                    self.repository.record_attempt(
+                        "succeeded_with_warning", file_sha256=file_sha256,
+                        warning_count=len(parsed.warnings), actor=actor,
+                        resulting_catalog_version=self.repository.catalog_version(),
+                    )
                 except Exception:
                     pass
                 return {
@@ -705,21 +776,26 @@ class OneCHistoryImportService:
                     "warnings": [*post_commit_warnings, "Снимок активирован; служебное обновление после фиксации завершилось с ошибкой."],
                 }
             try:
-                self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_FAILED")
+                self.repository.record_attempt("failed", file_sha256=file_sha256, error_code="IMPORT_FAILED", actor=actor)
             except Exception:
                 pass
             raise OneCImportError("Не удалось активировать историю закупок. Текущий снимок не изменён.") from exc
         finally:
-            try:
-                pending.path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if terminal:
+                with self._lock:
+                    if self._pending.get(request.preview_id) is pending:
+                        self._pending.pop(request.preview_id, None)
+                try:
+                    pending.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             if staging is not None:
                 try:
                     staging.unlink(missing_ok=True)
                 except OSError:
                     pass
             pending.analysis_lock.release()
+            update_lease.release()
 
 
 __all__ = ["OneCHistoryImportService"]

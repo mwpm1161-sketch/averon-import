@@ -259,6 +259,7 @@ def test_session_login_generic_errors_cookies_csrf_and_logout(session_api, monke
         "role": "admin",
         "capabilities": {
             "settings": True,
+            "one_c_history_import": True,
             "provider_maintenance": True,
             "admin_reports": True,
             "user_management": True,

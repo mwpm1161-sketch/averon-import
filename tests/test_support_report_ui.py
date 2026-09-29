@@ -34,7 +34,7 @@ def test_api_error_keeps_legacy_message_and_structured_export_metadata():
 
 def test_user_and_admin_report_entry_are_capability_gated_and_boot_is_lazy():
     boot = APP_JS.split("async function boot()", 1)[1].split("function updateCloudStatus", 1)[0]
-    assert '"#settings-button").hidden = !isAdmin' in boot
+    assert '"#settings-button").hidden = capabilities.settings !== true && capabilities.one_c_history_import !== true' in boot
     assert 'if (currentUser?.capabilities?.admin_reports === true)' in boot
     assert '"#admin-reports-button"' in boot
     assert "/api/support/reports" not in boot

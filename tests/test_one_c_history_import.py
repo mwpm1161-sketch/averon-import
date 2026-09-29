@@ -16,6 +16,7 @@ from openpyxl import Workbook
 
 from averon_import.core.unit_normalization import normalize_unit_family
 from averon_import.services.one_c_history.models import ImportMappingRequest, PreviewMappingRequest
+from averon_import.services.one_c_history.activity import OneCHistoryActivityConflict, OneCHistoryActivityRegistry
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.one_c_history.service import OneCHistoryImportService
 from averon_import.services.one_c_history.xlsx_import import (
@@ -688,6 +689,134 @@ def test_preview_is_bounded_path_free_and_deletes_temp_after_success(tmp_path):
     with sqlite3.connect(service.repository.database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("SELECT COUNT(*) FROM purchase_events").fetchone()[0] == 3
+
+
+def test_preview_ownership_busy_retry_profile_permission_and_actor_audit(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _xlsx_bytes(tmp_path / "owned.xlsx", rows=_hierarchical_rows())
+    registry = OneCHistoryActivityRegistry()
+    service.activity_registry = registry
+
+    async def exercise():
+        preview = await service.create_preview(_upload(payload), owner_key="user:a")
+        other_mapping = PreviewMappingRequest(
+            sheet_name=preview["sheet_name"],
+            header_row=preview["header_row"],
+            layout_type=preview["layout_type"],
+            field_mapping=preview["field_mapping"],
+            group_header_row=preview.get("group_header_row"),
+            event_header_row=preview.get("event_header_row"),
+            group_field_mapping=preview.get("group_field_mapping") or {},
+            event_field_mapping=preview.get("event_field_mapping") or {},
+            item_name_parse_strategy=preview["item_name_parse_strategy"],
+        )
+        with pytest.raises(OneCImportError):
+            await service.inspect_preview_sheet(preview["preview_id"], preview["sheet_name"], owner_key="user:b")
+        with pytest.raises(OneCImportError):
+            await service.analyze_preview(preview["preview_id"], other_mapping, owner_key="user:b")
+
+        inspected = await service.inspect_preview_sheet(
+            preview["preview_id"], preview["sheet_name"], owner_key="user:a",
+        )
+        assert inspected["sheet_name"] == preview["sheet_name"]
+        analyzed = await service.analyze_preview(preview["preview_id"], other_mapping, owner_key="user:a")
+        request = ImportMappingRequest(
+            preview_id=preview["preview_id"],
+            sheet_name=analyzed["sheet_name"],
+            header_row=analyzed["header_row"],
+            group_header_row=analyzed.get("group_header_row"),
+            event_header_row=analyzed.get("event_header_row"),
+            layout_type=analyzed["layout_type"],
+            field_mapping=analyzed["field_mapping"],
+            group_field_mapping=analyzed.get("group_field_mapping") or {},
+            event_field_mapping=analyzed.get("event_field_mapping") or {},
+            item_name_parse_strategy=analyzed["item_name_parse_strategy"],
+        )
+        with pytest.raises(OneCImportError):
+            await service.import_confirmed(request, owner_key="user:b")
+        assert preview["preview_id"] in service._pending
+
+        with pytest.raises(PermissionError):
+            await service.import_confirmed(
+                request.model_copy(update={"save_profile": True, "profile_name": "Глобальный"}),
+                owner_key="user:a", can_manage_profiles=False,
+            )
+        assert preview["preview_id"] in service._pending
+
+        reader = registry.acquire_sourcing()
+        with pytest.raises(OneCHistoryActivityConflict) as busy:
+            await service.import_confirmed(request, owner_key="user:a")
+        assert busy.value.code == "ONE_C_HISTORY_IN_USE"
+        record = service._pending[preview["preview_id"]]
+        assert record.path.is_file()
+        assert record.analysis_key == service._analysis_key(record.detected)
+        reader.release()
+
+        actor = {"user_id": "user-a-id", "username": "colleague", "role": "user"}
+        result = await service.import_confirmed(request, owner_key="user:a", actor=actor, can_manage_profiles=False)
+        second_preview = await service.create_preview(_upload(payload), owner_key="user:b")
+        second_result = await service.import_confirmed(
+            request.model_copy(update={"preview_id": second_preview["preview_id"]}),
+            owner_key="user:b",
+            actor={"user_id": "user-b-id", "username": "another-user", "role": "user"},
+            can_manage_profiles=False,
+        )
+        return preview, result, second_result
+
+    preview, result, second_result = asyncio.run(exercise())
+    assert result["status"] == "succeeded"
+    assert second_result["status"] == "already_active" and second_result["idempotent"] is True
+    assert result["active_import"]["semantic_import_fingerprint"] == second_result["active_import"]["semantic_import_fingerprint"]
+    assert preview["preview_id"] not in service._pending
+    audit = service.repository.public_status()["recent_audit"]
+    assert audit[-2]["user_id"] == "user-a-id"
+    assert audit[-2]["username"] == "colleague"
+    assert audit[-2]["role"] == "user"
+    assert audit[-2]["outcome"] == "succeeded"
+    assert audit[-2]["catalog_version"] == service.repository.catalog_version()
+    assert audit[-1]["user_id"] == "user-b-id"
+    assert audit[-1]["outcome"] == "already_active"
+    active = service.repository.active_metadata()
+    assert "user_id" not in active and "username" not in active
+
+
+def test_preview_bounds_are_per_owner_and_global_without_cross_user_eviction(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _xlsx_bytes(tmp_path / "bounded.xlsx", rows=_hierarchical_rows())
+
+    async def exercise():
+        first_user = [await service.create_preview(_upload(payload), owner_key="user:a") for _ in range(3)]
+        other_user = await service.create_preview(_upload(payload), owner_key="user:b")
+        await service.create_preview(_upload(payload), owner_key="user:a")
+        assert other_user["preview_id"] in service._pending
+        assert first_user[0]["preview_id"] not in service._pending
+        assert sum(item.owner_key == "user:a" for item in service._pending.values()) == 3
+
+        for index in range(2, 18):
+            await service.create_preview(_upload(payload), owner_key=f"user:{index}")
+        assert len(service._pending) == 20
+        with pytest.raises(OneCImportError, match="Слишком много подготовленных отчётов"):
+            await service.create_preview(_upload(payload), owner_key="user:20")
+        assert len(service._pending) == 20
+        assert other_user["preview_id"] in service._pending
+
+    asyncio.run(exercise())
+
+
+def test_expired_preview_is_removed_on_next_capacity_check(tmp_path):
+    service = _make_service(tmp_path)
+    payload = _xlsx_bytes(tmp_path / "expiry.xlsx", rows=_hierarchical_rows())
+
+    async def exercise():
+        expired = await service.create_preview(_upload(payload), owner_key="user:a")
+        record = service._pending[expired["preview_id"]]
+        path = record.path
+        record.expires_at = 0
+        await service.create_preview(_upload(payload), owner_key="user:b")
+        assert expired["preview_id"] not in service._pending
+        assert not path.exists()
+
+    asyncio.run(exercise())
 
 
 def test_same_sha_is_idempotent_and_profiles_survive_snapshot_replacement(tmp_path):

@@ -63,10 +63,16 @@ from averon_import.services.auth import (
     login_work_guard,
     require_admin,
     require_authenticated,
+    require_one_c_history_import,
 )
 from averon_import.services.export_service import ExcelExportService
 from averon_import.services.jobs import JobService
-from averon_import.services.one_c_history import OneCHistoryImportService, OneCHistoryRepository
+from averon_import.services.one_c_history import (
+    OneCHistoryActivityConflict,
+    OneCHistoryActivityRegistry,
+    OneCHistoryImportService,
+    OneCHistoryRepository,
+)
 from averon_import.services.one_c_history.models import ImportMappingRequest, PreviewMappingRequest
 from averon_import.services.one_c_history.xlsx_import import OneCImportError
 from averon_import.services.document_mutation import DocumentMutationLocks
@@ -165,7 +171,8 @@ smart_ai = SmartAIIntegration(service=ai_service)
 job_service = JobService(max_workers=1)
 app_settings_service = AppSettingsService(DATA_DIR)
 one_c_history_repository = OneCHistoryRepository(DATA_DIR)
-one_c_history_service = OneCHistoryImportService(one_c_history_repository)
+one_c_history_activity = OneCHistoryActivityRegistry()
+one_c_history_service = OneCHistoryImportService(one_c_history_repository, one_c_history_activity)
 secret_store = create_secret_store(DATA_DIR)
 yandex_vision_provider = YandexVisionProvider(
     settings_service=app_settings_service,
@@ -359,54 +366,112 @@ def admin_health():
     return payload
 
 
+def _one_c_history_owner_key(user: CurrentUser) -> str:
+    if user.user_id:
+        return f"id:{user.user_id[:128]}"
+    return f"username:{normalize_username(user.username)[:128]}"
+
+
+def _one_c_history_actor(user: CurrentUser) -> dict[str, str | None]:
+    return {"user_id": user.user_id, "username": user.username, "role": user.role.value}
+
+
+def _one_c_history_status(*, include_audit: bool) -> dict[str, Any]:
+    payload = one_c_history_repository.public_status(include_audit=include_audit)
+    payload["activity"] = one_c_history_activity.status()
+    return payload
+
+
+def _one_c_history_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, OneCHistoryActivityConflict):
+        return HTTPException(status_code=409, detail={
+            "code": exc.code,
+            "message": exc.message,
+            "active_sourcing_count": exc.active_sourcing_count,
+        })
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, OneCImportError):
+        return HTTPException(status_code=400, detail=str(exc))
+    raise exc
+
+
 @app.get("/api/admin/one-c-history", dependencies=[Depends(require_admin)])
-def get_one_c_history_status():
-    return one_c_history_repository.public_status()
+def get_one_c_history_status(_admin: CurrentUser = Depends(require_admin)):
+    return _one_c_history_status(include_audit=True)
+
+
+@app.get("/api/one-c-history")
+def get_capability_one_c_history_status(user: CurrentUser = Depends(require_one_c_history_import)):
+    return _one_c_history_status(include_audit=user.capabilities["settings"])
 
 
 @app.post("/api/admin/one-c-history/previews", dependencies=[Depends(require_admin)])
+@app.post("/api/one-c-history/previews")
 async def create_one_c_history_preview(
     file: UploadFile = File(...),
     profile_id: str | None = Form(default=None),
+    user: CurrentUser = Depends(require_one_c_history_import),
 ):
     try:
-        return await one_c_history_service.create_preview(file, profile_id=profile_id)
-    except OneCImportError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await one_c_history_service.create_preview(
+            file, profile_id=profile_id, owner_key=_one_c_history_owner_key(user),
+        )
+    except Exception as exc:
+        raise _one_c_history_http_error(exc) from exc
 
 
 @app.post("/api/admin/one-c-history/previews/{preview_id}/mapping", dependencies=[Depends(require_admin)])
-async def analyze_one_c_history_preview(preview_id: str, request: PreviewMappingRequest):
+@app.post("/api/one-c-history/previews/{preview_id}/mapping")
+async def analyze_one_c_history_preview(
+    preview_id: str,
+    request: PreviewMappingRequest,
+    user: CurrentUser = Depends(require_one_c_history_import),
+):
     try:
-        return await one_c_history_service.analyze_preview(preview_id, request)
-    except OneCImportError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await one_c_history_service.analyze_preview(
+            preview_id, request, owner_key=_one_c_history_owner_key(user),
+        )
+    except Exception as exc:
+        raise _one_c_history_http_error(exc) from exc
 
 
 @app.get("/api/admin/one-c-history/previews/{preview_id}/sheets/{sheet_name}", dependencies=[Depends(require_admin)])
+@app.get("/api/one-c-history/previews/{preview_id}/sheets/{sheet_name}")
 async def inspect_one_c_history_sheet(
     preview_id: str,
     sheet_name: str,
     header_row: int | None = Query(default=None, ge=1, le=50),
     group_header_row: int | None = Query(default=None, ge=1, le=50),
     event_header_row: int | None = Query(default=None, ge=1, le=50),
+    user: CurrentUser = Depends(require_one_c_history_import),
 ):
     try:
         return await one_c_history_service.inspect_preview_sheet(
             preview_id, sheet_name, header_row,
             group_header_row=group_header_row,
             event_header_row=event_header_row,
+            owner_key=_one_c_history_owner_key(user),
         )
-    except OneCImportError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise _one_c_history_http_error(exc) from exc
 
 
 @app.post("/api/admin/one-c-history/imports", dependencies=[Depends(require_admin)])
-async def confirm_one_c_history_import(request: ImportMappingRequest):
+@app.post("/api/one-c-history/imports")
+async def confirm_one_c_history_import(
+    request: ImportMappingRequest,
+    user: CurrentUser = Depends(require_one_c_history_import),
+):
     try:
-        return await one_c_history_service.import_confirmed(request)
-    except OneCImportError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await one_c_history_service.import_confirmed(
+            request,
+            owner_key=_one_c_history_owner_key(user),
+            actor=_one_c_history_actor(user),
+            can_manage_profiles=user.capabilities["settings"],
+        )
+    except Exception as exc:
+        raise _one_c_history_http_error(exc) from exc
 
 
 @app.delete("/api/admin/one-c-history/profiles/{profile_id}", dependencies=[Depends(require_admin)])
@@ -1844,7 +1909,9 @@ def sourcing_providers():
 
 @app.get("/api/sourcing/history-status", dependencies=[Depends(require_authenticated)])
 def sourcing_history_status():
-    return one_c_history_repository.sourcing_status()
+    status = dict(one_c_history_repository.sourcing_status())
+    status["activity"] = one_c_history_activity.status()
+    return status
 
 
 @app.post("/api/sourcing/providers/lemana_b2b/sync", dependencies=[Depends(require_admin)])
@@ -1997,16 +2064,24 @@ def sourcing_understand(request: SourcingRowRequest):
 
 @app.post("/api/sourcing/search", dependencies=[Depends(require_authenticated)])
 def sourcing_search(request: SourcingRowRequest):
+    lease = None
     try:
+        if request.source_mode != SourcingSourceMode.PROVIDER_ONLY:
+            lease = one_c_history_activity.acquire_sourcing()
         result = sourcing_service.search_row_routed(
             request.row,
             source_mode=request.source_mode,
             provider_key=request.provider,
             limit=max(1, min(request.limit, 100)),
         )
+        return _sourcing_payload(result)
+    except OneCHistoryActivityConflict as exc:
+        raise _one_c_history_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return _sourcing_payload(result)
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 @app.post("/api/sourcing/search-intent", dependencies=[Depends(require_authenticated)])
@@ -2054,10 +2129,12 @@ def _submit_sourcing_project_job(
         and row.get("row_type") in {"item", "component", "item_candidate"}
     )
     progress_state = {"current": 0, "total": eligible_total}
+    history_lease = None
 
     def run(progress):
         telemetry: list[dict[str, Any]] = []
         catalog_version = "unknown"
+        captured_history_version: str | None = None
 
         def tracked_progress(current: int, total: int, message: str) -> None:
             progress_state["current"] = current
@@ -2077,6 +2154,8 @@ def _submit_sourcing_project_job(
                     ai_rerank=False,
                 )
             else:
+                captured_history_version = one_c_history_repository.catalog_version()
+                catalog_version = captured_history_version or "unknown"
                 result = sourcing_service.search_project_routed(
                     rows,
                     source_mode=source_mode,
@@ -2086,7 +2165,8 @@ def _submit_sourcing_project_job(
                     telemetry=telemetry.append,
                     ai_rerank=False,
                 )
-                catalog_version = result.catalog_version or "unknown"
+                _assert_project_history_version(result, captured_history_version)
+                catalog_version = result.catalog_version or catalog_version
             payload = _sourcing_payload(result)
             if history is not None and run_id is not None:
                 completed_at = datetime.now(timezone.utc).isoformat()
@@ -2122,9 +2202,42 @@ def _submit_sourcing_project_job(
                     source_mode=source_mode.value,
                 )
             raise
+        finally:
+            if history_lease is not None:
+                history_lease.release()
 
-    job = _submit_document_job(document_id, run) if document_id is not None else job_service.submit(run)
-    return job.public()
+    if source_mode != SourcingSourceMode.PROVIDER_ONLY:
+        try:
+            history_lease = one_c_history_activity.acquire_sourcing()
+        except OneCHistoryActivityConflict as exc:
+            raise _one_c_history_http_error(exc) from exc
+    try:
+        job = _submit_document_job(document_id, run) if document_id is not None else job_service.submit(run)
+        return job.public()
+    except Exception:
+        if history_lease is not None:
+            history_lease.release()
+        raise
+
+
+def _assert_project_history_version(result: Any, captured_version: str | None) -> None:
+    payload = _sourcing_payload(result)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Project sourcing result has an invalid shape")
+    rows = payload.get("results", [])
+    if not isinstance(rows, list):
+        raise RuntimeError("Project sourcing rows have an invalid shape")
+    versions: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        route = row.get("route")
+        if isinstance(route, dict):
+            version = route.get("history_catalog_version")
+            if isinstance(version, str) and version:
+                versions.add(version)
+    if len(versions) > 1 or (versions and versions != {captured_version}):
+        raise RuntimeError("A project sourcing run returned mixed 1C history snapshots")
 
 
 @app.post("/api/sourcing/search-all", dependencies=[Depends(require_authenticated)])

@@ -377,6 +377,7 @@
           <label class="sourcing-mode-field" for="sourcing-source-mode"><span class="field-label">Источник подбора</span><select class="select" id="sourcing-source-mode"><option value="one_c_then_provider">История 1С → поставщик</option><option value="one_c_only">Только история 1С</option><option value="provider_only">Только поставщик</option></select></label>
           <div class="sourcing-mode-status"><p id="sourcing-history-status" role="status">Проверяем доступность истории 1С…</p><button class="button text" type="button" id="sourcing-history-refresh">Обновить статус</button></div>
           <p id="sourcing-mode-change-note" class="sourcing-mode-change-note" role="status" hidden>Режим изменён. Запустите подбор повторно, чтобы применить.</p>
+          <p id="sourcing-stale-history-warning" class="sourcing-history-stale-warning" role="status" hidden>История 1С была обновлена после этого подбора. Запустите подбор повторно, чтобы использовать новый отчёт.</p>
         </section>
         <div id="sourcing-content" class="sourcing-content"><p class="hint">Выберите позицию, чтобы начать поиск.</p></div>
     </div>
@@ -397,8 +398,9 @@
 
   <dialog class="modal" id="settings-modal">
     <form method="dialog" class="modal-card settings-card" id="settings-form">
-      <div class="modal-header"><div><span class="eyebrow">Yandex Cloud</span><h2>Настройки распознавания</h2><p>API-ключ записывается в защищённое хранилище и никогда не показывается обратно.</p></div><button class="icon-button" value="cancel" aria-label="Закрыть">×</button></div>
-      <div class="settings-grid">
+      <div class="modal-header settings-admin-section"><div><span class="eyebrow">Yandex Cloud</span><h2>Настройки распознавания</h2><p>API-ключ записывается в защищённое хранилище и никогда не показывается обратно.</p></div><button class="icon-button" value="cancel" aria-label="Закрыть">×</button></div>
+      <div class="modal-header settings-user-header" hidden><div><span class="eyebrow">Настройки</span><h2>История закупок 1С</h2><p>Вам доступна загрузка истории закупок 1С. Системные настройки изменяет администратор.</p></div></div>
+      <div class="settings-grid settings-admin-section">
         <div>
           <label class="field-label" for="settings-folder-id">Folder ID</label>
           <input class="input" id="settings-folder-id" autocomplete="off">
@@ -462,15 +464,16 @@
           <p class="hint">Отдельный ключ AI Studio; значение не отображается и не сохраняется в settings.json.</p>
         </div>
       </div>
-      <p class="mode-status" id="settings-connection"></p>
+      <div class="settings-admin-section"><p class="mode-status" id="settings-connection"></p>
       <p class="mode-status" id="settings-ai-connection"></p>
-      <p class="mode-status" id="settings-etm-connection"></p>
+      <p class="mode-status" id="settings-etm-connection"></p></div>
       <section class="one-c-history-panel" aria-labelledby="one-c-history-title">
         <div class="one-c-history-heading">
-          <div><span class="eyebrow">Администрирование</span><h3 id="one-c-history-title">История закупок 1С</h3><p>Загрузите отчёт, проверьте сопоставление и подтвердите замену текущего снимка.</p></div>
+          <div><span class="eyebrow settings-admin-section">Администрирование</span><h3 id="one-c-history-title">История закупок 1С</h3><p>Загрузите отчёт, проверьте сопоставление и подтвердите замену текущего снимка.</p></div>
           <button class="button ghost" type="button" id="one-c-history-refresh">Обновить статус</button>
         </div>
         <p class="mode-status" id="one-c-history-status" role="status">История ещё не импортирована.</p>
+        <p class="mode-status history-activity-warning" id="one-c-history-activity" role="status" hidden></p>
         <div class="one-c-history-upload">
           <label><span class="field-label">Отчёт XLSX</span><input class="input" id="one-c-history-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>
           <label><span class="field-label">Профиль импорта</span><select class="select" id="one-c-history-profile"><option value="">Автоматически определить</option></select></label>
@@ -489,8 +492,8 @@
           <div id="one-c-history-group-mappings" class="one-c-history-mappings"></div>
           <h4>Сопоставление событий</h4>
           <div id="one-c-history-mappings" class="one-c-history-mappings"></div>
-          <label class="one-c-history-save-profile"><input type="checkbox" id="one-c-history-save-profile"> Сохранить или обновить профиль</label>
-          <div class="one-c-history-controls">
+          <label class="one-c-history-save-profile settings-admin-section"><input type="checkbox" id="one-c-history-save-profile"> Сохранить или обновить профиль</label>
+          <div class="one-c-history-controls settings-admin-section">
             <label><span class="field-label">Название профиля</span><input class="input" id="one-c-history-profile-name" maxlength="100" placeholder="Например, 1С — поступления"></label>
             <label><span class="field-label">Обновить профиль</span><select class="select" id="one-c-history-profile-update"><option value="">Создать новый</option></select></label>
           </div>
@@ -502,7 +505,7 @@
           </div>
         </div>
       </section>
-      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary" type="button" id="save-settings">Сохранить</button></div>
+      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button primary settings-admin-section" type="button" id="save-settings">Сохранить</button></div>
     </form>
   </dialog>
 

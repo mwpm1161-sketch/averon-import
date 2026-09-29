@@ -129,16 +129,43 @@ class OneCHistoryRepository:
             )
             return True
 
-    def record_attempt(self, status: str, *, file_sha256: str | None = None, warning_count: int = 0, error_code: str | None = None) -> None:
-        payload = self._read_json(self.status_path, {})
-        payload["last_attempt"] = {
-            "status": status,
-            "attempted_at": utc_now(),
-            "sha256": file_sha256,
-            "warning_count": max(0, int(warning_count)),
-            "error_code": error_code,
-        }
-        self._atomic_json(self.status_path, payload)
+    def record_attempt(
+        self,
+        status: str,
+        *,
+        file_sha256: str | None = None,
+        warning_count: int = 0,
+        error_code: str | None = None,
+        actor: dict[str, str | None] | None = None,
+        resulting_catalog_version: str | None = None,
+    ) -> None:
+        with self._lock:
+            payload = self._read_json(self.status_path, {})
+            attempted_at = utc_now()
+            payload["last_attempt"] = {
+                "status": status,
+                "attempted_at": attempted_at,
+                "sha256": file_sha256,
+                "warning_count": max(0, int(warning_count)),
+                "error_code": error_code,
+            }
+            if actor and status in {
+                "succeeded", "succeeded_with_warning", "already_active", "failed",
+                "ONE_C_HISTORY_IN_USE", "ONE_C_HISTORY_UPDATE_IN_PROGRESS",
+            }:
+                recent = payload.get("recent_audit")
+                if not isinstance(recent, list):
+                    recent = []
+                recent.append({
+                    "user_id": (actor.get("user_id") or "")[:128] or None,
+                    "username": (actor.get("username") or "")[:128] or None,
+                    "role": (actor.get("role") or "")[:20] or None,
+                    "attempted_at": attempted_at,
+                    "outcome": status,
+                    "catalog_version": (resulting_catalog_version or "")[:100] or None,
+                })
+                payload["recent_audit"] = recent[-20:]
+            self._atomic_json(self.status_path, payload)
 
     def active_metadata(self) -> dict | None:
         if not self.database_path.is_file():
@@ -567,13 +594,29 @@ class OneCHistoryRepository:
                 if connection is not None:
                     connection.close()
 
-    def public_status(self) -> dict:
+    def public_status(self, *, include_audit: bool = True) -> dict:
         status = self._read_json(self.status_path, {})
-        return {
-            "active_import": self.active_metadata(),
-            "last_attempt": status.get("last_attempt") if isinstance(status, dict) else None,
+        last_attempt = status.get("last_attempt") if isinstance(status, dict) else None
+        if not include_audit and isinstance(last_attempt, dict):
+            last_attempt = {key: last_attempt.get(key) for key in ("status", "attempted_at")}
+        active = self.active_metadata()
+        if not include_audit and isinstance(active, dict):
+            safe_keys = {
+                "imported_at", "period_start", "period_end", "item_count", "group_count",
+                "physical_row_count", "event_count", "distinct_counterparty_count",
+                "unit_vocabulary_count", "usable_price_event_count", "warning_count",
+                "warnings", "mapping_profile_id",
+            }
+            active = {key: value for key, value in active.items() if key in safe_keys}
+        result = {
+            "active_import": active,
+            "last_attempt": last_attempt,
             "profiles": [item.model_dump(mode="json") for item in self.profiles()],
         }
+        if include_audit and isinstance(status, dict):
+            audit = status.get("recent_audit")
+            result["recent_audit"] = audit[-20:] if isinstance(audit, list) else []
+        return result
 
     def build_staging_snapshot(
         self,

@@ -5,6 +5,14 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _sources():
+    return (
+        (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8"),
+        (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8"),
+        (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8"),
+    )
+
+
 def test_admin_settings_has_bounded_one_c_import_controls():
     template = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
     script = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
@@ -63,12 +71,63 @@ def test_one_c_history_ui_only_loads_on_open_or_explicit_action_and_does_not_per
     end = script.index("function updateSourcingProviderFields", start)
     code = script[start:end]
 
-    assert 'loadOneCHistoryStatus();' in script[script.index('$("#settings-button").addEventListener'):]
-    assert '$("#one-c-history-refresh").addEventListener("click",loadOneCHistoryStatus)' in script
+    assert 'Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()])' in script[script.index('$("#settings-button").addEventListener'):]
+    assert '$("#one-c-history-refresh").addEventListener("click",() => { void Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()]); })' in script
     assert "setInterval(" not in code
     assert "localStorage" not in code
     assert "sessionStorage" not in code
     assert not re.search(r"loadOneCHistoryStatus\(\);\s*\n\s*boot", code)
+
+
+def test_user_settings_view_is_capability_scoped_and_never_loads_system_settings():
+    template = (ROOT / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    boot = script.split("async function boot()", 1)[1].split("function updateCloudStatus", 1)[0]
+    click = script.split('$("#settings-button").addEventListener("click",()=>{', 1)[1].split('$("#one-c-history-refresh")', 1)[0]
+
+    assert 'capabilities.settings !== true && capabilities.one_c_history_import !== true' in boot
+    assert 'if (isAdmin) {\n        state.settings = await api("/api/settings")' in boot
+    assert 'section.hidden = !isAdmin' in click
+    assert 'if (isAdmin) initializeSettings(state.settings || {})' in click
+    assert '$(".settings-user-header").hidden = isAdmin' in click
+    assert 'class="settings-grid settings-admin-section"' in template
+    assert 'id="settings-connection"' in template and 'settings-admin-section' in template.split('id="settings-connection"', 1)[0][-100:]
+    assert 'id="save-settings"' in template and 'settings-admin-section' in template.split('id="save-settings"', 1)[0][-100:]
+    assert 'class="one-c-history-save-profile settings-admin-section"' in template
+    assert 'class="one-c-history-controls settings-admin-section"' in template
+    assert 'id="one-c-history-profile"' in template  # existing profile selector remains available
+    assert "async function saveSettings() {\n  if (state.currentUser?.capabilities?.settings !== true) return;" in script
+    assert 'api("/api/one-c-history")' in script
+    assert 'api("/api/one-c-history/previews"' in script
+    assert 'api("/api/one-c-history/imports"' in script
+
+
+def test_shared_history_activity_disables_only_final_import_and_busy_retry_keeps_preview():
+    _template, script, css = _sources()
+    status = script.split("function renderOneCHistoryStatus()", 1)[1].split("function renderOneCHistoryMapping", 1)[0]
+    button = script.split("function updateOneCHistoryImportButton()", 1)[1].split("async function startOneCHistoryPreview", 1)[0]
+    importing = script.split("async function importOneCHistory()", 1)[1].split("function updateSourcingProviderFields", 1)[0]
+
+    assert "activity.active_sourcing_count" in status
+    assert "activity.replacement_allowed === false" in button
+    assert "state.oneCHistory.preview = null" not in importing.split("} catch (error)", 1)[1].split("} finally", 1)[0]
+    assert "loadOneCHistoryStatus(), loadSourcingHistoryStatus()" in importing
+    assert "История 1С сейчас используется в" in status
+    assert ".history-activity-warning,.sourcing-history-stale-warning" in css
+
+
+def test_global_import_confirmation_and_stale_result_warning_are_neutral_and_manual():
+    template, script, _css = _sources()
+    importing = script.split("async function importOneCHistory()", 1)[1].split("function updateSourcingProviderFields", 1)[0]
+    stale = script.split("function resultHistoryCatalogVersions", 1)[1].split("async function loadSourcingHistoryStatus", 1)[0]
+
+    assert "Заменить общую историю закупок 1С?" in importing
+    assert "Текущий период:" in importing and "Новый период:" in importing
+    assert "После активации новый отчёт будет использоваться всеми пользователями." in importing
+    assert 'id="sourcing-stale-history-warning"' in template
+    assert "История 1С была обновлена после этого подбора. Запустите подбор повторно, чтобы использовать новый отчёт." in template
+    assert "history_catalog_version" in stale and "warning.hidden" in stale
+    assert "runProjectSourcing" not in stale and "openSourcingForRow" not in stale
 
 
 def test_one_c_history_settings_layout_constrains_controls_and_keeps_table_scroll_local():

@@ -42,6 +42,7 @@ class CurrentUser:
         is_admin = self.role is Role.ADMIN
         return {
             "settings": is_admin,
+            "one_c_history_import": True,
             "provider_maintenance": is_admin,
             "admin_reports": is_admin,
             "user_management": is_admin,
@@ -277,6 +278,12 @@ def require_admin(user: CurrentUser = Depends(require_authenticated)) -> Current
     return user
 
 
+def require_one_c_history_import(user: CurrentUser = Depends(require_authenticated)) -> CurrentUser:
+    if not user.capabilities.get("one_c_history_import", False):
+        raise _auth_error(403, "Недостаточно прав")
+    return user
+
+
 __all__ = [
     "AuthConfig",
     "CurrentUser",
@@ -290,5 +297,6 @@ __all__ = [
     "login_work_guard",
     "require_admin",
     "require_authenticated",
+    "require_one_c_history_import",
     "resolve_current_user",
 ]

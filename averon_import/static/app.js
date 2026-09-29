@@ -147,6 +147,7 @@ async function api(url, options = {}) {
     try {
       payload = await response.json();
       if (typeof payload?.detail === "string" && payload.detail.trim()) message = payload.detail;
+      else if (typeof payload?.detail?.message === "string" && payload.detail.message.trim()) message = payload.detail.message;
     } catch (_) {}
     const error = payload?.error && typeof payload.error === "object" ? payload.error : {};
     const detail = payload?.detail && typeof payload.detail === "object" ? payload.detail : {};
@@ -864,8 +865,9 @@ async function boot() {
       state.authMode = authMode;
       state.authState = "authenticated";
       updateContextualSupportButton();
-      const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
-      $("#settings-button").hidden = !isAdmin;
+      const capabilities = currentUser?.capabilities || {};
+      $("#settings-button").hidden = capabilities.settings !== true && capabilities.one_c_history_import !== true;
+      const isAdmin = capabilities.settings === true;
       $("#logout-button").hidden = authMode !== "session";
       $("#users-button").hidden = currentUser?.capabilities?.user_management !== true;
       const reportsButton = $("#admin-reports-button");
@@ -1055,6 +1057,21 @@ function renderSourcingHistoryControls() {
     statusNode.textContent = `История 1С активна · Период данных: ${sourcingHistoryPeriod(history)} · Событий закупки: ${sourcingCount(history.event_count)}`;
   }
   if (note) note.hidden = !sourcing.modeChangedAfterResult;
+  renderStaleSourcingHistoryWarning();
+}
+
+function resultHistoryCatalogVersions(result) {
+  if (!result || typeof result !== "object") return [];
+  const rows = Array.isArray(result.results) ? result.results : [result];
+  return rows.map((row) => row?.route?.history_catalog_version).filter((version) => typeof version === "string" && version);
+}
+
+function renderStaleSourcingHistoryWarning() {
+  const warning = $("#sourcing-stale-history-warning");
+  if (!warning) return;
+  const activeVersion = state.sourcing.historyStatus?.catalog_version;
+  const versions = resultHistoryCatalogVersions(state.sourcing.result);
+  warning.hidden = !activeVersion || !versions.some((version) => version !== activeVersion);
 }
 
 async function loadSourcingHistoryStatus() {
@@ -1129,7 +1146,7 @@ function handleSourcingModeChange(event) {
 async function loadOneCHistoryStatus() {
   const generation = state.oneCHistory.requestGeneration;
   try {
-    const status = await api("/api/admin/one-c-history");
+    const status = await api("/api/one-c-history");
     if (!isCurrentOneCHistoryRequest(generation)) return;
     state.oneCHistory.status = status;
     renderOneCHistoryStatus();
@@ -1160,6 +1177,17 @@ function renderOneCHistoryStatus() {
   }
   const lastAttempt = status.last_attempt;
   if (lastAttempt) node.textContent += ` Последняя попытка: ${lastAttempt.status} · ${formatOneCHistoryDate(lastAttempt.attempted_at)}.`;
+  const activity = status.activity || {};
+  const activityNode = $("#one-c-history-activity");
+  if (activityNode) {
+    const count = Number(activity.active_sourcing_count) || 0;
+    activityNode.hidden = count === 0 && activity.update_in_progress !== true;
+    activityNode.textContent = activity.update_in_progress === true
+      ? "История 1С сейчас обновляется. Новый отчёт можно подготовить, а импорт станет доступен после завершения замены."
+      : `История 1С сейчас используется в ${count} ${count === 1 ? "подборе" : count >= 2 && count <= 4 ? "подборах" : "подборах"}. Новый отчёт можно подготовить, но заменить активную историю можно после их завершения.`;
+    activityNode.className = "mode-status history-activity-warning";
+  }
+  updateOneCHistoryImportButton();
   for (const selector of ["#one-c-history-profile", "#one-c-history-profile-update"]) {
     const select = $(selector);
     if (!select) continue;
@@ -1254,7 +1282,14 @@ function renderOneCHistorySummary(preview) {
       .forEach((value) => { const td = document.createElement("td"); td.textContent = value === null || value === undefined || value === "" ? "—" : String(value); tr.append(td); });
     tbody.append(tr);
   });
-  $("#one-c-history-import").disabled = !state.oneCHistory.analysisReady || state.oneCHistory.busy;
+  updateOneCHistoryImportButton();
+}
+
+function updateOneCHistoryImportButton() {
+  const button = $("#one-c-history-import");
+  if (!button) return;
+  const activity = state.oneCHistory.status?.activity || {};
+  button.disabled = !state.oneCHistory.analysisReady || state.oneCHistory.busy || activity.replacement_allowed === false;
 }
 
 async function startOneCHistoryPreview() {
@@ -1270,7 +1305,7 @@ async function startOneCHistoryPreview() {
     const form = new FormData();
     form.append("file", file);
     if ($("#one-c-history-profile").value) form.append("profile_id", $("#one-c-history-profile").value);
-    const preview = await api("/api/admin/one-c-history/previews", {method:"POST", body:form});
+    const preview = await api("/api/one-c-history/previews", {method:"POST", body:form});
     if (!isCurrentOneCHistoryRequest(generation)) return;
     renderOneCHistoryPreview(preview);
   } catch (error) {
@@ -1278,7 +1313,10 @@ async function startOneCHistoryPreview() {
     setOneCHistoryMessage(error.message, "warning");
     toast(error.message, "error");
   } finally {
-    if (isCurrentOneCHistoryRequest(generation)) state.oneCHistory.busy = false;
+    if (isCurrentOneCHistoryRequest(generation)) {
+      state.oneCHistory.busy = false;
+      updateOneCHistoryImportButton();
+    }
   }
 }
 
@@ -1295,7 +1333,7 @@ async function inspectOneCHistorySheet() {
     if (groupHeaderRow) queryParams.set("group_header_row", String(groupHeaderRow));
     const queryString = queryParams.toString();
     const query = queryString ? `?${queryString}` : "";
-    const result = await api(`/api/admin/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/sheets/${encodeURIComponent(sheetName)}${query}`);
+    const result = await api(`/api/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/sheets/${encodeURIComponent(sheetName)}${query}`);
     if (!isCurrentOneCHistoryRequest(generation)) return;
     preview.sheet_name = sheetName;
     preview.header_row = result.header_row;
@@ -1332,7 +1370,7 @@ async function analyzeOneCHistoryMapping() {
   state.oneCHistory.analysisReady = false;
   $("#one-c-history-import").disabled = true;
   try {
-    const analyzed = await api(`/api/admin/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/mapping`, {
+    const analyzed = await api(`/api/one-c-history/previews/${encodeURIComponent(preview.preview_id)}/mapping`, {
       method:"POST", headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
         sheet_name:$("#one-c-history-sheet").value,
@@ -1349,29 +1387,41 @@ async function analyzeOneCHistoryMapping() {
     if (!isCurrentOneCHistoryRequest(generation)) return;
     renderOneCHistoryPreview(analyzed);
     state.oneCHistory.analysisReady = true;
-    $("#one-c-history-import").disabled = false;
+    updateOneCHistoryImportButton();
   } catch (error) {
     if (!isCurrentOneCHistoryRequest(generation)) return;
     setOneCHistoryMessage(error.message, "warning");
     toast(error.message, "error");
   } finally {
-    if (isCurrentOneCHistoryRequest(generation)) state.oneCHistory.busy = false;
+    if (isCurrentOneCHistoryRequest(generation)) {
+      state.oneCHistory.busy = false;
+      updateOneCHistoryImportButton();
+    }
   }
 }
 
 async function importOneCHistory() {
   const preview = state.oneCHistory.preview;
   if (!preview || !state.oneCHistory.analysisReady) return;
-  const saveProfile = $("#one-c-history-save-profile").checked;
-  const profileId = $("#one-c-history-profile-update").value || null;
-  const profileName = $("#one-c-history-profile-name").value.trim();
+  const canManageProfiles = state.currentUser?.capabilities?.settings === true;
+  const saveProfile = canManageProfiles && $("#one-c-history-save-profile").checked;
+  const profileId = canManageProfiles ? $("#one-c-history-profile-update").value || null : null;
+  const profileName = canManageProfiles ? $("#one-c-history-profile-name").value.trim() : "";
   if (saveProfile && !profileId && !profileName) { toast("Укажите название нового профиля", "error"); return; }
-  if (!window.confirm("Импортировать этот отчёт и заменить активный снимок истории закупок 1С?")) return;
+  const active = state.oneCHistory.status?.active_import || {};
+  const next = preview.summary || {};
+  const period = (value) => {
+    const start = formatSourcingHistoryDate(value?.period_start) || "?";
+    const end = formatSourcingHistoryDate(value?.period_end) || "?";
+    return value?.period_start || value?.period_end ? `${start} — ${end}` : "период не определён";
+  };
+  const confirmation = `Заменить общую историю закупок 1С?\n\nТекущий период: ${period(active)}\nНовый период: ${period(next)}\n\nПосле активации новый отчёт будет использоваться всеми пользователями.`;
+  if (!window.confirm(confirmation)) return;
   const generation = state.oneCHistory.requestGeneration;
   state.oneCHistory.busy = true;
   $("#one-c-history-import").disabled = true;
   try {
-    const result = await api("/api/admin/one-c-history/imports", {
+    const result = await api("/api/one-c-history/imports", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
         preview_id:preview.preview_id,
@@ -1404,8 +1454,12 @@ async function importOneCHistory() {
     if (!isCurrentOneCHistoryRequest(generation)) return;
     setOneCHistoryMessage(error.message, "warning");
     toast(error.message, "error");
+    await Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()]);
   } finally {
-    if (isCurrentOneCHistoryRequest(generation)) state.oneCHistory.busy = false;
+    if (isCurrentOneCHistoryRequest(generation)) {
+      state.oneCHistory.busy = false;
+      updateOneCHistoryImportButton();
+    }
   }
 }
 
@@ -1443,6 +1497,7 @@ function updateSourcingStatus() {
 }
 
 async function saveSettings() {
+  if (state.currentUser?.capabilities?.settings !== true) return;
   const codes = $("#settings-language-codes").value.split(",").map((value) => value.trim()).filter(Boolean);
   if (!codes.length) { toast("Укажите хотя бы один язык OCR", "error"); return; }
   const apiKey = $("#settings-api-key").value.trim();
@@ -4705,12 +4760,16 @@ function setupEvents() {
   $("#recognize-button").addEventListener("click",startRecognition);
   $("#new-document-button").addEventListener("click",resetApp);
   $("#settings-button").addEventListener("click",()=>{
-    if (String(state.currentUser?.role || "").toLowerCase() !== "admin") return;
-    initializeSettings(state.settings || {});
+    const capabilities = state.currentUser?.capabilities || {};
+    if (capabilities.settings !== true && capabilities.one_c_history_import !== true) return;
+    const isAdmin = capabilities.settings === true;
+    $$(".settings-admin-section").forEach((section) => { section.hidden = !isAdmin; });
+    $(".settings-user-header").hidden = isAdmin;
+    if (isAdmin) initializeSettings(state.settings || {});
     $("#settings-modal").showModal();
-    loadOneCHistoryStatus();
+    void Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()]);
   });
-  $("#one-c-history-refresh").addEventListener("click",loadOneCHistoryStatus);
+  $("#one-c-history-refresh").addEventListener("click",() => { void Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()]); });
   $("#one-c-history-preview").addEventListener("click",startOneCHistoryPreview);
   $("#one-c-history-analyze").addEventListener("click",analyzeOneCHistoryMapping);
   $("#one-c-history-import").addEventListener("click",importOneCHistory);

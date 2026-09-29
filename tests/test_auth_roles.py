@@ -48,6 +48,26 @@ class ApiClient:
     def post(self, path, **kwargs):
         return self.request("POST", path, **kwargs)
 
+    def post_multipart(self, path, *, headers=None, files, data=None):
+        boundary = "----AveronTestBoundary7MA4YWxk"
+        parts = []
+        for name, value in (data or {}).items():
+            parts.extend([
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n".encode(),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ])
+        for name, (filename, content, content_type) in files.items():
+            parts.extend([
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n".encode(),
+                content,
+                b"\r\n",
+            ])
+        parts.append(f"--{boundary}--\r\n".encode())
+        request_headers = dict(headers or {})
+        request_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        return _asgi_request(self.app, "POST", path, headers=request_headers, raw_body=b"".join(parts))
+
     def put(self, path, **kwargs):
         return self.request("PUT", path, **kwargs)
 
@@ -55,12 +75,13 @@ class ApiClient:
         return self.request("DELETE", path, **kwargs)
 
 
-def _asgi_request(app, method, path, *, headers=None, json=None):
-    payload = b""
+def _asgi_request(app, method, path, *, headers=None, json=None, raw_body=None):
+    payload = raw_body or b""
     request_headers = [(str(key).lower().encode(), str(value).encode()) for key, value in (headers or {}).items()]
     if json is not None:
         payload = json_module_dumps(json).encode("utf-8")
-        request_headers.append((b"content-type", b"application/json"))
+        if not any(key == b"content-type" for key, _ in request_headers):
+            request_headers.append((b"content-type", b"application/json"))
     messages = []
     sent_body = False
 
@@ -137,6 +158,7 @@ def test_valid_user_and_admin_identity(auth_client):
         "auth_mode": "trusted_proxy",
         "capabilities": {
             "settings": False,
+            "one_c_history_import": True,
             "provider_maintenance": False,
             "admin_reports": False,
             "user_management": False,
@@ -221,8 +243,13 @@ def test_sourcing_history_status_is_authenticated_and_safe_for_users(auth_client
     response = auth_client.get("/api/sourcing/history-status", headers=_headers("colleague"))
 
     assert response.status_code == 200
-    assert response.json() == status
-    assert set(response.json()) == allowed
+    assert {key: value for key, value in response.json().items() if key != "activity"} == status
+    assert {key for key in response.json() if key != "activity"} == allowed
+    assert response.json()["activity"] == {
+        "active_sourcing_count": 0,
+        "update_in_progress": False,
+        "replacement_allowed": True,
+    }
     assert auth_client.get("/api/admin/one-c-history", headers=_headers("colleague")).status_code == 403
 
 
@@ -370,7 +397,7 @@ def test_frontend_boot_loads_settings_only_for_admin_and_hides_button_for_user()
     assert 'const currentUser = await api("/api/me")' in boot
     assert 'if (isAdmin)' in boot
     assert 'state.settings = await api("/api/settings")' in boot
-    assert '$("#settings-button").hidden = !isAdmin' in boot
+    assert '$("#settings-button").hidden = capabilities.settings !== true && capabilities.one_c_history_import !== true' in boot
     assert '$("#logout-button").hidden = authMode !== "session"' in boot
     assert '$("#users-button").hidden = currentUser?.capabilities?.user_management !== true' in boot
     assert '<button class="button ghost" id="settings-button" hidden>' in html
@@ -496,6 +523,113 @@ def test_one_c_history_routes_require_admin_dependency(auth_client):
     assert routes
     assert all(has_admin_dependency(route.dependant) for route in routes)
 
+
+def test_capability_one_c_history_routes_are_available_to_users_without_system_settings(auth_client):
+    from averon_import import main
+    from averon_import.services.auth import require_one_c_history_import
+
+    def has_capability_dependency(dependant):
+        if dependant.call is require_one_c_history_import:
+            return True
+        return any(has_capability_dependency(child) for child in dependant.dependencies)
+
+    user = auth_client.get("/api/me", headers=_headers("colleague")).json()
+    admin = auth_client.get("/api/me", headers=_headers("averon")).json()
+    assert user["capabilities"]["settings"] is False
+    assert user["capabilities"]["one_c_history_import"] is True
+    assert admin["capabilities"]["settings"] is True
+    assert admin["capabilities"]["one_c_history_import"] is True
+    assert auth_client.get("/api/one-c-history", headers=_headers("colleague")).status_code == 200
+    assert auth_client.get("/api/one-c-history", headers=_headers("averon")).status_code == 200
+    assert auth_client.get("/api/settings", headers=_headers("colleague")).status_code == 403
+    assert auth_client.put("/api/settings", headers=_headers("colleague"), json={"processing_mode": "cloud"}).status_code == 403
+    assert auth_client.delete("/api/admin/one-c-history/profiles/missing", headers=_headers("colleague")).status_code == 403
+    user_status = auth_client.get("/api/one-c-history", headers=_headers("colleague")).json()
+    assert "recent_audit" not in user_status
+    assert not {"username", "user_id", "document_id"}.intersection(user_status["activity"])
+
+    routes = [
+        route for route in main.app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/one-c-history")
+    ]
+    assert {route.path for route in routes} >= {
+        "/api/one-c-history",
+        "/api/one-c-history/previews",
+        "/api/one-c-history/previews/{preview_id}/mapping",
+        "/api/one-c-history/previews/{preview_id}/sheets/{sheet_name}",
+        "/api/one-c-history/imports",
+    }
+    assert all(has_capability_dependency(route.dependant) for route in routes)
+
+
+def test_user_can_create_and_use_only_owned_capability_scoped_preview(auth_client, monkeypatch):
+    from averon_import import main
+
+    observed = []
+
+    async def create_preview(upload, *, profile_id=None, owner_key=None):
+        observed.append(("create", upload.filename, owner_key))
+        return {"preview_id": "a" * 32, "owner": owner_key}
+
+    async def inspect_preview(preview_id, sheet_name, header_row=None, *, group_header_row=None, event_header_row=None, owner_key=None):
+        observed.append(("inspect", preview_id, owner_key))
+        return {"sheet_name": sheet_name}
+
+    async def analyze_preview(preview_id, request, *, owner_key=None):
+        observed.append(("analyze", preview_id, owner_key))
+        return {"preview_id": preview_id}
+
+    async def import_preview(request, *, owner_key=None, actor=None, can_manage_profiles=True):
+        observed.append(("import", request.preview_id, owner_key, actor, can_manage_profiles))
+        if request.save_profile and not can_manage_profiles:
+            raise PermissionError("Недостаточно прав для сохранения профиля импорта.")
+        return {"status": "succeeded"}
+
+    monkeypatch.setattr(main.one_c_history_service, "create_preview", create_preview)
+    monkeypatch.setattr(main.one_c_history_service, "inspect_preview_sheet", inspect_preview)
+    monkeypatch.setattr(main.one_c_history_service, "analyze_preview", analyze_preview)
+    monkeypatch.setattr(main.one_c_history_service, "import_confirmed", import_preview)
+
+    preview = auth_client.post_multipart(
+        "/api/one-c-history/previews",
+        headers=_headers("colleague"),
+        files={"file": ("report.xlsx", b"test-xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert preview.status_code == 200
+    assert preview.json()["owner"] == "username:colleague"
+    assert auth_client.get(
+        f"/api/one-c-history/previews/{'a' * 32}/sheets/TDSheet?header_row=1",
+        headers=_headers("colleague"),
+    ).status_code == 200
+    body = {
+        "sheet_name": "TDSheet", "header_row": 1, "layout_type": "flat",
+        "field_mapping": {"item_name": 0},
+    }
+    assert auth_client.post(
+        f"/api/one-c-history/previews/{'a' * 32}/mapping",
+        headers=_headers("colleague"), json=body,
+    ).status_code == 200
+    assert auth_client.post(
+        "/api/one-c-history/imports",
+        headers=_headers("colleague"),
+        json={"preview_id": "a" * 32, "layout_type": "flat", "save_profile": False},
+    ).status_code == 200
+    assert [item[0] for item in observed] == ["create", "inspect", "analyze", "import"]
+    assert all(item[2] == "username:colleague" for item in observed if item[0] != "import")
+    assert observed[-1][2] == "username:colleague"
+    assert observed[-1][4] is False
+    denied_profile = auth_client.post(
+        "/api/one-c-history/imports",
+        headers=_headers("colleague"),
+        json={"preview_id": "a" * 32, "layout_type": "flat", "save_profile": True, "profile_name": "Global"},
+    )
+    assert denied_profile.status_code == 403
+
+    assert auth_client.post_multipart(
+        "/api/admin/one-c-history/previews",
+        headers=_headers("colleague"),
+        files={"file": ("report.xlsx", b"test-xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    ).status_code == 403
 
 def _make_cleanup_workspace(service, document_id: str):
     root = service.documents_dir / document_id

@@ -291,6 +291,8 @@ button { cursor: pointer; }
 .ai-disabled-note b { color:#30353c; font-size:12px; }
 .settings-card { width:min(720px,calc(100vw - 80px)); }
 .settings-card { min-width:0; max-width:calc(100vw - 32px); max-height:calc(100vh - 32px); overflow:auto; box-sizing:border-box; }
+.settings-card .settings-admin-section[hidden],.settings-card .settings-user-header[hidden] { display:none !important; }
+.settings-card .settings-user-header { display:flex; }
 .settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; min-width:0; }
 .settings-grid > * { min-width:0; }
 .settings-grid .hint { margin:6px 0 0; }
@@ -322,6 +324,7 @@ button { cursor: pointer; }
 .one-c-history-sample th,.one-c-history-sample td { padding:6px 8px; border-bottom:1px solid #eceff2; text-align:left; white-space:nowrap; }
 .one-c-history-sample th { position:sticky; top:0; background:#f5f7f9; color:#59616c; }
 .one-c-history-actions { justify-content:flex-end; flex-wrap:wrap; padding-top:0; }
+.history-activity-warning,.sourcing-history-stale-warning { padding:8px 10px; border:1px solid #dbe3ec; border-radius:8px; background:#f4f7fa; color:#475569; font-size:11px; line-height:1.45; }
 @media (max-width:720px) { .settings-grid { grid-template-columns:1fr; } }
 @media (max-width:720px) { .one-c-history-heading { flex-direction:column; } }
 
