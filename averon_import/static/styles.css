@@ -405,13 +405,17 @@ button { cursor: pointer; }
 .sourcing-decision-reject { background:#fbe7e6; color:#8f3029; }
 .sourcing-decision-without-offers { background:#eef0f2; color:#59616d; }
 .sourcing-project-list { border:1px solid #e2e8f0; border-radius:12px; overflow-x:auto; overflow-y:hidden; }
-.project-result-grid { min-width:1120px; }
-.project-result-header, .project-result-row { display:grid; grid-template-columns:minmax(180px,1.35fr) 72px minmax(220px,1.85fr) 110px 125px minmax(150px,1.15fr) minmax(140px,1fr); gap:10px; }
+.project-result-grid { min-width:1220px; }
+.project-result-header, .project-result-row { display:grid; grid-template-columns:minmax(180px,1.35fr) 72px minmax(220px,1.85fr) minmax(140px,.9fr) minmax(165px,1fr) minmax(180px,1.15fr) minmax(180px,1fr); gap:10px; }
 .project-result-header { padding:10px 14px; border-bottom:1px solid #cbd5e1; background:#f8fafc; color:#475569; font-size:10px; font-weight:750; letter-spacing:.02em; }
 .project-result-row { padding:12px 14px; border-bottom:1px solid #e2e8f0; align-items:start; font-size:13px; }
 .project-result-row > span { min-width:0; overflow-wrap:anywhere; word-break:break-word; }
-.project-result-row > span:nth-child(2), .project-result-row > span:nth-child(4), .project-result-row > span:nth-child(5) { text-align:right; white-space:nowrap; overflow-wrap:normal; word-break:normal; font-variant-numeric:tabular-nums; }
-.project-result-row > span:nth-child(6) { min-width:0; }
+.project-result-quantity { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.project-result-price, .project-result-total { min-width:0; text-align:right; white-space:normal; overflow-wrap:anywhere; word-break:normal; line-height:1.4; font-variant-numeric:tabular-nums; }
+.project-result-price-primary { display:block; min-width:0; overflow-wrap:anywhere; }
+.project-result-status, .project-result-source { min-width:0; overflow-wrap:anywhere; word-break:normal; line-height:1.4; }
+.project-result-status .sourcing-decision { min-width:0; white-space:normal; }
+.project-result-status .sourcing-decision-label { white-space:normal; overflow-wrap:anywhere; }
 .project-offer-link { color:#245579; text-decoration:underline; text-decoration-color:#b7cfdf; text-underline-offset:2px; }
 .project-offer-link:hover { color:#123b58; text-decoration-color:#245579; }
 .project-review-candidates { display:block; margin-top:8px; padding:5px 8px; font-size:11px; }

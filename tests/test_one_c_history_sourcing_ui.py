@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +11,12 @@ def _sources():
         (ROOT / "averon_import" / "static" / "app.js").read_text(encoding="utf-8"),
         (ROOT / "averon_import" / "static" / "styles.css").read_text(encoding="utf-8"),
     )
+
+
+def _css_rule(css, selector):
+    match = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    assert match, f"missing CSS rule for {selector}"
+    return match.group(1)
 
 
 def test_sourcing_mode_controls_are_persistent_and_offer_the_three_routes():
@@ -74,7 +81,7 @@ def test_history_results_are_distinct_from_live_provider_offers_and_totals():
     assert "positions_history_review" in result_renderer
     assert "HISTORY_SAFE_MATCH" in app.split("const SOURCING_DECISION_LABELS", 1)[1].split("function sourcingDecisionLabel", 1)[0]
     assert 'final_source_kind === "historical_purchase"' in app.split("function projectDecision", 1)[1].split("function projectReason", 1)[0]
-    assert "Не рассчитывается для истории" in project_renderer
+    assert 'Не рассчитывается</span><small class="project-result-secondary">для истории' in project_renderer
     assert 'historicalReview ? " · требуется проверка"' in project_renderer
     assert "Рекомендуемое предложение" in result_renderer  # provider-only legacy path remains intact
 
@@ -109,3 +116,41 @@ def test_sourcing_controls_and_historical_cards_fit_narrow_viewports():
     assert "@media (max-width:420px)" in css
     assert ".sourcing-route-coverage { grid-template-columns:repeat(2,minmax(0,1fr)); }" in css
     assert ".historical-offer-card.recommended" in css
+
+
+def test_project_result_price_and_total_columns_wrap_without_hiding_facts():
+    _html, app, css = _sources()
+    price_total = _css_rule(css, ".project-result-price, .project-result-total")
+    price_primary = _css_rule(css, ".project-result-price-primary")
+    renderer = app.split("function renderProjectResultRow", 1)[1].split("function renderProjectSourcingList", 1)[0]
+    price_renderer = app.split("function renderProjectPriceCell", 1)[1].split("function renderProjectResultRow", 1)[0]
+
+    assert "white-space:normal" in price_total
+    assert "overflow-wrap:anywhere" in price_total
+    assert "min-width:0" in price_total and "line-height:1.4" in price_total
+    assert "white-space:nowrap" not in price_total
+    assert "overflow-wrap:anywhere" in price_primary
+    assert "Валюта в истории не указана" in price_renderer
+    assert "Не рассчитывается</span><small class=\"project-result-secondary\">для истории" in renderer
+    assert "project-result-price" in renderer and "project-result-total" in renderer
+    assert "text-overflow:ellipsis" not in price_total + price_primary
+    assert "overflow:hidden" not in price_total + price_primary
+
+
+def test_project_result_status_and_source_cells_wrap_with_internal_table_scroll():
+    _html, app, css = _sources()
+    status = _css_rule(css, ".project-result-status, .project-result-source")
+    decision = _css_rule(css, ".project-result-status .sourcing-decision-label")
+    list_scroll = _css_rule(css, ".sourcing-project-list")
+    row_renderer = app.split("function renderProjectResultRow", 1)[1].split("function renderProjectSourcingList", 1)[0]
+    price_renderer = app.split("function renderProjectPriceCell", 1)[1].split("function renderProjectResultRow", 1)[0]
+
+    assert "min-width:0" in status and "overflow-wrap:anywhere" in status
+    assert "white-space:normal" in decision and "overflow-wrap:anywhere" in decision
+    assert "project-result-status" in row_renderer and "project-result-source" in row_renderer
+    assert "Поставщик в истории:" in row_renderer
+    assert "overflow-x:auto" in list_scroll
+    assert "overflow-x:hidden" not in css
+    assert "text-overflow:ellipsis" not in status
+    assert "return formatMoney(offer?.price, offer?.currency)" in price_renderer
+    assert 'sourcingProviderLabel(offer)' in row_renderer

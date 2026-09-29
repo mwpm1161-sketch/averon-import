@@ -3179,7 +3179,7 @@ function historicalOfferDate(offer, route = null) {
 }
 
 function historicalOfferCounterparty(offer) {
-  return String(offer?.data_provenance?.counterparty || "Поставщик в истории не указан");
+  return String(offer?.data_provenance?.counterparty || "не указан");
 }
 
 function renderHistoricalOfferCard(result, {compact = false, route = null} = {}) {
@@ -3345,6 +3345,16 @@ function projectHasReviewCandidates(item) {
   return projectDecision(item) === "REVIEW" && projectReviewCandidates(item).length > 0;
 }
 
+function renderProjectPriceCell(offer, historical) {
+  if (!historical) return formatMoney(offer?.price, offer?.currency);
+  if (offer?.price === null || offer?.price === undefined || offer?.price === "") {
+    return `<span class="project-result-price-primary">Цена в истории не указана</span>`;
+  }
+  const currency = String(offer.currency || "").trim();
+  const unit = offer.price_unit ? ` / ${escapeHtml(offer.price_unit)}` : "";
+  return `<span class="project-result-price-primary">${formatMoney(offer.price, currency)}${unit}</span>${currency ? "" : `<small class="project-result-secondary">Валюта в истории не указана</small>`}`;
+}
+
 function renderProjectResultRow(view, itemIndex) {
   const {item, offer, decision, total, reason, route, historical} = view;
   const alternative = item.review_candidate
@@ -3360,22 +3370,20 @@ function renderProjectResultRow(view, itemIndex) {
     : historicalReview ? `Вариант истории 1С для проверки: ${offerTitleHtml(offer)}`
     : offerTitleHtml(offer);
   const sourceCell = route?.final_source_kind === "historical_purchase" || historicalReview
-    ? `<span>История 1С${historicalReview ? " · требуется проверка" : ""}</span><small class="project-result-secondary">Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))} · ${escapeHtml(historicalOfferCounterparty(offer))}</small>`
+    ? `<span>История 1С${historicalReview ? " · требуется проверка" : ""}</span><small class="project-result-secondary">Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))}</small><small class="project-result-secondary">Поставщик в истории: ${escapeHtml(historicalOfferCounterparty(offer))}</small>`
     : offer ? `<span>${escapeHtml(sourcingProviderLabel(offer))}</span>${route?.fallback_called ? `<small class="project-result-secondary">После проверки истории 1С</small>` : ""}`
     : "—";
-  const priceCell = offer
-    ? historical ? historicalOfferPrice(offer) : formatMoney(offer.price, offer.currency)
-    : "—";
-  const totalCell = historical ? "Не рассчитывается для истории"
+  const priceCell = offer ? renderProjectPriceCell(offer, historical) : "—";
+  const totalCell = historical ? `<span>Не рассчитывается</span><small class="project-result-secondary">для истории</small>`
     : total === null ? (offer ? "Требует проверки" : "—") : formatMoney(total, offer.currency);
   return `<div class="project-result-row" role="row">
-    <span>${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span>
-    <span>${escapeHtml(item.intent.quantity || "—")}</span>
-    <span>${offerCell}${alternative}${inspectCandidates}${renderSourcingRouteExplanation(route)}</span>
-    <span>${priceCell}</span>
-    <span>${totalCell}</span>
-    <span>${renderSourcingDecision(decision, reason)}</span>
-    <span>${sourceCell}</span>
+    <span class="project-result-position">${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span>
+    <span class="project-result-quantity">${escapeHtml(item.intent.quantity || "—")}</span>
+    <span class="project-result-offer">${offerCell}${alternative}${inspectCandidates}${renderSourcingRouteExplanation(route)}</span>
+    <span class="project-result-price">${priceCell}</span>
+    <span class="project-result-total">${totalCell}</span>
+    <span class="project-result-status">${renderSourcingDecision(decision, reason)}</span>
+    <span class="project-result-source">${sourceCell}</span>
   </div>`;
 }
 
