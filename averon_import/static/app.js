@@ -1069,7 +1069,7 @@ async function loadSourcingHistoryStatus() {
       sourcing.historyStatus = status && typeof status === "object" ? status : {available:false};
       sourcing.historyStatusLoaded = true;
       if (!sourcing.sourceModeTouched && !sourcing.result) {
-        sourcing.sourceMode = sourcing.historyStatus.available === true ? "one_c_then_provider" : "provider_only";
+        sourcing.sourceMode = sourcing.historyStatus.available === true ? "one_c_only" : "provider_only";
       }
     } catch (_) {
       if (state.sourcing !== sourcing || state.authState !== "authenticated" || sourcing.historyStatusGeneration !== generation) return;
@@ -2304,10 +2304,35 @@ async function pollJob(jobId) {
 }
 
 function isYandexCriticalRow(row) {
-  return row?.ocr_metadata?.provider === "yandex_vision"
-    && ["item", "component"].includes(row.row_type)
-    && ["name", "position", "type_mark", "code", "manufacturer"]
-      .some((key) => String(row[key] ?? "").trim());
+  const metadata = row?.ocr_metadata || {};
+  const semanticAuthoritative = Boolean(row?.semantic_authoritative || metadata.semantic_authoritative);
+  const rowType = row?.row_type || metadata.semantic_row_type
+    || (metadata.semantic_role === "ITEM_ROOT" ? "item" : "");
+  const itemLikeTypes = ["item", "component", "item_candidate"];
+  if (semanticAuthoritative) return itemLikeTypes.includes(rowType);
+  if (metadata.provider !== "yandex_vision") return false;
+
+  const reasons = new Set(row?.review_reasons || []);
+  const structuralReasons = [
+    "structural_ambiguity",
+    "structural_disagreement",
+    "structural_boundary_conflict",
+    "word_assignment_ambiguity",
+    "identity_cell_missing",
+  ];
+  const structuralImpact = String(row?.semantic_structural_impact || metadata.semantic_structural_impact || "").trim().toUpperCase();
+  if (structuralImpact === "INFORMATIONAL") {
+    for (const reason of ["structural_ambiguity", "structural_disagreement", "structural_boundary_conflict", "word_assignment_ambiguity"]) {
+      structuralReasons.splice(structuralReasons.indexOf(reason), 1);
+    }
+  }
+  const identityFields = ["name", "position", "type_mark", "code", "manufacturer"];
+  if (row?.structured_table && structuralReasons.some((reason) => reasons.has(reason))) {
+    return [...identityFields, "note"].some((key) => String(row[key] ?? "").trim());
+  }
+  if (!itemLikeTypes.includes(rowType)) return false;
+  return identityFields.some((key) => String(row[key] ?? "").trim())
+    || ["unit", "quantity", "mass"].some((key) => String(row[key] ?? "").trim());
 }
 
 function missingCriticalFields(row) {
@@ -2334,8 +2359,9 @@ function humanAbsenceConfirmationMatches(row, key) {
   const record = row?.human_confirmed_absent_fields?.[key];
   return !String(row?.[key] ?? "").trim()
     && !record?.invalidated
+    && record?.decision === "CONFIRM_FIELD_ABSENT"
     && record?.provenance === "human"
-    && Boolean(record.decision_key && record.evidence_fingerprint);
+    && Boolean(record.decision_key && record.decision_id && record.evidence_fingerprint);
 }
 
 function numericSuspectFields(row) {

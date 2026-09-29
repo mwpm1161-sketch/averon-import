@@ -1242,7 +1242,26 @@ def _restore_server_owned_review_state(
         row = dict(submitted)
         for key in evidence_fields:
             if key in canonical:
-                row[key] = canonical[key]
+                canonical_value = canonical[key]
+                if key == "human_confirmed_absent_fields" and isinstance(canonical_value, dict):
+                    canonical_value = {
+                        field: dict(record) if isinstance(record, dict) else record
+                        for field, record in canonical_value.items()
+                    }
+                    submitted_absences = submitted.get(key)
+                    if isinstance(submitted_absences, dict):
+                        for field, record in canonical_value.items():
+                            requested_record = submitted_absences.get(field)
+                            if (
+                                isinstance(record, dict)
+                                and isinstance(requested_record, dict)
+                                and requested_record.get("invalidated") is True
+                                and requested_record.get("decision_key") == record.get("decision_key")
+                                and requested_record.get("decision_id") == record.get("decision_id")
+                                and requested_record.get("evidence_fingerprint") == record.get("evidence_fingerprint")
+                            ):
+                                record["invalidated"] = True
+                row[key] = canonical_value
             else:
                 row.pop(key, None)
         edited = list(canonical.get("edited_fields") or [])

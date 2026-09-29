@@ -130,9 +130,11 @@ def human_confirmed_absence_applies(row: object, field: str) -> bool:
     record = records.get(field)
     return bool(
         isinstance(record, dict)
+        and record.get("decision") == "CONFIRM_FIELD_ABSENT"
         and record.get("provenance") == "human"
         and not record.get("invalidated")
         and record.get("decision_key")
+        and record.get("decision_id")
         and record.get("evidence_fingerprint")
     )
 

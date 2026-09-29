@@ -17,10 +17,12 @@ from averon_import.services.review_decisions import (
     ReviewDecisionStore,
 )
 from averon_import.services.review_policy import (
+    critical_field_count,
     critical_blockers_for_row,
     human_verified_value_applies,
     missing_critical_fields,
     refresh_review_state,
+    row_is_ready,
     row_requires_review,
 )
 from averon_import.services.sourcing.service import _trusted_quantity
@@ -711,6 +713,112 @@ def test_confirm_absence_keeps_field_blank_and_is_idempotent():
     assert "quantity" in missing_critical_fields(replayed["rows"][0])
 
 
+@pytest.mark.parametrize(
+    ("row_type", "field", "semantic"),
+    [
+        ("item", "quantity", False),
+        ("component", "unit", False),
+        ("item_candidate", "quantity", True),
+    ],
+)
+def test_absence_confirmation_uses_backend_critical_row_contract(row_type, field, semantic):
+    row = _row(quantity="2", unit="м2", mass="3")
+    row.update(
+        row_type=row_type,
+        review_reasons=["critical_value_missing"],
+        critical_blockers=["critical_value_missing"],
+    )
+    row[field] = ""
+    row["ocr_metadata"]["normalization"] = {}
+    if semantic:
+        row["semantic_authoritative"] = True
+        row["ocr_metadata"]["semantic_authoritative"] = True
+        row["ocr_metadata"]["semantic_required_critical_fields"] = ["quantity", "unit", "mass"]
+    result = _result(row)
+    service = HumanReviewService()
+
+    assert field in missing_critical_fields(row)
+    decision = _decision(service, result, CONFIRM_FIELD_ABSENT_DECISION, field=field)
+    updated, _, _, applied = service.apply_decision_incremental(result, decision)
+
+    confirmed = updated["rows"][0]
+    record = confirmed["human_confirmed_absent_fields"][field]
+    assert applied
+    assert confirmed[field] == ""
+    assert record["decision"] == CONFIRM_FIELD_ABSENT_DECISION
+    assert record["decision_key"] == decision.decision_key
+    assert record["decision_id"] == decision.decision_id
+    assert record["evidence_fingerprint"] == decision.evidence_fingerprint
+    assert record["provenance"] == "human"
+    assert field not in missing_critical_fields(confirmed)
+    assert "critical_value_missing" not in critical_blockers_for_row(confirmed)
+    assert not critical_field_count(confirmed)
+    assert row_is_ready(confirmed)
+
+
+def test_absence_confirmation_does_not_clear_unrelated_structural_blocker():
+    row = _row(quantity="", unit="м2", mass="3")
+    row["review_reasons"] = ["critical_value_missing", "ambiguous_table_schema"]
+    row["critical_blockers"] = ["critical_value_missing", "ambiguous_table_schema"]
+    result = _result(row)
+    service = HumanReviewService()
+    decision = _decision(service, result, CONFIRM_FIELD_ABSENT_DECISION, field="quantity")
+
+    updated, _, _, applied = service.apply_decision_incremental(result, decision)
+
+    assert applied
+    assert "quantity" not in missing_critical_fields(updated["rows"][0])
+    assert "critical_value_missing" not in critical_blockers_for_row(updated["rows"][0])
+    assert "ambiguous_table_schema" in critical_blockers_for_row(updated["rows"][0])
+    assert row_requires_review(updated["rows"][0])
+
+
+def test_saved_absence_is_invalidated_when_physical_ocr_evidence_changes():
+    result = _result(_row(quantity=""))
+    service = HumanReviewService()
+    decision = _decision(service, result, CONFIRM_FIELD_ABSENT_DECISION, field="quantity")
+    confirmed, _, _, applied = service.apply_decision_incremental(result, decision)
+    assert applied
+    changed_evidence = deepcopy(confirmed)
+    changed_evidence["rows"][0]["ocr_metadata"]["raw_physical_cells"][0]["raw_text"] = "новое OCR evidence"
+
+    replayed = service.apply_saved_decisions(
+        changed_evidence, [decision], result["document_fingerprint"]
+    )
+    row = replayed["rows"][0]
+
+    assert row["human_confirmed_absent_fields"]["quantity"]["invalidated"] is True
+    assert "quantity" in missing_critical_fields(row)
+    assert "critical_value_missing" in critical_blockers_for_row(row)
+    assert row_requires_review(row)
+
+
+def test_absence_reconfirmation_after_edit_and_revert_creates_new_human_decision():
+    result = _result(_row(quantity=""))
+    service = HumanReviewService()
+    decision = _decision(service, result, CONFIRM_FIELD_ABSENT_DECISION, field="quantity")
+    confirmed, _, _, applied = service.apply_decision_incremental(result, decision)
+    assert applied
+    row = confirmed["rows"][0]
+    row["quantity"] = "5"
+    refresh_review_state(row)
+    row["quantity"] = ""
+    refresh_review_state(row)
+    assert row["human_confirmed_absent_fields"]["quantity"]["invalidated"] is True
+    assert "quantity" in missing_critical_fields(row)
+
+    reaffirmation = _decision(
+        service, confirmed, CONFIRM_FIELD_ABSENT_DECISION, field="quantity"
+    )
+    reaffirmed, _, _, reapplied = service.apply_decision_incremental(confirmed, reaffirmation)
+
+    assert reapplied
+    assert reaffirmation.decision_key != decision.decision_key
+    assert reaffirmed["rows"][0]["quantity"] == ""
+    assert not reaffirmed["rows"][0]["human_confirmed_absent_fields"]["quantity"].get("invalidated")
+    assert "quantity" not in missing_critical_fields(reaffirmed["rows"][0])
+
+
 def test_absence_does_not_clear_other_missing_fields_and_is_invalidated_by_entry():
     result = _result(_row(quantity="", unit=""))
     service = HumanReviewService()
@@ -910,6 +1018,141 @@ def test_review_decisions_use_top_level_refs_when_metadata_refs_are_empty(
     else:
         assert set(patched) == {"pilot-parent", "pilot-child"}
         assert "Продолжение" in patched["pilot-parent"]["name"]
+
+
+def test_absence_confirmation_survives_save_reload_and_exports_blank_then_stays_invalidated(
+    monkeypatch, tmp_path
+):
+    from averon_import import main
+    from averon_import.services.auth import CurrentUser, Role
+
+    row = _pilot_shape_row()
+    row.update(unit="шт.", mass="2", selected=True)
+    result = _pilot_shape_result(row)
+    result["review_projection_version"] = main.REVIEW_PROJECTION_VERSION
+    result["page_statuses"]["25"].update(
+        layout_status="TRUSTED",
+        schema_status="SUPPORTED",
+        page_disposition="SPEC_OUTPUT",
+        output_status="REVIEW_REQUIRED",
+        blockers=["critical_value_missing"],
+        diagnostics={
+            "selected_mode": "geometry_first",
+            "geometry_grid": {"high_confidence": True},
+            "schema": {"status": "supported"},
+            "page_disposition": {"disposition": "SPEC_OUTPUT"},
+        },
+    )
+    main, service, document_id, workspace = _install_pilot_shape_document(
+        monkeypatch, tmp_path, result
+    )
+
+    response = main.save_review_decision(
+        document_id,
+        main.ReviewDecisionRequest(
+            page=25,
+            physical_refs=_pilot_refs(17),
+            decision=CONFIRM_FIELD_ABSENT_DECISION,
+            field="quantity",
+        ),
+    )
+    patch = response["result_patch"]
+    confirmed = patch["rows"][0]
+    decision = ReviewDecisionStore(workspace.review_decisions_path).load()[0]
+    assert confirmed["quantity"] == ""
+    assert confirmed["human_confirmed_absent_fields"]["quantity"]["provenance"] == "human"
+    assert confirmed["human_confirmed_absent_fields"]["quantity"]["decision_id"] == decision.decision_id
+    assert "quantity" not in missing_critical_fields(confirmed)
+    assert "critical_value_missing" not in critical_blockers_for_row(confirmed)
+    assert patch["summary"]["unresolved_critical"] == 0
+
+    saved = main.save_results(
+        document_id,
+        main.SaveRowsRequest(rows=deepcopy(patch["rows"]), expected_revision=patch["revision"]),
+    )
+    assert saved["saved"] is True
+    reopened = main.get_results(document_id)
+    reopened_row = reopened["rows"][0]
+    assert reopened_row["quantity"] == ""
+    assert reopened_row["human_confirmed_absent_fields"]["quantity"]["decision_id"] == decision.decision_id
+    assert "quantity" not in missing_critical_fields(reopened_row)
+    assert reopened["summary"]["unresolved_critical"] == 0
+    assert reopened["page_statuses"]["25"]["output_status"] == "USABLE"
+
+    exported = main.export(
+        document_id,
+        main.ExportRequest(
+            columns=["quantity"],
+            rows=deepcopy(reopened["rows"]),
+            expected_revision=reopened["revision"],
+        ),
+        user=CurrentUser("admin", Role.ADMIN),
+    )
+    workbook = load_workbook(exported.path)
+    assert workbook["Спецификация"]["A2"].value is None
+
+    edited_row = deepcopy(reopened_row)
+    edited_row["quantity"] = "5"
+    edited_row["human_confirmed_absent_fields"]["quantity"]["invalidated"] = True
+    edited = main.save_results(
+        document_id,
+        main.SaveRowsRequest(rows=[edited_row], expected_revision=reopened["revision"]),
+    )
+    assert edited["result"]["rows"][0]["human_confirmed_absent_fields"]["quantity"]["invalidated"]
+
+    cleared_row = deepcopy(edited["result"]["rows"][0])
+    cleared_row["quantity"] = ""
+    cleared = main.save_results(
+        document_id,
+        main.SaveRowsRequest(rows=[cleared_row], expected_revision=edited["revision"]),
+    )
+    cleared_row = main.get_results(document_id)["rows"][0]
+    assert cleared["saved"] is True
+    assert cleared_row["quantity"] == ""
+    assert cleared_row["human_confirmed_absent_fields"]["quantity"]["invalidated"] is True
+    assert "quantity" in missing_critical_fields(cleared_row)
+    assert "critical_value_missing" in critical_blockers_for_row(cleared_row)
+
+
+def test_human_absence_merge_uses_server_canonical_state_for_row_and_summary():
+    source = Path("averon_import/static/app.js").read_text(encoding="utf-8")
+    merge = _extract_js_function(source, "mergeHumanReviewPatch")
+    script = f"""
+const vm = require('vm');
+const stale = {{id:'pilot-row', page:25, row_type:'item', status:'review', selected:true,
+  quantity:'', unit:'шт.', mass:'2', critical_blockers:['critical_value_missing'],
+  canonical_critical_blockers:['critical_value_missing']}};
+const context = {{
+  state: {{dirty:false, result:{{rows:[stale], summary:{{unresolved_critical:1}}, revision:10}}, rows:[{{...stale}}],
+    document:{{document_id:'doc'}}, performanceCounters:{{rowPatches:0}}}},
+  replaceResultIndex: () => {{}}, renderPatchedReviewRows: () => {{}},
+  updateSummary: () => {{ context.summaryUpdated = true; }}, summaryUpdated:false,
+  refreshClientReview: () => {{}},
+}};
+vm.createContext(context);
+vm.runInContext({json.dumps(merge)}, context);
+const clean = {{...stale, status:'verified', critical_blockers:[],
+  human_confirmed_absent_fields:{{quantity:{{decision:'CONFIRM_FIELD_ABSENT', decision_key:'key',
+    decision_id:'id', evidence_fingerprint:'fp', provenance:'human'}}}}}};
+const applied = context.mergeHumanReviewPatch({{rows:[clean], summary:{{unresolved_critical:0}}, revision:11, review_ledger_revision:1}});
+console.log(JSON.stringify({{
+  applied,
+  localCanonical:context.state.rows[0].canonical_critical_blockers,
+  resultCanonical:context.state.result.rows[0].critical_blockers,
+  summary:context.state.result.summary.unresolved_critical,
+  summaryUpdated:context.summaryUpdated,
+  absence:context.state.rows[0].human_confirmed_absent_fields.quantity,
+}}));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, check=True, text=True)
+    actual = json.loads(completed.stdout)
+
+    assert actual["applied"] is True
+    assert actual["localCanonical"] == []
+    assert actual["resultCanonical"] == []
+    assert actual["summary"] == 0
+    assert actual["summaryUpdated"] is True
+    assert actual["absence"]["decision"] == CONFIRM_FIELD_ABSENT_DECISION
 
 
 def test_empty_review_refs_return_400_without_mutating_result_or_ledger(

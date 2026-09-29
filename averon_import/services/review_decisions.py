@@ -1029,6 +1029,51 @@ class HumanReviewService:
         self.metrics["full_result_copies"] += 1
         updated = _detached_review_copy(result)
         updated["document_fingerprint"] = document_fingerprint
+        absence_decisions = {
+            decision.decision_key: decision
+            for decision in decisions
+            if decision.document_fingerprint == document_fingerprint
+            and decision.decision == CONFIRM_FIELD_ABSENT_DECISION
+        }
+        for row in updated.get("rows") or []:
+            records = row.get("human_confirmed_absent_fields")
+            if not isinstance(records, Mapping):
+                continue
+            refreshed_records = {}
+            records_changed = False
+            for field, original in records.items():
+                record = dict(original) if isinstance(original, Mapping) else original
+                if isinstance(record, dict):
+                    decision = absence_decisions.get(str(record.get("decision_key") or ""))
+                    expected_fingerprint = (
+                        self.evidence_fingerprint(
+                            row,
+                            field=str(field),
+                            decision=CONFIRM_FIELD_ABSENT_DECISION,
+                            confirmed_value=None,
+                        )
+                        if decision is not None
+                        else ""
+                    )
+                    record_matches = bool(
+                        field in CRITICAL_FIELDS
+                        and decision is not None
+                        and decision.field == field
+                        and decision.page == int(row.get("page") or 0)
+                        and _same_refs(decision.physical_refs, _row_refs(row))
+                        and record.get("decision") == CONFIRM_FIELD_ABSENT_DECISION
+                        and record.get("decision_id") == decision.decision_id
+                        and record.get("evidence_fingerprint") == decision.evidence_fingerprint
+                        and expected_fingerprint == decision.evidence_fingerprint
+                        and not str(row.get(field, "") or "").strip()
+                    )
+                    if not record_matches and not record.get("invalidated"):
+                        record["invalidated"] = True
+                        records_changed = True
+                refreshed_records[field] = record
+            if records_changed:
+                row["human_confirmed_absent_fields"] = refreshed_records
+                refresh_review_state(row)
         legacy_projection = (
             result.get("review_projection_version") != REVIEW_PROJECTION_VERSION
         )

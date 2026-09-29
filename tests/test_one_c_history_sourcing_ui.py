@@ -1,5 +1,7 @@
 from pathlib import Path
+import json
 import re
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +42,96 @@ def test_sourcing_mode_controls_are_persistent_and_offer_the_three_routes():
     assert "setInterval(" not in app[app.index("const SOURCING_MODE_LABELS"):app.index("async function loadOneCHistoryStatus")]
     sourcing_helpers = app[app.index("const SOURCING_MODE_LABELS"):app.index("async function loadOneCHistoryStatus")]
     assert "localStorage" not in sourcing_helpers and "sessionStorage" not in sourcing_helpers
+
+
+def test_sourcing_mode_runtime_defaults_and_preserves_session_selection():
+    _html, app, _css = _sources()
+
+    def extract_function(name):
+        async_marker = f"async function {name}("
+        marker = async_marker if async_marker in app else f"function {name}("
+        start = app.index(marker)
+        ends = [
+            index for marker in ("\nfunction ", "\nasync function ")
+            if (index := app.find(marker, start + 1)) >= 0
+        ]
+        return app[start:min(ends) if ends else len(app)]
+
+    functions = "\n".join(extract_function(name) for name in (
+        "loadSourcingHistoryStatus",
+        "openSourcingModal",
+        "handleSourcingModeChange",
+        "clearSourcingProtectedState",
+    ))
+    script = f"""
+const vm = require('vm');
+const context = {{
+  authState: 'authenticated',
+  status: {{available: true}},
+  api: () => Promise.resolve(context.status),
+  renderSourcingHistoryControls: () => {{}},
+  SOURCING_MODE_LABELS: {{one_c_only: 'Только история 1С', one_c_then_provider: 'История 1С → поставщик', provider_only: 'Только поставщик'}},
+  createSourcingState: () => ({{sourceMode: 'provider_only', historyStatus:null, historyStatusLoaded:false,
+    historyStatusGeneration:0, historyStatusPromise:null, sourceModeTouched:false, result:null,
+    modeChangedAfterResult:false}}),
+  $: selector => selector === '#sourcing-modal'
+    ? {{showModal: () => {{}}}}
+    : {{options: [], value: '', textContent: '', hidden: false}},
+  state: {{authState: 'authenticated', sourcing: null}},
+}};
+vm.createContext(context);
+vm.runInContext({json.dumps(functions)}, context);
+(async () => {{
+  context.state.sourcing = context.createSourcingState();
+  await context.loadSourcingHistoryStatus();
+  const activeDefault = context.state.sourcing.sourceMode;
+
+  context.state.sourcing = context.createSourcingState();
+  context.status = {{available: false}};
+  await context.loadSourcingHistoryStatus();
+  const unavailableDefault = context.state.sourcing.sourceMode;
+
+  context.state.sourcing = context.createSourcingState({{sourceMode: 'provider_only'}});
+  context.status = {{available: true}};
+  await context.loadSourcingHistoryStatus();
+  context.handleSourcingModeChange({{target: {{value: 'one_c_then_provider'}}}});
+  context.status = {{available: true, event_count: 20}};
+  await context.loadSourcingHistoryStatus();
+  await context.openSourcingModal();
+  const touchedSelection = context.state.sourcing.sourceMode;
+
+  context.handleSourcingModeChange({{target: {{value: 'provider_only'}}}});
+  await context.openSourcingModal();
+  const providerSelection = context.state.sourcing.sourceMode;
+
+  context.state.sourcing.result = {{source_mode: 'provider_only'}};
+  context.state.sourcing.sourceModeTouched = false;
+  context.state.sourcing.sourceMode = 'one_c_then_provider';
+  await context.loadSourcingHistoryStatus();
+  const resultModeIdentity = context.state.sourcing.sourceMode;
+
+  context.clearSourcingProtectedState();
+  const cleared = {{
+    sourceMode: context.state.sourcing.sourceMode,
+    sourceModeTouched: context.state.sourcing.sourceModeTouched,
+  }};
+  context.status = {{available: true}};
+  await context.loadSourcingHistoryStatus();
+  console.log(JSON.stringify({{activeDefault, unavailableDefault, touchedSelection, providerSelection, resultModeIdentity, cleared, nextSessionDefault: context.state.sourcing.sourceMode}}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, check=True, text=True)
+    actual = json.loads(completed.stdout)
+
+    assert actual == {
+        "activeDefault": "one_c_only",
+        "unavailableDefault": "provider_only",
+        "touchedSelection": "one_c_then_provider",
+        "providerSelection": "provider_only",
+        "resultModeIdentity": "one_c_then_provider",
+        "cleared": {"sourceMode": "provider_only", "sourceModeTouched": False},
+        "nextSessionDefault": "one_c_only",
+    }
 
 
 def test_sourcing_routes_are_sent_for_row_project_and_manual_project_requests():
