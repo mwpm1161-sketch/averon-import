@@ -472,13 +472,17 @@ def test_exact_source_name_unit_with_specification_token_is_safe_and_keeps_unkno
 
 
 @pytest.mark.parametrize("name", [
-    "Кабель 1",
-    "Насос 2",
-    "Труба 20",
-    "Позиция 1",
-    "Материал 5",
+    "Кабель-1",
+    "Насос-2",
+    "Труба-20",
+    "Болт-10",
+    "Позиция-1",
+    "Материал-5",
+    "Кабель/1",
+    "Насос/2",
+    "Позиция/1",
 ])
-def test_generic_word_number_name_is_not_specific_enough_for_safe_history(name, tmp_path):
+def test_generic_word_separator_number_name_is_not_specific_enough_for_safe_history(name, tmp_path):
     _, provider = _provider(tmp_path, [_event(name=name, article="")])
     source = _intent(name=name, article="")
 
@@ -493,6 +497,7 @@ def test_generic_word_number_name_is_not_specific_enough_for_safe_history(name, 
     "Клапан DN 50",
     "Клапан PN16",
     "Светильник IP65",
+    "Цемент M-500",
     "Цемент М-500",
     "Шпунт AZ-13-770",
     "Насос 32-80",
