@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -101,6 +103,14 @@ def settings(tmp_path, *, enabled=True, max_live_candidates=5):
     )
 
 
+def _new_etm_client(tmp_path, *args, **kwargs):
+    kwargs.setdefault(
+        "auth_state_path",
+        tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json",
+    )
+    return EtmIproClient(*args, **kwargs)
+
+
 def intent(**updates):
     value = {
         "source_row_id": "row-1",
@@ -125,7 +135,7 @@ def test_auth_success_uses_session_and_never_puts_credentials_in_errors(tmp_path
             return FakeResponse({"data": {"session": "session-private"}})
         return FakeResponse({"data": {"gdscode": "A-100", "name": "Клапан"}})
 
-    client = EtmIproClient(
+    client = _new_etm_client(tmp_path,
         settings(tmp_path), "login@example.com", "p&ss",
         transport=transport, clock=clock,
     )
@@ -233,7 +243,7 @@ class OfficialWireTransport:
 
 def test_official_wire_contract_uses_query_session_and_rows_adapters(tmp_path):
     transport = OfficialWireTransport()
-    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    client = _new_etm_client(tmp_path, settings(tmp_path), "login", "password", transport=transport)
 
     goods_mnf = client.get_goods("9536092", lookup_type="mnf", manufacturer_code="686")
     goods_etm = client.get_goods("9536092", lookup_type="etm")
@@ -557,7 +567,7 @@ def test_snapshot_download_streams_chunks_and_keeps_normal_response_limit(tmp_pa
 
     destination = tmp_path / "snapshot.json"
     progress = []
-    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    client = _new_etm_client(tmp_path, settings(tmp_path), "login", "password", transport=transport)
     result = client.download_snapshot_to_file(
         "https://ipro.etm.ru/catalog.json?signature=private",
         destination,
@@ -576,7 +586,7 @@ def test_snapshot_download_streams_chunks_and_keeps_normal_response_limit(tmp_pa
 
 def test_snapshot_content_length_cap_fails_before_body_read(tmp_path):
     response = StreamingResponse(b"ignored", content_length=_MAX_SNAPSHOT_BYTES + 1)
-    client = EtmIproClient(
+    client = _new_etm_client(tmp_path,
         settings(tmp_path), "login", "password", transport=lambda request, timeout: response
     )
     destination = tmp_path / "snapshot.json"
@@ -591,7 +601,7 @@ def test_snapshot_content_length_cap_fails_before_body_read(tmp_path):
 def test_snapshot_actual_byte_cap_fails_without_content_length(tmp_path, monkeypatch):
     monkeypatch.setattr(etm_client, "_MAX_SNAPSHOT_BYTES", 5)
     response = StreamingResponse(b"123456", content_length=None, chunk_size=3)
-    client = EtmIproClient(
+    client = _new_etm_client(tmp_path,
         settings(tmp_path), "login", "password", transport=lambda request, timeout: response
     )
     destination = tmp_path / "snapshot.json"
@@ -793,7 +803,7 @@ def test_background_import_removes_temp_snapshot_after_parse_failure(tmp_path):
 
 def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp_path):
     transport = OfficialWireTransport()
-    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    client = _new_etm_client(tmp_path, settings(tmp_path), "login", "password", transport=transport)
     mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
     mirror.sync_snapshot({
         "data": [{
@@ -830,7 +840,7 @@ def test_official_wire_payload_maps_through_provider_without_inventing_stock(tmp
 
 def test_nested_official_details_feed_deterministic_validator_without_ai(tmp_path):
     transport = OfficialWireTransport()
-    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport)
+    client = _new_etm_client(tmp_path, settings(tmp_path), "login", "password", transport=transport)
     mirror = EtmCatalogMirror(tmp_path / "catalog.sqlite3")
     mirror.sync_snapshot({"data": [{
         "gdscode": 9536092,
@@ -871,7 +881,7 @@ def test_nested_official_details_feed_deterministic_validator_without_ai(tmp_pat
                     ]
             return response
 
-    no_voltage_client = EtmIproClient(settings(tmp_path), "login", "password", transport=NoVoltageTransport())
+    no_voltage_client = _new_etm_client(tmp_path, settings(tmp_path), "login", "password", transport=NoVoltageTransport())
     no_voltage_provider = EtmIproProvider(
         settings(tmp_path), MemorySecretStore(), tmp_path, client=no_voltage_client, mirror=mirror
     )
@@ -958,32 +968,318 @@ def test_name_only_search_without_catalog_returns_catalog_not_ready_notice(tmp_p
     ],
 )
 def test_snapshot_download_rejects_unsafe_urls(tmp_path, url):
-    client = EtmIproClient(settings(tmp_path), "login", "password", transport=OfficialWireTransport())
+    client = _new_etm_client(tmp_path, settings(tmp_path), "login", "password", transport=OfficialWireTransport())
     with pytest.raises(SourcingProviderError, match="безопасный адрес"):
         client.download_snapshot(url)
 
 
-def test_403_allows_one_reauth_retry_after_documented_login_cooldown(tmp_path):
-    clock = FakeClock()
+@pytest.mark.parametrize("failure_status", [401, 403])
+def test_failed_login_persists_twelve_hour_quarantine_without_secrets_and_expires_explicitly(
+    tmp_path, failure_status, caplog
+):
+    wall_time = [1_800_000_000.0]
+    auth_state_path = tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json"
+    login_calls = []
+
+    def transport(request, timeout):
+        if "/user/login" in request.full_url:
+            login_calls.append(request.full_url)
+            # The circuit must already be durably closed before the login leaves.
+            state = json.loads(auth_state_path.read_text(encoding="utf-8"))
+            assert state["blocked_until"] > wall_time[0]
+            if len(login_calls) == 1:
+                return FakeResponse({"error": "credentials rejected"}, status=failure_status)
+            return FakeResponse({"data": {"session": "private-session-value"}})
+        raise AssertionError("only a login request is expected")
+
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "private-login-value",
+        "private-password-value",
+        transport=transport,
+        wall_clock=lambda: wall_time[0],
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as failure:
+        client.check_access()
+    assert failure.value.code == "ETM_AUTH_FAILURE"
+    assert failure.value.category == "auth"
+    assert failure.value.status_code == failure_status
+
+    persisted = auth_state_path.read_text(encoding="utf-8")
+    state = json.loads(persisted)
+    assert state["failure_category"] == "auth"
+    assert state["status_code"] == failure_status
+    assert state["blocked_until"] == wall_time[0] + 12 * 60 * 60
+    for secret in ("private-login-value", "private-password-value", "private-session-value", "etm.example"):
+        assert secret not in persisted
+        assert secret not in str(failure.value)
+        assert secret not in caplog.text
+
+    restarted_client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "private-login-value",
+        "private-password-value",
+        transport=transport,
+        wall_clock=lambda: wall_time[0],
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as quarantined:
+        restarted_client.check_access()
+    assert quarantined.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(login_calls) == 1
+    for item_id in range(100):
+        with pytest.raises(SourcingProviderError) as repeated:
+            restarted_client.get_goods(str(item_id))
+        assert repeated.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(login_calls) == 1
+
+    wall_time[0] += 12 * 60 * 60 + 1
+    restarted_client.check_access()
+    assert len(login_calls) == 2
+    assert not auth_state_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("login_response", "expected_status"),
+    [
+        (FakeResponse({"data": {"session": []}}), None),
+        (TimeoutError("private-login-password"), None),
+    ],
+)
+def test_malformed_login_and_timeout_are_quarantined_without_leaking_details(
+    tmp_path, login_response, expected_status, caplog
+):
+    calls = []
+
+    def transport(request, timeout):
+        calls.append(request.full_url)
+        if isinstance(login_response, Exception):
+            raise login_response
+        return login_response
+
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "private-login",
+        "private-password",
+        transport=transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as failure:
+        client.check_access()
+    assert failure.value.code == "ETM_AUTH_FAILURE"
+    assert failure.value.status_code == expected_status
+    assert "private" not in str(failure.value)
+    persisted = (tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json").read_text(
+        encoding="utf-8"
+    )
+    assert "private-login" not in persisted
+    assert "private-password" not in persisted
+    assert "private-login" not in caplog.text
+    assert "private-password" not in caplog.text
+    with pytest.raises(SourcingProviderError) as quarantined:
+        client.check_access()
+    assert quarantined.value.code == "ETM_AUTH_QUARANTINED"
+    for item_id in range(100):
+        with pytest.raises(SourcingProviderError) as repeated:
+            client.get_goods(str(item_id))
+        assert repeated.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(calls) == 1
+
+
+def test_authenticated_403_quarantines_without_same_operation_relogin_or_retry(tmp_path):
+    auth_state_path = tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json"
     calls = []
 
     def transport(request, timeout):
         calls.append(request.full_url)
         if "/user/login" in request.full_url:
-            return FakeResponse({"data": {"session": f"session-{len([x for x in calls if '/user/login' in x])}"}})
-        if len([x for x in calls if "/user/login" in x]) == 1:
-            clock.value = 120.0
-            return FakeResponse({"error": "denied"}, status=403)
+            return FakeResponse({"data": {"session": "private-session"}})
+        return FakeResponse({"error": "denied"}, status=403)
+
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as failure:
+        client.get_goods("A-100")
+    assert failure.value.code == "ETM_AUTH_QUARANTINED"
+    assert failure.value.status_code == 403
+    assert len([call for call in calls if "/user/login" in call]) == 1
+    assert len(calls) == 2
+
+    with pytest.raises(SourcingProviderError) as quarantined:
+        client.get_goods("A-100")
+    assert quarantined.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(calls) == 2
+
+    state_text = auth_state_path.read_text(encoding="utf-8")
+    assert json.loads(state_text)["failure_category"] == "auth"
+    assert "private-session" not in state_text
+    restarted_client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as after_restart:
+        restarted_client.check_access()
+    assert after_restart.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("failure_status", [400, 404, 500, 502])
+def test_non_auth_endpoint_failure_does_not_quarantine_or_invalidate_session(tmp_path, failure_status):
+    calls = []
+
+    def transport(request, timeout):
+        calls.append(request.full_url)
+        if "/user/login" in request.full_url:
+            return FakeResponse({"data": {"session": "session-ok"}})
+        if len([call for call in calls if "/goods/" in call]) == 1:
+            return FakeResponse({"error": "temporary"}, status=failure_status)
         return FakeResponse({"data": {"gdscode": "A-100"}})
 
-    client = EtmIproClient(settings(tmp_path), "login", "password", transport=transport, clock=clock)
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as upstream:
+        client.get_goods("A-100")
+    assert upstream.value.status_code == failure_status
     assert client.get_goods("A-100")["data"]["gdscode"] == "A-100"
-    assert len([url for url in calls if "/user/login" in url]) == 2
+    assert len([call for call in calls if "/user/login" in call]) == 1
+    assert not (tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json").exists()
+
+
+def test_many_successful_requests_reuse_one_valid_session(tmp_path):
+    calls = []
+
+    def transport(request, timeout):
+        calls.append(request.full_url)
+        if "/user/login" in request.full_url:
+            return FakeResponse({"data": {"session": "session-reused"}})
+        return FakeResponse({"data": {"gdscode": "A-100"}})
+
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    for _ in range(25):
+        assert client.get_goods("A-100")["data"]["gdscode"] == "A-100"
+    assert len([call for call in calls if "/user/login" in call]) == 1
+    assert len(calls) == 26
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        "{malformed",
+        json.dumps({
+            "version": 1,
+            "blocked_until": 1_900_000_000,
+            "failure_category": [],
+            "status_code": None,
+            "updated_at": 1_800_000_000,
+        }),
+    ],
+)
+def test_corrupt_persisted_auth_state_fails_closed_without_login(tmp_path, raw_state):
+    auth_state_path = tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json"
+    auth_state_path.parent.mkdir(parents=True)
+    auth_state_path.write_text(raw_state, encoding="utf-8")
+    calls = []
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=lambda request, timeout: calls.append(request.full_url),
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as failure:
+        client.check_access()
+    assert failure.value.code == "ETM_AUTH_QUARANTINED"
+    assert calls == []
+    state = json.loads(auth_state_path.read_text(encoding="utf-8"))
+    assert state["failure_category"] == "persisted_state_invalid"
+
+
+def test_auth_state_write_failure_prevents_outbound_login(tmp_path, monkeypatch):
+    calls = []
+
+    def fail_replace(source, target):
+        raise OSError("private filesystem failure")
+
+    monkeypatch.setattr(etm_client.os, "replace", fail_replace)
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=lambda request, timeout: calls.append(request.full_url),
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as failure:
+        client.check_access()
+    assert failure.value.code == "ETM_AUTH_STATE_UNAVAILABLE"
+    assert calls == []
+    with pytest.raises(SourcingProviderError) as blocked:
+        client.check_access()
+    assert blocked.value.code == "ETM_AUTH_QUARANTINED"
+    assert calls == []
+
+
+def test_concurrent_auth_failures_issue_at_most_one_login(tmp_path):
+    calls = []
+    start = threading.Barrier(9)
+
+    def transport(request, timeout):
+        calls.append(request.full_url)
+        return FakeResponse({"error": "rejected"}, status=401)
+
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+
+    def check_access():
+        start.wait(timeout=5)
+        with pytest.raises(SourcingProviderError):
+            client.check_access()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(check_access) for _ in range(8)]
+        start.wait(timeout=5)
+        for future in futures:
+            future.result(timeout=5)
+    assert len(calls) == 1
 
 
 def test_auth_refresh_is_not_repeated_inside_two_minutes(tmp_path):
     clock = FakeClock()
-    client = EtmIproClient(
+    client = _new_etm_client(tmp_path,
         settings(tmp_path), "login", "password",
         transport=lambda request, timeout: FakeResponse({"data": {"session": "session"}}),
         clock=clock,
@@ -1007,7 +1303,7 @@ def test_rate_limiter_is_monotonic_and_provider_owned():
 
 
 def test_price_batch_is_bounded_to_fifty_codes(tmp_path):
-    client = EtmIproClient(
+    client = _new_etm_client(tmp_path,
         settings(tmp_path), "login", "password",
         transport=lambda request, timeout: FakeResponse({"data": {"session": "session"}}),
     )
@@ -1412,7 +1708,7 @@ def test_etm_candidate_enrichment_interleaves_goods_and_remains_buckets(tmp_path
         clock.value += seconds
 
     transport = TimedWireTransport()
-    client = EtmIproClient(
+    client = _new_etm_client(tmp_path,
         settings(tmp_path, max_live_candidates=5),
         "login",
         "password",

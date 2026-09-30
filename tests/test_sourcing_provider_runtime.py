@@ -374,6 +374,9 @@ def test_runtime_factory_preserves_provider_capabilities_and_normalizes_runtime_
     assert local.capabilities.supports_product_url is True
     assert etm.capabilities.supports_product_url is True
     assert etm.capabilities.supports_stock_quantity is True
+    assert etm.client._auth_state_path == (
+        tmp_path / "data" / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json"
+    )
     assert local.capabilities.supports_price is True
     assert local.capabilities.supports_batch_search is False
     assert type(local_state) is SourcingProviderRuntimeState

@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import ipaddress
+import math
+import os
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30,6 +33,12 @@ _SNAPSHOT_CHUNK_BYTES = 1024 * 1024
 _SESSION_LIFETIME_SECONDS = 8 * 60 * 60
 _SESSION_MARGIN_SECONDS = 5 * 60
 _LOGIN_INTERVAL_SECONDS = 120.0
+_AUTH_QUARANTINE_SECONDS = 12 * 60 * 60
+_AUTH_STATE_MAX_BYTES = 4096
+_AUTH_QUARANTINE_MESSAGE = (
+    "ЭТМ отклонил авторизацию. Автоматические повторные входы приостановлены, "
+    "чтобы избежать временной блокировки поставщиком."
+)
 
 Transport = Callable[[urllib.request.Request, float], Any]
 
@@ -98,18 +107,23 @@ class EtmIproClient:
         login: str | None,
         password: str | None,
         *,
+        auth_state_path: str | Path,
         transport: Transport | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
         rate_limiter: EtmRateLimiter | None = None,
     ) -> None:
         self.settings = settings
         self._login_value = str(login or "").strip()
         self._password = str(password or "").strip()
+        self._auth_state_path = Path(auth_state_path)
         self._transport = transport or _default_transport
         self._clock = clock
+        self._wall_clock = wall_clock
         self._session: _Session | None = None
         self._last_login_at: float | None = None
+        self._local_quarantine_until: float | None = None
         self._session_lock = threading.Lock()
         self.rate_limiter = rate_limiter or EtmRateLimiter(clock=clock, sleeper=sleeper)
 
@@ -332,8 +346,11 @@ class EtmIproClient:
                 code="NOT_CONFIGURED",
                 category="not_configured",
             )
-        now = self._clock()
         with self._session_lock:
+            now = self._clock()
+            quarantine = self._load_auth_quarantine_locked()
+            if quarantine is not None and quarantine > self._wall_clock():
+                raise self._auth_quarantined_error()
             if not force and self._session is not None and self._session.expires_at > now:
                 return self._session.value
             if (
@@ -346,15 +363,41 @@ class EtmIproClient:
                     category="rate_limit",
                 )
             self.rate_limiter.acquire("auth")
-            query = urlencode({"log": self._login_value, "pwd": self._password})
-            payload = self._request_json("POST", f"{ETM_LOGIN_PATH}?{query}", auth=False, bucket="auth")
-            session = self._data_value(payload, "session")
-            if isinstance(session, (dict, list)) or not str(session or "").strip():
-                raise SourcingProviderError(
-                    "ЭТМ iPRO не вернул рабочую сессию",
-                    code="INVALID_RESPONSE",
-                    category="invalid_response",
-                )
+            try:
+                # Persist a closed circuit before login so a process crash or
+                # restart during the request cannot immediately retry it.
+                self._write_auth_quarantine_locked("login_attempt", None)
+            except OSError:
+                raise self._auth_state_unavailable_error() from None
+            try:
+                query = urlencode({"log": self._login_value, "pwd": self._password})
+                payload = self._request_json("POST", f"{ETM_LOGIN_PATH}?{query}", auth=False, bucket="auth")
+                session = self._data_value(payload, "session")
+                if not isinstance(session, str) or not session.strip():
+                    raise SourcingProviderError(
+                        "ЭТМ iPRO не вернул рабочую сессию",
+                        code="INVALID_RESPONSE",
+                        category="invalid_response",
+                    )
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                category = getattr(exc, "category", "auth")
+                safe_category = "network" if category == "network" else "auth"
+                try:
+                    self._write_auth_quarantine_locked(safe_category, status_code)
+                except OSError:
+                    # The pre-request record remains in place if this update
+                    # fails; the request must still fail with a safe message.
+                    pass
+                self._session = None
+                raise self._auth_failure_error(status_code=status_code) from None
+            try:
+                self._auth_state_path.unlink(missing_ok=True)
+            except OSError:
+                self._session = None
+                self._local_quarantine_until = self._wall_clock() + _AUTH_QUARANTINE_SECONDS
+                raise self._auth_state_unavailable_error() from None
+            self._local_quarantine_until = None
             self._last_login_at = now
             self._session = _Session(
                 str(session).strip(),
@@ -373,33 +416,141 @@ class EtmIproClient:
     ) -> Any:
         url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{self.api_base_url}{path_or_url}"
         headers = {"Accept": "application/json"}
+        request_query = dict(query or {})
         session: str | None = None
-        for attempt in range(2 if auth else 1):
-            request_query = dict(query or {})
-            if auth:
-                session = self._get_session(force=attempt == 1)
-                request_query["session-id"] = session
-            request_url = self._replace_query(url, request_query, authenticated=auth)
+        if auth:
+            session = self._get_session()
+            request_query["session-id"] = session
+        request_url = self._replace_query(url, request_query, authenticated=auth)
+        try:
+            status, raw = self._request_raw(method, request_url, headers=headers, bucket=bucket)
+            if not 200 <= status < 300:
+                raise self._status_error(status)
             try:
-                status, raw = self._request_raw(method, request_url, headers=headers, bucket=bucket)
-                if not 200 <= status < 300:
-                    raise self._status_error(status)
-                try:
-                    return json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise SourcingProviderError(
-                        "ЭТМ iPRO вернул некорректный JSON",
-                        code="INVALID_RESPONSE",
-                        category="invalid_response",
-                    ) from exc
-            except SourcingProviderError as exc:
-                if auth and attempt == 0 and exc.status_code == 403 and session:
-                    with self._session_lock:
-                        if self._session is not None and self._session.value == session:
-                            self._session = None
-                    continue
-                raise
-        raise SourcingProviderError("ЭТМ iPRO не вернул ответ", category="upstream_error")
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SourcingProviderError(
+                    "ЭТМ iPRO вернул некорректный JSON",
+                    code="INVALID_RESPONSE",
+                    category="invalid_response",
+                ) from exc
+        except SourcingProviderError as exc:
+            if auth and exc.status_code == 403:
+                with self._session_lock:
+                    self._session = None
+                    self._local_quarantine_until = self._wall_clock() + _AUTH_QUARANTINE_SECONDS
+                    try:
+                        self._write_auth_quarantine_locked("auth", 403)
+                    except OSError:
+                        raise self._auth_state_unavailable_error() from None
+                raise self._auth_quarantined_error(status_code=403) from None
+            raise
+
+    def _load_auth_quarantine_locked(self) -> float | None:
+        now = self._wall_clock()
+        if self._local_quarantine_until is not None and self._local_quarantine_until > now:
+            return self._local_quarantine_until
+        try:
+            with self._auth_state_path.open("rb") as source:
+                raw = source.read(_AUTH_STATE_MAX_BYTES + 1)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise self._auth_state_unavailable_error() from None
+        try:
+            if len(raw) > _AUTH_STATE_MAX_BYTES:
+                raise ValueError("state too large")
+            state = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(state, dict)
+                or type(state.get("version")) is not int
+                or state.get("version") != 1
+            ):
+                raise ValueError("unsupported state")
+            blocked_until = state.get("blocked_until")
+            updated_at = state.get("updated_at")
+            category = state.get("failure_category")
+            status_code = state.get("status_code")
+            if (
+                isinstance(blocked_until, bool)
+                or not isinstance(blocked_until, (int, float))
+                or not math.isfinite(float(blocked_until))
+                or isinstance(updated_at, bool)
+                or not isinstance(updated_at, (int, float))
+                or not math.isfinite(float(updated_at))
+                or not isinstance(category, str)
+                or category not in {"login_attempt", "auth", "network", "persisted_state_invalid"}
+                or status_code is not None
+                and (isinstance(status_code, bool) or not isinstance(status_code, int) or not 100 <= status_code <= 599)
+            ):
+                raise ValueError("invalid state fields")
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            try:
+                self._write_auth_quarantine_locked("persisted_state_invalid", None)
+            except OSError:
+                raise self._auth_state_unavailable_error() from None
+            raise self._auth_quarantined_error() from None
+        return float(blocked_until)
+
+    def _write_auth_quarantine_locked(self, category: str, status_code: int | None) -> None:
+        now = self._wall_clock()
+        self._local_quarantine_until = now + _AUTH_QUARANTINE_SECONDS
+        state = {
+            "version": 1,
+            "blocked_until": self._local_quarantine_until,
+            "failure_category": category,
+            "status_code": status_code if isinstance(status_code, int) and 100 <= status_code <= 599 else None,
+            "updated_at": now,
+        }
+        path = self._auth_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output:
+                temporary_path = output.name
+                os.chmod(temporary_path, 0o600)
+                json.dump(state, output, separators=(",", ":"))
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                Path(temporary_path).unlink(missing_ok=True)
+
+    @staticmethod
+    def _auth_quarantined_error(*, status_code: int | None = None) -> SourcingProviderError:
+        return SourcingProviderError(
+            _AUTH_QUARANTINE_MESSAGE,
+            code="ETM_AUTH_QUARANTINED",
+            category="auth",
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _auth_failure_error(*, status_code: int | None = None) -> SourcingProviderError:
+        return SourcingProviderError(
+            "Не удалось подтвердить авторизацию; автоматические повторные входы приостановлены "
+            "на 12 часов, чтобы избежать временной блокировки поставщиком",
+            code="ETM_AUTH_FAILURE",
+            category="auth",
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _auth_state_unavailable_error() -> SourcingProviderError:
+        return SourcingProviderError(
+            "Не удалось безопасно сохранить состояние авторизации ЭТМ iPRO; запрос остановлен",
+            code="ETM_AUTH_STATE_UNAVAILABLE",
+            category="auth",
+        )
 
     @staticmethod
     def _replace_query(url: str, query: dict[str, Any], *, authenticated: bool) -> str:

@@ -67,7 +67,12 @@ class EtmIproProvider:
         )
         login = resolve_secret(os.environ.get("AVERON_ETM_IPRO_LOGIN"), secret_store, ETM_IPRO_LOGIN)
         password = resolve_secret(os.environ.get("AVERON_ETM_IPRO_PASSWORD"), secret_store, ETM_IPRO_PASSWORD)
-        self.client = client or EtmIproClient(settings, login, password)
+        self.client = client or EtmIproClient(
+            settings,
+            login,
+            password,
+            auth_state_path=data_root / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json",
+        )
 
     @property
     def configured(self) -> bool:
