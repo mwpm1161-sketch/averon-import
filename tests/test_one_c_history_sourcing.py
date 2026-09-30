@@ -1162,6 +1162,8 @@ def test_one_c_then_provider_review_falls_back_once_without_mixing_history_candi
     assert result.route.fallback_called is True
     assert result.route.fallback_status == "completed"
     assert result.route.final_source_kind == "provider"
+    assert not any(notice.code == "ONE_C_FALLBACK_SUPPRESSED" for notice in result.notices)
+    assert any(notice.code == "ONE_C_HISTORY_REVIEW" for notice in result.notices)
     assert all(offer.provider == live.key for offer in result.offers)
     assert live.stats_calls == 1
     assert live.search_calls == 1
@@ -1213,6 +1215,8 @@ def test_one_c_then_provider_stats_failure_suppresses_live_call_and_history_cand
     assert result.offers == []
     assert result.review_candidate is None
     assert live.stats_calls == 1
+    assert any(notice.code == "ONE_C_FALLBACK_SUPPRESSED" for notice in result.notices)
+    assert not any(notice.code == "ONE_C_FALLBACK_USED" for notice in result.notices)
     assert live.search_calls == 0
 
 

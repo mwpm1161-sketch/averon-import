@@ -167,9 +167,7 @@ class JobCoordinator:
                     "JOB_LANE_BUSY",
                     "Выполняется другое задание обслуживания. Повторите позже.",
                 )
-            running = sum(item.status == "running" for item in active)
-            queued = sum(item.status == "queued" for item in active)
-            if running >= running_capacity and queued >= queued_capacity:
+            if len(active) >= running_capacity + queued_capacity:
                 self._release_callbacks(callbacks)
                 raise JobAdmissionError(
                     "JOB_LANE_BUSY",
@@ -233,6 +231,15 @@ class JobCoordinator:
             if job is None or (owner_id is not None and job.owner_id != owner_id):
                 raise KeyError(job_id)
             return job
+
+    def get_public(self, job_id: str, *, owner_id: str | None = None) -> dict[str, Any]:
+        """Return one coherent, public-only job snapshot under the coordinator lock."""
+        with self.lock:
+            self._cleanup_locked()
+            job = self.jobs.get(job_id)
+            if job is None or (owner_id is not None and job.owner_id != owner_id):
+                raise KeyError(job_id)
+            return job.public()
 
     def _find_duplicate_locked(self, owner_id: str, dedupe_key: str | None) -> Job | None:
         if not dedupe_key:

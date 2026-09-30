@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import Future
 
 import pytest
 
@@ -104,6 +105,78 @@ def test_lane_capacity_allows_one_running_and_exactly_two_queued():
         assert [jobs.get(item.id).status for item in queued] == ["queued", "queued"]
         assert released_rejected == ["released"]
         assert jobs.get(first.id).status == "running"
+    finally:
+        release.set()
+        jobs.executor.shutdown(wait=True)
+
+
+def test_lane_capacity_is_reserved_before_executor_starts_jobs():
+    class DeferredExecutor:
+        def __init__(self):
+            self.submitted = []
+
+        def submit(self, function):
+            future = Future()
+            self.submitted.append((function, future))
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            return None
+
+    jobs = JobCoordinator()
+    deferred = DeferredExecutor()
+    jobs._executors[SOURCING] = deferred
+    try:
+        accepted = [jobs.submit(lambda _progress: True, lane=SOURCING) for _ in range(3)]
+        assert len(deferred.submitted) == 3
+        assert [job.status for job in accepted] == ["queued", "queued", "queued"]
+        assert sum(job.active and job.lane == SOURCING for job in jobs.jobs.values()) == 3
+        with pytest.raises(JobAdmissionError) as error:
+            jobs.submit(lambda _progress: True, lane=SOURCING)
+        assert error.value.code == "JOB_LANE_BUSY"
+        assert len(deferred.submitted) == 3
+        assert [job.status for job in accepted] == ["queued", "queued", "queued"]
+    finally:
+        jobs.executor.shutdown(wait=True)
+
+
+def test_get_public_returns_a_public_snapshot():
+    jobs = JobCoordinator()
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        job = jobs.submit(
+            lambda _progress: (started.set(), release.wait(2))[1],
+            lane=SOURCING,
+            owner_id="private-owner",
+        )
+        assert started.wait(1)
+        original_public = job.public
+        lock_attempted = threading.Event()
+        lock_acquired = threading.Event()
+
+        def verify_snapshot_lock():
+            def contend_for_snapshot_lock():
+                acquired = jobs.lock.acquire(blocking=False)
+                if acquired:
+                    lock_acquired.set()
+                    jobs.lock.release()
+                lock_attempted.set()
+
+            contender = threading.Thread(target=contend_for_snapshot_lock)
+            contender.start()
+            assert lock_attempted.wait(1)
+            contender.join(1)
+            assert not lock_acquired.is_set()
+            return original_public()
+
+        job.public = verify_snapshot_lock
+        snapshot = jobs.get_public(job.id, owner_id="private-owner")
+        assert snapshot["id"] == job.id
+        assert snapshot["status"] == "running"
+        assert "owner_id" not in snapshot
+        assert "traceback" not in snapshot
+        assert "_future" not in snapshot
     finally:
         release.set()
         jobs.executor.shutdown(wait=True)

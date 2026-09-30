@@ -1284,7 +1284,7 @@ def recognize(
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str, user: CurrentUser = Depends(require_authenticated)):
     try:
-        return job_service.get(job_id, owner_id=_job_owner_id(user)).public()
+        return job_service.get_public(job_id, owner_id=_job_owner_id(user))
     except KeyError as exc:
         raise HTTPException(
             404,

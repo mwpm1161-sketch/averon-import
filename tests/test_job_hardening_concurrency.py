@@ -225,6 +225,13 @@ def test_one_c_then_provider_keeps_later_safe_history_match_after_live_circuit_o
     assert result.results[2].route.fallback_status == "suppressed"
     assert result.results[2].route.fallback_called is False
     assert result.results[2].provider_call_suppressed is True
+    assert not any(
+        notice.code == "ONE_C_FALLBACK_USED" for notice in result.results[2].notices
+    )
+    assert any(
+        notice.code == "ONE_C_FALLBACK_SUPPRESSED" for notice in result.results[2].notices
+    )
+    assert result.results[2].offers == []
     assert result.positions_fallback_called == 1
     assert result.positions_history_matched == 1
     assert result.confirmed_total is None
@@ -262,6 +269,16 @@ def test_one_c_fallback_health_failure_is_not_counted_as_live_call():
     assert result.positions_fallback_called == 0
     assert all(item.route.fallback_called is False for item in result.results)
     assert all(item.route.fallback_status == "suppressed" for item in result.results)
+    assert all(item.provider_call_suppressed is True for item in result.results)
+    assert all(
+        any(notice.code == "ONE_C_FALLBACK_SUPPRESSED" for notice in item.notices)
+        for item in result.results
+    )
+    assert all(
+        not any(notice.code == "ONE_C_FALLBACK_USED" for notice in item.notices)
+        for item in result.results
+    )
+    assert all(item.offers == [] for item in result.results)
 
 
 def test_sourcing_runtime_rebuild_does_not_rebind_accepted_job(monkeypatch):

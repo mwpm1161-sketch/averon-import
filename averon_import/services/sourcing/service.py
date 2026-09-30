@@ -346,12 +346,6 @@ class SourcingService:
 
         # one_c_then_provider falls back on every non-SAFE outcome. History
         # review candidates never enter the live provider's offers or ranking.
-        history_notice_code = (
-            "ONE_C_HISTORY_UNAVAILABLE" if history_outcome == "UNAVAILABLE"
-            else "ONE_C_HISTORY_REVIEW" if history_outcome == "REVIEW"
-            else "ONE_C_FALLBACK_USED"
-        )
-        fallback_notice = _history_notice(history_notice_code)
         context = fallback_context if fallback_context is not None else {}
         if not context.get("initialized"):
             context["initialized"] = True
@@ -367,7 +361,19 @@ class SourcingService:
         catalog_version = context.get("catalog_version")
         provider_error = context.get("error")
         warnings = list(understanding.warnings)
-        notices = dedupe_sourcing_notices([*understanding.notices, fallback_notice])
+        history_notice_codes = []
+        if history_outcome == "UNAVAILABLE":
+            history_notice_codes.append("ONE_C_HISTORY_UNAVAILABLE")
+        elif history_outcome == "REVIEW":
+            history_notice_codes.append("ONE_C_HISTORY_REVIEW")
+        if context.get("circuit_open"):
+            history_notice_codes.append("ONE_C_FALLBACK_SUPPRESSED")
+        elif history_outcome not in {"UNAVAILABLE", "REVIEW"}:
+            history_notice_codes.append("ONE_C_FALLBACK_USED")
+        notices = dedupe_sourcing_notices([
+            *understanding.notices,
+            *(_history_notice(code) for code in history_notice_codes),
+        ])
         if context.get("circuit_open"):
             result = self._provider_circuit_suppressed_result(
                 understanding.resolved_intent,
@@ -1197,6 +1203,7 @@ def _history_notice(code: str) -> SourcingNotice:
     messages = {
         "ONE_C_HISTORY_USED": "Использована историческая закупка 1С; текущая доступность не подтверждена.",
         "ONE_C_FALLBACK_USED": "В истории 1С нет безопасно подтверждённого совпадения; выполнен поиск у выбранного поставщика.",
+        "ONE_C_FALLBACK_SUPPRESSED": "В истории 1С нет безопасно подтверждённого совпадения; обращение к поставщику пропущено, поскольку поставщик уже недоступен в рамках текущего подбора.",
         "ONE_C_HISTORY_UNAVAILABLE": "История закупок 1С недоступна.",
         "ONE_C_HISTORY_REVIEW": "В истории 1С найдены варианты, требующие проверки.",
         "ONE_C_HISTORY_NOT_FOUND": "В истории 1С не найдено подходящей позиции.",

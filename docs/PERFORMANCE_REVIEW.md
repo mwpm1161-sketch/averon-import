@@ -64,6 +64,10 @@ The result table now attaches click, input, change, and focus handlers once to i
 
 The job executor remains at one worker. OCR and PDF rendering have material per-job memory use; sourcing/ETM calls may have provider rate limits and shared clients. `JobService` retains completed payloads and tracebacks in its process-local dictionary without a bound. This pass does not change concurrency or retention because the repository does not establish safe provider concurrency or the maximum result size. A safe next design is bounded admission by workload class, keeping OCR/PDF concurrency capped by measured peak RSS, imposing explicit queue limits, and expiring terminal job records only after a retention window longer than the client polling window; completed large payloads should be released only after a client acknowledgement or that expiry. Provider concurrency and memory measurements are prerequisites.
 
+### Phase 2 review item: synchronous row sourcing
+
+`POST /api/sourcing/search` and `POST /api/sourcing/search-intent` remain synchronous and outside the background `SOURCING` lane. ETM outbound HTTP is serialized process-wide, but the next sourcing phase must review whether synchronous live sourcing needs a shared provider/mirror admission gate. The gate should prevent a live request from overlapping local mirror maintenance or accumulating request threads while waiting; this phase does not add workers or redesign those endpoints.
+
 ## Structural before/after measurements
 
 | Operation | Base `pilot-v1.2` | Feature branch, measured or asserted structurally |
