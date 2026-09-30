@@ -122,3 +122,20 @@ Tesseract пытался открыть файл вида `tessdata_best"/rus.tr
 - Release builder `--verify`: **PASS**, archive manifest и состав проверены, 141 packaged files.
 - Повторная release build в отдельный output: **PASS**; ZIP SHA-256 двух архивов совпал, внешние manifests идентичны.
 - `git diff --check`: **PASS**.
+
+## Validation — 1.0.0-rc10 candidate
+
+Candidate checks were run in the Windows developer environment with an isolated `AVERON_DATA_DIR`; production and live provider systems were not accessed.
+
+- ETM iPRO focused tests: **77 passed**.
+- Provider runtime focused tests: **24 passed**.
+- Required combined ETM and provider-runtime gate: **101 passed**.
+- Date-sensitive 1C routing age tests: **4 passed** with deterministic test-local dates; 1C runtime behavior was not changed.
+- Release tooling tests: **4 passed**.
+- Full `pytest -q`: **1328 passed, 3 failed, 2 skipped**. The only failures were the known Tesseract-dependent tests `test_local_profile_resolves_tesseract_adapter`, `test_settings_processing_mode_influences_resolver` and `test_local_mode_rejects_cloud_llm_combination`; system Tesseract is intentionally absent.
+- `python -m compileall averon_import`: **PASS**.
+- `node --check averon_import/static/app.js`: **PASS**.
+- `git diff --check`: **PASS**.
+- Release builder `--verify`: **PASS**, **141 packaged files**.
+- Second deterministic build: **PASS**; the release and reproduction ZIPs and external manifests are identical.
+- No live ETM requests were made during validation.
