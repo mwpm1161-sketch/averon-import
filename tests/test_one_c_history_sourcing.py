@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 from pathlib import Path
@@ -26,6 +27,7 @@ from averon_import.services.sourcing.providers.one_c_history import (
     normalize_product_search_text,
 )
 from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy
+from averon_import.services.sourcing import service as sourcing_service_module
 from averon_import.services.sourcing.service import SourcingService
 
 
@@ -1088,15 +1090,26 @@ def test_one_c_then_provider_safe_history_row_skips_provider_network(tmp_path):
     ["2026-09-22", "2026-08-30", "2026-06-29", "2026-03-29"],
     ids=["7-days", "1-month", "3-months", "6-months"],
 )
-def test_historical_routing_has_no_age_cutoff_for_user_selected_periods(tmp_path, requested_period_start):
+def test_historical_routing_has_no_age_cutoff_for_user_selected_periods(
+    tmp_path, requested_period_start, monkeypatch
+):
     # Vary the snapshot's actual range while keeping the same current purchase
     # event. The selected display period is metadata only and must not change
     # SAFE_MATCH routing or impose a fixed freshness cutoff.
+    frozen_today = datetime(2026, 9, 30, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_today if tz is not None else frozen_today.replace(tzinfo=None)
+
+    monkeypatch.setattr(sourcing_service_module, "datetime", FrozenDateTime)
+    purchase_date = "2026-09-29"
     service, repository, _, live = _routed_service(
         tmp_path,
         [
             _event(row=2, when=requested_period_start, price_usable=False, price=None, reported=None, amount=None),
-            _event(row=3, when="2026-09-29"),
+            _event(row=3, when=purchase_date),
         ],
     )
     snapshot = repository.read_catalog_snapshot()
@@ -1112,8 +1125,9 @@ def test_historical_routing_has_no_age_cutoff_for_user_selected_periods(tmp_path
     assert snapshot is not None
     assert actual_period_start == requested_period_start
     assert result.route.final_source_kind == "historical_purchase"
-    assert result.route.history_purchase_date == "2026-09-29"
-    assert result.route.history_age_days == 0
+    expected_age = (frozen_today.date() - datetime.fromisoformat(purchase_date).date()).days
+    assert result.route.history_purchase_date == purchase_date
+    assert result.route.history_age_days == expected_age
     assert result.route.fallback_called is False
     assert live.stats_calls == 0 and live.search_calls == 0
 
