@@ -36,8 +36,8 @@ _LOGIN_INTERVAL_SECONDS = 120.0
 _AUTH_QUARANTINE_SECONDS = 12 * 60 * 60
 _AUTH_STATE_MAX_BYTES = 4096
 _AUTH_QUARANTINE_MESSAGE = (
-    "ЭТМ отклонил авторизацию. Автоматические повторные входы приостановлены, "
-    "чтобы избежать временной блокировки поставщиком."
+    "Повторная авторизация ЭТМ временно приостановлена, "
+    "чтобы избежать автоматической блокировки поставщиком."
 )
 
 Transport = Callable[[urllib.request.Request, float], Any]
@@ -379,7 +379,7 @@ class EtmIproClient:
                         code="INVALID_RESPONSE",
                         category="invalid_response",
                     )
-            except Exception as exc:
+            except SourcingProviderError as exc:
                 status_code = getattr(exc, "status_code", None)
                 category = getattr(exc, "category", "auth")
                 safe_category = "network" if category == "network" else "auth"

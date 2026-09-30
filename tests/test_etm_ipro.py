@@ -1029,6 +1029,8 @@ def test_failed_login_persists_twelve_hour_quarantine_without_secrets_and_expire
     with pytest.raises(SourcingProviderError) as quarantined:
         restarted_client.check_access()
     assert quarantined.value.code == "ETM_AUTH_QUARANTINED"
+    assert "Повторная авторизация ЭТМ временно приостановлена" in str(quarantined.value)
+    assert "отклонил" not in str(quarantined.value).casefold()
     assert len(login_calls) == 1
     for item_id in range(100):
         with pytest.raises(SourcingProviderError) as repeated:
@@ -1073,6 +1075,7 @@ def test_malformed_login_and_timeout_are_quarantined_without_leaking_details(
     assert failure.value.code == "ETM_AUTH_FAILURE"
     assert failure.value.status_code == expected_status
     assert "private" not in str(failure.value)
+    assert "отклонил" not in str(failure.value).casefold()
     persisted = (tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json").read_text(
         encoding="utf-8"
     )
@@ -1220,6 +1223,54 @@ def test_corrupt_persisted_auth_state_fails_closed_without_login(tmp_path, raw_s
     assert calls == []
     state = json.loads(auth_state_path.read_text(encoding="utf-8"))
     assert state["failure_category"] == "persisted_state_invalid"
+
+
+def test_unexpected_login_exception_propagates_but_persisted_guard_survives_restart(
+    tmp_path, caplog
+):
+    auth_state_path = tmp_path / "sourcing" / "providers" / "etm_ipro" / "auth_quarantine.json"
+    requests = []
+
+    def defective_transport(request, timeout):
+        requests.append(request.full_url)
+        raise RuntimeError("unexpected transport adapter defect")
+
+    client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "private-login",
+        "private-password",
+        transport=defective_transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(RuntimeError, match="unexpected transport adapter defect"):
+        client.check_access()
+
+    persisted = auth_state_path.read_text(encoding="utf-8")
+    state = json.loads(persisted)
+    assert state["failure_category"] == "login_attempt"
+    assert state["blocked_until"] > state["updated_at"]
+    assert "private-login" not in persisted
+    assert "private-password" not in persisted
+    assert "private-login" not in caplog.text
+    assert "private-password" not in caplog.text
+
+    def forbidden_transport(request, timeout):
+        requests.append(request.full_url)
+        raise AssertionError("quarantined client must not send another login")
+
+    restarted_client = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "private-login",
+        "private-password",
+        transport=forbidden_transport,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(SourcingProviderError) as blocked:
+        restarted_client.check_access()
+    assert blocked.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(requests) == 1
 
 
 def test_auth_state_write_failure_prevents_outbound_login(tmp_path, monkeypatch):
