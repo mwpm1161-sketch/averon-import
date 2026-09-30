@@ -55,7 +55,13 @@ class CountingProvider:
     def search(self, requested, *, limit=20):
         self.search_calls.append(requested.source_row_id)
         if requested.source_row_id in self.fail_ids:
-            raise ValueError("temporary provider failure")
+            # Only an explicit category proves this failure is row-local;
+            # unknown provider failures open the project-wide circuit.
+            from averon_import.services.sourcing.providers.base import SourcingProviderError
+
+            raise SourcingProviderError(
+                "temporary provider failure", category="invalid_request"
+            )
         return [offer()][:limit]
 
 
@@ -184,8 +190,10 @@ def test_demo_store_unreachable_fails_before_processing_rows(tmp_path):
             raise AssertionError("search must not run after health precheck")
 
     provider = OfflineDemoStore()
-    with pytest.raises(ValueError, match="store offline"):
-        service_for(tmp_path, provider).search_project(rows()[:2])
+    result = service_for(tmp_path, provider).search_project(rows()[:2])
+    assert result.positions_processed == 2
+    assert result.results[0].provider_error_category == "health_error"
+    assert all(item.provider_call_suppressed for item in result.results)
     assert provider.search_calls == 0
 
 
@@ -220,6 +228,27 @@ def test_project_sourcing_ui_polls_job_and_renders_completed_result():
 
     app_js = (Path(__file__).parents[1] / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     assert "const job = await api(url" in app_js
-    assert "pollSourcingJob(job.id" in app_js
+    assert "await pollSourcingJob(\n      job.id," in app_js
     assert "await api(`/api/jobs/${jobId}`)" in app_js
     assert "renderSourcingResult(job.result)" in app_js
+
+
+def test_sourcing_job_poller_checks_generation_before_and_after_job_get():
+    from pathlib import Path
+
+    app_js = (Path(__file__).parents[1] / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    poller = app_js.split("async function pollSourcingJob(", 1)[1].split("\nfunction cellHtml", 1)[0]
+    before_get = poller.index("if (!isCurrent()) return;")
+    job_get = poller.index("const job = await getJobForPolling(jobId);")
+    after_get = poller.index("if (!isCurrent()) return;", job_get)
+
+    assert before_get < job_get < after_get
+    assert 'const statusLabel = queued ? "В очереди" : "Выполняется";' in poller
+    assert "Math.min(2000 * (2 ** (queuedPoll - 1)), 8000)" in poller
+    assert "const JOB_RESTART_MESSAGE = \"Задание было прервано перезапуском сервера. Запустите его повторно.\";" in app_js
+    assert "if (error instanceof ApiError && error.status === 404)" in app_js
+    assert "method:\"POST\"" not in poller
+
+    submitter = app_js.split("async function runProjectSourcing(", 1)[1].split("\nasync function openProjectSourcing", 1)[0]
+    assert submitter.index("submitButton.disabled = true;") < submitter.index("const job = await api(url")
+    assert "submitButton.disabled = previousButtonDisabled;" in submitter

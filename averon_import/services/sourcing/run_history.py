@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +20,15 @@ _SAFE_DECISIONS = {
     "WITHOUT_OFFERS",
     "HISTORY_SAFE_MATCH",
 }
-_SAFE_FALLBACK_STATUSES = {"not_called", "completed", "error"}
+_SAFE_FALLBACK_STATUSES = {"not_called", "completed", "error", "suppressed"}
+_RUN_HISTORY_LOCKS_GUARD = threading.Lock()
+_RUN_HISTORY_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _run_history_lock(root: Path) -> threading.RLock:
+    key = str(root.expanduser().resolve())
+    with _RUN_HISTORY_LOCKS_GUARD:
+        return _RUN_HISTORY_LOCKS.setdefault(key, threading.RLock())
 
 
 class SourcingRunHistory:
@@ -27,6 +38,7 @@ class SourcingRunHistory:
 
     def __init__(self, root: Path, *, retention_limit: int | None = None):
         self.root = Path(root)
+        self._lock = _run_history_lock(self.root)
         self.retention_limit = max(1, int(retention_limit or self.retention_limit))
 
     @staticmethod
@@ -135,19 +147,20 @@ class SourcingRunHistory:
         return self._persist(record)
 
     def list_records(self) -> list[dict[str, Any]]:
-        if not self.root.is_dir():
-            return []
-        records: list[dict[str, Any]] = []
-        try:
-            paths = list(self.root.glob("*.json"))
-        except OSError:
-            return []
-        for path in paths:
-            record = self._read(path)
-            if record is not None:
-                records.append(record)
-        records.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-        return records
+        with self._lock:
+            if not self.root.is_dir():
+                return []
+            records: list[dict[str, Any]] = []
+            try:
+                paths = list(self.root.glob("*.json"))
+            except OSError:
+                return []
+            for path in paths:
+                record = self._read(path)
+                if record is not None:
+                    records.append(record)
+            records.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+            return records
 
     def list_public(self) -> list[dict[str, Any]]:
         return [_without_rows(record) for record in self.list_records()]
@@ -155,19 +168,36 @@ class SourcingRunHistory:
     def get(self, run_id: str) -> dict[str, Any] | None:
         if not _RUN_ID_RE.fullmatch(str(run_id)):
             return None
-        return self._read(self.root / f"{run_id}.json")
+        with self._lock:
+            return self._read(self.root / f"{run_id}.json")
 
     def _persist(self, record: dict[str, Any]) -> dict[str, Any]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        path = self.root / f"{record['run_id']}.json"
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(record, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-        self._prune()
-        return record
+        with self._lock:
+            self.root.mkdir(parents=True, exist_ok=True)
+            path = self.root / f"{record['run_id']}.json"
+            if path.exists():
+                raise FileExistsError("Sourcing run ids are immutable")
+            temporary_name: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.root,
+                    prefix=f".{path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary_name = temporary.name
+                    json.dump(record, temporary, ensure_ascii=False, indent=2)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_name, path)
+                temporary_name = None
+            finally:
+                if temporary_name is not None:
+                    Path(temporary_name).unlink(missing_ok=True)
+            self._prune()
+            return record
 
     def _read(self, path: Path) -> dict[str, Any] | None:
         try:
@@ -177,21 +207,22 @@ class SourcingRunHistory:
         return value if isinstance(value, dict) and _RUN_ID_RE.fullmatch(str(value.get("run_id") or "")) else None
 
     def _prune(self) -> None:
-        valid: list[tuple[str, Path]] = []
-        try:
-            paths = list(self.root.glob("*.json"))
-        except OSError:
-            return
-        for path in paths:
-            record = self._read(path)
-            if record is not None:
-                valid.append((str(record.get("created_at") or ""), path))
-        valid.sort(key=lambda item: item[0], reverse=True)
-        for _, path in valid[self.retention_limit:]:
+        with self._lock:
+            valid: list[tuple[str, Path]] = []
             try:
-                path.unlink()
+                paths = list(self.root.glob("*.json"))
             except OSError:
-                continue
+                return
+            for path in paths:
+                record = self._read(path)
+                if record is not None:
+                    valid.append((str(record.get("created_at") or ""), path))
+            valid.sort(key=lambda item: item[0], reverse=True)
+            for _, path in valid[self.retention_limit:]:
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
 
 
 def _result_dict(result: Any) -> dict[str, Any]:
@@ -251,6 +282,8 @@ def _sanitize_row(value: dict[str, Any]) -> dict[str, Any]:
             "fallback_catalog_version": _safe_text(route.get("fallback_catalog_version"), 120),
             "routing_policy_revision": _safe_text(route.get("routing_policy_revision"), 80),
         }} if route else {}),
+        "provider_error_category": _safe_text(value.get("provider_error_category"), 80),
+        "provider_call_suppressed": bool(value.get("provider_call_suppressed")),
         **({"match": {
             "matched_attributes": _safe_text_list(match.get("matched_attributes")),
             "missing_attributes": _safe_text_list(match.get("missing_attributes")),

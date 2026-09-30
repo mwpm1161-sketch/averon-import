@@ -66,7 +66,13 @@ from averon_import.services.auth import (
     require_one_c_history_import,
 )
 from averon_import.services.export_service import ExcelExportService
-from averon_import.services.jobs import JobService
+from averon_import.services.jobs import (
+    DOCUMENT_PROCESSING,
+    SOURCING,
+    JobAdmissionError,
+    JobService,
+    stable_fingerprint,
+)
 from averon_import.services.one_c_history import (
     OneCHistoryActivityConflict,
     OneCHistoryActivityRegistry,
@@ -200,6 +206,7 @@ sourcing_service = sourcing_runtime.service
 human_review_service = HumanReviewService()
 document_mutation_locks = DocumentMutationLocks()
 document_activity_registry = DocumentActivityRegistry()
+_sourcing_runtime_lock = threading.RLock()
 
 
 def require_document_activity(document_id: str):
@@ -210,23 +217,51 @@ def require_document_activity(document_id: str):
         raise HTTPException(404, "Документ не найден") from exc
 
 
-def _submit_document_job(document_id: str, run):
-    """Hold a lifecycle lease from queueing through the background job's exit."""
+def _job_owner_id(user: CurrentUser | None) -> str:
+    """Return an owner key from the authenticated server-side identity."""
+    if not isinstance(user, CurrentUser):
+        return "__internal__"
+    return str(user.user_id or user.username.casefold())
+
+
+def _job_admission_http_error(exc: JobAdmissionError) -> HTTPException:
+    return HTTPException(
+        409,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+def _submit_document_job(
+    document_id: str,
+    run,
+    *,
+    lane: str = DOCUMENT_PROCESSING,
+    owner_id: str = "__internal__",
+    kind: str = "document_operation",
+    dedupe_key: str | None = None,
+    release_callbacks=(),
+):
+    """Transfer a lifecycle lease to the coordinator for its full job lifetime."""
     try:
         release = document_activity_registry.acquire(document_id)
     except DocumentUnavailable as exc:
         raise HTTPException(404, "Документ не найден") from exc
-
-    def leased_run(progress):
-        try:
-            return run(progress)
-        finally:
-            release()
-
+    callbacks = [release, *release_callbacks]
     try:
-        return job_service.submit(leased_run)
+        return job_service.submit(
+            run,
+            lane=lane,
+            kind=kind,
+            owner_id=owner_id,
+            document_id=document_id,
+            dedupe_key=dedupe_key,
+            release_callbacks=callbacks,
+        )
+    except JobAdmissionError as exc:
+        raise _job_admission_http_error(exc) from exc
     except Exception:
-        release()
+        for callback in callbacks:
+            callback()
         raise
 
 
@@ -306,16 +341,18 @@ def _rebuild_sourcing_runtime() -> None:
     """Rebind sourcing dependencies after settings or secret changes."""
 
     global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
-    sourcing_runtime = create_sourcing_runtime(
+    rebuilt = create_sourcing_runtime(
         DATA_DIR,
         app_settings_service,
         secret_store,
         one_c_history_repository=one_c_history_repository,
     )
-    sourcing_repository = sourcing_runtime.repository
-    sourcing_provider = sourcing_runtime.providers["local_catalog"]
-    demo_store_provider = sourcing_runtime.providers["demo_store_http"]
-    sourcing_service = sourcing_runtime.service
+    with _sourcing_runtime_lock:
+        sourcing_runtime = rebuilt
+        sourcing_repository = rebuilt.repository
+        sourcing_provider = rebuilt.providers["local_catalog"]
+        demo_store_provider = rebuilt.providers["demo_store_http"]
+        sourcing_service = rebuilt.service
 
 app = FastAPI(
     title=APP_NAME,
@@ -1131,7 +1168,10 @@ def page_image(document_id: str, page_number: int, dpi: int = 110):
     "/api/documents/{document_id}/suggest-pages",
     dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
 )
-def suggest_pages(document_id: str):
+def suggest_pages(
+    document_id: str,
+    user: CurrentUser = Depends(require_authenticated),
+):
     try:
         workspace = workspace_service.get(document_id)
         metadata = workspace_service.read_json(workspace.metadata_path)
@@ -1143,14 +1183,24 @@ def suggest_pages(document_id: str):
             workspace.pdf_path, workspace.pages_dir, metadata["page_count"], progress
         )
 
-    return _submit_document_job(document_id, run).public()
+    return _submit_document_job(
+        document_id,
+        run,
+        kind="suggest_pages",
+        owner_id=_job_owner_id(user),
+        dedupe_key=stable_fingerprint({"kind": "suggest_pages", "document_id": document_id}),
+    ).public()
 
 
 @app.post(
     "/api/documents/{document_id}/recognize",
     dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
 )
-def recognize(document_id: str, request: RecognitionRequest):
+def recognize(
+    document_id: str,
+    request: RecognitionRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
     try:
         workspace = workspace_service.get(document_id)
         metadata = workspace_service.read_json(workspace.metadata_path)
@@ -1211,16 +1261,35 @@ def recognize(document_id: str, request: RecognitionRequest):
             workspace_service.write_json(workspace.result_path, result)
         return result
 
-    job = _submit_document_job(document_id, run)
+    job = _submit_document_job(
+        document_id,
+        run,
+        kind="recognition",
+        owner_id=_job_owner_id(user),
+        dedupe_key=stable_fingerprint({
+            "kind": "recognition",
+            "document_id": document_id,
+            "base_revision": recognition_base_revision,
+            "pages": pages,
+            "crop": crop,
+            "dpi": request.dpi,
+            "processing_mode": request.processing_mode,
+            "ocr_mode": request.ocr_mode,
+            "ai_provider": request.ai_provider,
+        }),
+    )
     return job.public()
 
 
-@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_authenticated)])
-def get_job(job_id: str):
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str, user: CurrentUser = Depends(require_authenticated)):
     try:
-        return job_service.get(job_id).public()
+        return job_service.get(job_id, owner_id=_job_owner_id(user)).public()
     except KeyError as exc:
-        raise HTTPException(404, "Задание не найдено") from exc
+        raise HTTPException(
+            404,
+            detail={"code": "JOB_NOT_FOUND", "message": "Задание не найдено"},
+        ) from exc
 
 
 @app.get(
@@ -1902,6 +1971,26 @@ def _sourcing_payload(value: Any) -> Any:
     return value
 
 
+def _submit_sourcing_maintenance(
+    run,
+    *,
+    owner_id: str,
+    kind: str,
+    provider_key: str,
+):
+    try:
+        return job_service.submit(
+            run,
+            lane=SOURCING,
+            kind=kind,
+            owner_id=owner_id,
+            dedupe_key=stable_fingerprint({"kind": kind, "provider": provider_key}),
+            fail_if_lane_occupied=True,
+        )
+    except JobAdmissionError as exc:
+        raise _job_admission_http_error(exc) from exc
+
+
 @app.get("/api/sourcing/providers", dependencies=[Depends(require_authenticated)])
 def sourcing_providers():
     return sourcing_service.public_config()
@@ -1914,9 +2003,10 @@ def sourcing_history_status():
     return status
 
 
-@app.post("/api/sourcing/providers/lemana_b2b/sync", dependencies=[Depends(require_admin)])
-def sync_lemana_b2b():
-    provider = sourcing_service.provider("lemana_b2b")
+@app.post("/api/sourcing/providers/lemana_b2b/sync")
+def sync_lemana_b2b(admin: CurrentUser = Depends(require_admin)):
+    service = sourcing_service
+    provider = service.provider("lemana_b2b")
     sync_method = getattr(provider, "sync", None)
     if not callable(sync_method):
         raise HTTPException(404, "Синхронизация Lemana PRO B2B недоступна")
@@ -1929,7 +2019,12 @@ def sync_lemana_b2b():
             return asdict(result)
         return _sourcing_payload(result)
 
-    return job_service.submit(run).public()
+    return _submit_sourcing_maintenance(
+        run,
+        owner_id=_job_owner_id(admin),
+        kind="provider_maintenance:lemana_b2b:sync",
+        provider_key="lemana_b2b",
+    ).public()
 
 
 @app.get("/api/sourcing/providers/etm_ipro/health", dependencies=[Depends(require_admin)])
@@ -1941,13 +2036,18 @@ def etm_ipro_health():
     return _sourcing_payload(health_method())
 
 
-@app.post("/api/sourcing/providers/etm_ipro/manufacturers/sync", dependencies=[Depends(require_admin)])
-def sync_etm_ipro_manufacturers():
+@app.post("/api/sourcing/providers/etm_ipro/manufacturers/sync")
+def sync_etm_ipro_manufacturers(admin: CurrentUser = Depends(require_admin)):
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "sync_manufacturers", None)
     if not callable(method):
         raise HTTPException(404, "Синхронизация производителей ЭТМ iPRO недоступна")
-    return job_service.submit(lambda progress: {"count": method()}).public()
+    return _submit_sourcing_maintenance(
+        lambda progress: {"count": method()},
+        owner_id=_job_owner_id(admin),
+        kind="provider_maintenance:etm_ipro:manufacturers_sync",
+        provider_key="etm_ipro",
+    ).public()
 
 
 @app.get("/api/sourcing/providers/etm_ipro/manufacturers/status", dependencies=[Depends(require_authenticated)])
@@ -1959,13 +2059,18 @@ def etm_ipro_manufacturer_status():
     return _sourcing_payload(method())
 
 
-@app.post("/api/sourcing/providers/etm_ipro/catalog/sync", dependencies=[Depends(require_admin)])
-def start_etm_ipro_catalog_sync():
+@app.post("/api/sourcing/providers/etm_ipro/catalog/sync")
+def start_etm_ipro_catalog_sync(admin: CurrentUser = Depends(require_admin)):
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "start_catalog_sync", None)
     if not callable(method):
         raise HTTPException(404, "Синхронизация каталога ЭТМ iPRO недоступна")
-    return job_service.submit(lambda progress: _sourcing_payload(method())).public()
+    return _submit_sourcing_maintenance(
+        lambda progress: _sourcing_payload(method()),
+        owner_id=_job_owner_id(admin),
+        kind="provider_maintenance:etm_ipro:catalog_sync",
+        provider_key="etm_ipro",
+    ).public()
 
 
 @app.get("/api/sourcing/providers/etm_ipro/catalog/status", dependencies=[Depends(require_admin)])
@@ -1981,25 +2086,31 @@ def etm_ipro_catalog_status():
     return payload
 
 
-@app.post("/api/sourcing/providers/etm_ipro/catalog/import", dependencies=[Depends(require_admin)])
-def import_etm_ipro_catalog():
+@app.post("/api/sourcing/providers/etm_ipro/catalog/import")
+def import_etm_ipro_catalog(admin: CurrentUser = Depends(require_admin)):
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "import_completed_catalog", None)
     if not callable(method):
         raise HTTPException(404, "Импорт каталога ЭТМ iPRO недоступен")
-    return job_service.submit(
-        lambda progress: _sourcing_payload(method(progress))
+    return _submit_sourcing_maintenance(
+        lambda progress: _sourcing_payload(method(progress)),
+        owner_id=_job_owner_id(admin),
+        kind="provider_maintenance:etm_ipro:catalog_import",
+        provider_key="etm_ipro",
     ).public()
 
 
-@app.post("/api/sourcing/providers/etm_ipro/catalog/reindex", dependencies=[Depends(require_admin)])
-def reindex_etm_ipro_catalog():
+@app.post("/api/sourcing/providers/etm_ipro/catalog/reindex")
+def reindex_etm_ipro_catalog(admin: CurrentUser = Depends(require_admin)):
     provider = sourcing_service.provider("etm_ipro")
     method = getattr(provider, "rebuild_search_index", None)
     if not callable(method):
         raise HTTPException(404, "Переиндексация каталога ЭТМ iPRO недоступна")
-    return job_service.submit(
-        lambda progress: _sourcing_payload(method(progress))
+    return _submit_sourcing_maintenance(
+        lambda progress: _sourcing_payload(method(progress)),
+        owner_id=_job_owner_id(admin),
+        kind="provider_maintenance:etm_ipro:catalog_reindex",
+        provider_key="etm_ipro",
     ).public()
 
 
@@ -2109,18 +2220,32 @@ def _submit_sourcing_project_job(
     limit: int,
     source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY,
     document_id: str | None = None,
+    owner_id: str = "__internal__",
 ):
     source_mode = SourcingSourceMode(source_mode)
+    # Keep the accepted job on the runtime that existed at admission. A later
+    # settings refresh may replace the module globals while this job is queued.
+    with _sourcing_runtime_lock:
+        runtime = sourcing_runtime
+        service = (
+            sourcing_service
+            if sourcing_service is not runtime.service
+            else runtime.service
+        )
     provider = (
-        sourcing_service.provider(provider_key)
+        service.provider(provider_key)
         if source_mode == SourcingSourceMode.PROVIDER_ONLY
         else None
     )
     history = None
     run_id = None
     created_at = datetime.now(timezone.utc).isoformat()
+    document_revision = 0
     if document_id is not None:
         workspace = workspace_service.get(document_id)
+        document_revision = _result_revision(
+            workspace_service.read_json(workspace.result_path, default={})
+        )
         history = SourcingRunHistory(workspace.sourcing_runs_dir)
         run_id = history.new_run_id()
     eligible_total = sum(
@@ -2143,20 +2268,19 @@ def _submit_sourcing_project_job(
 
         try:
             if source_mode == SourcingSourceMode.PROVIDER_ONLY:
-                catalog_version = sourcing_service._project_catalog_version(provider)
-                result = sourcing_service.search_project(
+                result = service.search_project(
                     rows,
                     provider_key=provider_key,
                     limit=limit,
                     progress=tracked_progress,
                     telemetry=telemetry.append,
-                    catalog_version=catalog_version,
                     ai_rerank=False,
                 )
+                catalog_version = result.catalog_version or "unknown"
             else:
                 captured_history_version = one_c_history_repository.catalog_version()
                 catalog_version = captured_history_version or "unknown"
-                result = sourcing_service.search_project_routed(
+                result = service.search_project_routed(
                     rows,
                     source_mode=source_mode,
                     provider_key=provider_key,
@@ -2202,17 +2326,44 @@ def _submit_sourcing_project_job(
                     source_mode=source_mode.value,
                 )
             raise
-        finally:
-            if history_lease is not None:
-                history_lease.release()
-
     if source_mode != SourcingSourceMode.PROVIDER_ONLY:
         try:
             history_lease = one_c_history_activity.acquire_sourcing()
         except OneCHistoryActivityConflict as exc:
             raise _one_c_history_http_error(exc) from exc
     try:
-        job = _submit_document_job(document_id, run) if document_id is not None else job_service.submit(run)
+        dedupe_key = stable_fingerprint({
+            "kind": "project_sourcing",
+            "document_id": document_id,
+            "document_revision": document_revision,
+            "source_mode": source_mode.value,
+            "provider": provider_key,
+            "limit": max(1, min(limit, 100)),
+            "rows": rows,
+        })
+        releases = [history_lease.release] if history_lease is not None else []
+        if document_id is not None:
+            job = _submit_document_job(
+                document_id,
+                run,
+                lane=SOURCING,
+                owner_id=owner_id,
+                kind="project_sourcing",
+                dedupe_key=dedupe_key,
+                release_callbacks=releases,
+            )
+        else:
+            try:
+                job = job_service.submit(
+                    run,
+                    lane=SOURCING,
+                    kind="project_sourcing",
+                    owner_id=owner_id,
+                    dedupe_key=dedupe_key,
+                    release_callbacks=releases,
+                )
+            except JobAdmissionError as exc:
+                raise _job_admission_http_error(exc) from exc
         return job.public()
     except Exception:
         if history_lease is not None:
@@ -2240,8 +2391,11 @@ def _assert_project_history_version(result: Any, captured_version: str | None) -
         raise RuntimeError("A project sourcing run returned mixed 1C history snapshots")
 
 
-@app.post("/api/sourcing/search-all", dependencies=[Depends(require_authenticated)])
-def sourcing_search_all(request: SourcingProjectRequest):
+@app.post("/api/sourcing/search-all")
+def sourcing_search_all(
+    request: SourcingProjectRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
     rows = [dict(row) for row in request.rows]
     provider_key = request.provider
     limit = max(1, min(request.limit, 100))
@@ -2250,6 +2404,7 @@ def sourcing_search_all(request: SourcingProjectRequest):
         provider_key=provider_key,
         limit=limit,
         source_mode=request.source_mode,
+        owner_id=_job_owner_id(user),
     )
 
 
@@ -2380,7 +2535,11 @@ def document_sourcing_search(document_id: str, request: SourcingRowRequest):
     "/api/documents/{document_id}/sourcing/search-all",
     dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
 )
-def document_sourcing_search_all(document_id: str, request: SourcingProjectRequest):
+def document_sourcing_search_all(
+    document_id: str,
+    request: SourcingProjectRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
     _ensure_document(document_id)
     # The client sends the current selected/exportable rows, including any
     # reviewed edits.  The document id is used only to scope the operation.
@@ -2391,6 +2550,7 @@ def document_sourcing_search_all(document_id: str, request: SourcingProjectReque
         limit=max(1, min(request.limit, 100)),
         source_mode=request.source_mode,
         document_id=document_id,
+        owner_id=_job_owner_id(user),
     )
 
 

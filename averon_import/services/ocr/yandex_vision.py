@@ -23,6 +23,7 @@ import json
 import math
 import os
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -113,6 +114,10 @@ class _HttpFailure(Exception):
         self.headers = headers or {}
 
 
+class _RetryablePollFailure(Exception):
+    """One bounded poll request failed transiently; the operation may retry."""
+
+
 class _HttpResponse:
     def __init__(self, status: int, body: bytes, headers: dict | None = None):
         self.status = status
@@ -171,6 +176,7 @@ class YandexVisionProvider:
         poll_interval_s: float = 2.0,
         poll_interval_max_s: float = 15.0,
         submit_attempts: int = 2,
+        request_attempts: int = 3,
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], float] = time.monotonic,
         grid_detector=None,
@@ -188,6 +194,7 @@ class YandexVisionProvider:
         self._poll_interval_s = poll_interval_s
         self._poll_interval_max_s = poll_interval_max_s
         self._submit_attempts = submit_attempts
+        self._request_attempts = max(1, int(request_attempts))
         self._sleep = sleep_fn
         self._now = now_fn
         self._grid_detector = grid_detector or RasterRuledTableGridDetector()
@@ -329,9 +336,7 @@ class YandexVisionProvider:
             "pages": pages_payload,
         }
         path = self._cache_dir / "results" / f"{key}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        self._atomic_write_json(path, payload)
 
     @staticmethod
     def _drop_quietly(path: Path) -> None:
@@ -370,9 +375,30 @@ class YandexVisionProvider:
             "pages": list(page_numbers),
             "created_at": time.time(),
         }
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, path)
+        self._atomic_write_json(path, payload)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                json.dump(payload, temporary, ensure_ascii=False)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, path)
+            temporary_name = None
+        finally:
+            if temporary_name is not None:
+                Path(temporary_name).unlink(missing_ok=True)
 
     def _pending_delete(self, key: str) -> None:
         path = self._pending_path(key)
@@ -405,18 +431,24 @@ class YandexVisionProvider:
         allow_submit_retry: bool = False,
         allow_not_ready_404: bool = False,
         timeout_error_message: str | None = None,
+        deadline: float | None = None,
     ) -> _HttpResponse:
         attempt = 0
         while True:
             self._check_cancel(cancel)
+            if deadline is not None and self._now() >= deadline:
+                raise self._operation_timeout_error()
             attempt += 1
             try:
+                request_timeout = float(timeout)
+                if deadline is not None:
+                    request_timeout = min(request_timeout, max(0.001, deadline - self._now()))
                 response = self._http.request(
                     method,
                     url,
                     body=body,
                     headers=self._auth_headers(api_key, folder_id),
-                    timeout=timeout,
+                    timeout=request_timeout,
                 )
                 if response.status < 400:
                     return response
@@ -431,9 +463,18 @@ class YandexVisionProvider:
                 and self._is_not_ready_404(failure.message)
             ):
                 raise failure
-            retryable = failure.status in RETRYABLE_STATUSES or failure.status == 0
-            limit = self._submit_attempts if allow_submit_retry else None
-            if not (retryable and (limit is None or attempt < limit)):
+            retryable = (
+                failure.status in {408, 429}
+                or 500 <= failure.status <= 599
+                or failure.status == 0
+            )
+            limit = self._submit_attempts if allow_submit_retry else self._request_attempts
+            # An async poll consumes one operation deadline, even when each
+            # individual poll request is retryable.
+            bounded_by_deadline = deadline is not None
+            if retryable and bounded_by_deadline and attempt >= limit:
+                raise _RetryablePollFailure() from None
+            if not (retryable and (bounded_by_deadline or attempt < limit)):
                 if failure.status == 0:
                     if timeout_error_message:
                         raise OcrProviderError(timeout_error_message) from None
@@ -452,7 +493,18 @@ class YandexVisionProvider:
                     f"(попытка {attempt}), повтор..."
                 )
             retry_after = self._retry_after_seconds(failure.headers)
-            self._sleep(retry_after if retry_after is not None else min(2 ** attempt, 8))
+            delay = retry_after if retry_after is not None else min(2 ** attempt, 8)
+            if deadline is not None:
+                remaining = max(0.0, deadline - self._now())
+                delay = min(delay, remaining)
+            self._sleep(delay)
+
+    def _operation_timeout_error(self) -> OcrProviderError:
+        return OcrProviderError(
+            "Превышено время ожидания операции Yandex Vision. Идентификатор "
+            "операции сохранён — при следующем запуске опрос продолжится "
+            "без повторной отправки документа."
+        )
 
     @staticmethod
     def _failure_from_response(response: _HttpResponse) -> _HttpFailure:
@@ -1264,7 +1316,8 @@ class YandexVisionProvider:
         return f"{recognition_base}{_recognition_path()}?operationId={operation_id}"
 
     def _poll_once(
-        self, operation_id: str, recognition_base: str, config: dict, api_key: str, cancel
+        self, operation_id: str, recognition_base: str, config: dict, api_key: str, cancel,
+        *, deadline: float,
     ) -> _HttpResponse | None:
         warnings: list[str] = []
         try:
@@ -1278,6 +1331,7 @@ class YandexVisionProvider:
                 cancel=cancel,
                 warnings=warnings,
                 allow_not_ready_404=True,
+                deadline=deadline,
             )
         except _HttpFailure as exc:
             if exc.status == 404 and self._is_not_ready_404(exc.message):
@@ -1338,9 +1392,22 @@ class YandexVisionProvider:
         interval = self._poll_interval_s
         while True:
             self._check_cancel(cancel)
-            response = self._poll_once(
-                operation_id, recognition_base, config, api_key, cancel
-            )
+            if self._now() >= deadline:
+                raise self._operation_timeout_error()
+            try:
+                response = self._poll_once(
+                    operation_id, recognition_base, config, api_key, cancel,
+                    deadline=deadline,
+                )
+            except _RetryablePollFailure:
+                if self._now() >= deadline:
+                    raise self._operation_timeout_error() from None
+                if progress:
+                    elapsed = max(0, int(self._now() - started))
+                    progress(f"Yandex OCR: ожидаем результат, {elapsed} с")
+                self._sleep(min(interval, max(0.0, deadline - self._now())))
+                interval = min(interval * 2, self._poll_interval_max_s)
+                continue
             if response is not None and response.body.strip():
                 status, objects = self._parse_jsonl(response.body)
                 if status is None:

@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 
 class SourcingModel(BaseModel):
@@ -41,7 +41,7 @@ class HistorySafeMatchBasis(str, Enum):
 class SourcingRouteMetadata(SourcingModel):
     source_mode: SourcingSourceMode
     final_source_kind: Literal["historical_purchase", "provider", "history_review", "none"]
-    fallback_status: Literal["not_called", "completed", "error"] = "not_called"
+    fallback_status: Literal["not_called", "completed", "error", "suppressed"] = "not_called"
     history_outcome: Literal["SAFE_MATCH", "REVIEW", "NO_MATCH", "UNAVAILABLE"] = "NO_MATCH"
     history_safe_basis: HistorySafeMatchBasis | None = None
     history_reason_code: str = Field(default="", max_length=100)
@@ -278,6 +278,8 @@ class SourcingRankingResult:
 
 
 class SourcingResult(SourcingModel):
+    _provider_call_attempted: bool = PrivateAttr(default=False)
+
     intent: ProductIntent
     understanding: ProductUnderstandingResult | None = None
     recommended_offer: Offer | None = None
@@ -291,6 +293,8 @@ class SourcingResult(SourcingModel):
     timings: dict[str, float] = Field(default_factory=dict)
     ai_mode: str = "fallback"
     route: SourcingRouteMetadata | None = None
+    provider_error_category: str | None = None
+    provider_call_suppressed: bool = False
 
 
 class ProjectSourcingResult(SourcingModel):

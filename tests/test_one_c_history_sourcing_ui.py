@@ -142,7 +142,7 @@ def test_sourcing_routes_are_sent_for_row_project_and_manual_project_requests():
 
     assert "source_mode:sourceMode" in row_search
     assert "source_mode:sourceMode" in project_search
-    assert "await runProjectSourcing(manualRowsForSourcing(), null)" in manual_search
+    assert 'await runProjectSourcing(manualRowsForSourcing(), null, $("#manual-project-sourcing-button"))' in manual_search
     assert "requestGeneration" in row_search and "requestGeneration" in project_search
     assert "sourceModeTouched" in app and "modeChangedAfterResult" in app
     assert "Режим изменён. Запустите подбор повторно, чтобы применить." in _html

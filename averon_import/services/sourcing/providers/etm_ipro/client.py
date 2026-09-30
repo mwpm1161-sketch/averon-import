@@ -39,6 +39,7 @@ _AUTH_QUARANTINE_MESSAGE = (
     "Повторная авторизация ЭТМ временно приостановлена, "
     "чтобы избежать автоматической блокировки поставщиком."
 )
+_ETM_OUTBOUND_GATE = threading.RLock()
 
 Transport = Callable[[urllib.request.Request, float], Any]
 
@@ -209,6 +210,19 @@ class EtmIproClient:
     ) -> EtmSnapshotDownload:
         """Stream a completed SgGds snapshot without buffering it in memory."""
 
+        with _ETM_OUTBOUND_GATE:
+            return self._download_snapshot_to_file_unlocked(
+                url, destination, progress=progress
+            )
+
+    def _download_snapshot_to_file_unlocked(
+        self,
+        url: str,
+        destination: str | Path,
+        *,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> EtmSnapshotDownload:
+
         safe_url = self._validate_snapshot_url(url)
         output_path = Path(destination)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +354,13 @@ class EtmIproClient:
         return safe_url
 
     def _get_session(self, *, force: bool = False) -> str:
+        # Keep lock ordering consistent with authenticated requests, which take
+        # the process-wide outbound gate before touching this client's session
+        # state. The gate is reentrant so login can use _request_raw safely.
+        with _ETM_OUTBOUND_GATE:
+            return self._resolve_session(force=force)
+
+    def _resolve_session(self, *, force: bool = False) -> str:
         if not self.configured:
             raise SourcingProviderError(
                 "ЭТМ iPRO не настроен: укажите логин и пароль",
@@ -423,7 +444,13 @@ class EtmIproClient:
             request_query["session-id"] = session
         request_url = self._replace_query(url, request_query, authenticated=auth)
         try:
-            status, raw = self._request_raw(method, request_url, headers=headers, bucket=bucket)
+            status, raw = self._request_raw(
+                method,
+                request_url,
+                headers=headers,
+                bucket=bucket,
+                authenticated=auth,
+            )
             if not 200 <= status < 300:
                 raise self._status_error(status)
             try:
@@ -436,13 +463,6 @@ class EtmIproClient:
                 ) from exc
         except SourcingProviderError as exc:
             if auth and exc.status_code == 403:
-                with self._session_lock:
-                    self._session = None
-                    self._local_quarantine_until = self._wall_clock() + _AUTH_QUARANTINE_SECONDS
-                    try:
-                        self._write_auth_quarantine_locked("auth", 403)
-                    except OSError:
-                        raise self._auth_state_unavailable_error() from None
                 raise self._auth_quarantined_error(status_code=403) from None
             raise
 
@@ -573,40 +593,64 @@ class EtmIproClient:
         *,
         headers: dict[str, str],
         bucket: str,
+        authenticated: bool = False,
     ) -> tuple[int, bytes]:
         request = urllib.request.Request(url, headers=headers, method=method)
         if bucket not in {"auth", "general"}:
             self.rate_limiter.acquire(bucket)
-        try:
-            response = self._transport(request, float(self.settings.request_timeout_s))
+        with _ETM_OUTBOUND_GATE:
+            if authenticated:
+                with self._session_lock:
+                    quarantine = self._load_auth_quarantine_locked()
+                if quarantine is not None and quarantine > self._wall_clock():
+                    raise self._auth_quarantined_error()
             try:
-                status = getattr(response, "status", None) or getattr(response, "code", None)
-                raw = response.read(_MAX_RESPONSE_BYTES + 1)
-            finally:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-            if not isinstance(status, int):
-                raise SourcingProviderError("ЭТМ iPRO вернул ответ без HTTP-статуса", category="invalid_response")
-            if len(raw) > _MAX_RESPONSE_BYTES:
-                raise SourcingProviderError("Ответ ЭТМ iPRO превышает безопасный размер", category="invalid_response")
-            return status, raw
-        except urllib.error.HTTPError as exc:
-            raise self._status_error(int(exc.code)) from None
-        except SourcingProviderError:
-            raise
-        except (OSError, TimeoutError, ValueError) as exc:
-            raise SourcingProviderError(
-                "ЭТМ iPRO временно недоступен; повторите запрос позже",
-                code="UPSTREAM_UNAVAILABLE",
-                category="network",
-            ) from exc
+                response = self._transport(request, float(self.settings.request_timeout_s))
+                try:
+                    status = getattr(response, "status", None) or getattr(response, "code", None)
+                    raw = response.read(_MAX_RESPONSE_BYTES + 1)
+                finally:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+                if not isinstance(status, int):
+                    raise SourcingProviderError("ЭТМ iPRO вернул ответ без HTTP-статуса", category="invalid_response")
+                if len(raw) > _MAX_RESPONSE_BYTES:
+                    raise SourcingProviderError("Ответ ЭТМ iPRO превышает безопасный размер", category="invalid_response")
+                if authenticated and status == 403:
+                    self._quarantine_authenticated_403()
+                    raise self._auth_quarantined_error(status_code=403)
+                return status, raw
+            except urllib.error.HTTPError as exc:
+                if authenticated and int(exc.code) == 403:
+                    self._quarantine_authenticated_403()
+                    raise self._auth_quarantined_error(status_code=403) from None
+                raise self._status_error(int(exc.code)) from None
+            except SourcingProviderError:
+                raise
+            except (OSError, TimeoutError, ValueError) as exc:
+                raise SourcingProviderError(
+                    "ЭТМ iPRO временно недоступен; повторите запрос позже",
+                    code="UPSTREAM_UNAVAILABLE",
+                    category="network",
+                ) from exc
+
+    def _quarantine_authenticated_403(self) -> None:
+        with self._session_lock:
+            self._session = None
+            self._local_quarantine_until = self._wall_clock() + _AUTH_QUARANTINE_SECONDS
+            try:
+                self._write_auth_quarantine_locked("auth", 403)
+            except OSError:
+                raise self._auth_state_unavailable_error() from None
 
     @staticmethod
     def _status_error(status: int) -> SourcingProviderError:
         if status == 403:
             message = "ЭТМ iPRO отклонил сессию; повторите запрос позже"
             category = "auth"
+        elif status == 429:
+            message, category = "ЭТМ iPRO ограничил частоту запросов; повторите позже", "rate_limit"
         elif 400 <= status < 500:
             message, category = "ЭТМ iPRO отклонил запрос", "invalid_request"
         else:

@@ -361,12 +361,24 @@ class SourcingService:
                 context["catalog_version"] = self._project_catalog_version(context["provider"])
             except Exception as exc:
                 context["error"] = exc
+                context["circuit_open"] = True
+                context["error_category"] = _provider_error_category(exc)
         provider = context.get("provider")
         catalog_version = context.get("catalog_version")
         provider_error = context.get("error")
         warnings = list(understanding.warnings)
         notices = dedupe_sourcing_notices([*understanding.notices, fallback_notice])
-        if provider_error is not None:
+        if context.get("circuit_open"):
+            result = self._provider_circuit_suppressed_result(
+                understanding.resolved_intent,
+                understanding,
+                _safe_provider_category(
+                    context.get("error_category") or _provider_error_category(provider_error)
+                ),
+                warnings,
+                notices,
+            )
+        elif provider_error is not None:
             result = self._provider_failure_result(
                 understanding.resolved_intent,
                 understanding,
@@ -386,15 +398,30 @@ class SourcingService:
                 catalog_version=catalog_version,
             )
         fallback_failed = bool(result.timings.get("provider_error"))
+        error_category = result.provider_error_category
+        if error_category and _provider_error_is_project_wide(error_category):
+            context["circuit_open"] = True
+            context["error_category"] = error_category
+        fallback_called = (
+            result._provider_call_attempted
+        )
+        if result.provider_call_suppressed:
+            fallback_status = "suppressed"
+        elif fallback_failed:
+            fallback_status = "error"
+        elif fallback_called:
+            fallback_status = "completed"
+        else:
+            fallback_status = "not_called"
         route = SourcingRouteMetadata(
             source_mode=source_mode,
             final_source_kind="none" if fallback_failed else "provider",
-            fallback_status="error" if fallback_failed else "completed",
+            fallback_status=fallback_status,
             history_outcome=history_outcome,
             history_reason_code=lookup.reason_code or "history_unavailable",
             history_catalog_version=lookup.catalog_version,
             history_candidate_count=len(lookup.candidates),
-            fallback_called=True,
+            fallback_called=fallback_called,
             fallback_provider_key=provider.key if provider is not None else "",
             fallback_provider_label=provider.label if provider is not None else "",
             fallback_catalog_version=catalog_version or "",
@@ -655,7 +682,10 @@ class SourcingService:
         try:
             offers = provider.search(intent, limit=limit)
         except (SourcingProviderError, ValueError) as exc:
-            return self._provider_failure_result(intent, understanding, warnings, notices, exc)
+            return self._provider_failure_result(
+                intent, understanding, warnings, notices, exc,
+                provider_call_attempted=True,
+            )
         except Exception as exc:
             return self._provider_failure_result(
                 intent,
@@ -663,6 +693,7 @@ class SourcingService:
                 warnings,
                 notices,
                 _as_provider_error(exc),
+                provider_call_attempted=True,
             )
         retrieval_time = time.perf_counter() - started
         matching_started = time.perf_counter()
@@ -701,6 +732,7 @@ class SourcingService:
             },
             ai_mode=self._current_ai_mode(understanding),
         )
+        result._provider_call_attempted = True
         if cache_policy.cache_search_results:
             # Catalog offers and deterministic match facts are reusable. Audit
             # Provenance, parser warnings and notices belong to the current response only.
@@ -726,8 +758,10 @@ class SourcingService:
         warnings: list[str] | None,
         notices: list[SourcingNotice] | None,
         exc: ValueError,
+        *,
+        provider_call_attempted: bool = False,
     ) -> SourcingResult:
-        return SourcingResult(
+        result = SourcingResult(
             intent=intent,
             understanding=understanding,
             warnings=list(dict.fromkeys([_safe_provider_warning(exc), *(warnings or [])])),
@@ -737,6 +771,41 @@ class SourcingService:
             ]),
             timings={"provider_error": 1.0, "search_cache_hit": 0.0},
             ai_mode=self._current_ai_mode(understanding),
+            provider_error_category=_safe_provider_category(_provider_error_category(exc)),
+        )
+        result._provider_call_attempted = provider_call_attempted
+        return result
+
+    def _provider_circuit_suppressed_result(
+        self,
+        intent: ProductIntent,
+        understanding: ProductUnderstandingResult | None,
+        category: str,
+        warnings: list[str] | None = None,
+        notices: list[SourcingNotice] | None = None,
+    ) -> SourcingResult:
+        return SourcingResult(
+            intent=intent,
+            understanding=understanding,
+            warnings=list(dict.fromkeys([
+                *(warnings or []),
+                "Поиск у поставщика пропущен: поставщик уже недоступен в рамках этого проекта.",
+            ])),
+            notices=dedupe_sourcing_notices([
+                *(notices or []),
+                SourcingNotice(
+                    code="PROJECT_PROVIDER_CIRCUIT_OPEN",
+                    severity="warning",
+                    message=(
+                        "Поиск у поставщика для этой позиции не выполнялся, "
+                        "поскольку поставщик уже недоступен в рамках проекта."
+                    ),
+                ),
+            ]),
+            timings={"provider_error": 1.0, "search_cache_hit": 0.0},
+            ai_mode=self._current_ai_mode(understanding),
+            provider_error_category=_safe_provider_category(category),
+            provider_call_suppressed=True,
         )
 
     def _compose_cached_result(
@@ -761,13 +830,15 @@ class SourcingService:
                 user_visible=False,
             ),
         ])
-        return cached.model_copy(update={
+        result = cached.model_copy(update={
             "understanding": understanding,
             "ai_mode": self._current_ai_mode(understanding),
             "warnings": merged_warnings,
             "notices": merged_notices,
             "timings": {**cached.timings, "search_cache_hit": 1.0},
         })
+        result._provider_call_attempted = False
+        return result
 
     def search_project(
         self,
@@ -788,7 +859,13 @@ class SourcingService:
         total = len(eligible)
         started_project = time.perf_counter()
         provider = self.provider(provider_key)
-        catalog_version = catalog_version or self._project_catalog_version(provider)
+        project_circuit_error: Exception | None = None
+        if catalog_version is None:
+            try:
+                catalog_version = self._project_catalog_version(provider)
+            except Exception as exc:
+                project_circuit_error = exc
+                catalog_version = ""
         if progress:
             progress(0, total, "Проверяем каталог предложений")
         results: list[SourcingResult] = []
@@ -809,25 +886,42 @@ class SourcingService:
             understanding_time += time.perf_counter() - understanding_started
             if understanding_cache_hit:
                 understanding_cache_hits += 1
-            try:
-                result = self.search_intent(
-                    understanding.resolved_intent,
-                    provider_key=provider_key,
-                    limit=limit,
-                    warnings=list(understanding.warnings),
-                    notices=list(understanding.notices),
-                    understanding=understanding,
-                    ai_rerank=ai_rerank,
-                    catalog_version=catalog_version,
-                )
-            except ValueError as exc:
-                result = self._provider_failure_result(
+            if project_circuit_error is not None:
+                result = self._provider_circuit_suppressed_result(
                     understanding.resolved_intent,
                     understanding,
+                    _safe_provider_category(_provider_error_category(project_circuit_error)),
                     list(understanding.warnings),
                     list(understanding.notices),
-                    exc,
                 )
+            else:
+                try:
+                    result = self.search_intent(
+                        understanding.resolved_intent,
+                        provider_key=provider_key,
+                        limit=limit,
+                        warnings=list(understanding.warnings),
+                        notices=list(understanding.notices),
+                        understanding=understanding,
+                        ai_rerank=ai_rerank,
+                        catalog_version=catalog_version,
+                    )
+                except ValueError as exc:
+                    result = self._provider_failure_result(
+                        understanding.resolved_intent,
+                        understanding,
+                        list(understanding.warnings),
+                        list(understanding.notices),
+                        exc,
+                    )
+                if (
+                    result.provider_error_category
+                    and _provider_error_is_project_wide(result.provider_error_category)
+                ):
+                    project_circuit_error = SourcingProviderError(
+                        "Поставщик недоступен в рамках этого проекта",
+                        category=result.provider_error_category,
+                    )
             results.append(result)
             warnings.extend(result.warnings)
             notices.extend(result.notices)
@@ -1079,6 +1173,26 @@ def _safe_provider_warning(exc: ValueError) -> str:
     return f"Ошибка поиска: {message}"
 
 
+def _provider_error_category(exc: Exception | None) -> str:
+    category = str(getattr(exc, "category", "") or "provider_error").strip().casefold()
+    return _safe_provider_category(category)
+
+
+def _safe_provider_category(value: Any) -> str:
+    category = str(value or "provider_error").strip().casefold()
+    if not category or len(category) > 80 or not all(
+        char.isascii() and (char.isalnum() or char in "_-") for char in category
+    ):
+        return "provider_error"
+    return category
+
+
+def _provider_error_is_project_wide(category: str) -> bool:
+    # Only this explicitly typed category describes a bad individual search
+    # request. Unknown categories fail closed for the rest of this project.
+    return _safe_provider_category(category) != "invalid_request"
+
+
 def _history_notice(code: str) -> SourcingNotice:
     messages = {
         "ONE_C_HISTORY_USED": "Использована историческая закупка 1С; текущая доступность не подтверждена.",
@@ -1173,6 +1287,8 @@ def _row_telemetry(
         "conflicting_attributes": list(match.conflicting_attributes) if match else [],
         "preferred_differences": preferred,
         "route": result.route.model_dump(mode="json") if result.route is not None else None,
+        "provider_error_category": result.provider_error_category,
+        "provider_call_suppressed": result.provider_call_suppressed,
     }
 
 

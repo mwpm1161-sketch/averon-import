@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -283,11 +285,16 @@ def test_admin_provider_maintenance_endpoints_remain_available(auth_client, monk
             return {"id": "auth-test-job", "status": "queued"}
 
     class FakeJobs:
-        def submit(self, function):
+        def __init__(self):
+            self.submissions = []
+
+        def submit(self, function, **_job_options):
+            self.submissions.append(_job_options)
             return FakeJob()
 
+    jobs = FakeJobs()
     monkeypatch.setattr(main.sourcing_service, "provider", lambda key: FakeProvider())
-    monkeypatch.setattr(main, "job_service", FakeJobs())
+    monkeypatch.setattr(main, "job_service", jobs)
 
     checks = [
         ("/api/sourcing/providers/lemana_b2b/sync", "post"),
@@ -301,6 +308,9 @@ def test_admin_provider_maintenance_endpoints_remain_available(auth_client, monk
     for path, method in checks:
         response = getattr(auth_client, method)(path, headers=_headers("averon"))
         assert response.status_code == 200, (path, response.text)
+        if method == "post":
+            assert jobs.submissions[-1]["lane"] == "sourcing"
+            assert jobs.submissions[-1]["fail_if_lane_occupied"] is True
 
 
 def test_user_can_reach_normal_document_and_export_routes(auth_client):
@@ -749,27 +759,37 @@ def test_document_delete_returns_conflict_while_a_document_operation_is_active(
 def test_document_jobs_hold_a_lifecycle_lease_from_queue_until_completion(monkeypatch):
     from averon_import import main
     from averon_import.services.document_lifecycle import DocumentActivityRegistry
+    from averon_import.services.jobs import DOCUMENT_PROCESSING, JobCoordinator
 
     monkeypatch.setattr(main, "document_activity_registry", DocumentActivityRegistry())
     document_id = uuid.uuid4().hex
-    queued = []
-
-    class StubJob:
-        def public(self):
-            return {"id": "job"}
-
-    def submit(run):
-        queued.append(run)
-        return StubJob()
-
-    monkeypatch.setattr(main.job_service, "submit", submit)
-    assert main._submit_document_job(document_id, lambda _progress: "done").public() == {"id": "job"}
+    jobs = JobCoordinator()
+    started = threading.Event()
+    release = threading.Event()
+    blocker = jobs.submit(
+        lambda _progress: (started.set(), release.wait(2))[1],
+        lane=DOCUMENT_PROCESSING,
+    )
+    assert started.wait(1)
+    monkeypatch.setattr(main, "job_service", jobs)
+    job = main._submit_document_job(document_id, lambda _progress: "done")
+    assert job.id != blocker.id
+    assert job.status == "queued"
     assert main.document_activity_registry.active_operations(document_id) == 1
     assert main.document_activity_registry.begin_delete(document_id) is False
-    assert queued[0](lambda *_args: None) == "done"
-    assert main.document_activity_registry.active_operations(document_id) == 0
-    assert main.document_activity_registry.begin_delete(document_id) is True
-    main.document_activity_registry.cancel_delete(document_id)
+    try:
+        release.set()
+        deadline = time.monotonic() + 2
+        while job.active and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert job.status == "completed"
+        assert job.result == "done"
+        assert main.document_activity_registry.active_operations(document_id) == 0
+        assert main.document_activity_registry.begin_delete(document_id) is True
+        main.document_activity_registry.cancel_delete(document_id)
+    finally:
+        release.set()
+        jobs.executor.shutdown(wait=True)
 
 
 def test_workspace_rename_hides_document_before_recursive_cleanup(

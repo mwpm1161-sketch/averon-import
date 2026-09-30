@@ -2317,6 +2317,11 @@ function positionCropBox() {
 async function startRecognition() {
   const pages = [...state.selectedPages].sort((a,b)=>a-b);
   if (!pages.length) return;
+  const button = $("#recognize-button");
+  const previousLabel = button.textContent;
+  const previousDisabled = button.disabled;
+  button.disabled = true;
+  button.textContent = "Запускаем OCR…";
   setView("processing");
   $("#processing-progress").style.width = "0%";
   $("#processing-title").textContent = "Облачное распознавание";
@@ -2338,12 +2343,29 @@ async function startRecognition() {
   } catch (error) {
     toast(error.message, "error");
     setView("pages");
+  } finally {
+    button.disabled = previousDisabled;
+    button.textContent = previousLabel;
+  }
+}
+
+const JOB_RESTART_MESSAGE = "Задание было прервано перезапуском сервера. Запустите его повторно.";
+
+async function getJobForPolling(jobId) {
+  try {
+    return await api(`/api/jobs/${jobId}`);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      throw new Error(JOB_RESTART_MESSAGE);
+    }
+    throw error;
   }
 }
 
 async function pollJob(jobId) {
+  let queuedPoll = 0;
   while (true) {
-    const job = await api(`/api/jobs/${jobId}`);
+    const job = await getJobForPolling(jobId);
     const total = job.total || state.selectedPages.size;
     const percent = total ? Math.round(job.current / total * 100) : 0;
     $("#processing-progress").style.width = `${percent}%`;
@@ -2354,7 +2376,13 @@ async function pollJob(jobId) {
       return;
     }
     if (job.status === "failed") throw new Error(job.error || "Ошибка распознавания");
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    if (job.status === "expired") throw new Error(job.error || "Задание истекло в очереди. Запустите его повторно.");
+    if (job.status === "queued") {
+      queuedPoll += 1;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (2 ** (queuedPoll - 1)), 8000)));
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
   }
 }
 
@@ -3624,8 +3652,14 @@ async function openSourcingForRow(row) {
   }
 }
 
-async function runProjectSourcing(rows, documentId = null) {
+async function runProjectSourcing(rows, documentId = null, submitButton = null) {
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
+  const previousButtonLabel = submitButton?.textContent;
+  const previousButtonDisabled = submitButton?.disabled;
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = "Запускаем подбор…";
+  }
   const sourcing = state.sourcing;
   const generation = ++sourcing.requestGeneration;
   const sourceMode = sourcing.sourceMode;
@@ -3641,17 +3675,30 @@ async function runProjectSourcing(rows, documentId = null) {
     const url = documentId ? `/api/documents/${documentId}/sourcing/search-all` : "/api/sourcing/search-all";
     const job = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows, limit:20, source_mode:sourceMode})});
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
-    await pollSourcingJob(job.id, rows.length, () => state.sourcing === sourcing && sourcing.requestGeneration === generation);
+    await pollSourcingJob(
+      job.id,
+      rows.length,
+      () => state.sourcing === sourcing && sourcing.requestGeneration === generation,
+      (status) => {
+        if (!submitButton) return;
+        submitButton.textContent = status === "queued" ? "В очереди…" : "Подбираем…";
+      },
+    );
   } catch (error) {
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     $("#sourcing-subtitle").textContent = "Подбор не выполнен";
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
+  } finally {
+    if (submitButton) {
+      submitButton.disabled = previousButtonDisabled;
+      submitButton.textContent = previousButtonLabel;
+    }
   }
 }
 
 async function openProjectSourcing() {
   const rows = state.rows.filter((row) => row.selected && sourcingEligible(row));
-  await runProjectSourcing(rows, state.document?.document_id || null);
+  await runProjectSourcing(rows, state.document?.document_id || null, $("#project-sourcing-button"));
 }
 
 async function openManualProjectSourcing() {
@@ -3665,18 +3712,23 @@ async function openManualProjectSourcing() {
     requestAnimationFrame(() => document.querySelector(`.manual-cell-input[data-manual-id="${CSS.escape(first.id)}"]`)?.focus());
     return;
   }
-  await runProjectSourcing(manualRowsForSourcing(), null);
+  await runProjectSourcing(manualRowsForSourcing(), null, $("#manual-project-sourcing-button"));
 }
 
-async function pollSourcingJob(jobId, expectedTotal, isCurrent = () => true) {
+async function pollSourcingJob(jobId, expectedTotal, isCurrent = () => true, onStatus = () => {}) {
+  let queuedPoll = 0;
   while (true) {
-    const job = await api(`/api/jobs/${jobId}`);
+    if (!isCurrent()) return;
+    const job = await getJobForPolling(jobId);
     if (!isCurrent()) return;
     const total = job.total || expectedTotal;
     const current = Math.min(Number(job.current || 0), total || Number(job.current || 0));
-    $("#sourcing-subtitle").textContent = "Подбираем предложения";
+    $("#sourcing-subtitle").textContent = job.status === "queued" ? "Задание в очереди" : "Подбираем предложения";
     if (job.status === "running" || job.status === "queued") {
-      $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${escapeHtml(job.message || "Обрабатываем позиции")}</b><strong>${current} из ${total}</strong><small>Product Understanding → поиск → deterministic matching</small></div>`;
+      const queued = job.status === "queued";
+      const statusLabel = queued ? "В очереди" : "Выполняется";
+      $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${statusLabel}</b><strong>${current} из ${total}</strong><small>${queued ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
+      onStatus(job.status);
     }
     if (job.status === "completed") {
       $("#sourcing-subtitle").textContent = "Проектный подбор завершён";
@@ -3684,7 +3736,13 @@ async function pollSourcingJob(jobId, expectedTotal, isCurrent = () => true) {
       return;
     }
     if (job.status === "failed") throw new Error(job.error || "Ошибка подбора");
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (job.status === "expired") throw new Error(job.error || "Задание истекло в очереди. Запустите его повторно.");
+    if (job.status === "queued") {
+      queuedPoll += 1;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (2 ** (queuedPoll - 1)), 8000)));
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
   }
 }
 
@@ -4746,12 +4804,19 @@ function setupEvents() {
     const button=$("#suggest-pages"); const old=button.textContent; button.disabled=true; button.textContent="Анализируем…";
     try {
       const job=await api(`/api/documents/${state.document.document_id}/suggest-pages`,{method:"POST"});
+      let queuedPoll=0;
       while(true){
-        const current=await api(`/api/jobs/${job.id}`);
-        button.textContent=current.total?`Анализ ${current.current}/${current.total}`:"Анализируем…";
+        const current=await getJobForPolling(job.id);
+        button.textContent=current.status==="queued"?"В очереди…":current.total?`Анализ ${current.current}/${current.total}`:"Анализируем…";
         if(current.status==="completed"){state.selectedPages=new Set(current.result.pages);updatePageSelection();const p=current.result.pages[0];if(p)showCropPreview(p);toast(`Найдено страниц: ${current.result.pages.length}`,"success");break;}
         if(current.status==="failed")throw new Error(current.error||"Ошибка анализа");
-        await new Promise(r=>setTimeout(r,500));
+        if(current.status==="expired")throw new Error(current.error||"Задание истекло в очереди. Запустите его повторно.");
+        if(current.status==="queued"){
+          queuedPoll+=1;
+          await new Promise(r=>setTimeout(r,Math.min(2000*(2**(queuedPoll-1)),8000)));
+        }else{
+          await new Promise(r=>setTimeout(r,1000));
+        }
       }
     } catch(e){toast(e.message,"error");} finally {button.disabled=false;button.textContent=old;}
   });

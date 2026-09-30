@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+import threading
 from copy import deepcopy
 from typing import Any
 
@@ -21,6 +22,9 @@ from averon_import.services.sourcing.models import (
     SuggestionResolution,
     dedupe_sourcing_notices,
 )
+
+
+_SOURCING_AI_SHARED_LOCK = threading.RLock()
 
 
 PRODUCT_UNDERSTANDING_REVISION = "5"
@@ -777,6 +781,10 @@ class SourcingAIService:
         return bool(getattr(provider, "configured", False))
 
     def public_config(self) -> dict[str, Any]:
+        with _SOURCING_AI_SHARED_LOCK:
+            return self._public_config_locked()
+
+    def _public_config_locked(self) -> dict[str, Any]:
         if self.ai_service is None:
             return {"provider": self.provider_key, "available": False, "status": "not_configured"}
         provider_info = {}
@@ -860,6 +868,14 @@ class SourcingAIService:
         )
 
     def understand_with_audit(
+        self,
+        row: dict[str, Any],
+        fallback: ProductIntent,
+    ) -> ProductUnderstandingResult:
+        with _SOURCING_AI_SHARED_LOCK:
+            return self._understand_with_audit_locked(row, fallback)
+
+    def _understand_with_audit_locked(
         self,
         row: dict[str, Any],
         fallback: ProductIntent,
@@ -981,6 +997,14 @@ class SourcingAIService:
         return result.resolved_intent, result.warnings
 
     def rank_matches(
+        self,
+        intent: ProductIntent,
+        matches: list[MatchResult],
+    ) -> SourcingRankingResult:
+        with _SOURCING_AI_SHARED_LOCK:
+            return self._rank_matches_locked(intent, matches)
+
+    def _rank_matches_locked(
         self,
         intent: ProductIntent,
         matches: list[MatchResult],

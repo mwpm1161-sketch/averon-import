@@ -1190,7 +1190,7 @@ def test_one_c_then_provider_completed_empty_search_is_not_a_provider_error(tmp_
     assert live.search_calls == 1
 
 
-def test_one_c_then_provider_stats_failure_has_error_status_and_no_history_candidate(tmp_path):
+def test_one_c_then_provider_stats_failure_suppresses_live_call_and_history_candidate(tmp_path):
     live = _CountingLiveProvider(stats_fail=True)
     service, _, _, live = _routed_service(
         tmp_path,
@@ -1205,9 +1205,10 @@ def test_one_c_then_provider_stats_failure_has_error_status_and_no_history_candi
     )
 
     assert result.route.history_outcome == "REVIEW"
-    assert result.route.fallback_called is True
-    assert result.route.fallback_status == "error"
+    assert result.route.fallback_called is False
+    assert result.route.fallback_status == "suppressed"
     assert result.route.final_source_kind == "none"
+    assert result.provider_call_suppressed is True
     assert result.recommended_offer is None
     assert result.offers == []
     assert result.review_candidate is None

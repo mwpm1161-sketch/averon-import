@@ -291,7 +291,8 @@ def test_project_continues_after_one_lemana_price_failure(tmp_path):
     assert result.positions_processed == 2
     assert result.results[0].offers == []
     assert any(notice.code == "PROVIDER_ERROR" for notice in result.results[0].notices)
-    assert result.results[1].offers
+    assert result.results[1].offers == []
+    assert result.results[1].provider_call_suppressed is True
     assert client.failed is True
 
 

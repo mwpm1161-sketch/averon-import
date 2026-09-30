@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ class OpenAICompatibleProvider:
     temperature: float
     max_tokens: int
     last_call_diagnostics: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _diagnostics_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def key(self) -> str:
@@ -48,6 +50,20 @@ class OpenAICompatibleProvider:
         return self.settings.configured
 
     def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str:
+        with self._diagnostics_lock:
+            return self._complete_locked(
+                messages,
+                response_format=response_format,
+                reasoning_effort=reasoning_effort,
+            )
+
+    def _complete_locked(
         self,
         messages: list[dict[str, str]],
         *,

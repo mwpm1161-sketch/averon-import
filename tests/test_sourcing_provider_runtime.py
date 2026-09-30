@@ -15,7 +15,10 @@ from averon_import.services.sourcing.models import (
     SourcingProviderRuntimeState,
 )
 from averon_import.services.sourcing.product_understanding import SourcingAIService
-from averon_import.services.sourcing.providers.base import normalize_provider_runtime_state
+from averon_import.services.sourcing.providers.base import (
+    SourcingProviderError,
+    normalize_provider_runtime_state,
+)
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.sourcing.runtime import create_sourcing_runtime
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
@@ -293,11 +296,13 @@ class ProjectProvider:
     def search(self, intent, *, limit=20):
         self.search_calls.append(intent.source_row_id)
         if intent.source_row_id in self.failed_rows:
-            raise RuntimeError("temporary provider failure")
+            raise SourcingProviderError(
+                "temporary provider failure", category="invalid_request"
+            )
         return [_offer(intent.source_row_id)]
 
 
-def test_healthy_project_provider_error_does_not_stop_remaining_rows():
+def test_healthy_project_explicit_row_local_error_does_not_stop_remaining_rows():
     provider = ProjectProvider(failed_rows={"row-1"})
     result = _service({"project": provider}, default_provider="project").search_project([
         {"id": "row-1", "row_type": "item", "name": "Клапан", "quantity": "1"},
@@ -310,7 +315,7 @@ def test_healthy_project_provider_error_does_not_stop_remaining_rows():
     assert provider.search_calls == ["row-1", "row-2"]
 
 
-def test_unreachable_project_provider_fails_before_processing_rows():
+def test_unreachable_project_provider_suppresses_live_calls_for_project_rows():
     class UnreachableProvider(ProjectProvider):
         def stats(self):
             return {
@@ -321,10 +326,12 @@ def test_unreachable_project_provider_fails_before_processing_rows():
             }
 
     provider = UnreachableProvider()
-    with pytest.raises(ValueError, match="Проверка каталога поставщика не выполнена"):
-        _service({"project": provider}, default_provider="project").search_project([
-            {"id": "row-1", "row_type": "item", "name": "Клапан", "quantity": "1"},
-        ])
+    result = _service({"project": provider}, default_provider="project").search_project([
+        {"id": "row-1", "row_type": "item", "name": "Клапан", "quantity": "1"},
+    ])
+    assert result.positions_processed == 1
+    assert result.results[0].provider_error_category == "health_error"
+    assert result.results[0].provider_call_suppressed is True
     assert provider.search_calls == []
 
 

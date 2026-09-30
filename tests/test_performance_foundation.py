@@ -233,7 +233,7 @@ def test_recognition_final_commit_cannot_overwrite_concurrent_review(monkeypatch
     monkeypatch.setattr(main.coordinator, "process_document", process_document)
 
     class DeferredJobService:
-        def submit(self, function):
+        def submit(self, function, **_job_options):
             self.function = function
             return type("Job", (), {"public": lambda _self: {"id": "job"}})()
 

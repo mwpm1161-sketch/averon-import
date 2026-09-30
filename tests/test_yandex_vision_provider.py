@@ -1018,7 +1018,52 @@ def test_polling_errors_are_retryable_but_timeout_wins(tmp_path):
     )
     with pytest.raises(OcrProviderError, match="время ожидания"):
         recognize_async_chunk(provider, pdf, [1, 2])
-    assert len([c for c in http.calls if c["method"] == "GET"]) == 3
+    # Do not issue another poll once the operation deadline has elapsed.
+    assert len([c for c in http.calls if c["method"] == "GET"]) == 2
+
+
+def test_repeated_async_poll_failures_are_bounded_by_operation_deadline_without_resubmit(tmp_path):
+    class RepeatedPollFailure(FakeHttp):
+        def request(self, method, url, *, body=None, headers=None, timeout=30.0):
+            if method == "GET":
+                entry = {"method": method, "url": url, "body": body, "headers": headers, "timeout": timeout}
+                self.calls.append(entry)
+                return json_response(503, {"message": "temporary"})
+            return super().request(method, url, body=body, headers=headers, timeout=timeout)
+
+    pdf = any_pdf(tmp_path)
+    clock = TickingClock()
+    http = RepeatedPollFailure(script=[SUBMIT_OP])
+    provider = YandexVisionProvider(
+        settings_service=FakeSettingsService(
+            operation_timeout_s=5.0,
+            request_timeout_s=10.0,
+        ),
+        secret_store=keyed_store(),
+        cache_dir=tmp_path / "cache",
+        poll_interval_s=1.0,
+        sleep_fn=sleeper(clock),
+        now_fn=clock,
+        request_attempts=2,
+        http=http,
+    )
+    with pytest.raises(OcrProviderError, match="время ожидания"):
+        recognize_async_chunk(provider, pdf, [1, 2])
+    assert len(http.submit_calls()) == 1
+    assert len(http.get_calls()) >= 1
+    assert all(call["timeout"] <= 5.0 for call in http.get_calls())
+
+
+def test_yandex_atomic_temp_writes_do_not_remove_valid_pending_operation(tmp_path):
+    provider = ready_provider(cache_dir=tmp_path / "cache")
+    key = "a" * 64
+    provider._pending_save(key, "operation-1", [1], BASE_URL)
+    pending_path = provider._pending_path(key)
+    assert pending_path is not None
+    before = json.loads(pending_path.read_text(encoding="utf-8"))
+    provider._cache_save(key, [table_page_payload()])
+    assert json.loads(pending_path.read_text(encoding="utf-8")) == before
+    assert list((tmp_path / "cache").rglob("*.tmp")) == []
 
 
 def test_operation_error_state_raises_clear_message(tmp_path):

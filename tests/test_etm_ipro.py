@@ -1140,6 +1140,98 @@ def test_authenticated_403_quarantines_without_same_operation_relogin_or_retry(t
     assert len(calls) == 2
 
 
+def test_distinct_etm_clients_share_one_process_wide_outbound_gate(tmp_path):
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+
+    def transport(request, timeout):
+        nonlocal active, maximum
+        with guard:
+            active += 1
+            maximum = max(maximum, active)
+        threading.Event().wait(0.04)
+        with guard:
+            active -= 1
+        if "/user/login" in request.full_url:
+            return FakeResponse({"data": {"session": "synthetic-session"}})
+        return FakeResponse({"data": {"gdscode": "A-100"}})
+
+    clients = [
+        _new_etm_client(
+            tmp_path / f"client-{index}",
+            settings(tmp_path),
+            "login",
+            "password",
+            transport=transport,
+            rate_limiter=EtmRateLimiter(interval_seconds=0),
+        )
+        for index in range(2)
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(client.get_goods, "A-100") for client in clients]
+        [future.result(timeout=2) for future in futures]
+    assert maximum == 1
+
+
+def test_waiting_etm_request_rechecks_quarantine_before_outbound(tmp_path):
+    state_path = tmp_path / "shared-auth-state.json"
+    first_inside_transport = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def first_transport(request, timeout):
+        calls.append(request.full_url)
+        first_inside_transport.set()
+        assert release_first.wait(2)
+        return FakeResponse({"error": "denied"}, status=403)
+
+    def second_transport(request, timeout):
+        calls.append(request.full_url)
+        return FakeResponse({"data": {"gdscode": "must-not-send"}})
+
+    first = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=first_transport,
+        auth_state_path=state_path,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    waiting = _new_etm_client(
+        tmp_path,
+        settings(tmp_path),
+        "login",
+        "password",
+        transport=second_transport,
+        auth_state_path=state_path,
+        rate_limiter=EtmRateLimiter(interval_seconds=0),
+    )
+    for client in (first, waiting):
+        client._session = etm_client._Session("session", float("inf"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first.get_goods, "A-100")
+        assert first_inside_transport.wait(1)
+        waiting_future = pool.submit(waiting.get_goods, "B-200")
+        threading.Event().wait(0.05)
+        release_first.set()
+        with pytest.raises(SourcingProviderError) as denied:
+            first_future.result(timeout=2)
+        with pytest.raises(SourcingProviderError) as quarantined:
+            waiting_future.result(timeout=2)
+    assert denied.value.code == "ETM_AUTH_QUARANTINED"
+    assert quarantined.value.code == "ETM_AUTH_QUARANTINED"
+    assert len(calls) == 1
+    assert json.loads(state_path.read_text(encoding="utf-8"))["failure_category"] == "auth"
+
+
+def test_etm_http_429_has_a_safe_rate_limit_category():
+    error = EtmIproClient._status_error(429)
+    assert error.category == "rate_limit"
+    assert "429" not in str(error)
+
+
 @pytest.mark.parametrize("failure_status", [400, 404, 500, 502])
 def test_non_auth_endpoint_failure_does_not_quarantine_or_invalidate_session(tmp_path, failure_status):
     calls = []
@@ -1613,7 +1705,7 @@ def test_local_reindex_endpoint_uses_job_service_without_etm(monkeypatch):
         def __init__(self):
             self.submitted = None
 
-        def submit(self, function):
+        def submit(self, function, **_job_options):
             self.submitted = function
             return FakeJob()
 
@@ -1855,7 +1947,9 @@ def test_project_continues_after_one_etm_provider_row_failure(tmp_path):
     assert result.positions_processed == 2
     assert result.results[0].offers == []
     assert any(notice.code == "PROVIDER_ERROR" for notice in result.results[0].notices)
-    assert result.results[1].offers
+    assert result.results[1].offers == []
+    assert result.results[1].provider_call_suppressed is True
+    assert provider.client.failed is True
 
 
 def test_provider_search_is_bounded_and_does_not_enrich_zero_evidence(tmp_path):
@@ -1966,7 +2060,7 @@ def test_catalog_status_is_ready_only_and_import_is_background_job(monkeypatch):
         def __init__(self):
             self.submitted = None
 
-        def submit(self, function):
+        def submit(self, function, **_job_options):
             self.submitted = function
             return FakeJob()
 

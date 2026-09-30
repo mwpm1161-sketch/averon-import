@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 from types import SimpleNamespace
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -12,6 +13,17 @@ from averon_import.services.one_c_history.activity import (
     OneCHistoryActivityRegistry,
 )
 from averon_import.services.sourcing.models import SourcingSourceMode
+from averon_import.services.jobs import JobCoordinator, SOURCING
+
+
+def _wait_job_terminal(coordinator, job_id, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = coordinator.get(job_id)
+        if not job.active:
+            return job
+        time.sleep(0.005)
+    raise AssertionError("job did not reach a terminal state")
 
 
 def test_activity_registry_allows_shared_readers_and_fails_fast_for_writer_and_new_reader():
@@ -184,21 +196,30 @@ def test_project_job_holds_history_lease_while_queued_and_releases_after_worker(
         def public(self):
             return {"id": "queued-job"}
 
-    def submit(run):
-        captured["run"] = run
-        return FakeJob()
-
     monkeypatch.setattr(main, "sourcing_service", FakeSourcingService())
-    monkeypatch.setattr(main.job_service, "submit", submit)
+    jobs = JobCoordinator()
+    started = Event()
+    release = Event()
+    blocker = jobs.submit(
+        lambda _progress: (started.set(), release.wait(2))[1], lane=SOURCING
+    )
+    assert started.wait(1)
+    monkeypatch.setattr(main, "job_service", jobs)
     job = main._submit_sourcing_project_job([{"row_type": "item"}], provider_key=None, limit=10, source_mode=mode)
-    assert job == {"id": "queued-job"}
+    assert job["id"] != blocker.id
+    assert jobs.get(job["id"]).status == "queued"
     assert registry.status()["active_sourcing_count"] == 1
     with pytest.raises(OneCHistoryActivityConflict):
         registry.try_begin_update()
-
-    result = captured["run"](lambda *_args: None)
-    assert result["results"][0]["route"]["history_catalog_version"] == "catalog-A"
-    assert registry.status()["active_sourcing_count"] == 0
+    try:
+        release.set()
+        finished = _wait_job_terminal(jobs, job["id"])
+        assert finished.status == "completed"
+        assert finished.result["results"][0]["route"]["history_catalog_version"] == "catalog-A"
+        assert registry.status()["active_sourcing_count"] == 0
+    finally:
+        release.set()
+        jobs.executor.shutdown(wait=True)
 
 
 def test_project_mixed_snapshot_and_submit_failure_release_lease(monkeypatch, tmp_path):
@@ -206,8 +227,6 @@ def test_project_mixed_snapshot_and_submit_failure_release_lease(monkeypatch, tm
     registry = OneCHistoryActivityRegistry()
     monkeypatch.setattr(main, "one_c_history_activity", registry)
     monkeypatch.setattr(main.one_c_history_repository, "catalog_version", lambda: "catalog-A")
-    captured = {}
-
     class FakeSourcingService:
         def search_project_routed(self, *_args, **_kwargs):
             return FakeProject({"results": [
@@ -225,17 +244,22 @@ def test_project_mixed_snapshot_and_submit_failure_release_lease(monkeypatch, tm
             return self.payload
 
     monkeypatch.setattr(main, "sourcing_service", FakeSourcingService())
-    def capture(run):
-        captured["run"] = run
-        return SimpleNamespace(public=lambda: {"id": "queued-job"})
+    jobs = JobCoordinator()
+    monkeypatch.setattr(main, "job_service", jobs)
+    job = main._submit_sourcing_project_job([{"row_type": "item"}], provider_key=None, limit=10, source_mode=SourcingSourceMode.ONE_C_ONLY)
+    try:
+        finished = _wait_job_terminal(jobs, job["id"])
+        assert finished.status == "failed"
+        assert "mixed 1C history snapshots" in finished.error
+        assert registry.status()["active_sourcing_count"] == 0
+    finally:
+        jobs.executor.shutdown(wait=True)
 
-    monkeypatch.setattr(main.job_service, "submit", capture)
-    main._submit_sourcing_project_job([{"row_type": "item"}], provider_key=None, limit=10, source_mode=SourcingSourceMode.ONE_C_ONLY)
-    with pytest.raises(RuntimeError, match="mixed 1C history snapshots"):
-        captured["run"](lambda *_args: None)
-    assert registry.status()["active_sourcing_count"] == 0
+    class FailingJobs:
+        def submit(self, _run, **_job_options):
+            raise RuntimeError("submit failed")
 
-    monkeypatch.setattr(main.job_service, "submit", lambda _run: (_ for _ in ()).throw(RuntimeError("submit failed")))
+    monkeypatch.setattr(main, "job_service", FailingJobs())
     with pytest.raises(RuntimeError, match="submit failed"):
         main._submit_sourcing_project_job([{"row_type": "item"}], provider_key=None, limit=10, source_mode=SourcingSourceMode.ONE_C_ONLY)
     assert registry.status()["active_sourcing_count"] == 0
