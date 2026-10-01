@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill, Side
 
 from averon_import.services.manual_tenders import TenderActivityRegistry, TenderTemplateService, TenderWorkbookParser, TenderWorkspaceRepository
@@ -903,6 +904,8 @@ def tender_api(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "tender_activity", activity)
     monkeypatch.setattr(main, "tender_repository", repository)
     monkeypatch.setattr(main, "tender_sourcing_runs", TenderSourcingRunStore(repository))
+    from averon_import.services.manual_tenders.price_export import TenderPriceExportRepository
+    monkeypatch.setattr(main, "tender_price_exports", TenderPriceExportRepository(repository))
     isolated_jobs = JobService(max_workers=1)
     monkeypatch.setattr(main, "job_service", isolated_jobs)
     return main, repository
@@ -1130,6 +1133,15 @@ def test_ui_exposes_excel_path_without_changing_manual_sourcing_and_clears_on_lo
     assert "sessionStorage.setItem(EXCEL_TENDER_VIEW_KEY, JSON.stringify({rows" not in script
     assert "localStorage.setItem(EXCEL_TENDER_VIEW_KEY" not in script
     assert "const generation = ++state.excelTender.pollGeneration" in script
+    assert 'run.status === "completed"' in script
+    assert "/runs/${encodeURIComponent(runId)}/export" in script
+    assert "include_historical_prices:false, allow_partial:false" in script
+    assert "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED" in script
+    assert "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED" in script
+    export_action = script[script.index("async function startExcelTenderPriceExport()") : script.index("async function pollExcelTenderPriceExport(")]
+    assert "body:JSON.stringify(options)" in export_action
+    assert '"price"' not in export_action and "localStorage" not in export_action and "sessionStorage" not in export_action
+    assert 'id="tender-export-run"' in template and 'id="tender-export-download"' in template
 
 
 def test_read_only_excel_workspace_renders_370_rows_with_filtering():
@@ -1609,10 +1621,11 @@ def _project_result_with_offer(source_row, *, provider, provenance, source_mode=
 
     adapted = TenderSourcingRowAdapter.convert(source_row)
     intent = build_fallback_intent(adapted)
+    source_item_id = str(provenance.get("history_item_id") or "synthetic-source-item") if provider == "one_c_history" else "synthetic-source-item"
     offer = Offer(
         offer_id=f"{provider}:synthetic-offer",
         provider=provider,
-        source_item_id="synthetic-source-item",
+        source_item_id=source_item_id,
         title="Synthetic replacement assembly with bounded provider title",
         article="SYN-100",
         manufacturer="Synthetic manufacturer",
@@ -1671,6 +1684,203 @@ def _persist_project_result(store, repository, workspace, result, *, source_row,
         rows=rows,
     )
     return run["run_id"]
+
+
+def _persist_price_export_run(main, repository, workspace, source_row, *, provider="etm_ipro", provenance=None, history=False):
+    if provenance is None:
+        provenance = {
+            "source": provider,
+            "catalog_version": "etm-catalog-v4",
+            "source_item_id": "synthetic-source-item",
+            "price_field": "pricewnds",
+        }
+    mode = "one_c_only" if history else "provider_only"
+    provider_key = "one_c_history" if history else provider
+    result = _project_result_with_offer(source_row, provider=provider_key, provenance=provenance, source_mode=mode)
+    if history:
+        from averon_import.services.sourcing.models import HistorySafeMatchBasis
+        item = result.results[0]
+        route = item.route.model_copy(update={
+            "history_safe_basis": HistorySafeMatchBasis.EXACT_ARTICLE,
+            "history_catalog_version": "history-snapshot-v9",
+            "history_selected_event_id": str(provenance["selected_event_id"]),
+            "history_purchase_date": str(provenance["purchase_date"]),
+            "history_outcome": "SAFE_MATCH",
+        })
+        result = result.model_copy(update={"results": [item.model_copy(update={"route": route})]})
+    return _persist_project_result(
+        main.tender_sourcing_runs, repository, workspace, result,
+        source_row=source_row, source_mode=mode,
+    )
+
+
+def test_tender_price_export_target_collision_uses_semantic_empty_cells(tmp_path):
+    from averon_import.services.manual_tenders.price_export import _check_target_collision
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    def make_book(path, mutate=None):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["F1"] = ""
+        sheet["G1"] = ""
+        sheet["F2"].fill = PatternFill(fill_type="solid", fgColor="FFEEEEEE")
+        if mutate:
+            mutate(sheet)
+        workbook.save(path)
+        workbook.close()
+        return path
+
+    workspace = {"logical_right_edge": 5, "source_manifest": {}}
+    clean = make_book(tmp_path / "semantic-empty.xlsx")
+    with zipfile.ZipFile(clean) as archive:
+        sheet_xml = archive.read("xl/worksheets/sheet1.xml")
+    assert b'r="F1"' in sheet_xml and b'r="G1"' in sheet_xml
+    assert _check_target_collision(clean, workspace, "Sheet") == (6, 7)
+
+    for name, mutate in (
+        ("constant", lambda sheet: setattr(sheet["F3"], "value", "occupied")),
+        ("formula-empty", lambda sheet: setattr(sheet["F3"], "value", '=""')),
+        ("comment", lambda sheet: setattr(sheet["G3"], "comment", Comment("note", "tester"))),
+        ("hyperlink", lambda sheet: setattr(sheet["F3"], "hyperlink", "https://example.invalid/item")),
+        ("merge", lambda sheet: sheet.merge_cells("F1:G1")),
+        ("filter", lambda sheet: setattr(sheet.auto_filter, "ref", "A1:G5")),
+        ("validation", lambda sheet: (lambda validation: (validation.add("F3"), sheet.add_data_validation(validation)))(DataValidation(type="whole", operator="greaterThan", formula1="0"))),
+        ("conditional-format", lambda sheet: sheet.conditional_formatting.add("G3", CellIsRule(operator="greaterThan", formula=["0"]))),
+    ):
+        path = make_book(tmp_path / f"occupied-{name}.xlsx", mutate)
+        with pytest.raises(TenderWorkspaceError) as error:
+            _check_target_collision(path, workspace, "Sheet")
+        assert error.value.code == "TENDER_EXPORT_TARGET_OCCUPIED"
+
+
+def test_tender_price_resolver_uses_only_proven_etm_pricewnds(tender_api, tmp_path):
+    from averon_import.services.manual_tenders.price_export import TenderPriceResolver
+
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    resolver = TenderPriceResolver()
+    accepted_id = _persist_price_export_run(main, repository, workspace, source_row)
+    accepted_run = main.tender_sourcing_runs.get_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"], accepted_id)
+    accepted = resolver.resolve_run(workspace, accepted_run, tender_id=workspace["tender_id"], run_id=accepted_id, include_historical_prices=False)
+    assert len(accepted) == 1 and accepted[0].eligible
+    assert accepted[0].source_kind == "etm_ipro"
+    assert accepted[0].source_unit_price == Decimal("123456.000000")
+
+    net_id = _persist_price_export_run(
+        main, repository, workspace, source_row,
+        provenance={"source":"etm_ipro", "catalog_version":"etm-catalog-v4", "source_item_id":"synthetic-source-item", "price_field":"price"},
+    )
+    net_run = main.tender_sourcing_runs.get_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"], net_id)
+    rejected = resolver.resolve_run(workspace, net_run, tender_id=workspace["tender_id"], run_id=net_id, include_historical_prices=False)
+    assert len(rejected) == 1 and not rejected[0].eligible
+    assert rejected[0].reason_code == "PRICE_BASIS_UNPROVEN"
+
+
+def test_historical_price_export_requires_explicit_confirmation_without_ghost_job(tender_api, tmp_path):
+    main, repository = tender_api
+    from averon_import.services.manual_tenders.price_export import TenderPriceExportRepository
+
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    provenance = {
+        "source":"one_c_history", "source_kind":"historical_purchase",
+        "snapshot_version":"history-snapshot-v9", "history_item_id":"history-item-1",
+        "selected_event_id":"history-event-1", "purchase_date":"2025-01-24",
+        "price_basis":"gross_including_vat", "effective_unit_price_gross":"1234.5600",
+        "currency_basis":"RUB", "unit_family":"count",
+    }
+    run_id = _persist_price_export_run(main, repository, workspace, source_row, provider="one_c_history", provenance=provenance, history=True)
+    path = repository.workspace_root / workspace["tender_id"]
+    run = main.tender_sourcing_runs.get_public(path, workspace["tender_id"], run_id)
+    historical_decision = main.tender_price_resolver.resolve_run(
+        workspace, run, tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=True,
+    )[0]
+    assert historical_decision.eligible, historical_decision.safe_summary()
+    response = _api_request(main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export", headers={**_auth_headers(), "Content-Type":"application/json"}, body=b'{"include_historical_prices":false,"allow_partial":false}')
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED"
+    assert detail["summary"]["historical_count"] == 1
+    assert not list((path / "exports").glob("*")) if (path / "exports").exists() else True
+    assert not any(job.kind == "manual_tender_price_export" for job in main.job_service.jobs.values())
+    assert isinstance(main.tender_price_exports, TenderPriceExportRepository)
+
+
+def test_tender_price_export_job_persists_owner_bound_verified_artifact(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_price_export_run(main, repository, workspace, source_row)
+    path = repository.workspace_root / workspace["tender_id"]
+    response = _api_request(
+        main.app, "POST",
+        f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":false,"allow_partial":false}',
+    )
+    assert response.status_code == 202, response.text
+    job_id = response.json()["id"]
+    job = None
+    for _ in range(200):
+        snapshot = _api_request(main.app, "GET", f"/api/jobs/{job_id}", headers=_auth_headers())
+        assert snapshot.status_code == 200
+        job = snapshot.json()
+        if job["status"] in {"completed", "failed", "expired"}:
+            break
+        time.sleep(0.025)
+    assert job and job["status"] == "completed", job
+    record = job["result"]
+    assert record["run_id"] == run_id
+    assert record["target_columns"] == {"unit_price":"H", "total":"I"}
+    assert record["priced_count"] == 1 and record["blank_count"] == 0
+    assert "C:\\" not in json.dumps(record) and str(repository.root) not in json.dumps(record)
+    listed = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports", headers=_auth_headers())
+    assert listed.status_code == 200 and listed.json()["exports"][0]["export_id"] == record["export_id"]
+    wrong_owner = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports/{record['export_id']}", headers=_auth_headers("another-user"))
+    assert wrong_owner.status_code == 404
+    wrong_owner_download = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports/{record['export_id']}/download", headers=_auth_headers("another-user"))
+    assert wrong_owner_download.status_code == 404
+    wrong_owner_post = _api_request(
+        main.app, "POST",
+        f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers("another-user"), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":false,"allow_partial":false}',
+    )
+    assert wrong_owner_post.status_code == 404
+    malformed_export = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports/not-an-id", headers=_auth_headers())
+    assert malformed_export.status_code == 404
+    malformed_run = _api_request(
+        main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/not-a-run/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":false,"allow_partial":false}',
+    )
+    assert malformed_run.status_code == 404
+    downloaded = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports/{record['export_id']}/download", headers=_auth_headers())
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    assert "attachment" in downloaded.headers["content-disposition"].casefold()
+    output = tmp_path / "verified-output.xlsx"
+    output.write_bytes(downloaded.content)
+    workbook = load_workbook(output, data_only=False, read_only=False)
+    sheet = workbook[TEMPLATE_SHEET]
+    assert sheet["H1"].value == "Цена за единицу"
+    assert sheet["I1"].value == "Общая стоимость"
+    assert Decimal(str(sheet["H2"].value)) == Decimal("1234.560000")
+    assert Decimal(str(sheet["I2"].value)) == Decimal("2469.12")
+    assert sheet["H2"].data_type != "f" and sheet["I2"].data_type != "f"
+    assert len(sheet.tables) == 1 and next(iter(sheet.tables.values())).ref == "A1:G501"
+    workbook.close()
+    assert (path / "exports" / f"{record['export_id']}.json").is_file()
+    assert (path / "exports" / f"{record['export_id']}.xlsx").is_file()
+    from averon_import.services.manual_tenders.price_export import TenderPriceExportRepository
+    restarted = TenderPriceExportRepository(repository)
+    assert restarted.get_public(path, workspace["tender_id"], record["export_id"], "username:tender-user")["output_file_sha256"] == record["output_file_sha256"]
+    (path / "exports" / f"{record['export_id']}.xlsx").write_bytes(b"corrupt")
+    corrupt = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports/{record['export_id']}", headers=_auth_headers())
+    assert corrupt.status_code == 409
 
 
 def test_excel_adapter_uses_one_model_field_without_resource_code_leak():
@@ -1786,6 +1996,7 @@ def test_tender_price_provenance_is_allowlisted_durable_and_self_contained(tende
     route = history_detail.json()["rows"][0]["route"]
     assert route["final_source_kind"] == "historical_purchase"
     assert route["history_outcome"] == "SAFE_MATCH"
+    assert route["history_selected_event_id"] == "history-item-17:row-51"
     assert route["history_purchase_date"] == "2026-09-21"
     lemana_provenance = lemana_detail.json()["rows"][0]["price_provenance"]
     assert lemana_provenance == {
@@ -1915,3 +2126,467 @@ def test_tender_ui_uses_id_only_request_default_selection_runs_and_shared_result
     assert "Ошибок структуры нет." not in script
     assert "state.excelTender.sourcingActive = true" in script
     assert "state.excelTender.pollGeneration === generation" in script
+
+
+def _direct_tender_price_decision(
+    *,
+    source_unit="шт",
+    offer_unit="шт",
+    price="2.5",
+    quantity="3",
+    provider="etm_ipro",
+    price_field="pricewnds",
+    match_decision="MATCH",
+    currency="RUB",
+    include_historical_prices=False,
+    offer_id="synthetic-offer-1",
+    offer_source_item_id="synthetic-item-1",
+    provenance_patch=None,
+    route_patch=None,
+    run_patch=None,
+    no_offer=False,
+):
+    from averon_import.services.manual_tenders.price_export import TenderPriceResolver
+
+    source = {
+        "source_row_id": "a" * 32,
+        "excel_row": 21,
+        "row_type": "item",
+        "quantity": quantity,
+        "quantity_trusted": True,
+        "raw_unit": source_unit,
+        "unit_basis": parse_unit_basis(source_unit),
+    }
+    historical = provider == "one_c_history"
+    purchase_date = datetime.now(timezone.utc).date().isoformat()
+    if historical:
+        offer_id = offer_id or "one_c_history:history-item-1"
+        offer_source_item_id = offer_source_item_id or "history-item-1"
+        provenance = {
+            "source": "one_c_history",
+            "source_kind": "historical_purchase",
+            "snapshot_version": "history-snapshot-1",
+            "history_item_id": "history-item-1",
+            "selected_event_id": "history-event-1",
+            "purchase_date": purchase_date,
+            "price_basis": "gross_including_vat",
+            "effective_unit_price_gross": str(price),
+            "currency_basis": "company_default",
+            "unit_family": "count",
+        }
+        route = {
+            "final_source_kind": "historical_purchase",
+            "history_outcome": "SAFE_MATCH",
+            "history_safe_basis": "EXACT_ARTICLE",
+            "history_catalog_version": "history-snapshot-1",
+            "history_selected_event_id": "history-event-1",
+            "history_purchase_date": purchase_date,
+        }
+        run = {"source_mode": "one_c_only", "history_catalog_version": "history-snapshot-1"}
+    else:
+        provenance = {
+            "source": provider,
+            "catalog_version": "etm-catalog-1",
+            "source_item_id": "synthetic-item-1",
+            "price_field": price_field,
+        }
+        route = {"final_source_kind": "provider"}
+        run = {"source_mode": "provider_only"}
+    if provenance_patch:
+        provenance.update(provenance_patch)
+    if route_patch:
+        route.update(route_patch)
+    if run_patch:
+        run.update(run_patch)
+
+    offer = None if no_offer else {
+        "offer_id": offer_id,
+        "provider": provider,
+        "source_item_id": offer_source_item_id,
+        "price": price,
+        "currency": currency,
+        "price_unit": offer_unit,
+    }
+    canonical = {
+        "recommended_offer": offer,
+        "recommended_match": None if no_offer else {
+            "offer_id": offer_id,
+            "decision": match_decision,
+        },
+        "provider_source": {"provider": provider},
+        "route": route,
+        "price_provenance": provenance,
+    }
+    return TenderPriceResolver().resolve(
+        source, canonical, run,
+        include_historical_prices=include_historical_prices,
+    )
+
+
+def test_price_export_provider_and_match_authority_is_fail_closed():
+    for decision in ("MATCH", "LIKELY_MATCH"):
+        accepted = _direct_tender_price_decision(match_decision=decision)
+        assert accepted.eligible and accepted.source_kind == "etm_ipro"
+
+    for decision in ("ALTERNATIVE", "REVIEW", "REJECT"):
+        rejected = _direct_tender_price_decision(match_decision=decision)
+        assert not rejected.eligible and rejected.reason_code == "MATCH_NOT_EXPORTABLE"
+
+    cases = (
+        (_direct_tender_price_decision(price_field="price"), "PRICE_BASIS_UNPROVEN"),
+        (_direct_tender_price_decision(currency="USD"), "CURRENCY_UNSUPPORTED"),
+        (_direct_tender_price_decision(provider="lemana_b2b", price_field="pricewnds"), "PRICE_BASIS_UNPROVEN"),
+        (_direct_tender_price_decision(provider="future_provider", price_field="pricewnds"), "PRICE_BASIS_UNPROVEN"),
+        (_direct_tender_price_decision(no_offer=True), "NO_RECOMMENDED_OFFER"),
+        (_direct_tender_price_decision(offer_id="offer-a", provenance_patch={"source_item_id":"other-item"}), "PROVENANCE_MISMATCH"),
+        (_direct_tender_price_decision(offer_id="offer-a", provenance_patch={"source":"other-provider"}), "PROVENANCE_MISMATCH"),
+    )
+    for rejected, reason in cases:
+        assert not rejected.eligible and rejected.reason_code == reason
+
+
+def test_price_export_historical_1c_requires_complete_safe_provenance_and_consent():
+    accepted = _direct_tender_price_decision(
+        provider="one_c_history", offer_id="one_c_history:history-item-1",
+        offer_source_item_id="history-item-1", include_historical_prices=True,
+    )
+    assert accepted.eligible and accepted.historical
+
+    no_consent = _direct_tender_price_decision(
+        provider="one_c_history", offer_id="one_c_history:history-item-1",
+        offer_source_item_id="history-item-1", include_historical_prices=False,
+    )
+    assert no_consent.reason_code == "HISTORICAL_PRICE_NOT_INCLUDED"
+
+    rejected_cases = (
+        (_direct_tender_price_decision(
+            provider="one_c_history", offer_id="one_c_history:history-item-1",
+            offer_source_item_id="history-item-1", include_historical_prices=True,
+            route_patch={"history_outcome":"REVIEW"},
+        ), "HISTORY_NOT_SAFE"),
+        (_direct_tender_price_decision(
+            provider="one_c_history", offer_id="one_c_history:history-item-1",
+            offer_source_item_id="history-item-1", include_historical_prices=True,
+            provenance_patch={"history_item_id":"different-item"},
+        ), "PROVENANCE_MISMATCH"),
+        (_direct_tender_price_decision(
+            provider="one_c_history", offer_id="one_c_history:history-item-1",
+            offer_source_item_id="history-item-1", include_historical_prices=True,
+            route_patch={"history_selected_event_id":"different-event"},
+        ), "PROVENANCE_MISMATCH"),
+        (_direct_tender_price_decision(
+            provider="one_c_history", offer_id="one_c_history:history-item-1",
+            offer_source_item_id="history-item-1", include_historical_prices=True,
+            run_patch={"history_catalog_version":"different-snapshot"},
+        ), "PROVENANCE_MISMATCH"),
+        (_direct_tender_price_decision(
+            provider="one_c_history", offer_id="one_c_history:history-item-1",
+            offer_source_item_id="history-item-1", include_historical_prices=True,
+            provenance_patch={"price_basis":"gross_per_unit"},
+        ), "PRICE_BASIS_UNPROVEN"),
+        (_direct_tender_price_decision(
+            provider="one_c_history", offer_id="one_c_history:history-item-1",
+            offer_source_item_id="history-item-1", include_historical_prices=True,
+            provenance_patch={"purchase_date":"2999-01-01"},
+        ), "PROVENANCE_MISMATCH"),
+    )
+    for rejected, reason in rejected_cases:
+        assert not rejected.eligible and rejected.reason_code == reason
+
+
+@pytest.mark.parametrize(
+    ("source_unit", "offer_unit", "expected_price"),
+    [
+        ("шт", "шт", "2.500000"),
+        ("100 шт", "шт", "250.000000"),
+        ("10 шт", "шт", "25.000000"),
+        ("1000 шт", "шт", "2500.000000"),
+        ("м", "м", "2.500000"),
+        ("10 м", "м", "25.000000"),
+        ("1000 м", "м", "2500.000000"),
+        ("т", "кг", "2500.000000"),
+        ("кг", "т", "0.002500"),
+    ],
+)
+def test_price_export_unit_scales_use_decimal(source_unit, offer_unit, expected_price):
+    decision = _direct_tender_price_decision(source_unit=source_unit, offer_unit=offer_unit)
+    assert decision.eligible
+    assert decision.source_unit_price == Decimal(expected_price)
+    assert isinstance(decision.source_unit_price, Decimal)
+    assert isinstance(decision.total_price, Decimal)
+
+
+def test_price_export_unknown_package_incompatible_and_rounding_policies():
+    for source_unit, offer_unit, reason in (
+        ("затрата", "шт", "SOURCE_UNIT_UNTRUSTED"),
+        ("компл", "компл", "SOURCE_UNIT_UNTRUSTED"),
+        ("уп", "уп", "SOURCE_UNIT_UNTRUSTED"),
+        ("шт", "unknown", "OFFER_UNIT_UNTRUSTED"),
+        ("шт", "м", "UNIT_INCOMPATIBLE"),
+    ):
+        decision = _direct_tender_price_decision(source_unit=source_unit, offer_unit=offer_unit)
+        assert not decision.eligible and decision.reason_code == reason
+
+    half_up = _direct_tender_price_decision(price="1.2345675", quantity="3")
+    assert half_up.source_unit_price == Decimal("1.234568")
+    assert half_up.total_price == Decimal("3.70")
+
+    rounded_first = _direct_tender_price_decision(price="1.0000004", quantity="12500")
+    assert rounded_first.source_unit_price == Decimal("1.000000")
+    assert rounded_first.total_price == Decimal("12500.00")
+
+
+def test_export_repository_retention_download_pin_restart_and_quota(tender_api, tmp_path, monkeypatch):
+    from averon_import.services.manual_tenders.price_export import (
+        MAX_COMPLETED_EXPORTS_PER_WORKSPACE,
+        MAX_TENDER_STORAGE_BYTES as EXPORT_STORAGE_LIMIT,
+        TenderPriceExportRepository,
+    )
+
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_price_export_run(main, repository, workspace, source_row)
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    workspace = repository.verify_sourcing_snapshot(
+        workspace_path, workspace["tender_id"], "username:tender-user",
+        source_sha256=workspace["source_sha256"], revision=workspace["revision"],
+    )
+    run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
+    decisions = main.tender_price_resolver.resolve_run(
+        workspace, run, tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=False,
+    )
+
+    records = [
+        main.tender_price_exports.create_completed(
+            workspace_path, workspace, run, decisions,
+            owner_id="username:tender-user", allow_partial=False,
+            include_historical_prices=False, builder=main.tender_xlsx_price_exporter,
+        )
+        for _ in range(MAX_COMPLETED_EXPORTS_PER_WORKSPACE)
+    ]
+    first_id, second_id, third_id = [item["export_id"] for item in records]
+    _download_path, _metadata, release = main.tender_price_exports.acquire_download(
+        workspace_path, workspace["tender_id"], first_id, "username:tender-user",
+    )
+    fourth = main.tender_price_exports.create_completed(
+        workspace_path, workspace, run, decisions,
+        owner_id="username:tender-user", allow_partial=False,
+        include_historical_prices=False, builder=main.tender_xlsx_price_exporter,
+    )
+    retained = {item["export_id"] for item in main.tender_price_exports.list_public(
+        workspace_path, workspace["tender_id"], "username:tender-user",
+    )["exports"]}
+    assert retained == {first_id, third_id, fourth["export_id"]}
+    assert second_id not in retained
+
+    # A completed file and its checksum-backed metadata remain usable after
+    # reconstructing the repository service, like they would after app restart.
+    restarted = TenderPriceExportRepository(repository)
+    assert restarted.get_public(
+        workspace_path, workspace["tender_id"], first_id, "username:tender-user",
+    )["output_file_sha256"] == records[0]["output_file_sha256"]
+
+    export_dir = workspace_path / "exports"
+    orphan = export_dir / f".{uuid.uuid4().hex}.{uuid.uuid4().hex}.tmp.xlsx"
+    orphan.write_bytes(b"incomplete")
+    old = datetime.now(timezone.utc).timestamp() - 7200
+    os.utime(orphan, (old, old))
+    TenderPriceExportRepository(repository)
+    assert not orphan.exists()
+
+    # The output XLSX is already part of workspace bytes; the new metadata JSON
+    # must be included too, even when no older export can be reclaimed.
+    release()
+    for existing in export_dir.iterdir():
+        if existing.is_file():
+            existing.unlink()
+    monkeypatch.setattr(repository, "_workspace_storage_bytes", lambda: EXPORT_STORAGE_LIMIT - 1)
+    with pytest.raises(TenderWorkspaceError) as quota:
+        main.tender_price_exports.create_completed(
+            workspace_path, workspace, run, decisions,
+            owner_id="username:tender-user", allow_partial=False,
+            include_historical_prices=False, builder=main.tender_xlsx_price_exporter,
+        )
+    assert quota.value.code == "TENDER_DISK_QUOTA"
+    assert not list(export_dir.glob("[a-f0-9]" * 32 + ".json"))
+
+
+def test_export_semantic_verifier_tracks_workbook_controls(tmp_path):
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from averon_import.services.manual_tenders.price_export import _verify_semantic_roundtrip, _workbook_snapshot
+
+    source = tmp_path / "controls-source.xlsx"
+    output = tmp_path / "controls-output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Synthetic"
+    sheet.auto_filter.ref = "A1:A2"
+    validation = DataValidation(type="whole", operator="greaterThan", formula1="0")
+    validation.add("A2")
+    sheet.add_data_validation(validation)
+    sheet.conditional_formatting.add(
+        "A2", CellIsRule(operator="greaterThan", formula=["0"], fill=PatternFill(fill_type="solid", fgColor="FFFF0000")),
+    )
+    sheet.protection.sheet = True
+    workbook.save(source)
+    workbook.save(output)
+    workbook.close()
+
+    before = _workbook_snapshot(source)
+    after = _workbook_snapshot(output)
+    assert before["sheets"][0]["data_validations"] == after["sheets"][0]["data_validations"]
+    assert before["sheets"][0]["conditional_formatting"] == after["sheets"][0]["conditional_formatting"]
+    _verify_semantic_roundtrip(before, after, target_sheet="Sheet", allowed_cells=set(), target_columns=set())
+
+
+def test_historical_price_export_with_consent_is_visibly_marked(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    provenance = {
+        "source": "one_c_history", "source_kind": "historical_purchase",
+        "snapshot_version": "history-snapshot-v9", "history_item_id": "history-item-1",
+        "selected_event_id": "history-event-1", "purchase_date": "2025-01-24",
+        "price_basis": "gross_including_vat", "effective_unit_price_gross": "1234.5600",
+        "currency_basis": "RUB", "unit_family": "count",
+    }
+    run_id = _persist_price_export_run(
+        main, repository, workspace, source_row, provider="one_c_history",
+        provenance=provenance, history=True,
+    )
+    response = _api_request(
+        main.app, "POST",
+        f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert response.status_code == 202, response.text
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "completed", job
+    assert job["result"]["historical_count"] == 1
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    file_path, _record, release = main.tender_price_exports.acquire_download(
+        workspace_path, workspace["tender_id"], job["result"]["export_id"], "username:tender-user",
+    )
+    try:
+        workbook = load_workbook(file_path, data_only=False)
+        sheet = workbook[TEMPLATE_SHEET]
+        assert sheet["H2"].comment and "2025-01-24" in sheet["H2"].comment.text
+        assert len(sheet["H2"].comment.text) > 75
+        assert sheet["H2"].fill.fill_type == "solid"
+        assert sheet["H1"].comment and len(sheet["H1"].comment.text) > 75
+        workbook.close()
+    finally:
+        release()
+
+
+def test_price_export_job_holds_lease_through_deduped_completion(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_price_export_run(main, repository, workspace, source_row)
+    entered = threading.Event()
+    release_writer = threading.Event()
+    original_write = main.tender_xlsx_price_exporter.write
+
+    def delayed_write(*args, **kwargs):
+        entered.set()
+        assert release_writer.wait(5)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(main.tender_xlsx_price_exporter, "write", delayed_write)
+
+    def post(username="tender-user"):
+        return _api_request(
+            main.app, "POST",
+            f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+            headers={**_auth_headers(username), "Content-Type":"application/json"},
+            body=b'{"include_historical_prices":false,"allow_partial":false}',
+        )
+
+    first = post()
+    assert first.status_code == 202 and entered.wait(2)
+    duplicate = post()
+    assert duplicate.status_code == 202 and duplicate.json()["id"] == first.json()["id"]
+    assert post("another-user").status_code == 404
+    assert repository.activity.active(workspace["tender_id"])
+    blocked_delete = _api_request(
+        main.app, "DELETE", f"/api/manual-tenders/{workspace['tender_id']}", headers=_auth_headers(),
+    )
+    assert blocked_delete.status_code == 409
+
+    release_writer.set()
+    job = _wait_tender_job(main, first.json()["id"])
+    assert job["status"] == "completed", job
+    assert not repository.activity.active(workspace["tender_id"])
+    assert len(list((repository.workspace_root / workspace["tender_id"] / "exports").glob("*.json"))) == 1
+    assert _api_request(
+        main.app, "DELETE", f"/api/manual-tenders/{workspace['tender_id']}", headers=_auth_headers(),
+    ).status_code == 200
+
+
+def test_price_export_failure_admission_and_queue_expiry_release_leases(tender_api, tmp_path, monkeypatch):
+    from averon_import.services.jobs import DOCUMENT_PROCESSING, JobService, SOURCING
+
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source_row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_price_export_run(main, repository, workspace, source_row)
+
+    def post():
+        return _api_request(
+            main.app, "POST",
+            f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+            headers={**_auth_headers(), "Content-Type":"application/json"},
+            body=b'{"include_historical_prices":false,"allow_partial":false}',
+        )
+
+    export_dir = repository.workspace_root / workspace["tender_id"] / "exports"
+    monkeypatch.setattr(
+        main.tender_xlsx_price_exporter, "write",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic export failure")),
+    )
+    failed = post()
+    assert failed.status_code == 202
+    failed_job = _wait_tender_job(main, failed.json()["id"])
+    assert failed_job["status"] == "failed"
+    assert not repository.activity.active(workspace["tender_id"])
+    assert not list(export_dir.glob("*.json")) and not list(export_dir.glob("*.xlsx"))
+
+    admission_jobs = JobService(capacities={DOCUMENT_PROCESSING:(1,0), SOURCING:(1,0)})
+    monkeypatch.setattr(main, "job_service", admission_jobs)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    admission_jobs.submit(
+        lambda _progress: (blocker_started.set(), release_blocker.wait(5))[1],
+        lane=DOCUMENT_PROCESSING, owner_id="synthetic-admission-blocker",
+    )
+    assert blocker_started.wait(2)
+    rejected = post()
+    assert rejected.status_code == 409 and rejected.json()["detail"]["code"] == "JOB_LANE_BUSY"
+    assert not repository.activity.active(workspace["tender_id"])
+    assert not list(export_dir.glob("*.json")) and not list(export_dir.glob("*.xlsx"))
+    release_blocker.set()
+    admission_jobs.executor.shutdown(wait=True)
+
+    expiry_jobs = JobService(queue_wait_seconds=0.05)
+    monkeypatch.setattr(main, "job_service", expiry_jobs)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    expiry_jobs.submit(
+        lambda _progress: (blocker_started.set(), release_blocker.wait(5))[1],
+        lane=DOCUMENT_PROCESSING, owner_id="synthetic-expiry-blocker",
+    )
+    assert blocker_started.wait(2)
+    queued = post()
+    assert queued.status_code == 202
+    time.sleep(0.08)
+    expired = _wait_tender_job(main, queued.json()["id"])
+    assert expired["status"] == "expired"
+    assert not repository.activity.active(workspace["tender_id"])
+    assert not list(export_dir.glob("*.json")) and not list(export_dir.glob("*.xlsx"))
+    release_blocker.set()
+    expiry_jobs.executor.shutdown(wait=True)

@@ -247,6 +247,22 @@ def _style_fingerprint(cell: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def is_semantically_empty_cell(cell: Any) -> bool:
+    """Whether a target cell can be reused without replacing workbook meaning.
+
+    Physical empty-string shared-string cells and style-only cells are allowed.
+    Formulas, comments, hyperlinks and non-empty constants remain occupied even
+    when a formula happens to display an empty result.
+    """
+    if (
+        getattr(cell, "data_type", None) == "f"
+        or getattr(cell, "comment", None) is not None
+        or getattr(cell, "hyperlink", None) is not None
+    ):
+        return False
+    return getattr(cell, "value", None) in (None, "")
+
+
 class TenderWorkbookParser:
     def parse(self, path: Path, *, tender_id: str | None = None, mapping_override: dict[str, int | None] | None = None, selected_sheet: str | None = None, selected_header_row: int | None = None) -> dict[str, Any]:
         if path.suffix.casefold() != ".xlsx":
@@ -666,8 +682,10 @@ class TenderWorkbookParser:
             comments = []
             for row in range(1, min(sheet.max_row, MAX_ROWS_PER_SHEET) + 1):
                 cell = sheet.cell(row, column)
-                if cell.value is not None:
-                    (formulas if cell.data_type == "f" else values).append(cell.coordinate)
+                if cell.data_type == "f":
+                    formulas.append(cell.coordinate)
+                elif cell.value not in (None, ""):
+                    values.append(cell.coordinate)
                 if cell.comment:
                     comments.append(cell.coordinate)
             merged = [str(rng) for rng in sheet.merged_cells.ranges if rng.min_col <= column <= rng.max_col]
@@ -730,4 +748,4 @@ class TenderWorkbookParser:
         ))
 
 
-__all__ = ["TenderWorkbookParser", "TenderParseError", "preflight_tender_xlsx", "parse_unit_basis", "MAX_UPLOAD_BYTES", "MAX_UNCOMPRESSED_BYTES", "MAX_ACTUAL_ITEMS", "PARSER_VERSION"]
+__all__ = ["TenderWorkbookParser", "TenderParseError", "preflight_tender_xlsx", "parse_unit_basis", "is_semantically_empty_cell", "MAX_UPLOAD_BYTES", "MAX_UNCOMPRESSED_BYTES", "MAX_ACTUAL_ITEMS", "PARSER_VERSION"]

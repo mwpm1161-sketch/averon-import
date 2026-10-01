@@ -20,7 +20,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError, field_validator, model_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -94,6 +94,13 @@ from averon_import.services.manual_tenders.sourcing import (
     TenderSourcingRowAdapter,
     TenderSourcingRunStore,
     canonical_tender_projection,
+)
+from averon_import.services.manual_tenders.price_export import (
+    XLSX_MIME,
+    TenderPriceExportRepository,
+    TenderPriceResolver,
+    TenderXlsxPriceExporter,
+    summarize_decisions,
 )
 from averon_import.services.manual_tenders.parser import MAX_UPLOAD_BYTES as MAX_MANUAL_TENDER_UPLOAD_BYTES
 from averon_import.services.document_mutation import DocumentMutationLocks
@@ -197,6 +204,9 @@ one_c_history_service = OneCHistoryImportService(one_c_history_repository, one_c
 tender_activity = TenderActivityRegistry()
 tender_repository = TenderWorkspaceRepository(DATA_DIR, tender_activity)
 tender_sourcing_runs = TenderSourcingRunStore(tender_repository)
+tender_price_exports = TenderPriceExportRepository(tender_repository)
+tender_price_resolver = TenderPriceResolver()
+tender_xlsx_price_exporter = TenderXlsxPriceExporter()
 tender_parser = TenderWorkbookParser()
 tender_template_service = TenderTemplateService()
 secret_store = create_secret_store(DATA_DIR)
@@ -2208,6 +2218,13 @@ class ManualTenderSourcingRequest(BaseModel):
         return result
 
 
+class ManualTenderPriceExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    include_historical_prices: StrictBool = False
+    allow_partial: StrictBool = False
+
+
 def _tender_run_snapshot(tender_id: str, owner_id: str):
     path, metadata, lease = tender_repository.acquire_sourcing_workspace(tender_id, owner_id)
     return path, metadata, lease
@@ -2419,6 +2436,221 @@ def get_manual_tender_run(
     finally:
         if lease is not None:
             lease.release()
+
+
+def _price_export_confirmation_error(code: str, message: str, summary: dict[str, Any]) -> HTTPException:
+    return HTTPException(409, detail={"code": code, "message": message, "summary": summary})
+
+
+def _submit_manual_tender_price_export(
+    tender_id: str,
+    run_id: str,
+    request: ManualTenderPriceExportRequest,
+    user: CurrentUser,
+) -> dict[str, Any]:
+    lease = None
+    owner_id = _tender_owner_key(user)
+    try:
+        workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(tender_id, owner_id)
+        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        # Resolve history once with consent to identify whether explicit consent
+        # is needed, then resolve using only the submitted policy options.
+        with_history = tender_price_resolver.resolve_run(
+            workspace, run, tender_id=tender_id, run_id=run_id,
+            include_historical_prices=True,
+        )
+        history_summary = summarize_decisions(with_history)
+        if history_summary["historical_count"] and not request.include_historical_prices:
+            raise _price_export_confirmation_error(
+                "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED",
+                "В выбранном запуске есть исторические цены 1С. Подтвердите их отдельное включение.",
+                history_summary,
+            )
+        decisions = tender_price_resolver.resolve_run(
+            workspace, run, tender_id=tender_id, run_id=run_id,
+            include_historical_prices=request.include_historical_prices,
+        )
+        summary = summarize_decisions(decisions)
+        if summary["priced_count"] == 0:
+            raise _price_export_confirmation_error(
+                "TENDER_EXPORT_NO_ELIGIBLE_PRICES",
+                "В выбранном запуске нет безопасных цен для экспорта.",
+                summary,
+            )
+        if summary["blank_count"] and not request.allow_partial:
+            raise _price_export_confirmation_error(
+                "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED",
+                "Часть выбранных строк останется без цены. Подтвердите частичный экспорт.",
+                summary,
+            )
+
+        source_sha = str(workspace["source_sha256"])
+        revision = int(workspace["revision"])
+        owner_job_id = _job_owner_id(user)
+
+        def run_export(progress):
+            progress(0, 1, "Повторно проверяем запуск и книгу")
+            current_workspace = tender_repository.verify_sourcing_snapshot(
+                workspace_path, tender_id, owner_id,
+                source_sha256=source_sha, revision=revision,
+            )
+            current_run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+            current_decisions = tender_price_resolver.resolve_run(
+                current_workspace, current_run, tender_id=tender_id, run_id=run_id,
+                include_historical_prices=request.include_historical_prices,
+            )
+            current_summary = summarize_decisions(current_decisions)
+            if current_summary["priced_count"] == 0 or (
+                current_summary["blank_count"] and not request.allow_partial
+            ):
+                raise TenderWorkspaceError(
+                    "Условия безопасного экспорта изменились. Повторите проверку.",
+                    409, "TENDER_EXPORT_POLICY_CHANGED",
+                )
+            progress(0, 1, "Формируем копию исходной книги")
+            artifact = tender_price_exports.create_completed(
+                workspace_path, current_workspace, current_run, current_decisions,
+                owner_id=owner_id, allow_partial=request.allow_partial,
+                include_historical_prices=request.include_historical_prices,
+                builder=tender_xlsx_price_exporter,
+            )
+            progress(1, 1, "Экспорт готов")
+            return artifact
+
+        dedupe_key = stable_fingerprint({
+            "kind": "manual_tender_price_export",
+            "tender_id": tender_id,
+            "run_id": run_id,
+            "source_sha256": source_sha,
+            "workspace_revision": revision,
+            "policy_revision": "xlsx-price-export-v1",
+            "allow_partial": request.allow_partial,
+            "include_historical_prices": request.include_historical_prices,
+        })
+        try:
+            job = job_service.submit(
+                run_export,
+                lane=DOCUMENT_PROCESSING,
+                kind="manual_tender_price_export",
+                owner_id=owner_job_id,
+                dedupe_key=dedupe_key,
+                release_callbacks=[lease.release],
+            )
+            lease = None  # JobService now owns release, including dedupe/admission.
+            return job.public()
+        except JobAdmissionError as exc:
+            raise _job_admission_http_error(exc) from exc
+    except Exception as exc:
+        if lease is not None:
+            lease.release()
+        if isinstance(exc, HTTPException):
+            raise
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+
+
+@app.post(
+    "/api/manual-tenders/{tender_id}/runs/{run_id}/export",
+    status_code=202,
+    dependencies=[Depends(require_authenticated)],
+)
+def start_manual_tender_price_export(
+    tender_id: str,
+    run_id: str,
+    request: ManualTenderPriceExportRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    return _submit_manual_tender_price_export(tender_id, run_id, request, user)
+
+
+@app.get(
+    "/api/manual-tenders/{tender_id}/exports",
+    dependencies=[Depends(require_authenticated)],
+)
+def list_manual_tender_price_exports(
+    tender_id: str,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    lease = None
+    try:
+        workspace_path, _workspace, lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        return tender_price_exports.list_public(workspace_path, tender_id, _tender_owner_key(user))
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+@app.get(
+    "/api/manual-tenders/{tender_id}/exports/{export_id}",
+    dependencies=[Depends(require_authenticated)],
+)
+def get_manual_tender_price_export(
+    tender_id: str,
+    export_id: str,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    lease = None
+    try:
+        workspace_path, _workspace, lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        return tender_price_exports.get_public(
+            workspace_path, tender_id, export_id, _tender_owner_key(user),
+        )
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+@app.get(
+    "/api/manual-tenders/{tender_id}/exports/{export_id}/download",
+    dependencies=[Depends(require_authenticated)],
+)
+def download_manual_tender_price_export(
+    tender_id: str,
+    export_id: str,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    tender_lease = export_lease = None
+    try:
+        workspace_path, _workspace, tender_lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        path, record, export_lease = tender_price_exports.acquire_download(
+            workspace_path, tender_id, export_id, _tender_owner_key(user),
+        )
+
+        def release_downloads() -> None:
+            if export_lease is not None:
+                export_lease()
+            if tender_lease is not None:
+                tender_lease.release()
+
+        return FileResponse(
+            path,
+            media_type=XLSX_MIME,
+            filename=str(record["filename"]),
+            background=BackgroundTask(release_downloads),
+        )
+    except Exception as exc:
+        if export_lease is not None:
+            export_lease()
+        if tender_lease is not None:
+            tender_lease.release()
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
 
 
 def _sourcing_payload(value: Any) -> Any:

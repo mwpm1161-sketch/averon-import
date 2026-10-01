@@ -323,11 +323,15 @@ class TenderSourcingRunStore:
 def _safe_match(match: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(match, dict):
         return None
-    return {
+    safe = {
         key: match.get(key)
         for key in ("decision", "rank", "matched_attributes", "supporting_attributes", "conflicting_attributes", "missing_attributes")
         if key in match
     }
+    offer = match.get("offer") if isinstance(match.get("offer"), dict) else {}
+    if isinstance(offer.get("offer_id"), str):
+        safe["offer_id"] = offer["offer_id"][:180]
+    return safe
 
 
 def _safe_provenance_value(key: str, value: Any) -> Any:
@@ -411,7 +415,7 @@ def canonical_tender_projection(
             safe_offer = {
                 key: offer.get(key)
                 for key in (
-                    "provider", "source_item_id", "title", "article", "manufacturer", "brand",
+                    "offer_id", "provider", "source_item_id", "title", "article", "manufacturer", "brand",
                     "price", "currency", "price_unit", "retrieved_at", "availability", "availability_text",
                 )
                 if key in offer
@@ -439,6 +443,7 @@ def canonical_tender_projection(
                 for key in (
                     "source_mode", "final_source_kind", "fallback_status", "history_outcome",
                     "history_safe_basis", "history_reason_code", "history_catalog_version",
+                    "history_selected_event_id",
                     "history_purchase_date", "history_age_days", "fallback_called",
                     "fallback_provider_key", "fallback_catalog_version", "routing_policy_revision",
                 )

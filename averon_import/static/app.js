@@ -91,7 +91,7 @@ const state = {
   recentDocuments: [],
   pendingDocumentDelete: null,
   manual: {active: false, rows: []},
-  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,latestRuns:[]},
+  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -1745,7 +1745,7 @@ function returnToStartFromManual() {
 function clearExcelTenderState() {
   const generation = (state.excelTender?.pollGeneration || 0) + 1;
   if (state.excelTender?.filterTimer) clearTimeout(state.excelTender.filterTimer);
-  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,latestRuns:[]};
+  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null};
   try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {}
   const file = $("#tender-xlsx-file");
   if (file) file.value = "";
@@ -1807,7 +1807,17 @@ function openExcelTenderImport() {
   state.excelTender.jobId = null;
   state.excelTender.workspace = null;
   state.excelTender.sourcingActive = false;
+  state.excelTender.exportActive = false;
+  state.excelTender.exportJobId = null;
+  state.excelTender.selectedExportRunId = null;
   state.excelTender.latestRuns = [];
+  state.excelTender.latestExports = [];
+  state.excelTender.selectedExportId = null;
+  state.excelTender.exportActive = false;
+  state.excelTender.exportJobId = null;
+  state.excelTender.selectedExportRunId = null;
+  state.excelTender.latestExports = [];
+  state.excelTender.selectedExportId = null;
   state.excelTender.selectedIds = new Set();
   $("#tender-sourcing-submit").hidden = true;
   $("#tender-preview-pane").hidden = false;
@@ -1978,7 +1988,12 @@ function openExcelTenderWorkspace(workspace, {persist = true} = {}) {
   state.excelTender.workspace = workspace;
   state.excelTender.jobId = null;
   state.excelTender.sourcingActive = false;
+  state.excelTender.exportActive = false;
+  state.excelTender.exportJobId = null;
+  state.excelTender.selectedExportRunId = null;
   state.excelTender.latestRuns = [];
+  state.excelTender.latestExports = [];
+  state.excelTender.selectedExportId = null;
   state.excelTender.selectedIds = new Set((workspace.rows || []).filter((row) => row.row_type === "item").map((row) => row.source_row_id));
   $("#tender-document-name").textContent = workspace.filename || "Тендер из Excel";
   $("#tender-document-meta").textContent = `Лист ${workspace.sheet_name} · исходная книга ${String(workspace.source_sha256 || "").slice(0,12)}`;
@@ -2014,10 +2029,176 @@ async function refreshExcelTenderRuns(tenderId = state.excelTender.workspace?.te
     if (state.excelTender.workspace?.tender_id !== tenderId) return;
     state.excelTender.latestRuns = Array.isArray(payload.runs) ? payload.runs : [];
     renderExcelTenderLatestRun();
+    renderExcelTenderExportControls();
+    void refreshExcelTenderExports(tenderId);
   } catch (_) {
     if (state.excelTender.workspace?.tender_id === tenderId) {
       $("#tender-last-run").textContent = "Историю запусков сейчас загрузить не удалось.";
     }
+  }
+}
+
+function renderExcelTenderExportControls() {
+  const runSelect = $("#tender-export-run");
+  const artifactSelect = $("#tender-export-artifact");
+  const button = $("#tender-export-button");
+  const download = $("#tender-export-download");
+  if (!runSelect || !artifactSelect || !button || !download) return;
+  const completed = (state.excelTender.latestRuns || []).filter((run) => run.status === "completed" && /^[a-f0-9]{32}$/.test(run.run_id || ""));
+  const modes = {one_c_only:"История 1С", one_c_then_provider:"История 1С → поставщик", provider_only:"Поставщик"};
+  const selectedRun = completed.some((run) => run.run_id === state.excelTender.selectedExportRunId)
+    ? state.excelTender.selectedExportRunId : completed[0]?.run_id || "";
+  state.excelTender.selectedExportRunId = selectedRun || null;
+  runSelect.innerHTML = completed.map((run) => {
+    const when = run.completed_at ? new Date(run.completed_at).toLocaleString("ru-RU") : "";
+    return `<option value="${escapeHtml(run.run_id)}">${escapeHtml(modes[run.source_mode] || "Подбор")} · ${escapeHtml(when)} · ${escapeHtml(String(run.run_id).slice(0,8))}</option>`;
+  }).join("");
+  runSelect.value = selectedRun;
+  runSelect.disabled = !completed.length || state.excelTender.exportActive || state.excelTender.sourcingActive;
+  button.disabled = !selectedRun || state.excelTender.exportActive || state.excelTender.sourcingActive;
+  button.textContent = state.excelTender.exportActive ? "Формируем Excel…" : "Скачать Excel с ценами";
+  const artifacts = state.excelTender.latestExports || [];
+  const selectedArtifact = artifacts.some((item) => item.export_id === state.excelTender.selectedExportId)
+    ? state.excelTender.selectedExportId : artifacts[0]?.export_id || "";
+  state.excelTender.selectedExportId = selectedArtifact || null;
+  artifactSelect.innerHTML = artifacts.map((item) => {
+    const when = item.created_at ? new Date(item.created_at).toLocaleString("ru-RU") : "";
+    return `<option value="${escapeHtml(item.export_id)}">${escapeHtml(item.filename || "Экспорт") } · ${escapeHtml(when)} · ${item.priced_count || 0} цен</option>`;
+  }).join("");
+  artifactSelect.value = selectedArtifact;
+  artifactSelect.disabled = !artifacts.length;
+  download.disabled = !selectedArtifact || state.excelTender.exportActive;
+}
+
+async function refreshExcelTenderExports(tenderId = state.excelTender.workspace?.tender_id) {
+  if (!tenderId) return;
+  try {
+    const payload = await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}/exports`);
+    if (state.excelTender.workspace?.tender_id !== tenderId) return;
+    state.excelTender.latestExports = Array.isArray(payload.exports) ? payload.exports : [];
+    renderExcelTenderExportControls();
+  } catch (_) {
+    if (state.excelTender.workspace?.tender_id === tenderId) {
+      const status = $("#tender-export-status");
+      if (status) status.textContent = "Список готовых экспортов сейчас недоступен.";
+    }
+  }
+}
+
+function tenderExportConfirmationSummary(summary) {
+  const selected = Number(summary?.selected_count || 0);
+  const priced = Number(summary?.priced_count || 0);
+  const blank = Number(summary?.blank_count || 0);
+  const historical = Number(summary?.historical_count || 0);
+  return `Позиции: ${selected}; с ценой: ${priced}; без цены: ${blank}; исторические цены 1С: ${historical}.`;
+}
+
+async function startExcelTenderPriceExport() {
+  const workspace = state.excelTender.workspace;
+  const runId = state.excelTender.selectedExportRunId;
+  if (!workspace || !runId || state.excelTender.exportActive || state.excelTender.sourcingActive) return;
+  const tenderId = workspace.tender_id;
+  const generation = ++state.excelTender.pollGeneration;
+  const current = () => state.excelTender.workspace?.tender_id === tenderId
+    && state.excelTender.pollGeneration === generation
+    && state.excelTender.exportActive;
+  state.excelTender.exportActive = true;
+  state.excelTender.exportJobId = "submitting";
+  const status = $("#tender-export-status");
+  if (status) status.textContent = "Проверяем цены и ограничения экспорта…";
+  renderExcelTenderExportControls();
+  const options = {include_historical_prices:false, allow_partial:false};
+  try {
+    let job;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        job = await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}/runs/${encodeURIComponent(runId)}/export`, {
+          method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(options),
+        });
+        break;
+      } catch (error) {
+        const summary = error.payload?.detail?.summary || {};
+        if (error.code === "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED" && !options.include_historical_prices) {
+          const accepted = confirm(`Запуск содержит ${summary.historical_count || 0} исторических цен 1С. Они относятся к предыдущим покупкам, не подтверждают текущую доступность и будут явно отмечены в книге. Включить их?\n\n${tenderExportConfirmationSummary(summary)}`);
+          if (!accepted) throw new Error("Экспорт отменён.");
+          options.include_historical_prices = true;
+          continue;
+        }
+        if (error.code === "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED" && !options.allow_partial) {
+          const accepted = confirm(`Часть строк останется без цены. Продолжить частичный экспорт?\n\n${tenderExportConfirmationSummary(summary)}`);
+          if (!accepted) throw new Error("Экспорт отменён.");
+          options.allow_partial = true;
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (!job?.id || !current()) return;
+    state.excelTender.exportJobId = job.id;
+    await pollExcelTenderPriceExport(job.id, tenderId, generation);
+  } catch (error) {
+    if (current() && status) status.textContent = error.message || "Не удалось сформировать экспорт.";
+  } finally {
+    if (current()) {
+      state.excelTender.exportActive = false;
+      state.excelTender.exportJobId = null;
+      renderExcelTenderExportControls();
+    }
+  }
+}
+
+async function pollExcelTenderPriceExport(jobId, tenderId, generation) {
+  let queuedPoll = 0;
+  const current = () => state.excelTender.workspace?.tender_id === tenderId
+    && state.excelTender.pollGeneration === generation
+    && state.excelTender.exportActive
+    && state.excelTender.exportJobId === jobId;
+  while (current()) {
+    const job = await getJobForPolling(jobId);
+    if (!current()) return;
+    const status = $("#tender-export-status");
+    if (job.status === "completed") {
+      const record = job.result;
+      if (!record || !/^[a-f0-9]{32}$/.test(record.export_id || "")) throw new Error("Сервер вернул некорректный результат экспорта.");
+      state.excelTender.latestExports = [record, ...(state.excelTender.latestExports || []).filter((item) => item.export_id !== record.export_id)].slice(0, 3);
+      state.excelTender.selectedExportId = record.export_id;
+      if (status) status.textContent = `Готово: заполнено ${record.priced_count} из ${record.selected_count}; без цены ${record.blank_count}. Файл создан как копия исходной книги.`;
+      renderExcelTenderExportControls();
+      void refreshExcelTenderExports(tenderId);
+      return;
+    }
+    if (job.status === "failed" || job.status === "expired" || job.status === "interrupted") {
+      throw new Error(job.error || "Экспорт не выполнен. Запустите его повторно.");
+    }
+    if (status) status.textContent = job.status === "queued" ? "Экспорт ожидает очереди обработки…" : "Формируем и проверяем копию книги…";
+    if (job.status === "queued") {
+      queuedPoll += 1;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (2 ** (queuedPoll - 1)), 8000)));
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+}
+
+async function downloadExcelTenderPriceExport() {
+  const workspace = state.excelTender.workspace;
+  const exportId = state.excelTender.selectedExportId;
+  if (!workspace || !exportId) return;
+  try {
+    const response = await api(`/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}/exports/${encodeURIComponent(exportId)}/download`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    const record = (state.excelTender.latestExports || []).find((item) => item.export_id === exportId);
+    link.download = record?.filename || "Тендер_Averon_цены.xlsx";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    const status = $("#tender-export-status");
+    if (status) status.textContent = error.message || "Не удалось скачать готовый экспорт.";
   }
 }
 
@@ -2034,7 +2215,7 @@ function renderExcelTenderRows() {
   selectAll.indeterminate = visible.some((row) => state.excelTender.selectedIds.has(row.source_row_id)) && !selectAll.checked;
   const sourcingButton = $("#tender-sourcing-button");
   if (sourcingButton) {
-    sourcingButton.disabled = state.excelTender.sourcingActive || state.excelTender.selectedIds.size === 0;
+    sourcingButton.disabled = state.excelTender.sourcingActive || state.excelTender.exportActive || state.excelTender.selectedIds.size === 0;
     sourcingButton.textContent = state.excelTender.sourcingActive ? "Подбор выполняется…" : "Подобрать предложения";
   }
 }
@@ -2099,7 +2280,7 @@ async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
 
 async function startExcelTenderSourcing() {
   const workspace = state.excelTender.workspace;
-  if (!workspace || state.excelTender.sourcingActive) return;
+  if (!workspace || state.excelTender.sourcingActive || state.excelTender.exportActive) return;
   const selectedIds = [...state.excelTender.selectedIds];
   if (!selectedIds.length) { toast("Выберите хотя бы одну позицию для подбора", "error"); return; }
   const tenderId = workspace.tender_id;
@@ -5206,6 +5387,16 @@ function setupEvents() {
   $("#tender-delete-workspace").addEventListener("click", () => { void deleteExcelTenderWorkspace(); });
   $("#tender-sourcing-button").addEventListener("click", openExcelTenderSourcing);
   $("#tender-sourcing-submit").addEventListener("click", () => { void startExcelTenderSourcing(); });
+  $("#tender-export-run").addEventListener("change", (event) => {
+    state.excelTender.selectedExportRunId = event.target.value || null;
+    renderExcelTenderExportControls();
+  });
+  $("#tender-export-artifact").addEventListener("change", (event) => {
+    state.excelTender.selectedExportId = event.target.value || null;
+    renderExcelTenderExportControls();
+  });
+  $("#tender-export-button").addEventListener("click", () => { void startExcelTenderPriceExport(); });
+  $("#tender-export-download").addEventListener("click", () => { void downloadExcelTenderPriceExport(); });
   $("#tender-row-search").addEventListener("input", () => {
     if (state.excelTender.filterTimer) clearTimeout(state.excelTender.filterTimer);
     state.excelTender.filterTimer = setTimeout(() => { state.excelTender.filterTimer = null; renderExcelTenderRows(); }, 120);
