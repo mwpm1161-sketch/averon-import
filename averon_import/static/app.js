@@ -91,7 +91,7 @@ const state = {
   recentDocuments: [],
   pendingDocumentDelete: null,
   manual: {active: false, rows: []},
-  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null},
+  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,latestRuns:[]},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -1745,7 +1745,7 @@ function returnToStartFromManual() {
 function clearExcelTenderState() {
   const generation = (state.excelTender?.pollGeneration || 0) + 1;
   if (state.excelTender?.filterTimer) clearTimeout(state.excelTender.filterTimer);
-  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null};
+  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,latestRuns:[]};
   try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {}
   const file = $("#tender-xlsx-file");
   if (file) file.value = "";
@@ -1759,6 +1759,8 @@ function clearExcelTenderState() {
   if (workspacePane) workspacePane.hidden = true;
   const previewPane = $("#tender-preview-pane");
   if (previewPane) previewPane.hidden = false;
+  const sourcingSubmit = $("#tender-sourcing-submit");
+  if (sourcingSubmit) sourcingSubmit.hidden = true;
 }
 
 function storeExcelTenderView(tenderId) {
@@ -1800,9 +1802,14 @@ async function downloadExcelTenderTemplate() {
 }
 
 function openExcelTenderImport() {
+  state.excelTender.pollGeneration += 1;
   state.excelTender.previewId = null;
   state.excelTender.jobId = null;
   state.excelTender.workspace = null;
+  state.excelTender.sourcingActive = false;
+  state.excelTender.latestRuns = [];
+  state.excelTender.selectedIds = new Set();
+  $("#tender-sourcing-submit").hidden = true;
   $("#tender-preview-pane").hidden = false;
   $("#tender-workspace-pane").hidden = true;
   $("#tender-document-name").textContent = "Тендер из Excel";
@@ -1916,7 +1923,7 @@ function renderExcelTenderPreview(preview) {
     ${analysis.item_count ? "" : "<p class=\"tender-warnings\">Позиции не найдены. Добавьте строки позиций и загрузите книгу повторно.</p>"}
     <p><b>Сопоставление:</b> ${escapeHtml(mappingText)}</p>
     ${outputPlans ? `<p><b>Кандидаты будущих колонок:</b> ${escapeHtml(outputPlans)}</p>` : ""}
-    ${analysis.official_template ? "<p>Ошибок структуры нет.</p>" : ""}${warnings}
+    ${analysis.official_template ? "<p>Структура шаблона распознана.</p>" : ""}${warnings}
     <div class="tender-table-wrap"><table class="tender-table"><thead><tr><th>Строка</th><th>Код ресурса</th><th>Наименование</th><th>Ед. изм.</th><th>Кол-во</th></tr></thead><tbody>${sample}</tbody></table></div>
     </div>`;
   renderTenderMappingControls(analysis);
@@ -1967,8 +1974,12 @@ async function confirmExcelTenderImport() {
 }
 
 function openExcelTenderWorkspace(workspace, {persist = true} = {}) {
+  state.excelTender.pollGeneration += 1;
   state.excelTender.workspace = workspace;
-  state.excelTender.selectedIds = new Set();
+  state.excelTender.jobId = null;
+  state.excelTender.sourcingActive = false;
+  state.excelTender.latestRuns = [];
+  state.excelTender.selectedIds = new Set((workspace.rows || []).filter((row) => row.row_type === "item").map((row) => row.source_row_id));
   $("#tender-document-name").textContent = workspace.filename || "Тендер из Excel";
   $("#tender-document-meta").textContent = `Лист ${workspace.sheet_name} · исходная книга ${String(workspace.source_sha256 || "").slice(0,12)}`;
   $("#tender-preview-pane").hidden = true;
@@ -1978,6 +1989,36 @@ function openExcelTenderWorkspace(workspace, {persist = true} = {}) {
   renderExcelTenderRows();
   if (persist) storeExcelTenderView(workspace.tender_id);
   setView("excel-tender");
+  void refreshExcelTenderRuns(workspace.tender_id);
+}
+
+function renderExcelTenderLatestRun() {
+  const node = $("#tender-last-run");
+  if (!node) return;
+  const run = state.excelTender.latestRuns?.[0];
+  if (!run) { node.textContent = "Последние запуски: пока нет."; return; }
+  const modeLabels = {one_c_only:"Только история 1С", one_c_then_provider:"История 1С → поставщик", provider_only:"Только поставщик"};
+  const summary = run.summary || {};
+  const when = run.completed_at ? new Date(run.completed_at).toLocaleString("ru-RU") : "выполнение не завершено";
+  const prefix = `Последний подбор · ${modeLabels[run.source_mode] || "Подбор"} · ${when} · ${summary.positions_processed || 0}/${summary.positions_total || 0} · совпадений ${summary.positions_matched || 0} · на проверку ${summary.positions_review || 0} · без предложений ${summary.positions_without_offers || 0} · запуск ${String(run.run_id || "").slice(0,8)}`;
+  node.textContent = run.status === "interrupted"
+    ? `${prefix}. Подбор был прерван перезапуском сервера. Запустите его повторно.`
+    : run.status === "failed" ? `${prefix}. ${run.failure?.message || "Подбор не выполнен."}`
+    : run.status === "running" ? `${prefix}. Подбор выполняется.` : prefix;
+}
+
+async function refreshExcelTenderRuns(tenderId = state.excelTender.workspace?.tender_id) {
+  if (!tenderId) return;
+  try {
+    const payload = await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}/runs`);
+    if (state.excelTender.workspace?.tender_id !== tenderId) return;
+    state.excelTender.latestRuns = Array.isArray(payload.runs) ? payload.runs : [];
+    renderExcelTenderLatestRun();
+  } catch (_) {
+    if (state.excelTender.workspace?.tender_id === tenderId) {
+      $("#tender-last-run").textContent = "Историю запусков сейчас загрузить не удалось.";
+    }
+  }
 }
 
 function renderExcelTenderRows() {
@@ -1991,6 +2032,22 @@ function renderExcelTenderRows() {
   const selectAll = $("#tender-select-all");
   selectAll.checked = visible.length > 0 && visible.every((row) => state.excelTender.selectedIds.has(row.source_row_id));
   selectAll.indeterminate = visible.some((row) => state.excelTender.selectedIds.has(row.source_row_id)) && !selectAll.checked;
+  const sourcingButton = $("#tender-sourcing-button");
+  if (sourcingButton) {
+    sourcingButton.disabled = state.excelTender.sourcingActive || state.excelTender.selectedIds.size === 0;
+    sourcingButton.textContent = state.excelTender.sourcingActive ? "Подбор выполняется…" : "Подобрать предложения";
+  }
+}
+
+function openExcelTenderSourcing() {
+  if (!state.excelTender.workspace || state.excelTender.sourcingActive) return;
+  if (!state.excelTender.selectedIds.size) { toast("Выберите хотя бы одну позицию для подбора", "error"); return; }
+  $("#tender-sourcing-submit").hidden = false;
+  $("#tender-sourcing-submit").disabled = false;
+  $("#tender-sourcing-submit").textContent = "Запустить подбор по выбранным строкам";
+  $("#sourcing-subtitle").textContent = "Будут отправлены только выбранные строки Excel";
+  $("#sourcing-content").innerHTML = '<p class="hint">Проверьте выбранный источник подбора и запустите задание.</p>';
+  openSourcingModal();
 }
 
 async function deleteExcelTenderWorkspace() {
@@ -2001,6 +2058,91 @@ async function deleteExcelTenderWorkspace() {
     clearExcelTenderState();
     setView("upload");
   } catch (error) { toast(error.message || "Не удалось удалить тендер", "error"); }
+}
+
+async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
+  let queuedPoll = 0;
+  const current = () => state.excelTender.workspace?.tender_id === tenderId
+    && state.excelTender.pollGeneration === generation
+    && state.excelTender.sourcingActive
+    && state.excelTender.jobId === jobId;
+  while (current()) {
+    let job;
+    try { job = await getJobForPolling(jobId); }
+    catch (error) {
+      if (error.message === JOB_RESTART_MESSAGE) {
+        throw new Error("Подбор был прерван перезапуском сервера. Запустите его повторно.");
+      }
+      throw error;
+    }
+    if (!current()) return;
+    const total = job.total || expectedTotal;
+    const completed = Math.min(Number(job.current || 0), total || Number(job.current || 0));
+    if (job.status === "queued" || job.status === "running") {
+      $("#sourcing-subtitle").textContent = job.status === "queued" ? "Задание в очереди" : "Подбираем предложения";
+      $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${job.status === "queued" ? "В очереди" : "Выполняется"}</b><strong>${completed} из ${total}</strong><small>${job.status === "queued" ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
+    } else if (job.status === "completed") {
+      $("#sourcing-subtitle").textContent = "Подбор тендера завершён";
+      renderSourcingResult(job.result);
+      void refreshExcelTenderRuns(tenderId);
+      return;
+    } else if (job.status === "failed") throw new Error(job.error || "Подбор не выполнен");
+    else if (job.status === "expired") throw new Error(job.error || "Задание истекло в очереди. Запустите его повторно.");
+    if (job.status === "queued") {
+      queuedPoll += 1;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (2 ** (queuedPoll - 1)), 8000)));
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+}
+
+async function startExcelTenderSourcing() {
+  const workspace = state.excelTender.workspace;
+  if (!workspace || state.excelTender.sourcingActive) return;
+  const selectedIds = [...state.excelTender.selectedIds];
+  if (!selectedIds.length) { toast("Выберите хотя бы одну позицию для подбора", "error"); return; }
+  const tenderId = workspace.tender_id;
+  const generation = ++state.excelTender.pollGeneration;
+  const mode = state.sourcing.sourceMode;
+  state.excelTender.sourcingActive = true;
+  state.excelTender.jobId = "submitting";
+  renderExcelTenderRows();
+  const submit = $("#tender-sourcing-submit");
+  submit.disabled = true;
+  submit.textContent = "Запускаем подбор…";
+  const modeSelect = $("#sourcing-source-mode");
+  const wasModeDisabled = modeSelect.disabled;
+  modeSelect.disabled = true;
+  $("#sourcing-subtitle").textContent = sourcingModeLoadingCopy(mode).title;
+  $("#sourcing-content").innerHTML = '<div class="sourcing-loading"><span class="spinner"></span><b>Запускаем серверный подбор</b></div>';
+  const isCurrent = () => state.excelTender.workspace?.tender_id === tenderId
+    && state.excelTender.pollGeneration === generation
+    && state.excelTender.sourcingActive;
+  try {
+    const job = await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}/sourcing`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({source_row_ids:selectedIds,source_mode:mode,limit:20}),
+    });
+    if (!isCurrent()) return;
+    state.excelTender.jobId = job.id;
+    await pollExcelTenderJob(job.id, tenderId, generation, selectedIds.length);
+  } catch (error) {
+    if (!isCurrent()) return;
+    $("#sourcing-subtitle").textContent = "Подбор не выполнен";
+    $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message || "Подбор не выполнен")}</div>`;
+    if (error.message.includes("перезапуском сервера")) void refreshExcelTenderRuns(tenderId);
+  } finally {
+    modeSelect.disabled = state.excelTender.sourcingActive ? true : wasModeDisabled;
+    if (isCurrent()) {
+      state.excelTender.sourcingActive = false;
+      state.excelTender.jobId = null;
+      modeSelect.disabled = wasModeDisabled;
+      submit.disabled = false;
+      submit.textContent = "Запустить подбор по выбранным строкам";
+      renderExcelTenderRows();
+    }
+  }
 }
 
 function parseManualPaste(text) {
@@ -3897,6 +4039,7 @@ function renderSourcingResult(result, row = null) {
 }
 
 async function openSourcingForRow(row) {
+  $("#tender-sourcing-submit").hidden = true;
   const sourcing = state.sourcing;
   const generation = ++sourcing.requestGeneration;
   const sourceMode = sourcing.sourceMode;
@@ -3922,6 +4065,7 @@ async function openSourcingForRow(row) {
 }
 
 async function runProjectSourcing(rows, documentId = null, submitButton = null) {
+  $("#tender-sourcing-submit").hidden = true;
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
   const previousButtonLabel = submitButton?.textContent;
   const previousButtonDisabled = submitButton?.disabled;
@@ -5060,6 +5204,8 @@ function setupEvents() {
   });
   $("#tender-confirm-import").addEventListener("click", () => { void confirmExcelTenderImport(); });
   $("#tender-delete-workspace").addEventListener("click", () => { void deleteExcelTenderWorkspace(); });
+  $("#tender-sourcing-button").addEventListener("click", openExcelTenderSourcing);
+  $("#tender-sourcing-submit").addEventListener("click", () => { void startExcelTenderSourcing(); });
   $("#tender-row-search").addEventListener("input", () => {
     if (state.excelTender.filterTimer) clearTimeout(state.excelTender.filterTimer);
     state.excelTender.filterTimer = setTimeout(() => { state.excelTender.filterTimer = null; renderExcelTenderRows(); }, 120);
@@ -5218,7 +5364,7 @@ function setupEvents() {
   $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
   $("#sourcing-source-mode").addEventListener("change",handleSourcingModeChange);
   $("#sourcing-history-refresh").addEventListener("click",() => { void loadSourcingHistoryStatus(); });
-  $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
+  $("#close-sourcing").addEventListener("click",()=>{ $("#tender-sourcing-submit").hidden = true; $("#sourcing-modal").close(); });
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());
   $("#zoom-in").addEventListener("click",()=>setZoom(Math.min(1.8,state.zoom+.1))); $("#zoom-out").addEventListener("click",()=>setZoom(Math.max(.5,state.zoom-.1)));
   $("#clear-crop").addEventListener("click",()=>{state.crop=null;positionCropBox();$("#clear-crop").hidden=true;});

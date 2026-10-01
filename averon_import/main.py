@@ -20,7 +20,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError, field_validator, model_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -89,6 +89,11 @@ from averon_import.services.manual_tenders import (
     TenderWorkbookParser,
     TenderWorkspaceError,
     TenderWorkspaceRepository,
+)
+from averon_import.services.manual_tenders.sourcing import (
+    TenderSourcingRowAdapter,
+    TenderSourcingRunStore,
+    canonical_tender_projection,
 )
 from averon_import.services.manual_tenders.parser import MAX_UPLOAD_BYTES as MAX_MANUAL_TENDER_UPLOAD_BYTES
 from averon_import.services.document_mutation import DocumentMutationLocks
@@ -191,6 +196,7 @@ one_c_history_activity = OneCHistoryActivityRegistry()
 one_c_history_service = OneCHistoryImportService(one_c_history_repository, one_c_history_activity)
 tender_activity = TenderActivityRegistry()
 tender_repository = TenderWorkspaceRepository(DATA_DIR, tender_activity)
+tender_sourcing_runs = TenderSourcingRunStore(tender_repository)
 tender_parser = TenderWorkbookParser()
 tender_template_service = TenderTemplateService()
 secret_store = create_secret_store(DATA_DIR)
@@ -2172,6 +2178,247 @@ class SourcingProjectRequest(BaseModel):
     provider: str | None = None
     limit: int = 20
     source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
+
+
+class ManualTenderSourcingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_row_ids: list[StrictStr] = Field(min_length=1, max_length=500)
+    source_mode: SourcingSourceMode
+    provider: StrictStr | None = Field(default=None, min_length=1, max_length=100)
+    limit: StrictInt = Field(default=20, ge=1, le=100)
+
+    @field_validator("source_row_ids")
+    @classmethod
+    def _validate_source_row_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("source_row_ids must not contain duplicates")
+        if any(not re.fullmatch(r"[a-f0-9]{32}", item) for item in value):
+            raise ValueError("source_row_ids contains an invalid identifier")
+        return value
+
+    @field_validator("provider")
+    @classmethod
+    def _trim_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        result = value.strip()
+        if not result:
+            raise ValueError("provider must not be blank")
+        return result
+
+
+def _tender_run_snapshot(tender_id: str, owner_id: str):
+    path, metadata, lease = tender_repository.acquire_sourcing_workspace(tender_id, owner_id)
+    return path, metadata, lease
+
+
+def _tender_sourcing_integrity_fingerprint(metadata: dict[str, Any]) -> str:
+    return stable_fingerprint({
+        key: metadata.get(key)
+        for key in (
+            "rows", "mapping", "source_manifest", "logical_right_edge",
+            "future_output_columns", "counts", "sheet_name", "header_row",
+        )
+    })
+
+
+def _submit_manual_tender_sourcing(
+    tender_id: str,
+    request: ManualTenderSourcingRequest,
+    user: CurrentUser,
+) -> dict[str, Any]:
+    tender_lease = history_lease = None
+    repository = tender_repository
+    run_store = tender_sourcing_runs
+    try:
+        workspace_path, metadata, tender_lease = repository.acquire_sourcing_workspace(tender_id, _tender_owner_key(user))
+        selected_ids = list(request.source_row_ids)
+        source_rows = metadata.get("rows")
+        if not isinstance(source_rows, list):
+            raise TenderWorkspaceError("Строки тендера повреждены.", 409, "TENDER_WORKSPACE_CORRUPT")
+        rows_by_id = {
+            str(row.get("source_row_id") or ""): row
+            for row in source_rows if isinstance(row, dict)
+        }
+        if len(rows_by_id) != len(source_rows):
+            raise TenderWorkspaceError("Строки тендера повреждены.", 409, "TENDER_WORKSPACE_CORRUPT")
+        unknown = [row_id for row_id in selected_ids if row_id not in rows_by_id]
+        if unknown:
+            raise TenderWorkspaceError("Одна или несколько выбранных строк не найдены в тендере.", 400, "TENDER_SOURCE_ROW_UNKNOWN")
+        non_items = [row_id for row_id in selected_ids if rows_by_id[row_id].get("row_type") != "item"]
+        if non_items:
+            raise TenderWorkspaceError("Можно выбрать только строки с позициями.", 400, "TENDER_SOURCE_ROW_NOT_ITEM")
+        adapted_rows = TenderSourcingRowAdapter.selected_rows(source_rows, selected_ids)
+        integrity_fingerprint = _tender_sourcing_integrity_fingerprint(metadata)
+
+        with _sourcing_runtime_lock:
+            runtime = sourcing_runtime
+            service = sourcing_service if sourcing_service is not runtime.service else runtime.service
+        try:
+            service.provider(request.provider)
+        except ValueError as exc:
+            raise HTTPException(400, "Выбранный источник предложений недоступен.") from exc
+
+        source_mode = SourcingSourceMode(request.source_mode)
+        captured_history_version: str | None = None
+        if source_mode != SourcingSourceMode.PROVIDER_ONLY:
+            try:
+                history_lease = one_c_history_activity.acquire_sourcing()
+            except OneCHistoryActivityConflict as exc:
+                raise _one_c_history_http_error(exc) from exc
+            captured_history_version = one_c_history_repository.catalog_version()
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        progress_state = {"current": 0, "total": len(adapted_rows)}
+
+        def run(progress):
+            durable = run_store.create_running(
+                workspace_path, metadata,
+                source_mode=source_mode.value,
+                provider=request.provider,
+                selected_ids=selected_ids,
+                history_catalog_version=captured_history_version,
+            )
+            run_id = durable["run_id"]
+
+            def tracked_progress(current: int, total: int, message: str) -> None:
+                progress_state["current"] = current
+                progress_state["total"] = total
+                progress(current, total, message)
+
+            try:
+                current_metadata = repository.verify_sourcing_snapshot(
+                    workspace_path, tender_id, _tender_owner_key(user),
+                    source_sha256=str(metadata["source_sha256"]),
+                    revision=int(metadata["revision"]),
+                )
+                if _tender_sourcing_integrity_fingerprint(current_metadata) != integrity_fingerprint:
+                    raise TenderWorkspaceError(
+                        "Данные тендера изменились до начала подбора.", 409, "TENDER_WORKSPACE_CHANGED",
+                    )
+                if source_mode == SourcingSourceMode.PROVIDER_ONLY:
+                    result = service.search_project(
+                        adapted_rows, provider_key=request.provider, limit=request.limit,
+                        progress=tracked_progress, ai_rerank=False,
+                    )
+                else:
+                    result = service.search_project_routed(
+                        adapted_rows, source_mode=source_mode, provider_key=request.provider,
+                        limit=request.limit, progress=tracked_progress, ai_rerank=False,
+                    )
+                    _assert_project_history_version(result, captured_history_version)
+
+                payload = _sourcing_payload(result)
+                if not isinstance(payload, dict):
+                    raise TenderWorkspaceError("Результаты подбора имеют неверный формат.", 409, "TENDER_RESULT_INVALID")
+                selected_sources = [rows_by_id[row_id] for row_id in selected_ids]
+                projection = canonical_tender_projection(payload, selected_sources, selected_ids)
+                summary = {
+                    key: int(payload.get(key) or 0)
+                    for key in (
+                        "positions_total", "positions_processed", "positions_matched",
+                        "positions_alternatives", "positions_review", "positions_without_offers",
+                        "positions_history_matched", "positions_provider_matched",
+                        "positions_fallback_called", "positions_history_review",
+                        "positions_history_no_match", "positions_history_unavailable",
+                    )
+                }
+                version = str(payload.get("catalog_version") or captured_history_version or "")[:120] or None
+                run_store.complete(
+                    workspace_path, run_id, summary=summary,
+                    catalog_version=version,
+                    history_catalog_version=captured_history_version,
+                    rows=projection,
+                )
+                payload["run_id"] = run_id
+                payload["tender_id"] = tender_id
+                payload["run_created_at"] = created_at
+                payload["run_completed_at"] = datetime.now(timezone.utc).isoformat()
+                return payload
+            except Exception as exc:
+                code = "TENDER_RESULT_CORRELATION_FAILED" if getattr(exc, "code", "") == "TENDER_RESULT_CORRELATION_FAILED" else "SOURCING_FAILED"
+                run_store.fail(
+                    workspace_path, run_id, code=code,
+                    progress_current=progress_state["current"], progress_total=progress_state["total"],
+                )
+                raise
+
+        dedupe_key = stable_fingerprint({
+            "kind": "manual_tender_sourcing",
+            "tender_id": tender_id,
+            "source_sha256": metadata["source_sha256"],
+            "workspace_revision": int(metadata["revision"]),
+            "source_row_ids": sorted(selected_ids),
+            "source_mode": source_mode.value,
+            "provider": request.provider,
+            "limit": request.limit,
+        })
+        releases = [tender_lease.release]
+        if history_lease is not None:
+            releases.append(history_lease.release)
+        try:
+            job = job_service.submit(
+                run, lane=SOURCING, kind="manual_tender_sourcing",
+                owner_id=_job_owner_id(user), dedupe_key=dedupe_key,
+                release_callbacks=releases,
+            )
+        except JobAdmissionError as exc:
+            raise _job_admission_http_error(exc) from exc
+        return job.public()
+    except Exception as exc:
+        if tender_lease is not None:
+            tender_lease.release()
+        if history_lease is not None:
+            history_lease.release()
+        if isinstance(exc, HTTPException):
+            raise
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+
+
+@app.post("/api/manual-tenders/{tender_id}/sourcing", status_code=202, dependencies=[Depends(require_authenticated)])
+def start_manual_tender_sourcing(
+    tender_id: str,
+    request: ManualTenderSourcingRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    return _submit_manual_tender_sourcing(tender_id, request, user)
+
+
+@app.get("/api/manual-tenders/{tender_id}/runs", dependencies=[Depends(require_authenticated)])
+def list_manual_tender_runs(tender_id: str, user: CurrentUser = Depends(require_authenticated)):
+    lease = None
+    try:
+        path, metadata, lease = _tender_run_snapshot(tender_id, _tender_owner_key(user))
+        return tender_sourcing_runs.list_public(path, metadata["tender_id"])
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+@app.get("/api/manual-tenders/{tender_id}/runs/{run_id}", dependencies=[Depends(require_authenticated)])
+def get_manual_tender_run(
+    tender_id: str,
+    run_id: str,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    lease = None
+    try:
+        path, metadata, lease = _tender_run_snapshot(tender_id, _tender_owner_key(user))
+        return tender_sourcing_runs.get_public(path, metadata["tender_id"], run_id)
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 def _sourcing_payload(value: Any) -> Any:

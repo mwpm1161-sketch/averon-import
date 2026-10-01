@@ -24,6 +24,9 @@ MAX_WORKSPACES_GLOBAL = 20
 MAX_PREVIEWS_PER_USER = 3
 MAX_PREVIEWS_GLOBAL = 20
 MAX_WORKSPACE_METADATA_BYTES = 10 * 1024 * 1024
+MAX_TENDER_RUN_BYTES = 1024 * 1024
+MAX_TENDER_RUNS_PER_WORKSPACE = 5
+MAX_TENDER_STORAGE_BYTES = MAX_WORKSPACES_GLOBAL * (MAX_UPLOAD_BYTES + 2 * MAX_WORKSPACE_METADATA_BYTES)
 ID_RE = re.compile(r"^[a-f0-9]{32}$")
 PUBLIC_ABSOLUTE_PATH_RE = re.compile(r"(?:\b[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|/(?:home|var|opt|tmp|users|mnt|srv|root|etc)/)", re.IGNORECASE)
 
@@ -338,12 +341,7 @@ class TenderWorkspaceRepository:
                 raise TenderWorkspaceError("Достигнут лимит активных тендеров. Удалите завершённый тендер или повторите позже.", 409, "TENDER_WORKSPACE_QUOTA")
             # One source plus an old and a new bounded atomic metadata file.
             bounded_workspace_bytes = MAX_UPLOAD_BYTES + 2 * MAX_WORKSPACE_METADATA_BYTES
-            existing_bytes = sum(
-                file.stat().st_size
-                for directory in self._workspace_dirs()
-                for file in directory.iterdir()
-                if file.is_file()
-            )
+            existing_bytes = self._workspace_storage_bytes()
             if existing_bytes + bounded_workspace_bytes > MAX_WORKSPACES_GLOBAL * bounded_workspace_bytes:
                 raise TenderWorkspaceError("Достигнут общий лимит хранилища тендеров.", 409, "TENDER_DISK_QUOTA")
             source = source_dir / "source.xlsx"
@@ -411,6 +409,79 @@ class TenderWorkspaceRepository:
                 "absolute_expires_at": metadata["absolute_expires_at"],
             })
 
+    def _workspace_storage_bytes(self) -> int:
+        total = 0
+        for directory in self._workspace_dirs():
+            try:
+                for item in directory.rglob("*"):
+                    if item.is_file():
+                        total += item.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def acquire_sourcing_workspace(self, tender_id: str, owner_id: str):
+        """Atomically validate an immutable workspace and acquire its activity lease."""
+        with self._lock:
+            tender_id = self._validate_id(tender_id)
+            path = self.workspace_root / tender_id
+            metadata = self._metadata(path)
+            if metadata.get("owner_id") != owner_id:
+                raise TenderWorkspaceError("Тендер не найден.")
+            now = _now()
+            if datetime.fromisoformat(metadata["absolute_expires_at"]) <= now or datetime.fromisoformat(metadata["last_access_at"]) + timedelta(seconds=IDLE_TTL_SECONDS) <= now:
+                raise TenderWorkspaceError("Срок тендера истёк.", 410, "TENDER_WORKSPACE_EXPIRED")
+            source = path / "source.xlsx"
+            try:
+                if source.stat().st_size > MAX_UPLOAD_BYTES or hashlib.sha256(source.read_bytes()).hexdigest() != metadata.get("source_sha256"):
+                    raise TenderWorkspaceError("Исходная книга тендера повреждена.", 409, "TENDER_SOURCE_CHANGED")
+            except OSError as exc:
+                raise TenderWorkspaceError("Исходная книга тендера отсутствует.", 409, "TENDER_SOURCE_MISSING") from exc
+            lease = self.activity.acquire(tender_id)
+            try:
+                metadata["last_access_at"] = _iso(now)
+                self._atomic_json(path / "workspace.json", metadata)
+                return path, metadata, lease
+            except Exception:
+                lease.release()
+                raise
+
+    def reserve_tender_run_storage(self, workspace_path: Path) -> None:
+        """Reserve the maximum single run size against the existing global workspace quota."""
+        with self._lock:
+            resolved = Path(workspace_path).resolve()
+            if resolved.parent != self.workspace_root.resolve() or not resolved.is_dir():
+                raise TenderWorkspaceError("Тендер не найден.")
+            if self._workspace_storage_bytes() + MAX_TENDER_RUN_BYTES > MAX_TENDER_STORAGE_BYTES:
+                raise TenderWorkspaceError("Достигнут общий лимит хранилища тендеров.", 409, "TENDER_DISK_QUOTA")
+
+    def verify_sourcing_snapshot(
+        self,
+        workspace_path: Path,
+        tender_id: str,
+        owner_id: str,
+        *,
+        source_sha256: str,
+        revision: int,
+    ) -> dict[str, Any]:
+        """Recheck the queued job's confirmed workspace before it calls providers."""
+        with self._lock:
+            path = Path(workspace_path).resolve()
+            if path.parent != self.workspace_root.resolve() or path.name != self._validate_id(tender_id):
+                raise TenderWorkspaceError("Тендер не найден.")
+            metadata = self._metadata(path)
+            if metadata.get("owner_id") != owner_id:
+                raise TenderWorkspaceError("Тендер не найден.")
+            if metadata.get("source_sha256") != source_sha256 or int(metadata.get("revision", -1)) != int(revision):
+                raise TenderWorkspaceError("Рабочее пространство тендера изменилось до начала подбора.", 409, "TENDER_WORKSPACE_CHANGED")
+            source = path / "source.xlsx"
+            try:
+                if source.stat().st_size > MAX_UPLOAD_BYTES or hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+                    raise TenderWorkspaceError("Исходная книга тендера повреждена.", 409, "TENDER_SOURCE_CHANGED")
+            except OSError as exc:
+                raise TenderWorkspaceError("Исходная книга тендера отсутствует.", 409, "TENDER_SOURCE_MISSING") from exc
+            return metadata
+
     def delete(self, tender_id: str, owner_id: str) -> bool:
         tender_id = self._validate_id(tender_id)
         with self._lock:
@@ -439,4 +510,5 @@ class TenderWorkspaceRepository:
 __all__ = [
     "TenderWorkspaceRepository", "TenderWorkspaceError", "PREVIEW_TTL_SECONDS",
     "IDLE_TTL_SECONDS", "ABSOLUTE_TTL_SECONDS", "MAX_WORKSPACES_PER_USER", "MAX_WORKSPACES_GLOBAL",
+    "MAX_TENDER_RUN_BYTES", "MAX_TENDER_RUNS_PER_WORKSPACE", "MAX_TENDER_STORAGE_BYTES",
 ]

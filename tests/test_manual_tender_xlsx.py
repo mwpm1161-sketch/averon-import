@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import shutil
+import time
 import uuid
 import zipfile
 from copy import copy
@@ -21,6 +22,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Side
 
 from averon_import.services.manual_tenders import TenderActivityRegistry, TenderTemplateService, TenderWorkbookParser, TenderWorkspaceRepository
+from averon_import.services.manual_tenders.sourcing import TenderSourcingRowAdapter, TenderSourcingRunStore, canonical_tender_projection
 from averon_import.services.jobs import JobService
 from averon_import.services.manual_tenders.parser import (
     MAX_ACTUAL_ITEMS,
@@ -898,6 +900,7 @@ def tender_api(monkeypatch, tmp_path):
     repository = TenderWorkspaceRepository(tmp_path / "api-data", activity)
     monkeypatch.setattr(main, "tender_activity", activity)
     monkeypatch.setattr(main, "tender_repository", repository)
+    monkeypatch.setattr(main, "tender_sourcing_runs", TenderSourcingRunStore(repository))
     isolated_jobs = JobService(max_workers=1)
     monkeypatch.setattr(main, "job_service", isolated_jobs)
     return main, repository
@@ -1136,4 +1139,478 @@ def test_read_only_excel_workspace_renders_370_rows_with_filtering():
         capture_output=True, text=True, timeout=20, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS: 370-row workspace and generation-safe adaptive tender polling" in result.stdout
+    assert "PASS: 370-row workspace, default tender selection, and generation-safe adaptive sourcing polling" in result.stdout
+
+
+def _confirm_synthetic_tender(main, repository, tmp_path, *, count=1, official=False):
+    path = tmp_path / f"phase-b-{count}-{uuid.uuid4().hex}.xlsx"
+    if official:
+        payload = _official(path)
+    else:
+        _official(path, include_required=False)
+        workbook = load_workbook(path)
+        sheet = workbook[TEMPLATE_SHEET]
+        units = ["100 шт", "1000 шт", "10 м", "затрата", "шт", "м", "кг"]
+        for index in range(count):
+            row_number = index + 2
+            sheet.cell(row_number, 1, f"R-{index + 1:04d}")
+            sheet.cell(row_number, 2, f"Синтетическая позиция {index + 1}")
+            sheet.cell(row_number, 3, units[index % len(units)])
+            sheet.cell(row_number, 4, index % 5 + 1)
+            sheet.cell(row_number, 5, "")
+        workbook.save(path)
+        workbook.close()
+        payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    preview = repository.reserve_preview("username:tender-user", path.name, len(payload), digest)
+    source_path = repository.write_preview_source(preview["preview_id"], payload)
+    analysis = main.tender_parser.parse(source_path, tender_id=preview["preview_id"])
+    repository.update_preview(
+        preview["preview_id"], "username:tender-user", status="ready",
+        parser_version=analysis["parser_version"], mapping=analysis["mapping"], analysis=analysis,
+    )
+    return repository.confirm(preview["preview_id"], "username:tender-user")
+
+
+def _fake_tender_sourcing_service(monkeypatch, main, *, catalog_version="catalog-v1"):
+    from types import SimpleNamespace
+    from averon_import.services.sourcing.models import (
+        ProjectSourcingResult, SourcingResult, SourcingRouteMetadata, SourcingSourceMode,
+    )
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+
+    class FakeService:
+        def __init__(self):
+            self.received = []
+            self.calls = 0
+            self.modes = []
+
+        def provider(self, provider_key=None):
+            if provider_key == "invalid-provider":
+                raise ValueError("unknown provider")
+            return SimpleNamespace(key=provider_key or "fake-provider", label="Fake provider")
+
+        def _project(self, rows, source_mode, progress):
+            self.calls += 1
+            self.received = [dict(row) for row in rows]
+            self.modes.append(SourcingSourceMode(source_mode))
+            if progress:
+                progress(0, len(rows), "test")
+            results = []
+            for row in rows:
+                route = None
+                if source_mode != SourcingSourceMode.PROVIDER_ONLY:
+                    route = SourcingRouteMetadata(
+                        source_mode=source_mode, final_source_kind="none",
+                        history_catalog_version=catalog_version,
+                    )
+                results.append(SourcingResult(intent=build_fallback_intent(row), route=route))
+            if progress:
+                progress(len(rows), len(rows), "test")
+            return ProjectSourcingResult(
+                positions_total=len(rows), positions_processed=len(rows),
+                positions_without_offers=len(rows), source_mode=source_mode,
+                catalog_version=catalog_version, results=results,
+            )
+
+        def search_project(self, rows, *, source_mode=SourcingSourceMode.PROVIDER_ONLY, progress=None, **_kwargs):
+            return self._project(rows, SourcingSourceMode.PROVIDER_ONLY, progress)
+
+        def search_project_routed(self, rows, *, source_mode, progress=None, **_kwargs):
+            return self._project(rows, source_mode, progress)
+
+    service = FakeService()
+    monkeypatch.setattr(main, "sourcing_service", service)
+    monkeypatch.setattr(main, "sourcing_runtime", SimpleNamespace(service=service))
+    return service
+
+
+def _post_tender_sourcing(main, tender_id, payload, *, username="tender-user"):
+    body = json.dumps(payload).encode("utf-8")
+    return _api_request(
+        main.app, "POST", f"/api/manual-tenders/{tender_id}/sourcing",
+        headers={**_auth_headers(username), "Content-Type": "application/json"}, body=body,
+    )
+
+
+def _wait_tender_job(main, job_id, *, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            job = main.job_service.get_public(job_id, owner_id="tender-user")
+        except KeyError:
+            job = None
+        if job and job["status"] in {"completed", "failed", "expired"}:
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"tender sourcing job did not finish: {job_id}")
+
+
+def test_tender_sourcing_is_server_authoritative_durable_and_owner_bound(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=370)
+    service = _fake_tender_sourcing_service(monkeypatch, main)
+    before_sha = hashlib.sha256((repository.workspace_root / workspace["tender_id"] / "source.xlsx").read_bytes()).hexdigest()
+    items = [row for row in workspace["rows"] if row["row_type"] == "item"]
+    selected_ids = [row["source_row_id"] for row in items]
+    assert len(selected_ids) == len(set(selected_ids)) == 370
+
+    response = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": selected_ids, "source_mode": "provider_only", "limit": 20,
+    })
+    assert response.status_code == 202, response.text
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "completed", job
+    assert job["result"]["tender_id"] == workspace["tender_id"]
+    assert job["result"]["run_id"]
+    assert len(service.received) == 370
+    assert all("resource_code" not in row and "code" not in row and "source_text" not in row for row in service.received)
+    assert all(row["quantity_trusted"] is True for row in service.received)
+    assert {row["unit"] for row in service.received} >= {"100 шт", "1000 шт", "10 м", "затрата"}
+    for source, adapted in zip(items, service.received, strict=True):
+        assert adapted["source_row_id"] == source["source_row_id"]
+        assert adapted["article"] == source["article"]
+        assert adapted["quantity"] == source["quantity"]
+        assert adapted["unit"] == source["raw_unit"]
+    no_article = next(row for row in items if not row["article"] and row["resource_code"])
+    adapted = next(row for row in service.received if row["source_row_id"] == no_article["source_row_id"])
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+    assert adapted["article"] == "" and build_fallback_intent(adapted).article == ""
+
+    run_id = job["result"]["run_id"]
+    owner_detail = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}", headers=_auth_headers())
+    assert owner_detail.status_code == 200
+    run = owner_detail.json()
+    assert run["status"] == "completed"
+    assert run["source_sha256"] == workspace["source_sha256"]
+    assert run["workspace_revision"] == workspace["revision"]
+    assert len(run["rows"]) == 370
+    assert {item["source_row_id"] for item in run["rows"]} == set(selected_ids)
+    foreign_list = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs", headers=_auth_headers("other-user"))
+    foreign_detail = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}", headers=_auth_headers("other-user"))
+    assert foreign_list.status_code == foreign_detail.status_code == 404
+    foreign_sourcing = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": selected_ids[:1], "source_mode": "provider_only",
+    }, username="other-user")
+    assert foreign_sourcing.status_code == 404
+    listing = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs", headers=_auth_headers())
+    assert listing.status_code == 200 and listing.json()["runs"][0]["run_id"] == run_id
+    after_sha = hashlib.sha256((repository.workspace_root / workspace["tender_id"] / "source.xlsx").read_bytes()).hexdigest()
+    assert before_sha == after_sha == workspace["source_sha256"]
+
+
+def test_tender_sourcing_rejects_browser_facts_unknown_duplicate_nonitems_and_oversize(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    service = _fake_tender_sourcing_service(monkeypatch, main)
+    item = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    section = {"source_row_id":"d"*32,"row_type":"section","excel_row":1}
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    metadata = repository._metadata(workspace_path)
+    metadata["rows"].append(section)
+    repository._atomic_json(workspace_path / "workspace.json", metadata)
+
+    browser_facts = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": [item["source_row_id"]], "source_mode": "provider_only",
+        "name": "browser override", "quantity": "999", "resource_code": "browser code", "rows": [{"article": "FAKE"}],
+    })
+    assert browser_facts.status_code == 422
+    duplicate = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": [item["source_row_id"], item["source_row_id"]], "source_mode": "provider_only",
+    })
+    assert duplicate.status_code == 422
+    unknown = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": ["f" * 32], "source_mode": "provider_only",
+    })
+    assert unknown.status_code == 400 and unknown.json()["detail"]["code"] == "TENDER_SOURCE_ROW_UNKNOWN"
+    non_item = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": [section["source_row_id"]], "source_mode": "provider_only",
+    })
+    assert non_item.status_code == 400 and non_item.json()["detail"]["code"] == "TENDER_SOURCE_ROW_NOT_ITEM"
+    oversized = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids": [f"{index:032x}" for index in range(501)], "source_mode": "provider_only",
+    })
+    assert oversized.status_code == 422
+    empty = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[],"source_mode":"provider_only"})
+    malformed_mode = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[item["source_row_id"]],"source_mode":"history_first"})
+    malformed_limit = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[item["source_row_id"]],"source_mode":"provider_only","limit":0})
+    malformed_limit_type = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[item["source_row_id"]],"source_mode":"provider_only","limit":"20"})
+    assert empty.status_code == malformed_mode.status_code == malformed_limit.status_code == malformed_limit_type.status_code == 422
+    invalid_provider = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[item["source_row_id"]],"source_mode":"provider_only","provider":"invalid-provider"})
+    assert invalid_provider.status_code == 400
+    assert service.calls == 0
+
+
+def test_tender_sourcing_accepts_500_and_true_article_without_resource_code_leak(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    official = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    service = _fake_tender_sourcing_service(monkeypatch, main)
+    source = next(row for row in official["rows"] if row["row_type"] == "item")
+    assert source["article"] == "SKU-1" and source["resource_code"] == "R-001"
+    accepted = _post_tender_sourcing(main, official["tender_id"], {
+        "source_row_ids": [source["source_row_id"]], "source_mode": "provider_only",
+    })
+    assert accepted.status_code == 202
+    assert _wait_tender_job(main, accepted.json()["id"])["status"] == "completed"
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+    intent = build_fallback_intent(service.received[0])
+    assert intent.article == "SKU-1"
+    assert "R-001" not in intent.source_text
+
+    large = _confirm_synthetic_tender(main, repository, tmp_path, count=500)
+    large_items = [row for row in large["rows"] if row["row_type"] == "item"]
+    assert len(large_items) == 500
+    accepted_large = _post_tender_sourcing(main, large["tender_id"], {
+        "source_row_ids": [row["source_row_id"] for row in large_items], "source_mode": "provider_only",
+    })
+    assert accepted_large.status_code == 202, accepted_large.text
+    assert _wait_tender_job(main, accepted_large.json()["id"], timeout=8)["status"] == "completed"
+    assert len(service.received) == 500
+
+
+def test_tender_activity_lease_spans_queue_coalesces_and_releases(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    _fake_tender_sourcing_service(monkeypatch, main)
+    started = threading.Event()
+    release = threading.Event()
+    blocker = main.job_service.submit(lambda progress: (started.set(), release.wait(5))[1], lane="sourcing", owner_id="blocker")
+    assert started.wait(2)
+    row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    request = {"source_row_ids": [row["source_row_id"]], "source_mode": "provider_only"}
+    first = _post_tender_sourcing(main, workspace["tender_id"], request)
+    second = _post_tender_sourcing(main, workspace["tender_id"], request)
+    assert first.status_code == second.status_code == 202
+    assert first.json()["id"] == second.json()["id"]
+    assert repository.activity.active(workspace["tender_id"])
+    tender_sourcing_runs = main.tender_sourcing_runs.list_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"])
+    assert tender_sourcing_runs["runs"] == []
+    deleted = _api_request(main.app, "DELETE", f"/api/manual-tenders/{workspace['tender_id']}", headers=_auth_headers())
+    assert deleted.status_code == 409
+    release.set()
+    _wait_tender_job(main, first.json()["id"])
+    main.job_service.get_public(blocker.id)
+    assert not repository.activity.active(workspace["tender_id"])
+    final = _api_request(main.app, "DELETE", f"/api/manual-tenders/{workspace['tender_id']}", headers=_auth_headers())
+    assert final.status_code == 200
+
+
+def test_tender_admission_rejection_releases_lease_without_ghost_run(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    _fake_tender_sourcing_service(monkeypatch, main)
+    from averon_import.services.jobs import DOCUMENT_PROCESSING, SOURCING, JobService
+    jobs = JobService(capacities={DOCUMENT_PROCESSING:(1,2), SOURCING:(1,0)})
+    monkeypatch.setattr(main, "job_service", jobs)
+    started = threading.Event()
+    release = threading.Event()
+    jobs.submit(lambda progress: (started.set(), release.wait(5))[1], lane=SOURCING, owner_id="blocker")
+    assert started.wait(2)
+    row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[row["source_row_id"]],"source_mode":"provider_only"})
+    assert response.status_code == 409 and not repository.activity.active(workspace["tender_id"])
+    release.set()
+    jobs.executor.shutdown(wait=True)
+
+
+def test_tender_history_modes_hold_captured_history_lease_and_use_existing_router(tender_api, tmp_path, monkeypatch):
+    main, _repository = tender_api
+    workspace = _confirm_synthetic_tender(main, _repository, tmp_path, count=1)
+    service = _fake_tender_sourcing_service(monkeypatch, main, catalog_version="history-v1")
+    monkeypatch.setattr(main.one_c_history_repository, "catalog_version", lambda: "history-v1")
+    row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    from averon_import.services.jobs import SOURCING
+    started = threading.Event()
+    release = threading.Event()
+    blocker = main.job_service.submit(lambda progress: (started.set(), release.wait(5))[1], lane=SOURCING, owner_id="history-blocker")
+    assert started.wait(2)
+    for index, mode in enumerate(("one_c_only", "one_c_then_provider")):
+        response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[row["source_row_id"]],"source_mode":mode})
+        assert response.status_code == 202, response.text
+        if index == 0:
+            assert main.one_c_history_activity.status()["active_sourcing_count"] == 1
+            release.set()
+        assert _wait_tender_job(main, response.json()["id"])["status"] == "completed"
+        assert service.modes[-1].value == mode
+        detail = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{_wait_tender_job(main, response.json()['id'])['result']['run_id']}", headers=_auth_headers()).json()
+        assert detail["history_catalog_version"] == "history-v1"
+        assert detail["rows"][0]["route"]["history_catalog_version"] == "history-v1"
+        assert main.one_c_history_activity.status()["active_sourcing_count"] == 0
+    response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[row["source_row_id"]],"source_mode":"provider_only"})
+    assert response.status_code == 202
+    _wait_tender_job(main, response.json()["id"])
+    assert main.one_c_history_activity.status()["active_sourcing_count"] == 0
+    main.job_service.get_public(blocker.id)
+
+
+def test_tender_runs_recover_running_as_interrupted_are_immutable_and_bounded(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    path = repository.workspace_root / workspace["tender_id"]
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    running = main.tender_sourcing_runs.create_running(
+        path, {"tender_id":workspace["tender_id"],"source_sha256":workspace["source_sha256"],"revision":workspace["revision"]},
+        source_mode="provider_only",provider=None,selected_ids=[source["source_row_id"]],history_catalog_version=None,
+    )
+    complete_before_restart = main.tender_sourcing_runs.create_running(
+        path, {"tender_id":workspace["tender_id"],"source_sha256":workspace["source_sha256"],"revision":workspace["revision"]},
+        source_mode="provider_only",provider=None,selected_ids=[source["source_row_id"]],history_catalog_version=None,
+    )
+    main.tender_sourcing_runs.complete(path, complete_before_restart["run_id"],summary={"positions_total":1,"positions_processed":1,"positions_matched":1,"positions_review":0,"positions_without_offers":0},catalog_version="v",history_catalog_version=None,rows=[])
+    recovered = TenderSourcingRunStore(repository)
+    interrupted = recovered.get_public(path, workspace["tender_id"], running["run_id"])
+    assert interrupted["status"] == "interrupted"
+    assert "Подбор был прерван перезапуском сервера" in interrupted["failure"]["message"]
+    assert recovered.get_public(path, workspace["tender_id"], complete_before_restart["run_id"])["status"] == "completed"
+    completed_ids = []
+    for _ in range(6):
+        run = recovered.create_running(
+            path, {"tender_id":workspace["tender_id"],"source_sha256":workspace["source_sha256"],"revision":workspace["revision"]},
+            source_mode="provider_only",provider=None,selected_ids=[source["source_row_id"]],history_catalog_version=None,
+        )
+        completed_ids.append(run["run_id"])
+        recovered.complete(path, run["run_id"],summary={"positions_total":1,"positions_processed":1,"positions_matched":0,"positions_review":0,"positions_without_offers":1},catalog_version="v",history_catalog_version=None,rows=[])
+    newest = recovered.get_public(path, workspace["tender_id"], completed_ids[-1])
+    with pytest.raises(TenderWorkspaceError):
+        recovered.complete(path, newest["run_id"],summary={},catalog_version=None,history_catalog_version=None,rows=[])
+    files = list((path / "runs").glob("*.json"))
+    assert len(files) == 5
+    active = recovered.create_running(
+        path, {"tender_id":workspace["tender_id"],"source_sha256":workspace["source_sha256"],"revision":workspace["revision"]},
+        source_mode="provider_only",provider=None,selected_ids=[source["source_row_id"]],history_catalog_version=None,
+    )
+    assert recovered.get_public(path, workspace["tender_id"], active["run_id"])["status"] == "running"
+    assert len(list((path / "runs").glob("*.json"))) == 6
+    oversized = path / "runs" / f"{'e' * 32}.json"
+    with pytest.raises(TenderWorkspaceError, match="превышает допустимый объём"):
+        recovered._atomic_write(oversized, {"payload":"x" * (1024 * 1024)})
+
+
+def test_tender_result_correlation_fence_rejects_missing_duplicate_and_unknown_ids():
+    source_rows = [{"source_row_id":"a"*32,"excel_row":12},{"source_row_id":"b"*32,"excel_row":13}]
+    def result(*ids):
+        return {"results":[{"intent":{"source_row_id":row_id}} for row_id in ids]}
+    with pytest.raises(TenderWorkspaceError, match="соответствия строк"):
+        canonical_tender_projection(result("a"*32),source_rows,["a"*32,"b"*32])
+    with pytest.raises(TenderWorkspaceError, match="соответствия строк"):
+        canonical_tender_projection(result("a"*32,"a"*32),source_rows,["a"*32,"b"*32])
+    with pytest.raises(TenderWorkspaceError, match="соответствия строк"):
+        canonical_tender_projection(result("a"*32,"c"*32),source_rows,["a"*32,"b"*32])
+
+
+def test_tender_runner_failure_releases_lease_and_records_safe_failure(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    service = _fake_tender_sourcing_service(monkeypatch, main)
+    def fail_search(*_args, **_kwargs):
+        raise RuntimeError("provider secret/token must not be persisted")
+    monkeypatch.setattr(service, "search_project", fail_search)
+    row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[row["source_row_id"]],"source_mode":"provider_only"})
+    assert response.status_code == 202
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "failed"
+    assert not repository.activity.active(workspace["tender_id"])
+    run = main.tender_sourcing_runs.list_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"])["runs"][0]
+    encoded = json.dumps(run, ensure_ascii=False).casefold()
+    assert run["status"] == "failed"
+    assert run["failure"]["code"] == "SOURCING_FAILED"
+    assert "secret" not in encoded and "token" not in encoded
+
+
+def test_tender_queue_expiry_has_no_durable_run_and_releases_lease(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    _fake_tender_sourcing_service(monkeypatch, main)
+    from averon_import.services.jobs import DOCUMENT_PROCESSING, SOURCING, JobService
+    jobs = JobService(capacities={DOCUMENT_PROCESSING:(1,2), SOURCING:(1,2)}, queue_wait_seconds=5)
+    monkeypatch.setattr(main, "job_service", jobs)
+    started = threading.Event()
+    release = threading.Event()
+    blocker = jobs.submit(lambda progress: (started.set(), release.wait(5))[1], lane=SOURCING, owner_id="blocker")
+    assert started.wait(2)
+    row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[row["source_row_id"]],"source_mode":"provider_only"})
+    assert response.status_code == 202
+    queued = jobs.get(response.json()["id"], owner_id="tender-user")
+    queued._created_monotonic = time.monotonic() - 6
+    job = jobs.get_public(response.json()["id"], owner_id="tender-user")
+    assert job["status"] == "expired"
+    assert not repository.activity.active(workspace["tender_id"])
+    assert main.tender_sourcing_runs.list_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"])["runs"] == []
+    release.set()
+    jobs.get_public(blocker.id)
+    jobs.executor.shutdown(wait=True)
+
+
+def test_tender_queue_revalidates_source_and_canonical_rows_before_provider_call(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    service = _fake_tender_sourcing_service(monkeypatch, main)
+    from averon_import.services.jobs import SOURCING
+    started = threading.Event()
+    release = threading.Event()
+    blocker = main.job_service.submit(lambda progress: (started.set(), release.wait(5))[1], lane=SOURCING, owner_id="integrity-blocker")
+    assert started.wait(2)
+    item = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[item["source_row_id"]],"source_mode":"provider_only"})
+    assert response.status_code == 202
+    path = repository.workspace_root / workspace["tender_id"]
+    metadata = repository._metadata(path)
+    metadata["rows"][0]["name"] = "synthetic tamper before execution"
+    repository._atomic_json(path / "workspace.json", metadata)
+    release.set()
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "failed"
+    assert service.calls == 0
+    run = main.tender_sourcing_runs.list_public(path, workspace["tender_id"])["runs"][0]
+    detail = main.tender_sourcing_runs.get_public(path, workspace["tender_id"], run["run_id"])
+    assert run["status"] == "failed" and detail["source_sha256"] == workspace["source_sha256"]
+    main.job_service.get_public(blocker.id)
+
+
+def test_tender_runtime_is_captured_at_admission_and_job_owners_do_not_coalesce(tender_api, tmp_path, monkeypatch):
+    main, _repository = tender_api
+    workspace = _confirm_synthetic_tender(main, _repository, tmp_path, count=1)
+    admitted_service = _fake_tender_sourcing_service(monkeypatch, main)
+    from averon_import.services.jobs import SOURCING, JobService
+    started = threading.Event()
+    release = threading.Event()
+    main.job_service.submit(lambda progress: (started.set(), release.wait(5))[1], lane=SOURCING, owner_id="runtime-blocker")
+    assert started.wait(2)
+    row = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    response = _post_tender_sourcing(main, workspace["tender_id"], {"source_row_ids":[row["source_row_id"]],"source_mode":"provider_only"})
+    assert response.status_code == 202
+    replacement = _fake_tender_sourcing_service(monkeypatch, main)
+    release.set()
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "completed"
+    assert admitted_service.calls == 1 and replacement.calls == 0
+
+    jobs = JobService()
+    hold = threading.Event()
+    entered = threading.Event()
+    first = jobs.submit(lambda progress: (entered.set(), hold.wait(5))[1], lane=SOURCING, owner_id="owner-a", dedupe_key="same")
+    assert entered.wait(2)
+    second = jobs.submit(lambda progress: "second", lane=SOURCING, owner_id="owner-b", dedupe_key="same")
+    assert first.id != second.id
+    hold.set()
+    jobs.executor.shutdown(wait=True)
+
+
+def test_tender_ui_uses_id_only_request_default_selection_runs_and_shared_result_renderer():
+    root = Path(__file__).resolve().parents[1]
+    template = (root / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    script = (root / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="tender-sourcing-button">Подобрать предложения' in template
+    assert "selectedIds = new Set((workspace.rows || []).filter((row) => row.row_type === \"item\").map((row) => row.source_row_id))" in script
+    assert 'body:JSON.stringify({source_row_ids:selectedIds,source_mode:mode,limit:20})' in script
+    assert 'body:JSON.stringify({source_row_ids:selectedIds,source_mode:mode,limit:20})' in script
+    assert "renderSourcingResult(job.result)" in script
+    assert 'api(`/api/manual-tenders/${encodeURIComponent(tenderId)}/runs`)' in script
+    assert "state.excelTender.pollGeneration === generation" in script
+    assert "Подбор был прерван перезапуском сервера. Запустите его повторно." in script
+    assert "Структура шаблона распознана." in script
+    assert "Ошибок структуры нет." not in script
+    assert "state.excelTender.sourcingActive = true" in script
+    assert "state.excelTender.pollGeneration === generation" in script

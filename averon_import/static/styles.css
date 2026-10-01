@@ -101,6 +101,8 @@ button { cursor: pointer; }
 .manual-entry-actions { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
 .manual-entry-actions .button { margin-left:0; }
 .excel-tender-view { max-width:1600px; margin:0 auto; }
+.tender-sourcing-toolbar { display:flex; align-items:center; gap:16px; margin:12px 0; }
+.tender-sourcing-toolbar .hint { margin:0; }
 .tender-panel { padding:22px; }
 .tender-file-icon { background:#176b4c; }
 .tender-preview-summary { display:grid; gap:12px; padding:14px; margin:12px 0; border:1px solid var(--line); border-radius:12px; background:#fff; }
