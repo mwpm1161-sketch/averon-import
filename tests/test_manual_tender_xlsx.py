@@ -15,6 +15,7 @@ import zipfile
 from copy import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ from averon_import.services.manual_tenders.parser import (
 from averon_import.services.manual_tenders.repository import (
     ABSOLUTE_TTL_SECONDS,
     IDLE_TTL_SECONDS,
+    MAX_TENDER_RUN_BYTES,
     MAX_WORKSPACES_GLOBAL,
     MAX_WORKSPACES_PER_USER,
     PREVIEW_TTL_SECONDS,
@@ -1260,7 +1262,7 @@ def test_tender_sourcing_is_server_authoritative_durable_and_owner_bound(tender_
     })
     assert response.status_code == 202, response.text
     job = _wait_tender_job(main, response.json()["id"])
-    assert job["status"] == "completed", job
+    assert job["status"] == "completed", json.dumps(job, ensure_ascii=False, default=str)
     assert job["result"]["tender_id"] == workspace["tender_id"]
     assert job["result"]["run_id"]
     assert len(service.received) == 370
@@ -1596,6 +1598,305 @@ def test_tender_runtime_is_captured_at_admission_and_job_owners_do_not_coalesce(
     assert first.id != second.id
     hold.set()
     jobs.executor.shutdown(wait=True)
+
+
+def _project_result_with_offer(source_row, *, provider, provenance, source_mode="provider_only"):
+    from averon_import.services.sourcing.models import (
+        MatchDecision, MatchResult, Offer, ProjectSourcingResult,
+        SourcingResult, SourcingRouteMetadata, SourcingSourceMode,
+    )
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+
+    adapted = TenderSourcingRowAdapter.convert(source_row)
+    intent = build_fallback_intent(adapted)
+    offer = Offer(
+        offer_id=f"{provider}:synthetic-offer",
+        provider=provider,
+        source_item_id="synthetic-source-item",
+        title="Synthetic replacement assembly with bounded provider title",
+        article="SYN-100",
+        manufacturer="Synthetic manufacturer",
+        brand="Synthetic brand",
+        price=Decimal("1234.5600"),
+        currency="RUB",
+        price_unit="шт",
+        availability=True,
+        availability_text="Synthetic stock status",
+        data_provenance=provenance,
+    )
+    mode = SourcingSourceMode(source_mode)
+    if mode == SourcingSourceMode.ONE_C_ONLY:
+        route = SourcingRouteMetadata(
+            source_mode=mode,
+            final_source_kind="historical_purchase",
+            history_outcome="SAFE_MATCH",
+            history_catalog_version="history-snapshot-v9",
+            history_selected_event_id=str(provenance.get("selected_event_id") or ""),
+            history_purchase_date=str(provenance.get("purchase_date") or ""),
+        )
+    else:
+        route = SourcingRouteMetadata(source_mode=mode, final_source_kind="provider")
+    match = MatchResult(offer=offer, decision=MatchDecision.MATCH, rank=1, matched_attributes=["name"])
+    item = SourcingResult(intent=intent, recommended_offer=offer, match_results=[match], route=route)
+    return ProjectSourcingResult(
+        positions_total=1,
+        positions_processed=1,
+        positions_matched=1,
+        source_mode=mode,
+        results=[item],
+    )
+
+
+def _persist_project_result(store, repository, workspace, result, *, source_row, source_mode):
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run = store.create_running(
+        workspace_path,
+        workspace,
+        source_mode=source_mode,
+        provider=None,
+        selected_ids=[source_row["source_row_id"]],
+        history_catalog_version="history-snapshot-v9" if source_mode == "one_c_only" else None,
+    )
+    payload = result.model_dump(mode="json")
+    rows = canonical_tender_projection(payload, [source_row], [source_row["source_row_id"]])
+    store.complete(
+        workspace_path,
+        run["run_id"],
+        summary={
+            "positions_total": 1, "positions_processed": 1, "positions_matched": 1,
+            "positions_review": 0, "positions_without_offers": 0,
+        },
+        catalog_version="synthetic-provider-catalog-v4",
+        history_catalog_version="history-snapshot-v9" if source_mode == "one_c_only" else None,
+        rows=rows,
+    )
+    return run["run_id"]
+
+
+def test_excel_adapter_uses_one_model_field_without_resource_code_leak():
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+
+    source = {
+        "source_row_id": "a" * 32,
+        "row_type": "item",
+        "name": "Synthetic pump",
+        "model": "ABC-100",
+        "article": "TRUE-SKU-7",
+        "resource_code": "RESOURCE-CODE-9",
+        "manufacturer": "Synthetic manufacturer",
+        "raw_unit": "шт",
+        "quantity": "2",
+        "quantity_trusted": True,
+    }
+    adapted = TenderSourcingRowAdapter.convert(source)
+    intent = build_fallback_intent(adapted)
+
+    assert "model" not in adapted
+    assert adapted["type_mark"] == "ABC-100"
+    assert intent.model == "ABC-100"
+    assert intent.source_text.count("ABC-100") == 1
+    assert adapted["article"] == intent.article == "TRUE-SKU-7"
+    assert all("RESOURCE-CODE-9" not in str(value) for value in adapted.values())
+    assert "RESOURCE-CODE-9" not in intent.source_text
+
+
+def test_tender_price_provenance_is_allowlisted_durable_and_self_contained(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=3)
+    items = [row for row in workspace["rows"] if row["row_type"] == "item"]
+    store = main.tender_sourcing_runs
+
+    etm_result = _project_result_with_offer(
+        items[0], provider="etm_ipro", source_mode="provider_only",
+        provenance={
+            "source": "etm_ipro", "catalog_version": "etm-mirror-2026-10",
+            "source_item_id": "etm-item-42", "price_field": "pricewnds",
+            "price_status": "available", "token": "private-token-value",
+            "authorization": "Bearer private-auth-value", "secret": "private-secret-value",
+            "raw_response": {"items": [{"secret": "nested-secret-value"}]},
+            "nested": {"anything": "must not persist"},
+        },
+    )
+    etm_run_id = _persist_project_result(
+        store, repository, workspace, etm_result, source_row=items[0], source_mode="provider_only",
+    )
+    del etm_result
+
+    history_result = _project_result_with_offer(
+        items[1], provider="one_c_history", source_mode="one_c_only",
+        provenance={
+            "source": "one_c_history", "source_kind": "historical_purchase",
+            "snapshot_version": "history-snapshot-v9", "history_item_id": "history-item-17",
+            "selected_event_id": "history-item-17:row-51", "purchase_date": "2026-09-21",
+            "price_basis": "gross_per_unit", "effective_unit_price_gross": Decimal("987.654321"),
+            "currency_basis": "company_default", "unit_family": "piece",
+            "counterparty": "must not persist", "document_type": "must not persist",
+            "source_item_code": "must not persist",
+        },
+    )
+    history_run_id = _persist_project_result(
+        store, repository, workspace, history_result, source_row=items[1], source_mode="one_c_only",
+    )
+    del history_result
+
+    lemana_result = _project_result_with_offer(
+        items[2], provider="lemana_b2b", source_mode="provider_only",
+        provenance={
+            "source": "lemana_b2b", "product_item": "lemana-item-8",
+            "mirror_revision": "lemana-mirror-v3", "region_id": "region-4",
+            "price_basis": "gross_per_unit", "effective_unit_price_gross": "999.99",
+            "currency_basis": "verified_gross",
+        },
+    )
+    lemana_run_id = _persist_project_result(
+        store, repository, workspace, lemana_result, source_row=items[2], source_mode="provider_only",
+    )
+    del lemana_result
+
+    # A fresh store instance reads only the completed records; the in-memory
+    # project result objects are gone and the short-lived Job record is unused.
+    reloaded = TenderSourcingRunStore(repository)
+    monkeypatch.setattr(main, "tender_sourcing_runs", reloaded)
+    etm_detail = _api_request(
+        main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{etm_run_id}",
+        headers=_auth_headers(),
+    )
+    history_detail = _api_request(
+        main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{history_run_id}",
+        headers=_auth_headers(),
+    )
+    lemana_detail = _api_request(
+        main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{lemana_run_id}",
+        headers=_auth_headers(),
+    )
+    assert etm_detail.status_code == history_detail.status_code == lemana_detail.status_code == 200
+    etm_provenance = etm_detail.json()["rows"][0]["price_provenance"]
+    assert etm_provenance == {
+        "source": "etm_ipro", "catalog_version": "etm-mirror-2026-10",
+        "source_item_id": "etm-item-42", "price_field": "pricewnds", "price_status": "available",
+    }
+    history_provenance = history_detail.json()["rows"][0]["price_provenance"]
+    assert history_provenance == {
+        "source": "one_c_history", "source_kind": "historical_purchase",
+        "snapshot_version": "history-snapshot-v9", "history_item_id": "history-item-17",
+        "selected_event_id": "history-item-17:row-51", "purchase_date": "2026-09-21",
+        "price_basis": "gross_per_unit", "effective_unit_price_gross": "987.654321",
+        "currency_basis": "company_default", "unit_family": "piece",
+    }
+    route = history_detail.json()["rows"][0]["route"]
+    assert route["final_source_kind"] == "historical_purchase"
+    assert route["history_outcome"] == "SAFE_MATCH"
+    assert route["history_purchase_date"] == "2026-09-21"
+    lemana_provenance = lemana_detail.json()["rows"][0]["price_provenance"]
+    assert lemana_provenance == {
+        "source": "lemana_b2b", "product_item": "lemana-item-8",
+        "mirror_revision": "lemana-mirror-v3",
+    }
+    assert not any("gross" in key or "vat" in key for key in lemana_provenance)
+    from averon_import.services.manual_tenders.sourcing import _safe_price_provenance
+    bounded = _safe_price_provenance({
+        "provider": "etm_ipro",
+        "data_provenance": {
+            "source": "etm_ipro", "catalog_version": "v" * 200,
+            "source_item_id": {"nested": "not a scalar"},
+        },
+    })
+    assert len(bounded["catalog_version"]) == 120
+    assert "source_item_id" not in bounded
+
+    run_dir = repository.workspace_root / workspace["tender_id"] / "runs"
+    persisted_json = "\n".join(path.read_text(encoding="utf-8") for path in run_dir.glob("*.json"))
+    for forbidden in (
+        "private-token-value", "private-auth-value", "private-secret-value",
+        "raw_response", "nested-secret-value", "must not persist", "region-4",
+    ):
+        assert forbidden not in persisted_json
+    public_json = json.dumps([etm_detail.json(), history_detail.json(), lemana_detail.json()], ensure_ascii=False)
+    for forbidden in ("token", "authorization", "raw_response", "counterparty", "document_type", "verified_gross"):
+        assert forbidden not in public_json.casefold()
+    assert all(
+        "data_provenance" not in row
+        for detail in (etm_detail, history_detail, lemana_detail)
+        for row in detail.json()["rows"]
+    )
+
+
+def test_realistic_370_row_tender_run_fits_existing_one_mib_bound(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=370)
+    source_rows = [row for row in workspace["rows"] if row["row_type"] == "item"]
+    selected_ids = [row["source_row_id"] for row in source_rows]
+    results = []
+    for index, row in enumerate(source_rows, start=1):
+        offer_id = f"etm_ipro:synthetic-{index}"
+        results.append({
+            "intent": {
+                "source_row_id": row["source_row_id"],
+                "normalized_name": f"Industrial centrifugal pump assembly {index:03d} for process-water service",
+                "product_class": "pump equipment",
+                "manufacturer": "Synthetic Industrial Equipment Works",
+                "brand": "Synthetic Works",
+                "model": f"SP-{index:03d}-A",
+                "article": f"SYN-ARTICLE-{index:04d}",
+                "quantity": str(row.get("quantity") or "2"),
+                "unit": str(row.get("raw_unit") or "шт"),
+            },
+            "recommended_offer": {
+                "offer_id": offer_id, "provider": "etm_ipro",
+                "source_item_id": f"ETM-SYN-{index:06d}",
+                "title": f"Synthetic industrial pump, model SP-{index:03d}-A, cast housing, standard motor",
+                "article": f"SYN-ARTICLE-{index:04d}",
+                "manufacturer": "Synthetic Industrial Equipment Works",
+                "brand": "Synthetic Works", "price": "123456.78", "currency": "RUB",
+                "price_unit": "шт", "retrieved_at": "2026-10-01T12:00:00+00:00",
+                "availability": True, "availability_text": "In stock; synthetic test data",
+                "data_provenance": {
+                    "source": "etm_ipro", "catalog_version": "synthetic-etm-catalog-v2026-10",
+                    "source_item_id": f"ETM-SYN-{index:06d}",
+                    "price_field": "pricewnds", "price_status": "available",
+                    "raw_response": {"excluded": "never persisted"},
+                },
+            },
+            "match_results": [{
+                "offer": {"offer_id": offer_id}, "decision": "MATCH", "rank": 1,
+                "matched_attributes": ["product_class", "model", "manufacturer"],
+                "supporting_attributes": ["article"],
+                "conflicting_attributes": [], "missing_attributes": [],
+            }],
+            "route": {
+                "source_mode": "provider_only", "final_source_kind": "provider",
+                "fallback_status": "not_called", "history_outcome": "NO_MATCH",
+                "history_catalog_version": "", "history_selected_event_id": "",
+                "history_purchase_date": "", "history_age_days": None,
+                "fallback_called": False, "fallback_provider_key": "",
+                "fallback_catalog_version": "", "routing_policy_revision": "one-c-routing-v2",
+            },
+            "notices": [],
+        })
+
+    rows = canonical_tender_projection(
+        {"results": results}, source_rows, selected_ids,
+    )
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    store = main.tender_sourcing_runs
+    running = store.create_running(
+        workspace_path, workspace, source_mode="provider_only", provider=None,
+        selected_ids=selected_ids, history_catalog_version=None,
+    )
+    store.complete(
+        workspace_path, running["run_id"],
+        summary={
+            "positions_total": 370, "positions_processed": 370, "positions_matched": 370,
+            "positions_review": 0, "positions_without_offers": 0,
+        },
+        catalog_version="synthetic-etm-catalog-v2026-10",
+        history_catalog_version=None,
+        rows=rows,
+    )
+    run_path = workspace_path / "runs" / f"{running['run_id']}.json"
+    assert len(rows) == 370
+    assert run_path.stat().st_size < MAX_TENDER_RUN_BYTES
+    assert MAX_TENDER_RUN_BYTES == 1024 * 1024
 
 
 def test_tender_ui_uses_id_only_request_default_selection_runs_and_shared_result_renderer():

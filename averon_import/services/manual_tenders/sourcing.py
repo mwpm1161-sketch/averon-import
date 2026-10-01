@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,36 @@ from .repository import (
 _RUN_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Z0-9_-]{1,80}$")
 _TERMINAL = {"completed", "failed", "interrupted"}
+_PRICE_PROVENANCE_FIELDS = {
+    "etm_ipro": (
+        "source", "catalog_version", "source_item_id", "price_field", "price_status",
+    ),
+    "one_c_history": (
+        "source", "source_kind", "snapshot_version", "history_item_id",
+        "selected_event_id", "purchase_date", "price_basis",
+        "effective_unit_price_gross", "currency_basis", "unit_family",
+    ),
+    "lemana_b2b": ("source", "product_item", "mirror_revision"),
+}
+_PRICE_PROVENANCE_STRING_LIMITS = {
+    "source": 40,
+    "catalog_version": 120,
+    "source_item_id": 180,
+    "price_field": 40,
+    "price_status": 80,
+    "source_kind": 80,
+    "snapshot_version": 120,
+    "history_item_id": 180,
+    "selected_event_id": 180,
+    "purchase_date": 40,
+    "price_basis": 80,
+    "effective_unit_price_gross": 80,
+    "currency_basis": 80,
+    "unit_family": 80,
+    "product_item": 180,
+    "mirror_revision": 120,
+}
+_OMIT_PROVENANCE = object()
 
 
 def _now() -> str:
@@ -40,7 +72,6 @@ class TenderSourcingRowAdapter:
             "row_type": "item",
             "selected": True,
             "name": str(source.get("name") or ""),
-            "model": str(source.get("model") or ""),
             "type_mark": str(source.get("model") or ""),
             "manufacturer": str(source.get("manufacturer") or ""),
             "article": article,
@@ -299,6 +330,46 @@ def _safe_match(match: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _safe_provenance_value(key: str, value: Any) -> Any:
+    """Keep one bounded primitive from a known provider provenance contract."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return _OMIT_PROVENANCE
+        rendered = str(value)
+        return rendered if len(rendered) <= _PRICE_PROVENANCE_STRING_LIMITS[key] else _OMIT_PROVENANCE
+    if isinstance(value, str):
+        return value[:_PRICE_PROVENANCE_STRING_LIMITS[key]]
+    if isinstance(value, int):
+        return value if len(str(value)) <= 32 else _OMIT_PROVENANCE
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _OMIT_PROVENANCE
+    return _OMIT_PROVENANCE
+
+
+def _safe_price_provenance(offer: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(offer, dict):
+        return {}
+    provider = offer.get("provider")
+    fields = _PRICE_PROVENANCE_FIELDS.get(provider, ()) if isinstance(provider, str) else ()
+    provenance = offer.get("data_provenance")
+    if not fields or not isinstance(provenance, dict):
+        return {}
+    # Provider identity is a fixed part of each supported contract, rather
+    # than an arbitrary value supplied under an allowlisted key.
+    if provenance.get("source") != provider:
+        return {}
+    safe: dict[str, Any] = {}
+    for key in fields:
+        if key not in provenance:
+            continue
+        value = _safe_provenance_value(key, provenance[key])
+        if value is not _OMIT_PROVENANCE:
+            safe[key] = value
+    return safe
+
+
 def canonical_tender_projection(
     result_payload: dict[str, Any],
     source_rows: list[dict[str, Any]],
@@ -356,6 +427,7 @@ def canonical_tender_projection(
                 if key in intent
             },
             "recommended_offer": safe_offer,
+            "price_provenance": _safe_price_provenance(offer),
             "recommended_match": _safe_match(recommended_match),
             "provider_source": {
                 "kind": route.get("final_source_kind"),
