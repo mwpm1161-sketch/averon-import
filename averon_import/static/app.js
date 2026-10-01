@@ -1850,14 +1850,23 @@ async function uploadExcelTender(file) {
 }
 
 async function waitForExcelTenderPreview(generation) {
+  let queuedDelay = 2000;
+  let fallbackDelay = 2000;
   for (let attempt = 0; attempt < 240; attempt += 1) {
     if (generation !== state.excelTender.pollGeneration || !state.excelTender.previewId) return;
     const preview = await api(`/api/manual-tenders/previews/${encodeURIComponent(state.excelTender.previewId)}`);
+    if (generation !== state.excelTender.pollGeneration) return;
     if (preview.status === "ready" || preview.status === "failed" || preview.status === "interrupted") {
       renderExcelTenderPreview(preview);
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 750));
+    const delay = preview.status === "analyzing"
+      ? 1000
+      : preview.status === "queued" ? queuedDelay : Math.min(fallbackDelay, 8000);
+    if (preview.status === "queued") queuedDelay = Math.min(queuedDelay * 2, 8000);
+    else if (preview.status !== "analyzing") fallbackDelay = Math.min(fallbackDelay * 2, 8000);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (generation !== state.excelTender.pollGeneration) return;
   }
   if (generation === state.excelTender.pollGeneration) $("#tender-preview-status").textContent = "Проверка длится дольше обычного. Повторно откройте эту подготовку или загрузите файл снова.";
 }
@@ -1890,9 +1899,12 @@ function renderExcelTenderPreview(preview) {
     $("#tender-map-submit").hidden = true;
     return;
   }
-  status.textContent = analysis.official_template ? "Шаблон Averon v1" : "Предпросмотр Excel ведомости";
+  const invalidCount = Number(analysis.invalid_count || 0);
+  status.textContent = `${analysis.official_template ? "Шаблон Averon v1" : "Предпросмотр Excel ведомости"}${invalidCount ? ` · Требуют исправления: ${invalidCount}` : ""}`;
   const sample = (analysis.sample_rows || []).map((row) => `<tr><td>${row.excel_row}</td><td>${escapeHtml(row.resource_code || "")}</td><td>${escapeHtml(row.name || "")}</td><td>${escapeHtml(row.raw_unit || "")}</td><td>${escapeHtml(row.quantity_raw || "")}</td></tr>`).join("");
   const warnings = (analysis.warnings || []).map((warning) => `<p class="tender-warnings">${escapeHtml(warning.message || "Структурное предупреждение")}</p>`).join("");
+  const invalidReasonLabels = {missing_name:"не заполнено наименование",missing_quantity:"не заполнено количество",invalid_quantity:"некорректное количество"};
+  const invalidRows = (analysis.invalid_examples || []).map((row) => `<li>Строка ${Number(row.excel_row) || "—"}: ${(row.reasons || []).map((reason) => escapeHtml(invalidReasonLabels[reason] || "некорректные обязательные данные")).join(", ")}</li>`).join("");
   const counts = analysis.counts || {};
   const mappingLabels = {resource_code:"Код ресурса",name:"Наименование",unit:"Ед. изм.",quantity:"Кол-во",article:"Артикул",manufacturer:"Производитель",model:"Модель / тип"};
   const mappingText = Object.entries(analysis.mapping || {}).filter(([, column]) => column).map(([field, column]) => `${mappingLabels[field] || field} ← ${tenderColumnLetters(Number(column) - 1)}: ${analysis.headers?.[Number(column) - 1] || ""}`).join(" · ") || "Сопоставление нужно задать вручную";
@@ -1900,6 +1912,7 @@ function renderExcelTenderPreview(preview) {
   $("#tender-preview-summary").innerHTML = `<div class="tender-preview-summary">
     <p><b>Файл:</b> ${escapeHtml(preview.filename || "—")} · <b>лист:</b> ${escapeHtml(analysis.sheet_name || "—")} · <b>строка заголовка:</b> ${analysis.header_row || "—"} · <b>позиции:</b> ${analysis.item_count || 0}</p>
     <p><b>Разделы:</b> ${counts.section || 0} · <b>итоги:</b> ${counts.total || 0} · <b>граница таблицы:</b> ${escapeHtml(analysis.logical_right_column || "—")}</p>
+    ${invalidCount ? `<p class="tender-warnings"><b>Требуют исправления: ${invalidCount}</b>. Подтверждение импорта недоступно.</p><ul class="tender-warnings">${invalidRows}</ul>` : ""}
     ${analysis.item_count ? "" : "<p class=\"tender-warnings\">Позиции не найдены. Добавьте строки позиций и загрузите книгу повторно.</p>"}
     <p><b>Сопоставление:</b> ${escapeHtml(mappingText)}</p>
     ${outputPlans ? `<p><b>Кандидаты будущих колонок:</b> ${escapeHtml(outputPlans)}</p>` : ""}
@@ -1908,7 +1921,7 @@ function renderExcelTenderPreview(preview) {
     </div>`;
   renderTenderMappingControls(analysis);
   $("#tender-map-submit").hidden = analysis.official_template || !analysis.mapping_required;
-  $("#tender-confirm-import").hidden = analysis.mapping_required || Number(analysis.item_count || 0) < 1;
+  $("#tender-confirm-import").hidden = analysis.mapping_required || invalidCount > 0 || Number(analysis.item_count || 0) < 1;
 }
 
 function renderTenderMappingControls(analysis) {

@@ -43,6 +43,7 @@ class TenderSourceRow:
     source_cells: dict[str, str] = field(default_factory=dict)
     unit_basis: dict[str, object] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    invalid_reason_codes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

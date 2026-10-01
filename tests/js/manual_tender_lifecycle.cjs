@@ -27,4 +27,44 @@ nodes["#tender-row-search"].value = "позиция 370";
 vm.runInNewContext(`${source.slice(start, end)}; renderExcelTenderRows();`, context);
 const filteredRows = (nodes["#tender-rows"].innerHTML.match(/<tr\b/g) || []).length;
 if (filteredRows !== 1) throw new Error(`Expected one filtered row, got ${filteredRows}`);
-process.stdout.write("PASS: 370-row read-only tender workspace\n");
+
+async function verifyPollingLifecycle() {
+  const pollStart = source.indexOf("async function waitForExcelTenderPreview(generation) {");
+  const pollEnd = source.indexOf("async function refreshExcelTenderPreview", pollStart);
+  if (pollStart < 0 || pollEnd < 0) throw new Error("Tender preview poller was not found");
+  const pollSource = source.slice(pollStart, pollEnd);
+  const delays = [];
+  const terminal = [];
+  const sequence = ["queued", "queued", "queued", "queued", "analyzing", "ready"];
+  const pollContext = {
+    state: {excelTender: {pollGeneration: 7, previewId: "preview-id"}},
+    api: async () => ({status: sequence.shift()}),
+    renderExcelTenderPreview: preview => terminal.push(preview.status),
+    $: () => ({textContent: ""}),
+    setTimeout: (callback, delay) => { delays.push(delay); callback(); },
+    encodeURIComponent,
+  };
+  await vm.runInNewContext(`${pollSource}; waitForExcelTenderPreview(7);`, pollContext);
+  if (delays.join(",") !== "2000,4000,8000,8000,1000") throw new Error(`Unexpected adaptive polling delays: ${delays}`);
+  if (terminal.join(",") !== "ready") throw new Error(`Expected terminal ready render, got ${terminal}`);
+
+  let staleRequests = 0;
+  let staleWaits = 0;
+  const staleContext = {
+    state: {excelTender: {pollGeneration: 8, previewId: "preview-id"}},
+    api: async () => {
+      staleRequests += 1;
+      staleContext.state.excelTender.pollGeneration += 1;
+      return {status: "queued"};
+    },
+    renderExcelTenderPreview: () => { throw new Error("Stale preview must not render"); },
+    $: () => ({textContent: ""}),
+    setTimeout: callback => { staleWaits += 1; callback(); },
+    encodeURIComponent,
+  };
+  await vm.runInNewContext(`${pollSource}; waitForExcelTenderPreview(8);`, staleContext);
+  if (staleRequests !== 1 || staleWaits !== 0) throw new Error(`Stale poll continued: requests=${staleRequests}, waits=${staleWaits}`);
+}
+
+verifyPollingLifecycle().then(() => process.stdout.write("PASS: 370-row workspace and generation-safe adaptive tender polling\n"))
+  .catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

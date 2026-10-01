@@ -30,3 +30,26 @@ Resource references remain separate from article evidence. Unit parsing records
 a tender-specific basis and does not infer package or set ratios. The uploaded
 source workbook is copied into the confirmed workspace and is never modified
 in Phase A.
+
+The generated official template carries the defined-name schema marker
+`AveronTenderSchemaVersion=1`. Its table must start at A1, have the exact seven
+Phase A headers, and contain no more than 500 data rows. A recognizable
+official workbook with a missing or unsupported marker is rejected instead of
+being treated as a generic workbook. The official template accepts only item
+rows or invalid rows; the generic fallback parser may classify a pure
+name-only row as a section. Invalid required item facts are shown by physical
+Excel row and safe reason codes in the preview, and confirmation returns
+`TENDER_INVALID_ROWS` until the source workbook is corrected and uploaded again.
+
+The workbook manifest includes a SHA-256 fingerprint of normalized cell
+formatting properties (number format, font, fill, border, alignment, and
+protection). The fingerprint describes source formatting without depending on
+workbook-local style IDs. Preview polling follows job state, stops on terminal
+or interrupted previews, and checks the current UI generation before each
+request; interrupted parsing is never replayed automatically. Repository
+metadata uses same-directory unique temporary files and serialized
+read/modify/write operations for workspace touches.
+
+`TenderTemplateService` generates the workbook and caches its immutable bytes
+in process memory. No operator-managed XLSX file or server-side template folder
+is required.

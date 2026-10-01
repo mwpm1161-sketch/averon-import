@@ -5,22 +5,26 @@ import json
 import math
 import threading
 import asyncio
+import os
 import re
 import subprocess
 import shutil
 import uuid
 import zipfile
+from copy import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Side
 
 from averon_import.services.manual_tenders import TenderActivityRegistry, TenderTemplateService, TenderWorkbookParser, TenderWorkspaceRepository
 from averon_import.services.jobs import JobService
 from averon_import.services.manual_tenders.parser import (
     MAX_ACTUAL_ITEMS,
+    MAX_HEADER_LENGTH,
     MAX_UNCOMPRESSED_BYTES,
     MAX_UPLOAD_BYTES,
     TenderParseError,
@@ -35,7 +39,7 @@ from averon_import.services.manual_tenders.repository import (
     PREVIEW_TTL_SECONDS,
     TenderWorkspaceError,
 )
-from averon_import.services.manual_tenders.template import PREPARED_ROWS, TEMPLATE_HEADERS, TEMPLATE_SHEET, TEMPLATE_TABLE
+from averon_import.services.manual_tenders.template import PREPARED_ROWS, TEMPLATE_HEADERS, TEMPLATE_SCHEMA_NAME, TEMPLATE_SCHEMA_VERSION, TEMPLATE_SHEET, TEMPLATE_TABLE
 
 
 def _official(path: Path, *, include_required=True) -> bytes:
@@ -114,7 +118,10 @@ def test_official_template_contract_and_parser_fast_path(tmp_path):
     assert tuple(sheet.cell(1, col).value for col in range(1, 8)) == TEMPLATE_HEADERS
     assert list(sheet.tables) == [TEMPLATE_TABLE]
     assert sheet.tables[TEMPLATE_TABLE].ref == f"A1:G{PREPARED_ROWS + 1}"
+    assert workbook.defined_names[TEMPLATE_SCHEMA_NAME].attr_text == TEMPLATE_SCHEMA_VERSION
     assert sheet.freeze_panes == "A2"
+    assert sheet["A1"].fill.fgColor.rgb.endswith("E9ECEF")
+    assert sheet.column_dimensions["B"].width >= 40
     assert not any(cell.data_type == "f" for ws in workbook.worksheets for row in ws.iter_rows() for cell in row)
     instructions = [str(workbook["Инструкция"].cell(row, 1).value) for row in range(1, workbook["Инструкция"].max_row + 1)]
     assert any("Одна строка таблицы" in line for line in instructions)
@@ -164,6 +171,209 @@ def test_official_template_rejects_changed_headers_and_duplicate_table(tmp_path)
         TenderWorkbookParser().parse(stripped_path)
 
 
+def test_official_template_accepts_resized_371_row_table_and_requires_schema_marker(tmp_path):
+    path = tmp_path / "resized-official.xlsx"
+    _official(path, include_required=False)
+    workbook = load_workbook(path)
+    sheet = workbook[TEMPLATE_SHEET]
+    sheet.tables[TEMPLATE_TABLE].ref = "A1:G371"
+    sheet["A371"] = "R-371"
+    sheet["B371"] = "Синтетическая позиция 371"
+    sheet["C371"] = "шт"
+    sheet["D371"] = 1
+    workbook.save(path)
+    workbook.close()
+    parsed = TenderWorkbookParser().parse(path)
+    assert parsed["table_ref"] == "A1:G371"
+    assert parsed["item_count"] == 1 and parsed["invalid_count"] == 0
+    assert parsed["rows"][0]["excel_row"] == 371
+
+    missing_marker = tmp_path / "missing-schema.xlsx"
+    _official(missing_marker, include_required=False)
+    workbook = load_workbook(missing_marker)
+    del workbook.defined_names[TEMPLATE_SCHEMA_NAME]
+    workbook.save(missing_marker)
+    workbook.close()
+    with pytest.raises(TenderParseError, match="отсутствует версия схемы"):
+        TenderWorkbookParser().parse(missing_marker)
+
+    wrong_marker = tmp_path / "wrong-schema.xlsx"
+    _official(wrong_marker, include_required=False)
+    workbook = load_workbook(wrong_marker)
+    workbook.defined_names[TEMPLATE_SCHEMA_NAME].attr_text = "2"
+    workbook.save(wrong_marker)
+    workbook.close()
+    with pytest.raises(TenderParseError, match="Версия схемы официального шаблона"):
+        TenderWorkbookParser().parse(wrong_marker)
+
+
+def test_manifest_format_fingerprint_is_stable_and_tracks_style_properties(tmp_path):
+    original = tmp_path / "format-base.xlsx"
+    _official(original)
+    parser = TenderWorkbookParser()
+
+    def fingerprint(path):
+        parsed = parser.parse(path)
+        cell = next(item for item in parsed["manifest"]["meaningful_cells"] if item["cell"] == "B2")
+        return cell["style_fingerprint"]
+
+    baseline = fingerprint(original)
+    assert fingerprint(original) == baseline
+    mutations = ("number_format", "font", "fill", "border", "alignment", "protection")
+    for property_name in mutations:
+        path = tmp_path / f"format-{property_name}.xlsx"
+        path.write_bytes(original.read_bytes())
+        workbook = load_workbook(path)
+        cell = workbook[TEMPLATE_SHEET]["B2"]
+        if property_name == "number_format":
+            cell.number_format = "0.000"
+        elif property_name == "font":
+            style = copy(cell.font)
+            style.bold = True
+            cell.font = style
+        elif property_name == "fill":
+            cell.fill = PatternFill(fill_type="solid", fgColor="FFFF00")
+        elif property_name == "border":
+            style = copy(cell.border)
+            style.left = Side(style="thin", color="FF000000")
+            cell.border = style
+        elif property_name == "alignment":
+            style = copy(cell.alignment)
+            style.wrap_text = True
+            cell.alignment = style
+        else:
+            style = copy(cell.protection)
+            style.hidden = True
+            cell.protection = style
+        workbook.save(path)
+        workbook.close()
+        assert fingerprint(path) != baseline, property_name
+
+
+def test_invalid_item_candidates_are_exposed_safely_and_block_confirmation(tmp_path):
+    source = tmp_path / "incomplete.xlsx"
+    _official(source, include_required=False)
+    workbook = load_workbook(source)
+    sheet = workbook[TEMPLATE_SHEET]
+    sheet["A2"] = "R-2"
+    sheet["B2"] = "Синтетическая позиция"
+    sheet["C2"] = "шт"
+    sheet["D2"] = None
+    workbook.save(source)
+    workbook.close()
+    payload = source.read_bytes()
+    parser = TenderWorkbookParser()
+    analysis = parser.parse(source)
+    assert analysis["counts"]["invalid"] == analysis["invalid_count"] == 1
+    assert analysis["item_count"] == 0
+    assert analysis["invalid_examples"] == [{"excel_row": 2, "reasons": ["missing_quantity"]}]
+    assert "Синтетическая позиция" not in json.dumps(analysis["invalid_examples"], ensure_ascii=False)
+
+    repository = TenderWorkspaceRepository(tmp_path / "repo-data")
+    digest = hashlib.sha256(payload).hexdigest()
+    preview = repository.reserve_preview("owner", source.name, len(payload), digest)
+    repository.write_preview_source(preview["preview_id"], payload)
+    repository.update_preview(preview["preview_id"], "owner", status="ready", analysis=analysis, parser_version=analysis["parser_version"], mapping=analysis["mapping"])
+    with pytest.raises(TenderWorkspaceError) as rejected:
+        repository.confirm(preview["preview_id"], "owner")
+    assert rejected.value.status_code == 409
+    assert rejected.value.code == "TENDER_INVALID_ROWS"
+
+
+def test_369_valid_items_plus_one_invalid_candidate_cannot_be_confirmed(tmp_path):
+    source = tmp_path / "large-incomplete.xlsx"
+    _official(source, include_required=False)
+    workbook = load_workbook(source)
+    sheet = workbook[TEMPLATE_SHEET]
+    for row in range(2, 371):
+        sheet.cell(row, 1, f"R-{row}")
+        sheet.cell(row, 2, f"Синтетическая позиция {row}")
+        sheet.cell(row, 3, "шт")
+        sheet.cell(row, 4, 1)
+    sheet["A371"] = "R-371"
+    sheet["B371"] = "Синтетическая позиция 371"
+    sheet["C371"] = "шт"
+    sheet["D371"] = None
+    workbook.save(source)
+    workbook.close()
+    payload = source.read_bytes()
+    analysis = TenderWorkbookParser().parse(source)
+    assert analysis["item_count"] == 369 and analysis["invalid_count"] == 1
+    repository = TenderWorkspaceRepository(tmp_path / "large-repo-data")
+    digest = hashlib.sha256(payload).hexdigest()
+    preview = repository.reserve_preview("owner-large", source.name, len(payload), digest)
+    repository.write_preview_source(preview["preview_id"], payload)
+    repository.update_preview(preview["preview_id"], "owner-large", status="ready", analysis=analysis, parser_version=analysis["parser_version"], mapping=analysis["mapping"])
+    with pytest.raises(TenderWorkspaceError) as rejected:
+        repository.confirm(preview["preview_id"], "owner-large")
+    assert rejected.value.code == "TENDER_INVALID_ROWS"
+
+
+def test_fallback_name_only_may_be_section_but_item_signals_without_quantity_are_invalid(tmp_path):
+    path = tmp_path / "row-classes.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Код ресурса", "Наименование", "Ед. изм.", "Количество", "Артикул"])
+    sheet.append([None, "Синтетический раздел", None, None, None])
+    sheet.append(["R-1", "Синтетическая позиция", "шт", None, None])
+    sheet.append([None, "Ещё одна позиция", None, "не число", None])
+    workbook.save(path)
+    parsed = TenderWorkbookParser().parse(path)
+    assert [row["row_type"] for row in parsed["rows"]] == ["section", "invalid", "invalid"]
+    assert parsed["invalid_count"] == 2
+    assert parsed["invalid_examples"] == [
+        {"excel_row": 3, "reasons": ["missing_quantity"]},
+        {"excel_row": 4, "reasons": ["invalid_quantity"]},
+    ]
+
+
+def test_fallback_ignores_column_scaffold_and_numbered_note_and_recognizes_merged_sections(tmp_path):
+    path = tmp_path / "structural-row-classes.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Код ресурса"
+    sheet["C1"] = "Наименование"
+    sheet["D1"] = "Ед. изм."
+    sheet["E1"] = "Кол-во"
+    # A/C/D/E repeat their physical column indexes, a source-layout scaffold.
+    sheet["A2"] = 1
+    sheet["C2"] = 3
+    sheet["D2"] = 4
+    sheet["E2"] = "5"
+    # The section label is anchored outside the mapped name column.
+    sheet.merge_cells("A3:E3")
+    sheet["A3"] = "Синтетический раздел"
+    # A resource code plus item name and unit without quantity remains invalid.
+    sheet["A4"] = "REF-4"
+    sheet["C4"] = "Синтетическая позиция без количества"
+    sheet["D4"] = "шт"
+    # A numbered note in the resource/reference column is not an item.
+    sheet["A5"] = "1. Синтетическое дополнительное примечание"
+    # Unknown unit vocabulary alone does not invalidate a complete item.
+    sheet["A6"] = "REF-6"
+    sheet["C6"] = "Синтетическая позиция с неизвестной единицей"
+    sheet["D6"] = "единица-неизвестна"
+    sheet["E6"] = 2
+    # Short numbered or ordinary resource codes alone remain incomplete rows.
+    sheet["A7"] = "1. X"
+    sheet["A8"] = "REF-8"
+    workbook.save(path)
+    workbook.close()
+
+    parsed = TenderWorkbookParser().parse(path)
+    rows_by_excel_row = {row["excel_row"]: row for row in parsed["rows"]}
+    assert rows_by_excel_row[2]["row_type"] == "ignored"
+    assert rows_by_excel_row[3]["row_type"] == "section"
+    assert rows_by_excel_row[4]["row_type"] == "invalid"
+    assert rows_by_excel_row[5]["row_type"] == "ignored"
+    assert rows_by_excel_row[6]["row_type"] == "item"
+    assert rows_by_excel_row[7]["row_type"] == "invalid"
+    assert rows_by_excel_row[8]["row_type"] == "invalid"
+    assert rows_by_excel_row[6]["unit_basis"]["trusted"] is False
+    assert rows_by_excel_row[6]["warnings"]
+    assert parsed["counts"] == {"item": 1, "section": 1, "total": 0, "ignored": 2, "invalid": 3}
+
+
 def test_parser_deletes_normalized_temporary_and_preserves_uploaded_source(tmp_path, monkeypatch):
     import shutil
     import averon_import.services.manual_tenders.parser as parser_module
@@ -206,6 +416,51 @@ def test_fallback_header_12_a_c_d_e_boundary_hidden_columns_and_row_identity(tmp
     assert manifest["sheets"][0]["print_area"]
     assert manifest["sheets"][0]["merged_ranges"]
     assert manifest["sheets"][0]["hidden_columns"] == ["F", "G"]
+
+
+def test_fallback_skips_long_data_rows_as_header_candidates_without_truncating_source(tmp_path):
+    path = tmp_path / "long-preamble-and-data.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Ресурсная ведомость"
+    for coordinate, value in {
+        "A12": "№ смет/Код ресурса", "C12": "Наименование", "D12": "Ед. изм.", "E12": "Кол-во",
+    }.items():
+        sheet[coordinate] = value
+    long_449 = "Д" * 449
+    long_393 = "Е" * 393
+    for row, code, name in ((21, "R-21", long_449), (24, "R-24", long_393)):
+        sheet.cell(row, 1, code)
+        sheet.cell(row, 3, name)
+        sheet.cell(row, 4, "шт")
+        sheet.cell(row, 5, 1)
+    workbook.save(path)
+    workbook.close()
+
+    parsed = TenderWorkbookParser().parse(path)
+    assert parsed["header_row"] == 12
+    assert parsed["mapping"] == {"resource_code": 1, "name": 3, "unit": 4, "quantity": 5, "article": None, "manufacturer": None, "model": None}
+    assert parsed["item_count"] == 2 and parsed["invalid_count"] == 0
+    parsed_names = {row["excel_row"]: row["name"] for row in parsed["rows"] if row["row_type"] == "item"}
+    assert parsed_names == {21: long_449, 24: long_393}
+    manifest_values = {cell["cell"]: cell["value"] for cell in parsed["manifest"]["meaningful_cells"]}
+    assert manifest_values["C21"] == long_449 and manifest_values["C24"] == long_393
+
+
+def test_overlong_header_candidate_and_explicitly_selected_header_are_rejected(tmp_path):
+    path = tmp_path / "overlong-header.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Long header"
+    sheet.cell(12, 1, "Наименование" + "X" * (MAX_HEADER_LENGTH + 1))
+    sheet.cell(12, 2, "Количество")
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(TenderParseError, match="Не удалось определить лист и заголовки"):
+        TenderWorkbookParser().parse(path)
+    with pytest.raises(TenderParseError, match="Заголовок XLSX превышает допустимую длину"):
+        TenderWorkbookParser().parse(path, selected_sheet="Long header", selected_header_row=12)
 
 
 def test_generic_code_header_is_not_guessed_as_article_and_mapping_can_be_explicit(tmp_path):
@@ -473,6 +728,43 @@ def test_confirmed_ttl_does_not_extend_absolute_deadline(tmp_path):
     assert datetime.fromisoformat(metadata["last_access_at"]) - datetime.fromisoformat(metadata["created_at"]) < timedelta(seconds=IDLE_TTL_SECONDS)
 
 
+def test_concurrent_workspace_touches_keep_metadata_and_source_coherent(tmp_path):
+    repository = TenderWorkspaceRepository(tmp_path / "concurrent-data")
+    source_path = tmp_path / "concurrent-source.xlsx"
+    payload = _official(source_path)
+    digest = hashlib.sha256(payload).hexdigest()
+    preview = repository.reserve_preview("owner-concurrent", source_path.name, len(payload), digest)
+    repository.write_preview_source(preview["preview_id"], payload)
+    analysis = TenderWorkbookParser().parse(repository.preview_root / preview["preview_id"] / "source.xlsx")
+    repository.update_preview(preview["preview_id"], "owner-concurrent", status="ready", analysis=analysis, parser_version=analysis["parser_version"], mapping=analysis["mapping"])
+    workspace = repository.confirm(preview["preview_id"], "owner-concurrent")
+    workspace_dir = repository.workspace_root / workspace["tender_id"]
+    metadata_path = workspace_dir / "workspace.json"
+    original = json.loads(metadata_path.read_text(encoding="utf-8"))
+    barrier = threading.Barrier(12)
+
+    def touch_workspace(_):
+        barrier.wait()
+        return repository.public_workspace(workspace["tender_id"], "owner-concurrent", touch=True)
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        results = list(executor.map(touch_workspace, range(12)))
+    persisted = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert len(results) == 12
+    assert persisted["owner_id"] == original["owner_id"]
+    assert persisted["filename"] == original["filename"]
+    assert persisted["source_sha256"] == original["source_sha256"] == digest
+    assert persisted["absolute_expires_at"] == original["absolute_expires_at"]
+    assert hashlib.sha256((workspace_dir / "source.xlsx").read_bytes()).hexdigest() == digest
+    assert datetime.fromisoformat(persisted["last_access_at"])
+    assert not list(workspace_dir.glob(".workspace.json.*.tmp"))
+    orphan = workspace_dir / ".workspace.json.orphan.tmp"
+    orphan.write_text("incomplete", encoding="utf-8")
+    os.utime(orphan, (1, 1))
+    repository.cleanup()
+    assert not orphan.exists()
+
+
 def test_workspace_quotas_are_atomic_and_enforced(tmp_path, monkeypatch):
     import averon_import.services.manual_tenders.repository as repository_module
     monkeypatch.setattr(repository_module, "MAX_WORKSPACES_GLOBAL", 20)
@@ -667,6 +959,35 @@ def test_api_auth_template_preview_confirm_owner_isolation_and_delete(tender_api
     main.job_service.executor.shutdown(wait=True)
 
 
+def test_api_confirmation_returns_typed_invalid_rows_error(tender_api, tmp_path):
+    main, _repository = tender_api
+    path = tmp_path / "api-incomplete.xlsx"
+    _official(path, include_required=False)
+    workbook = load_workbook(path)
+    workbook[TEMPLATE_SHEET]["A2"] = "R-2"
+    workbook[TEMPLATE_SHEET]["B2"] = "Синтетическая позиция"
+    workbook[TEMPLATE_SHEET]["C2"] = "шт"
+    workbook.save(path)
+    workbook.close()
+    boundary, body = _multipart_file("file", path.name, path.read_bytes())
+    uploaded = _api_request(main.app, "POST", "/api/manual-tenders/previews", headers={**_auth_headers(), "Content-Type": f"multipart/form-data; boundary={boundary}"}, body=body)
+    assert uploaded.status_code == 202
+    preview_id = uploaded.json()["preview_id"]
+    for _ in range(100):
+        preview = _api_request(main.app, "GET", f"/api/manual-tenders/previews/{preview_id}", headers=_auth_headers()).json()
+        if preview["status"] in {"ready", "failed"}:
+            break
+        threading.Event().wait(0.02)
+    assert preview["status"] == "ready"
+    assert preview["analysis"]["invalid_count"] == 1
+    assert preview["analysis"]["invalid_examples"] == [{"excel_row": 2, "reasons": ["missing_quantity"]}]
+    confirmed = _api_request(main.app, "POST", f"/api/manual-tenders/previews/{preview_id}/confirm", headers=_auth_headers())
+    assert confirmed.status_code == 409
+    assert confirmed.json()["detail"]["code"] == "TENDER_INVALID_ROWS"
+    assert "требующие исправления" in confirmed.json()["detail"]["message"]
+    main.job_service.executor.shutdown(wait=True)
+
+
 def test_api_mapping_resolves_generic_code_without_article_leak(tender_api, tmp_path):
     main, _repository = tender_api
     path = tmp_path / "manual-mapping.xlsx"
@@ -794,6 +1115,9 @@ def test_ui_exposes_excel_path_without_changing_manual_sourcing_and_clears_on_lo
     assert "async function downloadExcelTenderTemplate()" in script
     assert "async function uploadExcelTender(file)" in script
     assert "async function waitForExcelTenderPreview(generation)" in script
+    assert "invalidCount > 0" in script
+    assert "Требуют исправления:" in script
+    assert "TENDER_INVALID_ROWS" not in script
     assert "function renderExcelTenderRows()" in script
     assert "function clearExcelTenderState()" in script
     assert 'state.manual.rows.filter((row) => row.selected !== false)' in script
@@ -812,4 +1136,4 @@ def test_read_only_excel_workspace_renders_370_rows_with_filtering():
         capture_output=True, text=True, timeout=20, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS: 370-row read-only tender workspace" in result.stdout
+    assert "PASS: 370-row workspace and generation-safe adaptive tender polling" in result.stdout

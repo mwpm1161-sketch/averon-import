@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 import time
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -96,15 +97,22 @@ class TenderWorkspaceRepository:
 
     @staticmethod
     def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-        temporary = path.with_suffix(".tmp")
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         if len(payload.encode("utf-8")) > MAX_WORKSPACE_METADATA_BYTES:
             raise TenderWorkspaceError("Структура книги превышает допустимый объём рабочего пространства.", 413, "TENDER_WORKSPACE_TOO_LARGE")
-        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _remove_tree(path: Path) -> None:
@@ -125,11 +133,26 @@ class TenderWorkspaceRepository:
     def _workspace_dirs(self) -> list[Path]:
         return [item for item in self.workspace_root.iterdir() if item.is_dir() and ID_RE.fullmatch(item.name)]
 
+    @staticmethod
+    def _cleanup_orphan_metadata_temps(directory: Path, *, older_than_seconds: int = 3600) -> None:
+        cutoff = time.time() - older_than_seconds
+        try:
+            candidates = directory.glob(".workspace.json.*.tmp")
+            for candidate in candidates:
+                try:
+                    if candidate.is_file() and candidate.stat().st_mtime < cutoff:
+                        candidate.unlink(missing_ok=True)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
     def cleanup(self) -> dict[str, int]:
         now = _now()
         removed_preview = removed_workspaces = 0
         with self._lock:
             for path in self._preview_dirs():
+                self._cleanup_orphan_metadata_temps(path)
                 try:
                     metadata = self._metadata(path)
                     if datetime.fromisoformat(metadata["expires_at"]) <= now and self.activity.begin_delete(path.name):
@@ -150,6 +173,7 @@ class TenderWorkspaceRepository:
                 except (OSError, KeyError, ValueError):
                     continue
             for path in self._workspace_dirs():
+                self._cleanup_orphan_metadata_temps(path)
                 try:
                     metadata = self._metadata(path)
                     expired = (
@@ -254,11 +278,12 @@ class TenderWorkspaceRepository:
         return path / "source.xlsx", metadata
 
     def update_preview(self, preview_id: str, owner_id: str, **updates: Any) -> dict[str, Any]:
-        _, metadata = self.preview_path(preview_id, owner_id)
-        path = self.preview_root / preview_id / "workspace.json"
-        metadata.update(updates)
-        self._atomic_json(path, metadata)
-        return metadata
+        with self._lock:
+            _, metadata = self.preview_path(preview_id, owner_id)
+            path = self.preview_root / preview_id / "workspace.json"
+            metadata.update(updates)
+            self._atomic_json(path, metadata)
+            return metadata
 
     def public_preview(self, preview_id: str, owner_id: str) -> dict[str, Any]:
         _, item = self.preview_path(preview_id, owner_id)
@@ -277,7 +302,7 @@ class TenderWorkspaceRepository:
             "header_row", "headers", "mapping", "mapping_required", "official_template",
             "table_name", "table_ref", "logical_right_edge", "logical_right_column",
             "future_output_columns", "counts", "item_count", "section_count", "total_count",
-            "warnings", "sample_rows",
+            "warnings", "sample_rows", "invalid_count", "invalid_examples",
         )
         return {key: analysis.get(key) for key in keys}
 
@@ -295,6 +320,12 @@ class TenderWorkspaceRepository:
                 raise TenderWorkspaceError("Проверка файла ещё не завершена.", 409, "TENDER_PREVIEW_NOT_READY")
             if analysis.get("mapping_required"):
                 raise TenderWorkspaceError("Сначала задайте однозначное сопоставление колонок.", 409, "TENDER_MAPPING_REQUIRED")
+            invalid_count = int(analysis.get("invalid_count", (analysis.get("counts") or {}).get("invalid", 0)))
+            if invalid_count > 0:
+                raise TenderWorkspaceError(
+                    "В таблице есть строки, требующие исправления. Исправьте файл и загрузите его повторно.",
+                    409, "TENDER_INVALID_ROWS",
+                )
             if int(analysis.get("item_count", 0)) < 1:
                 raise TenderWorkspaceError("В книге не найдены строки позиций для импорта.", 409, "TENDER_NO_ITEMS")
             workspaces = []
@@ -349,35 +380,36 @@ class TenderWorkspaceRepository:
             return self.public_workspace(tender_id, owner_id, touch=False)
 
     def public_workspace(self, tender_id: str, owner_id: str, *, touch: bool = True) -> dict[str, Any]:
-        tender_id = self._validate_id(tender_id)
-        path = self.workspace_root / tender_id
-        metadata = self._metadata(path)
-        if metadata.get("owner_id") != owner_id:
-            raise TenderWorkspaceError("Тендер не найден.")
-        now = _now()
-        if datetime.fromisoformat(metadata["absolute_expires_at"]) <= now or datetime.fromisoformat(metadata["last_access_at"]) + timedelta(seconds=IDLE_TTL_SECONDS) <= now:
-            raise TenderWorkspaceError("Срок тендера истёк.", 410, "TENDER_WORKSPACE_EXPIRED")
-        source = path / "source.xlsx"
-        try:
-            if source.stat().st_size > MAX_UPLOAD_BYTES or hashlib.sha256(source.read_bytes()).hexdigest() != metadata.get("source_sha256"):
-                raise TenderWorkspaceError("Исходная книга тендера повреждена.", 409, "TENDER_SOURCE_CHANGED")
-        except OSError as exc:
-            raise TenderWorkspaceError("Исходная книга тендера отсутствует.", 409, "TENDER_SOURCE_MISSING") from exc
-        if touch:
-            metadata["last_access_at"] = _iso(now)
-            self._atomic_json(path / "workspace.json", metadata)
-        # Internal owner, manifest, and server paths are never serialized.
-        return _sanitize_public_payload({
-            "tender_id": tender_id, "filename": metadata["filename"],
-            "source_sha256": metadata["source_sha256"], "sheet_name": metadata["sheet_name"],
-            "header_row": metadata["header_row"], "mapping": metadata["mapping"],
-            "rows": metadata["rows"], "counts": metadata["counts"],
-            "warnings": metadata["warnings"], "logical_right_edge": metadata["logical_right_edge"],
-            "future_output_columns": metadata["future_output_columns"],
-            "revision": metadata["revision"], "created_at": metadata["created_at"],
-            "last_access_at": metadata["last_access_at"],
-            "absolute_expires_at": metadata["absolute_expires_at"],
-        })
+        with self._lock:
+            tender_id = self._validate_id(tender_id)
+            path = self.workspace_root / tender_id
+            metadata = self._metadata(path)
+            if metadata.get("owner_id") != owner_id:
+                raise TenderWorkspaceError("Тендер не найден.")
+            now = _now()
+            if datetime.fromisoformat(metadata["absolute_expires_at"]) <= now or datetime.fromisoformat(metadata["last_access_at"]) + timedelta(seconds=IDLE_TTL_SECONDS) <= now:
+                raise TenderWorkspaceError("Срок тендера истёк.", 410, "TENDER_WORKSPACE_EXPIRED")
+            source = path / "source.xlsx"
+            try:
+                if source.stat().st_size > MAX_UPLOAD_BYTES or hashlib.sha256(source.read_bytes()).hexdigest() != metadata.get("source_sha256"):
+                    raise TenderWorkspaceError("Исходная книга тендера повреждена.", 409, "TENDER_SOURCE_CHANGED")
+            except OSError as exc:
+                raise TenderWorkspaceError("Исходная книга тендера отсутствует.", 409, "TENDER_SOURCE_MISSING") from exc
+            if touch:
+                metadata["last_access_at"] = _iso(now)
+                self._atomic_json(path / "workspace.json", metadata)
+            # Internal owner, manifest, and server paths are never serialized.
+            return _sanitize_public_payload({
+                "tender_id": tender_id, "filename": metadata["filename"],
+                "source_sha256": metadata["source_sha256"], "sheet_name": metadata["sheet_name"],
+                "header_row": metadata["header_row"], "mapping": metadata["mapping"],
+                "rows": metadata["rows"], "counts": metadata["counts"],
+                "warnings": metadata["warnings"], "logical_right_edge": metadata["logical_right_edge"],
+                "future_output_columns": metadata["future_output_columns"],
+                "revision": metadata["revision"], "created_at": metadata["created_at"],
+                "last_access_at": metadata["last_access_at"],
+                "absolute_expires_at": metadata["absolute_expires_at"],
+            })
 
     def delete(self, tender_id: str, owner_id: str) -> bool:
         tender_id = self._validate_id(tender_id)

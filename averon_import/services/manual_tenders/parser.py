@@ -17,7 +17,10 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from averon_import.services.one_c_history.xlsx_import import OneCImportError, preflight_xlsx as shared_preflight_xlsx
-from .template import PREPARED_ROWS, TEMPLATE_HEADERS, TEMPLATE_SHEET, TEMPLATE_TABLE
+from .template import (
+    PREPARED_ROWS, TEMPLATE_HEADERS, TEMPLATE_SCHEMA_NAME,
+    TEMPLATE_SCHEMA_VERSION, TEMPLATE_SHEET, TEMPLATE_TABLE,
+)
 from .models import TenderMapping, TenderSourceManifest, TenderSourceRow, TenderUnitBasis, TenderWorkbookStructure
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
@@ -196,6 +199,54 @@ def _json_value(value: Any) -> Any:
     return str(value)[:MAX_CELL_TEXT_LENGTH]
 
 
+def _color_style(color: Any) -> dict[str, Any] | None:
+    if color is None:
+        return None
+    # Some unset openpyxl descriptors return descriptor placeholders from
+    # getattr; __dict__ contains only values actually stored in the workbook.
+    return {key: value for key, value in vars(color).items() if key in {"type", "rgb", "indexed", "theme", "tint", "auto"}}
+
+
+def _style_fingerprint(cell: Any) -> str:
+    """Hash normalized formatting properties instead of workbook-local style ids."""
+    font = cell.font
+    fill = cell.fill
+    border = cell.border
+    alignment = cell.alignment
+    protection = cell.protection
+    sides = {}
+    for side_name in ("left", "right", "top", "bottom", "diagonal", "vertical", "horizontal", "start", "end"):
+        side = getattr(border, side_name, None)
+        sides[side_name] = None if side is None else {
+            "style": side.style,
+            "color": _color_style(side.color),
+        }
+    normalized = {
+        "number_format": cell.number_format,
+        "font": {
+            "name": font.name, "size": font.sz, "bold": font.bold,
+            "italic": font.italic, "underline": font.underline, "strike": font.strike,
+            "vert_align": font.vertAlign, "color": _color_style(font.color),
+            "scheme": font.scheme, "charset": font.charset, "family": font.family,
+        },
+        "fill": {
+            "type": fill.fill_type, "foreground": _color_style(fill.fgColor),
+            "background": _color_style(fill.bgColor),
+        },
+        "border": {
+            "sides": sides, "diagonal_up": border.diagonalUp,
+            "diagonal_down": border.diagonalDown, "outline": border.outline,
+        },
+        "alignment": {
+            key: getattr(alignment, key)
+            for key in ("horizontal", "vertical", "textRotation", "wrapText", "shrinkToFit", "indent", "relativeIndent", "justifyLastLine", "readingOrder")
+        },
+        "protection": {"locked": protection.locked, "hidden": protection.hidden},
+    }
+    payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class TenderWorkbookParser:
     def parse(self, path: Path, *, tender_id: str | None = None, mapping_override: dict[str, int | None] | None = None, selected_sheet: str | None = None, selected_header_row: int | None = None) -> dict[str, Any]:
         if path.suffix.casefold() != ".xlsx":
@@ -225,19 +276,33 @@ class TenderWorkbookParser:
                 if sheet.max_row > MAX_ROWS_PER_SHEET or sheet.max_column > MAX_COLUMNS_PER_SHEET:
                     raise TenderParseError("Размер листа превышает поддерживаемую границу.")
             table_hits = [(sheet, table) for sheet in workbook.worksheets for table in sheet.tables.values() if table.name == TEMPLATE_TABLE]
+            schema_marker = workbook.defined_names.get(TEMPLATE_SCHEMA_NAME)
+            if schema_marker is not None and str(schema_marker.attr_text or "").strip() != TEMPLATE_SCHEMA_VERSION:
+                raise TenderParseError("Версия схемы официального шаблона Averon не поддерживается.")
             is_official = bool(table_hits)
             if is_official:
+                if schema_marker is None:
+                    raise TenderParseError("В официальной книге отсутствует версия схемы Averon.")
                 if len(table_hits) != 1:
                     raise TenderParseError("Официальная таблица AveronTenderInput должна быть единственной.")
                 sheet, table = table_hits[0]
                 if sheet.title != TEMPLATE_SHEET:
                     raise TenderParseError("Таблица AveronTenderInput находится на неожиданном листе.")
                 min_col, min_row, max_col, max_row = __import__("openpyxl.utils.cell", fromlist=["range_boundaries"]).range_boundaries(table.ref)
-                if min_col != 1 or min_row != 1 or max_col != len(TEMPLATE_HEADERS) or max_row != PREPARED_ROWS + 1:
+                if min_col != 1 or min_row != 1 or max_col != len(TEMPLATE_HEADERS) or not 1 <= max_row <= PREPARED_ROWS + 1:
                     raise TenderParseError("Диапазон официальной таблицы Averon имеет неверную структуру.")
                 headers = [_cell_text(sheet.cell(1, column).value) for column in range(1, len(TEMPLATE_HEADERS) + 1)]
                 if tuple(headers) != TEMPLATE_HEADERS:
                     raise TenderParseError("Заголовки официальной таблицы Averon повреждены или изменены.")
+                table_columns = list(table.tableColumns or [])
+                if len(table_columns) != len(TEMPLATE_HEADERS) or tuple(column.name for column in table_columns) != TEMPLATE_HEADERS:
+                    raise TenderParseError("Столбцы официальной таблицы Averon повреждены или изменены.")
+                if any(
+                    (cell.value is not None or cell.comment is not None)
+                    and (cell.column > len(TEMPLATE_HEADERS) or cell.row > max_row)
+                    for cell in sheet._cells.values()
+                ):
+                    raise TenderParseError("В официальной книге найдены данные за пределами таблицы A1:G.")
                 mapping = {field: index for index, field in enumerate(OFFICIAL_FIELD_BY_HEADER.values(), start=1)}
                 header_row = 1
                 ambiguous = False
@@ -247,7 +312,7 @@ class TenderWorkbookParser:
                     official_sheet = workbook[TEMPLATE_SHEET]
                     first_row = tuple(_cell_text(official_sheet.cell(1, column).value) for column in range(1, len(TEMPLATE_HEADERS) + 1))
                     instruction_marker = "Инструкция" in workbook.sheetnames and workbook["Инструкция"]["A1"].value == "Шаблон Averon v1"
-                    if first_row == TEMPLATE_HEADERS or any(official_sheet.cell(1, column).value is not None for column in range(1, len(TEMPLATE_HEADERS) + 1)) or instruction_marker:
+                    if schema_marker is not None or first_row == TEMPLATE_HEADERS or any(official_sheet.cell(1, column).value is not None for column in range(1, len(TEMPLATE_HEADERS) + 1)) or instruction_marker:
                         raise TenderParseError("В официальной книге отсутствует корректная таблица AveronTenderInput.")
                 if selected_sheet is not None or selected_header_row is not None:
                     sheet = workbook[selected_sheet] if selected_sheet in workbook.sheetnames else None
@@ -257,6 +322,7 @@ class TenderWorkbookParser:
                     headers = [_cell_text(sheet.cell(header_row, column).value) for column in range(1, min(sheet.max_column, MAX_COLUMNS_PER_SHEET) + 1)]
                     while headers and not headers[-1]:
                         headers.pop()
+                    self._validate_header_lengths(headers)
                     mapping, ambiguous = self._mapping_for_headers(headers)
                     header_candidates = [{"sheet_name": sheet.title, "header_row": header_row}]
                 else:
@@ -279,7 +345,14 @@ class TenderWorkbookParser:
                     continue
                 name = values.get("name", (None, None))[0]
                 qty, qty_type = values.get("quantity", (None, "n"))
-                kind = self._classify(name, qty, qty_type, values)
+                if not is_official and self._is_column_number_scaffold(values, mapping):
+                    kind, invalid_reasons = "ignored", []
+                elif not is_official and self._is_merged_section_row(sheet, physical_row, mapping):
+                    kind, invalid_reasons = "section", []
+                elif not is_official and self._is_numbered_reference_note(values):
+                    kind, invalid_reasons = "ignored", []
+                else:
+                    kind, invalid_reasons = self._classify(name, qty, qty_type, values, official=is_official)
                 counts[kind] += 1
                 if kind == "item" and counts[kind] > MAX_ACTUAL_ITEMS:
                     raise TenderParseError("В книге больше 500 строк позиций.")
@@ -303,6 +376,7 @@ class TenderWorkbookParser:
                     "manufacturer": self._field_text(values, "manufacturer"),
                     "model": self._field_text(values, "model"),
                     "source_cells": {field: f"{get_column_letter(col)}{physical_row}" for field, col in mapping.items() if col is not None},
+                    "invalid_reason_codes": invalid_reasons,
                 }
                 row["quantity_raw"], row["quantity"], row["quantity_trusted"] = _decimal_quantity(qty, qty_type)
                 row["unit_basis"] = parse_unit_basis(row["raw_unit"])
@@ -360,6 +434,11 @@ class TenderWorkbookParser:
                 "item_count": counts["item"],
                 "section_count": counts["section"],
                 "total_count": counts["total"],
+                "invalid_count": counts["invalid"],
+                "invalid_examples": [
+                    {"excel_row": row["excel_row"], "reasons": row["invalid_reason_codes"]}
+                    for row in rows if row["row_type"] == "invalid"
+                ][:MAX_PREVIEW_ROWS],
                 "warnings": warnings,
                 "sample_rows": [row for row in rows if row["row_type"] == "item"][:MAX_PREVIEW_ROWS],
                 "rows": rows,
@@ -383,13 +462,101 @@ class TenderWorkbookParser:
     def _field_text(values: dict[str, tuple[Any, str]], field: str) -> str:
         return _cell_text(values.get(field, (None, "n"))[0])
 
+    @staticmethod
+    def _is_column_number_scaffold(
+        values: dict[str, tuple[Any, str]], mapping: dict[str, int | None],
+    ) -> bool:
+        """Recognize a compact row that repeats its mapped physical columns."""
+        matched_fields = []
+        for field, column in mapping.items():
+            if column is None:
+                continue
+            value = values.get(field, (None, "n"))[0]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if isinstance(value, bool):
+                return False
+            try:
+                if isinstance(value, str):
+                    text = value.strip()
+                    if not re.fullmatch(r"\+?\d+(?:\.0+)?", text):
+                        return False
+                    number = Decimal(text)
+                elif isinstance(value, (int, float, Decimal)):
+                    number = Decimal(str(value))
+                else:
+                    return False
+            except (InvalidOperation, ValueError):
+                return False
+            if number != number.to_integral_value() or not 1 <= number <= MAX_COLUMNS_PER_SHEET:
+                return False
+            if int(number) != column:
+                return False
+            matched_fields.append(field)
+
+        # Requiring multiple mapped fields, including both required fields,
+        # avoids treating an ordinary numeric code or quantity as scaffolding.
+        return len(matched_fields) >= 3 and {"name", "quantity"}.issubset(matched_fields)
+
+    @staticmethod
+    def _is_merged_section_row(sheet, physical_row: int, mapping: dict[str, int | None]) -> bool:
+        source_columns = [column for column in mapping.values() if column is not None]
+        if not source_columns:
+            return False
+        source_left, source_right = min(source_columns), max(source_columns)
+        covering_merges = [
+            merged for merged in sheet.merged_cells.ranges
+            if merged.min_row == physical_row == merged.max_row
+            and merged.min_col <= source_left and merged.max_col >= source_right
+        ]
+        if not covering_merges:
+            return False
+
+        # Only inspect the logical source area. Some workbooks repeat labels in
+        # distant print-layout columns that are outside the mapped table.
+        row_values = []
+        for column in range(source_left, source_right + 1):
+            cell = sheet._cells.get((physical_row, column))
+            if cell is not None and cell.value not in (None, ""):
+                row_values.append(cell)
+        if len(row_values) != 1:
+            return False
+        cell = row_values[0]
+        if cell.data_type == "f" or not isinstance(cell.value, str) or not _cell_text(cell.value):
+            return False
+        return any(
+            merged.min_row == physical_row and merged.min_col == cell.column
+            and merged.min_col <= cell.column <= merged.max_col
+            for merged in covering_merges
+        )
+
+    @staticmethod
+    def _is_numbered_reference_note(values: dict[str, tuple[Any, str]]) -> bool:
+        reference = values.get("resource_code", (None, "n"))[0]
+        if not isinstance(reference, str):
+            return False
+        note_match = re.match(r"^\s*\d{1,3}[.)]\s+(.+)$", reference, re.DOTALL)
+        if note_match is None:
+            return False
+        note_body = note_match.group(1).strip()
+        # Require explanatory, multiword content so a short numbered reference
+        # code remains an invalid incomplete row instead of being discarded.
+        if len(note_body) < 16 or len(note_body.split()) < 3:
+            return False
+        return not any(
+            values.get(field, (None, "n"))[0] not in (None, "")
+            for field in ("name", "unit", "quantity", "article", "manufacturer", "model")
+        )
+
     def _detect_fallback(self, workbook):
         candidates = []
         for sheet in workbook.worksheets:
             for row_number in range(1, min(sheet.max_row, MAX_HEADER_SCAN_ROWS) + 1):
                 headers = [_cell_text(sheet.cell(row_number, column).value) for column in range(1, min(sheet.max_column, MAX_COLUMNS_PER_SHEET) + 1)]
                 if any(len(value) > MAX_HEADER_LENGTH for value in headers):
-                    raise TenderParseError("Заголовок XLSX превышает допустимую длину.")
+                    # Long preamble/body cells are valid source content; this
+                    # row simply cannot be interpreted as a header candidate.
+                    continue
                 while headers and not headers[-1]:
                     headers.pop()
                 mapping, ambiguous = self._mapping_for_headers(headers)
@@ -402,6 +569,7 @@ class TenderWorkbookParser:
             raise TenderParseError("Не удалось определить лист и заголовки. Задайте сопоставление вручную.", "TENDER_MAPPING_REQUIRED")
         candidates.sort(key=lambda value: value[0], reverse=True)
         best = candidates[0]
+        self._validate_header_lengths(best[3])
         same_score = [candidate for candidate in candidates if candidate[0] == best[0]]
         ambiguous = best[5] or len(same_score) > 1 or any(best[4].get(field) is None for field in REQUIRED_FIELDS)
         bounded_headers = [
@@ -409,6 +577,11 @@ class TenderWorkbookParser:
             for candidate in candidates[:10]
         ]
         return best[1], best[2], best[3], best[4], ambiguous, bounded_headers
+
+    @staticmethod
+    def _validate_header_lengths(headers: list[str]) -> None:
+        if any(len(value) > MAX_HEADER_LENGTH for value in headers):
+            raise TenderParseError("Заголовок XLSX превышает допустимую длину.")
 
     @staticmethod
     def _mapping_for_headers(headers: list[str]) -> tuple[dict[str, int | None], bool]:
@@ -456,16 +629,31 @@ class TenderWorkbookParser:
         return asdict(TenderMapping(**result))
 
     @staticmethod
-    def _classify(name: Any, quantity: Any, quantity_type: str, values: dict[str, tuple[Any, str]]) -> str:
+    def _classify(name: Any, quantity: Any, quantity_type: str, values: dict[str, tuple[Any, str]], *, official: bool = False) -> tuple[str, list[str]]:
         strings = [_cell_text(value).casefold() for value, _kind in values.values() if value not in (None, "")]
-        if any(re.search(r"\b(итого|всего|сумма итого|total)\b", value) for value in strings):
-            return "total"
-        optional_identity = any(values.get(field, (None, ""))[0] not in (None, "") for field in ("article", "manufacturer", "model"))
-        if name not in (None, "") and quantity in (None, "") and not optional_identity:
-            return "section"
-        if name not in (None, "") and quantity not in (None, ""):
-            return "item"
-        return "invalid" if strings else "ignored"
+        if not official and any(re.search(r"\b(итого|всего|сумма итого|total)\b", value) for value in strings):
+            return "total", []
+        name_present = name not in (None, "") and bool(_cell_text(name))
+        quantity_raw, _normalized_quantity, quantity_trusted = _decimal_quantity(quantity, quantity_type)
+        quantity_present = bool(quantity_raw)
+        item_signals = any(
+            values.get(field, (None, ""))[0] not in (None, "")
+            for field in ("resource_code", "unit", "article", "manufacturer", "model")
+        )
+        if not official and name_present and not quantity_present and not item_signals:
+            return "section", []
+        if name_present and quantity_trusted:
+            return "item", []
+        if not strings:
+            return "ignored", []
+        reasons = []
+        if not name_present:
+            reasons.append("missing_name")
+        if not quantity_present:
+            reasons.append("missing_quantity")
+        elif not quantity_trusted:
+            reasons.append("invalid_quantity")
+        return "invalid", reasons
 
     @staticmethod
     def _future_columns(sheet, logical_edge: int) -> list[dict[str, Any]]:
@@ -508,7 +696,7 @@ class TenderWorkbookParser:
                     continue
                 if cell.comment:
                     comment_counts[sheet.title] += 1
-                item = {"sheet": sheet.title, "cell": cell.coordinate, "value": _json_value(cell.value), "formula": cell.data_type == "f", "type": cell.data_type, "comment": bool(cell.comment)}
+                item = {"sheet": sheet.title, "cell": cell.coordinate, "value": _json_value(cell.value), "formula": cell.data_type == "f", "type": cell.data_type, "comment": bool(cell.comment), "style_fingerprint": _style_fingerprint(cell)}
                 meaningful_bytes += len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
                 if meaningful_bytes > max_cell_bytes:
                     raise TenderParseError("Манифест превышает допустимый объём рабочего пространства.", "TENDER_WORKSPACE_TOO_LARGE")
