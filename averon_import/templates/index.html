@@ -104,7 +104,12 @@
             <h3 id="manual-entry-title">Тендер без спецификации</h3>
             <p>Введите или вставьте список позиций, если отдельной PDF-спецификации нет.</p>
           </div>
-          <button class="button secondary" type="button" id="open-manual-entry">Ввести позиции вручную</button>
+          <div class="manual-entry-actions">
+            <button class="button secondary" type="button" id="open-manual-entry">Ввести позиции вручную</button>
+            <button class="button primary" type="button" id="open-tender-xlsx">Загрузить Excel</button>
+            <button class="button ghost" type="button" id="download-tender-template">Скачать шаблон Excel</button>
+          </div>
+          <input type="file" id="tender-xlsx-file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
         </section>
         <section class="panel recent-documents" id="recent-documents-panel" hidden>
           <div class="panel-heading">
@@ -113,6 +118,34 @@
           </div>
           <div id="recent-documents-list" class="recent-documents-list"></div>
         </section>
+      </section>
+
+      <section id="excel-tender-view" class="view excel-tender-view">
+        <div class="document-strip">
+          <div class="file-icon tender-file-icon">XLSX</div>
+          <div class="document-info"><b id="tender-document-name">Тендер из Excel</b><small id="tender-document-meta">Исходная книга хранится в рабочем пространстве Averon Import.</small></div>
+          <div class="spacer"></div>
+          <button class="button ghost" type="button" id="tender-back-to-start">К старту</button>
+        </div>
+        <div class="panel tender-panel">
+          <div id="tender-preview-pane">
+            <div class="panel-heading"><div><h3>Загрузка ведомости</h3><p id="tender-preview-status" role="status" aria-live="polite">Выберите файл .xlsx или скачайте шаблон Averon.</p></div></div>
+            <div id="tender-preview-summary"></div>
+            <div id="tender-mapping-controls" hidden></div>
+            <div class="tender-preview-actions">
+              <button class="button secondary" type="button" id="tender-map-submit" hidden>Проверить сопоставление</button>
+              <button class="button primary" type="button" id="tender-confirm-import" hidden>Импортировать позиции</button>
+              <button class="button ghost" type="button" id="tender-retry-upload">Выбрать файл</button>
+            </div>
+          </div>
+          <div id="tender-workspace-pane" hidden>
+            <div class="panel-heading tender-workspace-heading"><div><h3>Позиции из Excel</h3><p id="tender-workspace-summary"></p></div><button class="button text" type="button" id="tender-delete-workspace">Удалить тендер</button></div>
+            <label class="field-label" for="tender-row-search">Поиск позиций</label>
+            <input class="input tender-row-search" id="tender-row-search" type="search" placeholder="Наименование, код ресурса, артикул">
+            <div class="tender-table-wrap"><table class="tender-table"><thead><tr><th><input type="checkbox" id="tender-select-all" aria-label="Выбрать все показанные позиции"></th><th>Строка Excel</th><th>Код ресурса</th><th>Наименование</th><th>Ед. изм.</th><th>Кол-во</th><th>Артикул</th><th>Производитель / модель</th><th>Проверка</th></tr></thead><tbody id="tender-rows"></tbody></table></div>
+            <p class="hint" id="tender-row-count"></p>
+          </div>
+        </div>
       </section>
 
       <section id="manual-view" class="view manual-view">

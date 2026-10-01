@@ -98,6 +98,27 @@ button { cursor: pointer; }
 .upload-card small { color:#8b919a; margin-top:17px; }
 .manual-entry-prompt { max-width:1200px; margin:0 auto 28px; padding:20px 22px; display:flex; align-items:center; gap:18px; border:1px solid var(--line); border-radius:16px; background:var(--surface); box-shadow:0 8px 35px rgba(17,24,39,.035); }
 .manual-entry-prompt h3 { margin:5px 0 4px; font-size:18px; }.manual-entry-prompt p { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }.manual-entry-prompt .button { margin-left:auto; white-space:nowrap; }
+.manual-entry-actions { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.manual-entry-actions .button { margin-left:0; }
+.excel-tender-view { max-width:1600px; margin:0 auto; }
+.tender-panel { padding:22px; }
+.tender-file-icon { background:#176b4c; }
+.tender-preview-summary { display:grid; gap:12px; padding:14px; margin:12px 0; border:1px solid var(--line); border-radius:12px; background:#fff; }
+.tender-preview-summary p { margin:0; font-size:12px; line-height:1.5; color:#515965; }
+.tender-warnings { color:#8a5a12!important; background:#fff9ea; border-radius:8px; padding:8px 10px; }
+.tender-mapping-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin:14px 0; }
+.tender-mapping-field label { display:block; margin-bottom:5px; font-size:11px; font-weight:700; color:#47505c; }
+.tender-mapping-field select { width:100%; min-width:0; border:1px solid var(--line-strong); border-radius:8px; padding:9px; background:white; }
+.tender-preview-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; padding-top:12px; border-top:1px solid var(--line); }
+.tender-workspace-heading { align-items:center; }
+.tender-row-search { max-width:540px; margin-bottom:12px; }
+.tender-table-wrap { overflow:auto; max-height:calc(100vh - 350px); border:1px solid var(--line); border-radius:10px; }
+.tender-table { width:100%; min-width:1050px; border-collapse:collapse; background:#fff; }
+.tender-table th,.tender-table td { padding:9px 10px; border-bottom:1px solid #e8eaee; text-align:left; vertical-align:top; font-size:11px; }
+.tender-table th { position:sticky; top:0; z-index:1; background:#f7f8fa; color:#515965; white-space:nowrap; }
+.tender-table tr:last-child td { border-bottom:0; }
+.tender-table .tender-row-warning { color:#8a5a12; background:#fffaf0; }
+.tender-table td:nth-child(4) { min-width:240px; white-space:normal; overflow-wrap:anywhere; }
 .button { border:1px solid transparent; border-radius:10px; padding:10px 15px; font-weight:650; font-size:13px; transition:.16s; display:inline-flex; align-items:center; justify-content:center; gap:8px; }
 .button:hover { transform:translateY(-1px); }
 .button.primary { background:var(--accent); color:#fff; box-shadow:0 7px 18px rgba(17,24,39,.14); }

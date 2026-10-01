@@ -91,11 +91,13 @@ const state = {
   recentDocuments: [],
   pendingDocumentDelete: null,
   manual: {active: false, rows: []},
+  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
 const CRITICAL_LABELS = {quantity:"Количество", unit:"Единица", mass:"Масса"};
 const MANUAL_DRAFT_KEY = "averonManualTenderDraft";
+const EXCEL_TENDER_VIEW_KEY = "averonExcelTenderView";
 const MANUAL_FIELDS = ["name", "type_mark", "manufacturer", "code", "quantity", "unit"];
 let authBootPromise = null;
 let authBootGeneration = null;
@@ -226,6 +228,7 @@ function clearProtectedMemory() {
   };
   state.recentDocuments = [];
   state.manual = {active: false, rows: []};
+  clearExcelTenderState();
   $$("dialog[open]").forEach((dialog) => dialog.close());
   ["#new-user-password", "#new-user-password-confirm", "#reset-user-password", "#reset-user-password-confirm"]
     .forEach((selector) => { const input = $(selector); if (input) input.value = ""; });
@@ -812,7 +815,7 @@ function updateContextualSupportButton() {
   const button = $("#contextual-support-report-button");
   if (!button) return;
   const activeView = $$(".view").find((view) => view.classList.contains("visible"));
-  button.hidden = state.authState !== "authenticated" || !state.document || activeView?.id === "manual-view";
+  button.hidden = state.authState !== "authenticated" || !state.document || activeView?.id === "manual-view" || activeView?.id === "excel-tender-view";
 }
 
 function setView(name) {
@@ -828,6 +831,7 @@ function setView(name) {
     processing: ["Распознавание документа", "Определение строк, столбцов и текста"],
     review: ["Проверка данных", "Сравните результат с PDF и подготовьте экспорт"],
     manual: ["Тендер без спецификации", "Введите позиции и подберите предложения в общем sourcing-процессе"],
+    "excel-tender": ["Тендер из Excel", "Проверка структуры и чтение исходной ресурсной ведомости"],
   };
   const [title, subtitle] = titles[name] || titles.upload;
   $("#page-title").textContent = title;
@@ -860,6 +864,7 @@ async function boot() {
       )) {
         clearOneCHistoryProtectedState();
         clearSourcingProtectedState();
+        clearExcelTenderState();
       }
       state.currentUser = currentUser;
       state.authMode = authMode;
@@ -906,7 +911,10 @@ async function boot() {
       const manualDraftActive = state.manual.active;
       if (manualDraftActive) openManualWorkspace();
       state.bootComplete = true;
-      if (!manualDraftActive) void resumeLastDocument();
+      if (!manualDraftActive) {
+        const tenderRestored = await restoreExcelTenderWorkspace();
+        if (!tenderRestored) void resumeLastDocument();
+      }
     } catch (error) {
       if (generation !== state.authGeneration) return;
       if (state.authState === "checking") {
@@ -1732,6 +1740,254 @@ function returnToStartFromManual() {
   state.manual.active = false;
   saveManualDraft();
   setView("upload");
+}
+
+function clearExcelTenderState() {
+  const generation = (state.excelTender?.pollGeneration || 0) + 1;
+  if (state.excelTender?.filterTimer) clearTimeout(state.excelTender.filterTimer);
+  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null};
+  try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {}
+  const file = $("#tender-xlsx-file");
+  if (file) file.value = "";
+  const rows = $("#tender-rows");
+  if (rows) rows.replaceChildren();
+  const summary = $("#tender-preview-summary");
+  if (summary) summary.replaceChildren();
+  const status = $("#tender-preview-status");
+  if (status) status.textContent = "Выберите файл .xlsx или скачайте шаблон Averon.";
+  const workspacePane = $("#tender-workspace-pane");
+  if (workspacePane) workspacePane.hidden = true;
+  const previewPane = $("#tender-preview-pane");
+  if (previewPane) previewPane.hidden = false;
+}
+
+function storeExcelTenderView(tenderId) {
+  const userId = String(state.currentUser?.user_id || state.currentUser?.username || "");
+  if (!tenderId || !userId) return;
+  try { sessionStorage.setItem(EXCEL_TENDER_VIEW_KEY, JSON.stringify({tender_id:tenderId,user_id:userId})); } catch (_) {}
+}
+
+async function restoreExcelTenderWorkspace() {
+  let stored;
+  try { stored = JSON.parse(sessionStorage.getItem(EXCEL_TENDER_VIEW_KEY) || "null"); } catch (_) { stored = null; }
+  const userId = String(state.currentUser?.user_id || state.currentUser?.username || "");
+  if (!stored || stored.user_id !== userId || typeof stored.tender_id !== "string") {
+    if (stored) { try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {} }
+    return false;
+  }
+  try {
+    const workspace = await api(`/api/manual-tenders/${encodeURIComponent(stored.tender_id)}`);
+    openExcelTenderWorkspace(workspace, {persist:false});
+    return true;
+  } catch (_) {
+    try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {}
+    return false;
+  }
+}
+
+async function downloadExcelTenderTemplate() {
+  try {
+    const response = await api("/api/manual-tenders/template");
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "Averon_Шаблон_тендера_v1.xlsx";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { toast(error.message || "Не удалось скачать шаблон", "error"); }
+}
+
+function openExcelTenderImport() {
+  state.excelTender.previewId = null;
+  state.excelTender.jobId = null;
+  state.excelTender.workspace = null;
+  $("#tender-preview-pane").hidden = false;
+  $("#tender-workspace-pane").hidden = true;
+  $("#tender-document-name").textContent = "Тендер из Excel";
+  $("#tender-document-meta").textContent = "Загрузка выполняется в отдельной очереди проверки документов.";
+  $("#tender-preview-status").textContent = "Выберите книгу .xlsx для проверки.";
+  $("#tender-preview-summary").replaceChildren();
+  $("#tender-mapping-controls").hidden = true;
+  $("#tender-map-submit").hidden = true;
+  $("#tender-confirm-import").hidden = true;
+  setView("excel-tender");
+  $("#tender-xlsx-file").click();
+}
+
+async function uploadExcelTender(file) {
+  if (!file) return;
+  const generation = ++state.excelTender.pollGeneration;
+  state.excelTender.previewId = null;
+  state.excelTender.workspace = null;
+  state.excelTender.preview = null;
+  $("#tender-preview-pane").hidden = false;
+  $("#tender-workspace-pane").hidden = true;
+  $("#tender-document-name").textContent = file.name;
+  $("#tender-document-meta").textContent = "Проверяем файл в ограниченной очереди обработки.";
+  $("#tender-preview-status").textContent = "Загружаем файл…";
+  $("#tender-preview-summary").replaceChildren();
+  $("#tender-map-submit").hidden = true;
+  $("#tender-confirm-import").hidden = true;
+  setView("excel-tender");
+  try {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const result = await api("/api/manual-tenders/previews", {method:"POST", body:form});
+    if (generation !== state.excelTender.pollGeneration) return;
+    state.excelTender.previewId = result.preview_id;
+    state.excelTender.jobId = result.job_id || null;
+    if (result.status === "ready") {
+      await refreshExcelTenderPreview(generation);
+      return;
+    }
+    $("#tender-preview-status").textContent = "Файл принят. Проверяем структуру…";
+    await waitForExcelTenderPreview(generation);
+  } catch (error) {
+    if (generation === state.excelTender.pollGeneration) $("#tender-preview-status").textContent = error.message || "Не удалось загрузить XLSX.";
+  } finally { $("#tender-xlsx-file").value = ""; }
+}
+
+async function waitForExcelTenderPreview(generation) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    if (generation !== state.excelTender.pollGeneration || !state.excelTender.previewId) return;
+    const preview = await api(`/api/manual-tenders/previews/${encodeURIComponent(state.excelTender.previewId)}`);
+    if (preview.status === "ready" || preview.status === "failed" || preview.status === "interrupted") {
+      renderExcelTenderPreview(preview);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 750));
+  }
+  if (generation === state.excelTender.pollGeneration) $("#tender-preview-status").textContent = "Проверка длится дольше обычного. Повторно откройте эту подготовку или загрузите файл снова.";
+}
+
+async function refreshExcelTenderPreview(generation = state.excelTender.pollGeneration) {
+  if (!state.excelTender.previewId) return;
+  const preview = await api(`/api/manual-tenders/previews/${encodeURIComponent(state.excelTender.previewId)}`);
+  if (generation === state.excelTender.pollGeneration) renderExcelTenderPreview(preview);
+}
+
+function tenderColumnLetters(index) {
+  let value = Number(index) + 1;
+  let result = "";
+  while (value > 0) { value -= 1; result = String.fromCharCode(65 + (value % 26)) + result; value = Math.floor(value / 26); }
+  return result;
+}
+
+function tenderColumnOptions(headers, selected) {
+  const options = [`<option value="">Не сопоставлять</option>`, ...headers.map((header, index) => `<option value="${index + 1}" ${selected === index + 1 ? "selected" : ""}>${tenderColumnLetters(index)}: ${escapeHtml(header || "пустой заголовок")}</option>`)];
+  return options.join("");
+}
+
+function renderExcelTenderPreview(preview) {
+  state.excelTender.preview = preview;
+  const status = $("#tender-preview-status");
+  const analysis = preview.analysis;
+  if (preview.status !== "ready" || !analysis) {
+    status.textContent = preview.error || (preview.status === "interrupted" ? "Проверка была прервана перезапуском. Выберите файл повторно." : "Не удалось проверить файл. Выберите файл повторно.");
+    $("#tender-confirm-import").hidden = true;
+    $("#tender-map-submit").hidden = true;
+    return;
+  }
+  status.textContent = analysis.official_template ? "Шаблон Averon v1" : "Предпросмотр Excel ведомости";
+  const sample = (analysis.sample_rows || []).map((row) => `<tr><td>${row.excel_row}</td><td>${escapeHtml(row.resource_code || "")}</td><td>${escapeHtml(row.name || "")}</td><td>${escapeHtml(row.raw_unit || "")}</td><td>${escapeHtml(row.quantity_raw || "")}</td></tr>`).join("");
+  const warnings = (analysis.warnings || []).map((warning) => `<p class="tender-warnings">${escapeHtml(warning.message || "Структурное предупреждение")}</p>`).join("");
+  const counts = analysis.counts || {};
+  const mappingLabels = {resource_code:"Код ресурса",name:"Наименование",unit:"Ед. изм.",quantity:"Кол-во",article:"Артикул",manufacturer:"Производитель",model:"Модель / тип"};
+  const mappingText = Object.entries(analysis.mapping || {}).filter(([, column]) => column).map(([field, column]) => `${mappingLabels[field] || field} ← ${tenderColumnLetters(Number(column) - 1)}: ${analysis.headers?.[Number(column) - 1] || ""}`).join(" · ") || "Сопоставление нужно задать вручную";
+  const outputPlans = (analysis.future_output_columns || []).map((target) => `${target.column} (${target.planned_header || "будущая колонка"}): занято ${target.value_count || 0}, формул ${target.formula_count || 0}, объединений ${target.merges?.length || 0}, комментариев ${target.comments?.length || 0}, объекты ${target.meaningful_objects ? "есть" : "нет"}${target.hidden ? ", скрыт" : ""}`).join(" · ");
+  $("#tender-preview-summary").innerHTML = `<div class="tender-preview-summary">
+    <p><b>Файл:</b> ${escapeHtml(preview.filename || "—")} · <b>лист:</b> ${escapeHtml(analysis.sheet_name || "—")} · <b>строка заголовка:</b> ${analysis.header_row || "—"} · <b>позиции:</b> ${analysis.item_count || 0}</p>
+    <p><b>Разделы:</b> ${counts.section || 0} · <b>итоги:</b> ${counts.total || 0} · <b>граница таблицы:</b> ${escapeHtml(analysis.logical_right_column || "—")}</p>
+    ${analysis.item_count ? "" : "<p class=\"tender-warnings\">Позиции не найдены. Добавьте строки позиций и загрузите книгу повторно.</p>"}
+    <p><b>Сопоставление:</b> ${escapeHtml(mappingText)}</p>
+    ${outputPlans ? `<p><b>Кандидаты будущих колонок:</b> ${escapeHtml(outputPlans)}</p>` : ""}
+    ${analysis.official_template ? "<p>Ошибок структуры нет.</p>" : ""}${warnings}
+    <div class="tender-table-wrap"><table class="tender-table"><thead><tr><th>Строка</th><th>Код ресурса</th><th>Наименование</th><th>Ед. изм.</th><th>Кол-во</th></tr></thead><tbody>${sample}</tbody></table></div>
+    </div>`;
+  renderTenderMappingControls(analysis);
+  $("#tender-map-submit").hidden = analysis.official_template || !analysis.mapping_required;
+  $("#tender-confirm-import").hidden = analysis.mapping_required || Number(analysis.item_count || 0) < 1;
+}
+
+function renderTenderMappingControls(analysis) {
+  const container = $("#tender-mapping-controls");
+  if (!analysis.mapping_required) { container.replaceChildren(); container.hidden = true; return; }
+  const candidates = analysis.header_candidates || [{sheet_name:analysis.sheet_name,header_row:analysis.header_row,headers:analysis.headers,mapping:analysis.mapping}];
+  const selectedIndex = Math.max(0, candidates.findIndex((candidate) => candidate.sheet_name === analysis.sheet_name && candidate.header_row === analysis.header_row));
+  container.innerHTML = `<div class="tender-mapping-field"><label for="tender-map-header">Лист и строка заголовка</label><select id="tender-map-header">${candidates.map((candidate,index) => `<option value="${index}" ${index === selectedIndex ? "selected" : ""}>${escapeHtml(candidate.sheet_name)} · строка ${candidate.header_row}</option>`).join("")}</select></div><div id="tender-mapping-fields"></div>`;
+  renderTenderMappingFields(candidates[selectedIndex]);
+  container.hidden = false;
+}
+
+function renderTenderMappingFields(candidate) {
+  if (!candidate) return;
+  const grid = document.querySelector("#tender-mapping-fields");
+  const labels = {resource_code:"Код ресурса / исходная ссылка",name:"Наименование (обязательно)",unit:"Единица измерения",quantity:"Количество (обязательно)",article:"Артикул (только явная колонка артикула)",manufacturer:"Производитель",model:"Модель / тип"};
+  grid.innerHTML = `<p class="hint">Сопоставьте колонки явно. Общий заголовок «Код» не считается артикулом автоматически.</p><div class="tender-mapping-grid">${Object.entries(labels).map(([field,label]) => `<div class="tender-mapping-field"><label for="tender-map-${field}">${label}</label><select id="tender-map-${field}" data-tender-map="${field}">${tenderColumnOptions(candidate.headers || [], candidate.mapping?.[field] ?? null)}</select></div>`).join("")}</div>`;
+}
+
+async function submitExcelTenderMapping() {
+  const previewId = state.excelTender.previewId;
+  if (!previewId) return;
+  const generation = ++state.excelTender.pollGeneration;
+  const candidateIndex = Number(document.querySelector("#tender-map-header")?.value || 0);
+  const candidate = state.excelTender.preview?.analysis?.header_candidates?.[candidateIndex] || state.excelTender.preview?.analysis;
+  const selects = $$("#tender-mapping-controls [data-tender-map]");
+  const mapping = Object.fromEntries(selects.map((select) => [select.dataset.tenderMap, select.value ? Number(select.value) : null]));
+  try {
+    const result = await api(`/api/manual-tenders/previews/${encodeURIComponent(previewId)}/mapping`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sheet_name:candidate.sheet_name,header_row:candidate.header_row,mapping})});
+    state.excelTender.jobId = result.job_id;
+    $("#tender-preview-status").textContent = "Проверяем выбранное сопоставление…";
+    await waitForExcelTenderPreview(generation);
+  } catch (error) { toast(error.message || "Не удалось проверить сопоставление", "error"); }
+}
+
+async function confirmExcelTenderImport() {
+  const previewId = state.excelTender.previewId;
+  if (!previewId) return;
+  try {
+    const workspace = await api(`/api/manual-tenders/previews/${encodeURIComponent(previewId)}/confirm`, {method:"POST"});
+    openExcelTenderWorkspace(workspace);
+  } catch (error) { toast(error.message || "Не удалось импортировать позиции", "error"); }
+}
+
+function openExcelTenderWorkspace(workspace, {persist = true} = {}) {
+  state.excelTender.workspace = workspace;
+  state.excelTender.selectedIds = new Set();
+  $("#tender-document-name").textContent = workspace.filename || "Тендер из Excel";
+  $("#tender-document-meta").textContent = `Лист ${workspace.sheet_name} · исходная книга ${String(workspace.source_sha256 || "").slice(0,12)}`;
+  $("#tender-preview-pane").hidden = true;
+  $("#tender-workspace-pane").hidden = false;
+  $("#tender-workspace-summary").textContent = `Позиций: ${workspace.counts?.item || 0} · исходная строка заголовка: ${workspace.header_row} · граница таблицы: ${workspace.logical_right_edge ? String.fromCharCode(64 + workspace.logical_right_edge) : "—"}`;
+  $("#tender-row-search").value = "";
+  renderExcelTenderRows();
+  if (persist) storeExcelTenderView(workspace.tender_id);
+  setView("excel-tender");
+}
+
+function renderExcelTenderRows() {
+  const workspace = state.excelTender.workspace;
+  if (!workspace) return;
+  const query = String($("#tender-row-search").value || "").trim().toLocaleLowerCase();
+  const items = (workspace.rows || []).filter((row) => row.row_type === "item");
+  const visible = items.filter((row) => !query || [row.name,row.resource_code,row.article,row.manufacturer,row.model].some((value) => String(value || "").toLocaleLowerCase().includes(query)));
+  $("#tender-rows").innerHTML = visible.map((row) => `<tr data-tender-row="${escapeHtml(row.source_row_id)}"><td><input type="checkbox" class="tender-row-select" data-row-id="${escapeHtml(row.source_row_id)}" ${state.excelTender.selectedIds.has(row.source_row_id) ? "checked" : ""} aria-label="Выбрать строку Excel ${row.excel_row}"></td><td>${row.excel_row}</td><td>${escapeHtml(row.resource_code || "")}</td><td>${escapeHtml(row.name || "")}</td><td>${escapeHtml(row.raw_unit || "")}</td><td>${escapeHtml(row.quantity_raw || "")}</td><td>${escapeHtml(row.article || "")}</td><td>${escapeHtml([row.manufacturer,row.model].filter(Boolean).join(" · "))}</td><td>${escapeHtml((row.warnings || []).join(" "))}${row.quantity_trusted ? "" : " · Количество требует проверки"}</td></tr>`).join("");
+  $("#tender-row-count").textContent = `Показано ${visible.length} из ${items.length} позиций. Выбрано: ${state.excelTender.selectedIds.size}. Исходные значения доступны только для чтения.`;
+  const selectAll = $("#tender-select-all");
+  selectAll.checked = visible.length > 0 && visible.every((row) => state.excelTender.selectedIds.has(row.source_row_id));
+  selectAll.indeterminate = visible.some((row) => state.excelTender.selectedIds.has(row.source_row_id)) && !selectAll.checked;
+}
+
+async function deleteExcelTenderWorkspace() {
+  const workspace = state.excelTender.workspace;
+  if (!workspace || !confirm("Удалить рабочее пространство этого тендера? Исходный файл будет удалён вместе с ним.")) return;
+  try {
+    await api(`/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}`, {method:"DELETE"});
+    clearExcelTenderState();
+    setView("upload");
+  } catch (error) { toast(error.message || "Не удалось удалить тендер", "error"); }
 }
 
 function parseManualPaste(text) {
@@ -4778,6 +5034,40 @@ function setupEvents() {
   $("#cancel-reset-user-password").addEventListener("click", closePasswordReset);
   $("#pdf-file").addEventListener("change", (event) => uploadFile(event.target.files[0]));
   $("#open-manual-entry").addEventListener("click", openManualWorkspace);
+  $("#open-tender-xlsx").addEventListener("click", openExcelTenderImport);
+  $("#download-tender-template").addEventListener("click", () => { void downloadExcelTenderTemplate(); });
+  $("#tender-retry-upload").addEventListener("click", () => $("#tender-xlsx-file").click());
+  $("#tender-xlsx-file").addEventListener("change", (event) => { void uploadExcelTender(event.target.files?.[0]); });
+  $("#tender-back-to-start").addEventListener("click", () => setView("upload"));
+  $("#tender-map-submit").addEventListener("click", () => { void submitExcelTenderMapping(); });
+  $("#tender-mapping-controls").addEventListener("change", (event) => {
+    if (event.target.id !== "tender-map-header") return;
+    const candidate = state.excelTender.preview?.analysis?.header_candidates?.[Number(event.target.value)];
+    renderTenderMappingFields(candidate);
+  });
+  $("#tender-confirm-import").addEventListener("click", () => { void confirmExcelTenderImport(); });
+  $("#tender-delete-workspace").addEventListener("click", () => { void deleteExcelTenderWorkspace(); });
+  $("#tender-row-search").addEventListener("input", () => {
+    if (state.excelTender.filterTimer) clearTimeout(state.excelTender.filterTimer);
+    state.excelTender.filterTimer = setTimeout(() => { state.excelTender.filterTimer = null; renderExcelTenderRows(); }, 120);
+  });
+  $("#tender-rows").addEventListener("change", (event) => {
+    const checkbox = event.target.closest(".tender-row-select");
+    if (!checkbox) return;
+    if (checkbox.checked) state.excelTender.selectedIds.add(checkbox.dataset.rowId);
+    else state.excelTender.selectedIds.delete(checkbox.dataset.rowId);
+    renderExcelTenderRows();
+  });
+  $("#tender-select-all").addEventListener("change", (event) => {
+    const query = String($("#tender-row-search").value || "").trim().toLocaleLowerCase();
+    for (const row of (state.excelTender.workspace?.rows || []).filter((item) => item.row_type === "item")) {
+      const matches = !query || [row.name,row.resource_code,row.article,row.manufacturer,row.model].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+      if (!matches) continue;
+      if (event.target.checked) state.excelTender.selectedIds.add(row.source_row_id);
+      else state.excelTender.selectedIds.delete(row.source_row_id);
+    }
+    renderExcelTenderRows();
+  });
   $("#manual-back-to-start").addEventListener("click", returnToStartFromManual);
   $("#manual-add-row").addEventListener("click", () => addManualRow());
   $("#manual-paste-list").addEventListener("click", () => $("#manual-paste-modal").showModal());

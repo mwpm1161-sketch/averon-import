@@ -20,7 +20,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -81,6 +81,16 @@ from averon_import.services.one_c_history import (
 )
 from averon_import.services.one_c_history.models import ImportMappingRequest, PreviewMappingRequest
 from averon_import.services.one_c_history.xlsx_import import OneCImportError
+from averon_import.services.manual_tenders import (
+    TenderActivityConflict,
+    TenderActivityRegistry,
+    TenderParseError,
+    TenderTemplateService,
+    TenderWorkbookParser,
+    TenderWorkspaceError,
+    TenderWorkspaceRepository,
+)
+from averon_import.services.manual_tenders.parser import MAX_UPLOAD_BYTES as MAX_MANUAL_TENDER_UPLOAD_BYTES
 from averon_import.services.document_mutation import DocumentMutationLocks
 from averon_import.services.document_lifecycle import (
     DocumentActivityRegistry,
@@ -179,6 +189,10 @@ app_settings_service = AppSettingsService(DATA_DIR)
 one_c_history_repository = OneCHistoryRepository(DATA_DIR)
 one_c_history_activity = OneCHistoryActivityRegistry()
 one_c_history_service = OneCHistoryImportService(one_c_history_repository, one_c_history_activity)
+tender_activity = TenderActivityRegistry()
+tender_repository = TenderWorkspaceRepository(DATA_DIR, tender_activity)
+tender_parser = TenderWorkbookParser()
+tender_template_service = TenderTemplateService()
 secret_store = create_secret_store(DATA_DIR)
 yandex_vision_provider = YandexVisionProvider(
     settings_service=app_settings_service,
@@ -441,6 +455,205 @@ def get_one_c_history_status(_admin: CurrentUser = Depends(require_admin)):
 @app.get("/api/one-c-history")
 def get_capability_one_c_history_status(user: CurrentUser = Depends(require_one_c_history_import)):
     return _one_c_history_status(include_audit=user.capabilities["settings"])
+
+
+def _tender_owner_key(user: CurrentUser) -> str:
+    if user.user_id:
+        return f"id:{user.user_id[:128]}"
+    return f"username:{normalize_username(user.username)[:128]}"
+
+
+def _tender_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, (TenderWorkspaceError, TenderParseError)):
+        return HTTPException(
+            status_code=getattr(exc, "status_code", 400),
+            detail={"code": getattr(exc, "code", "TENDER_XLSX_INVALID"), "message": str(exc)},
+        )
+    if isinstance(exc, TenderActivityConflict):
+        return HTTPException(status_code=409, detail={"code": "TENDER_WORKSPACE_BUSY", "message": str(exc)})
+    raise exc
+
+
+def _submit_tender_parse_job(preview_id: str, owner_id: str, *, mapping: dict[str, int | None] | None = None, selected_sheet: str | None = None, selected_header_row: int | None = None):
+    repository = tender_repository
+    parser = tender_parser
+    activity = tender_activity
+    try:
+        lease = activity.acquire(preview_id)
+    except TenderActivityConflict as exc:
+        raise _tender_http_error(exc) from exc
+
+    def run(progress):
+        try:
+            path, metadata = repository.preview_path(preview_id, owner_id)
+            repository.update_preview(preview_id, owner_id, status="analyzing", error=None)
+            progress(0, 1, "Проверяем структуру книги")
+            analysis = parser.parse(path, tender_id=preview_id, mapping_override=mapping, selected_sheet=selected_sheet, selected_header_row=selected_header_row)
+            repository.update_preview(
+                preview_id, owner_id, status="ready", parser_version=analysis["parser_version"],
+                mapping=analysis["mapping"], analysis=analysis, error=None,
+            )
+            progress(1, 1, "Проверка завершена")
+            return {"preview_id": preview_id, "status": "ready"}
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, (TenderParseError, TenderWorkspaceError)) else "Не удалось безопасно проанализировать XLSX. Загрузите файл повторно или проверьте его структуру."
+            try:
+                repository.update_preview(preview_id, owner_id, status="failed", error=message)
+            except Exception:
+                pass
+            if isinstance(exc, (TenderParseError, TenderWorkspaceError)):
+                raise
+            raise TenderParseError(message, "TENDER_PARSE_FAILED") from exc
+
+    try:
+        return job_service.submit(
+            run,
+            lane=DOCUMENT_PROCESSING,
+            kind="manual_tender_xlsx_preview",
+            owner_id=owner_id,
+            document_id=preview_id,
+            dedupe_key=stable_fingerprint({
+                "owner": owner_id, "preview": preview_id, "mapping": mapping,
+                "sheet": selected_sheet, "header_row": selected_header_row,
+            }),
+            release_callbacks=[lease.release],
+        )
+    except JobAdmissionError as exc:
+        lease.release()
+        raise _job_admission_http_error(exc) from exc
+    except Exception:
+        lease.release()
+        raise
+
+
+class TenderMappingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sheet_name: str
+    header_row: StrictInt = Field(ge=1, le=50)
+    mapping: dict[str, StrictInt | None]
+
+
+@app.get("/api/manual-tenders/template", dependencies=[Depends(require_authenticated)])
+def download_manual_tender_template():
+    filename = "Averon_Шаблон_тендера_v1.xlsx"
+    return Response(
+        content=tender_template_service.bytes(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''Averon_%D0%A8%D0%B0%D0%B1%D0%BB%D0%BE%D0%BD_%D1%82%D0%B5%D0%BD%D0%B4%D0%B5%D1%80%D0%B0_v1.xlsx"},
+    )
+
+
+@app.post("/api/manual-tenders/previews", status_code=202, dependencies=[Depends(require_authenticated)])
+async def create_manual_tender_preview(file: UploadFile = File(...), user: CurrentUser = Depends(require_authenticated)):
+    filename = file.filename or "tender.xlsx"
+    payload = bytearray()
+    digest = hashlib.sha256()
+    while chunk := await file.read(64 * 1024):
+        payload.extend(chunk)
+        if len(payload) > MAX_MANUAL_TENDER_UPLOAD_BYTES:
+            raise HTTPException(413, detail={"code": "TENDER_UPLOAD_TOO_LARGE", "message": "Размер XLSX превышает 5 МиБ."})
+        digest.update(chunk)
+    if not payload:
+        raise HTTPException(400, detail={"code": "TENDER_XLSX_EMPTY", "message": "Файл XLSX пуст."})
+    owner_id = _tender_owner_key(user)
+    existing = tender_repository.find_preview_by_hash(owner_id, digest.hexdigest())
+    if existing:
+        return {"preview_id": existing["preview_id"], "status": existing["status"], "job_id": None, "deduplicated": True}
+    metadata = None
+    try:
+        metadata = tender_repository.reserve_preview(owner_id, filename, len(payload), digest.hexdigest())
+        if metadata.get("deduplicated"):
+            return {"preview_id": metadata["preview_id"], "status": metadata["status"], "job_id": None, "deduplicated": True}
+        tender_repository.write_preview_source(metadata["preview_id"], bytes(payload))
+        job = _submit_tender_parse_job(metadata["preview_id"], owner_id)
+        return {"preview_id": metadata["preview_id"], "status": "queued", "job_id": job.id, "deduplicated": False}
+    except Exception as exc:
+        try:
+            if metadata is not None and not metadata.get("deduplicated"):
+                tender_repository.update_preview(metadata["preview_id"], owner_id, status="failed", error="Не удалось поставить файл в очередь. Повторите загрузку.")
+        except Exception:
+            pass
+        if isinstance(exc, HTTPException):
+            raise
+        raise _tender_http_error(exc) from exc
+
+
+@app.get("/api/manual-tenders/previews/{preview_id}", dependencies=[Depends(require_authenticated)])
+def get_manual_tender_preview(preview_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        lease = tender_activity.acquire(preview_id)
+        try:
+            return tender_repository.public_preview(preview_id, _tender_owner_key(user))
+        finally:
+            lease.release()
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
+
+
+@app.post("/api/manual-tenders/previews/{preview_id}/mapping", status_code=202, dependencies=[Depends(require_authenticated)])
+def map_manual_tender_preview(preview_id: str, request: TenderMappingBody, user: CurrentUser = Depends(require_authenticated)):
+    owner_id = _tender_owner_key(user)
+    try:
+        request_lease = tender_activity.acquire(preview_id)
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
+    try:
+        _, metadata = tender_repository.preview_path(preview_id, owner_id)
+        analysis = metadata.get("analysis") or {}
+        if not analysis or analysis.get("official_template"):
+            raise TenderWorkspaceError("Для официального шаблона сопоставление не требуется.", 409, "TENDER_MAPPING_NOT_ALLOWED")
+        candidate = next((
+            item for item in analysis.get("header_candidates", [])
+            if item.get("sheet_name") == request.sheet_name and item.get("header_row") == request.header_row
+        ), None)
+        if candidate is None:
+            raise TenderWorkspaceError("Лист или строка заголовка изменились. Загрузите файл повторно для новой проверки.", 409, "TENDER_MAPPING_SCOPE_CHANGED")
+        tender_parser.validate_mapping_override(request.mapping, candidate.get("headers", []))
+        previous_status = metadata.get("status", "ready")
+        tender_repository.update_preview(preview_id, owner_id, status="queued", error=None)
+        try:
+            job = _submit_tender_parse_job(preview_id, owner_id, mapping=request.mapping, selected_sheet=request.sheet_name, selected_header_row=request.header_row)
+        except HTTPException as exc:
+            tender_repository.update_preview(preview_id, owner_id, status=previous_status, error=None)
+            raise exc
+        return {"preview_id": preview_id, "status": "queued", "job_id": job.id}
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
+    finally:
+        request_lease.release()
+
+
+@app.post("/api/manual-tenders/previews/{preview_id}/confirm", status_code=201, dependencies=[Depends(require_authenticated)])
+def confirm_manual_tender_preview(preview_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        lease = tender_activity.acquire(preview_id)
+        try:
+            return tender_repository.confirm(preview_id, _tender_owner_key(user))
+        finally:
+            lease.release()
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
+
+
+@app.get("/api/manual-tenders/{tender_id}", dependencies=[Depends(require_authenticated)])
+def get_manual_tender(tender_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        lease = tender_activity.acquire(tender_id)
+        try:
+            return tender_repository.public_workspace(tender_id, _tender_owner_key(user))
+        finally:
+            lease.release()
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
+
+
+@app.delete("/api/manual-tenders/{tender_id}", dependencies=[Depends(require_authenticated)])
+def delete_manual_tender(tender_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        tender_repository.delete(tender_id, _tender_owner_key(user))
+        return {"deleted": True}
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
 
 
 @app.post("/api/admin/one-c-history/previews", dependencies=[Depends(require_admin)])
