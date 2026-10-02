@@ -409,6 +409,14 @@ button { cursor: pointer; }
 .history-evidence-badge { color:#1e40af; background:#dbeafe; }
 .history-fuzzy-badge { color:#475569; background:#e2e8f0; }
 .history-review-explanation { margin:6px 0 14px; color:#475569; font-size:13px; line-height:1.5; }
+.history-candidate-wrapper { min-width:0; }
+.history-candidate-wrapper .offer-card { margin-bottom:8px; }
+.history-human-confirmation { display:grid; gap:8px; padding:12px; border:1px solid #dbe4ee; border-radius:12px; background:#f8fafc; color:#334155; font-size:13px; }
+.history-human-confirmation p { margin:0; line-height:1.45; }
+.history-human-confirmation span { color:#475569; }
+.history-confirmation-blocked { margin:8px 0; padding:10px 12px; border-radius:10px; background:#fff7ed; color:#9a3412; font-size:12px; }
+.sourcing-project-summary .human-history-count { border-color:#cbd5e1; background:#f8fafc; }
+.tender-sourcing-toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .offer-card-heading { display:flex; align-items:flex-start; gap:10px; margin-bottom:12px; }
 .offer-card-heading b { min-width:0; font-size:16px; overflow-wrap:anywhere; }
 .offer-price { font-size:25px; font-weight:700; color:#0f172a; margin-bottom:12px; }

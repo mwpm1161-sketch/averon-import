@@ -904,6 +904,8 @@ def tender_api(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "tender_activity", activity)
     monkeypatch.setattr(main, "tender_repository", repository)
     monkeypatch.setattr(main, "tender_sourcing_runs", TenderSourcingRunStore(repository))
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+    monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
     from averon_import.services.manual_tenders.price_export import TenderPriceExportRepository
     monkeypatch.setattr(main, "tender_price_exports", TenderPriceExportRepository(repository))
     isolated_jobs = JobService(max_workers=1)
@@ -1989,6 +1991,477 @@ def test_tender_price_export_target_collision_uses_semantic_empty_cells(tmp_path
         with pytest.raises(TenderWorkspaceError) as error:
             _check_target_collision(path, workspace, "Sheet")
         assert error.value.code == "TENDER_EXPORT_TARGET_OCCUPIED"
+
+
+def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article=""):
+    path = tmp_path / f"ivy-{uuid.uuid4().hex}.xlsx"
+    _official(path, include_required=False)
+    workbook = load_workbook(path)
+    sheet = workbook[TEMPLATE_SHEET]
+    sheet["A2"] = "R-IVY"
+    sheet["B2"] = "Плющ искусственный"
+    sheet["C2"] = "шт"
+    sheet["D2"] = 2
+    sheet["E2"] = source_article or None
+    workbook.save(path)
+    workbook.close()
+    payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    preview = repository.reserve_preview("username:tender-user", path.name, len(payload), digest)
+    source_path = repository.write_preview_source(preview["preview_id"], payload)
+    analysis = main.tender_parser.parse(source_path, tender_id=preview["preview_id"])
+    repository.update_preview(
+        preview["preview_id"], "username:tender-user", status="ready",
+        parser_version=analysis["parser_version"], mapping=analysis["mapping"], analysis=analysis,
+    )
+    return repository.confirm(preview["preview_id"], "username:tender-user")
+
+
+def _persist_history_review_run(
+    main, repository, workspace, *, candidates=1, classification="EXACT_NAME_UNIT",
+    offer_overrides=None, provenance_overrides=None,
+):
+    from averon_import.services.sourcing.models import (
+        HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent,
+        ProjectSourcingResult, SourcingResult, SourcingRouteMetadata, SourcingSourceMode,
+    )
+
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    version = "history-snapshot-d3"
+    intent = ProductIntent(
+        source_row_id=source["source_row_id"], source_text=source["name"],
+        normalized_name=source["name"], unit=source["raw_unit"], quantity=str(source["quantity"]),
+    )
+    offers = []
+    matches = []
+    for index in range(candidates):
+        item_id = f"history-item-{index + 1}"
+        event_id = f"history-event-{index + 1}"
+        provenance = {
+            "source":"one_c_history", "source_kind":"historical_purchase",
+            "snapshot_version":version, "history_item_id":item_id,
+            "selected_event_id":event_id, "purchase_date":"2025-04-16",
+            "price_basis":"gross_including_vat", "effective_unit_price_gross":Decimal("123.4500"),
+            "currency_basis":"company_default", "unit_family":"piece",
+        }
+        provenance.update(provenance_overrides or {})
+        offer_values = {
+            "title":source["name"], "article":"", "manufacturer":"", "brand":"",
+            "price":Decimal("123.4500"), "currency":"RUB", "price_unit":"шт",
+        }
+        offer_values.update(offer_overrides or {})
+        offer = Offer(
+            offer_id=f"one_c_history:{item_id}", provider="one_c_history", source_item_id=item_id,
+            **offer_values,
+            data_provenance=provenance,
+            history_retrieval_classification=classification,
+        )
+        offers.append(offer)
+        matches.append(MatchResult(
+            offer=offer, decision=MatchDecision.REVIEW, rank=index + 1,
+            matched_attributes=["name", "unit"],
+        ))
+    route = SourcingRouteMetadata(
+        source_mode=SourcingSourceMode.ONE_C_ONLY, final_source_kind="history_review",
+        history_outcome="REVIEW", history_catalog_version=version,
+        history_reason_code="ambiguous_exact_name_identity" if candidates > 1 else "exact_name_unit_needs_review",
+        history_candidate_count=candidates,
+    )
+    item = SourcingResult(intent=intent, offers=offers, match_results=matches, route=route)
+    result = ProjectSourcingResult(
+        positions_total=1, positions_processed=1, positions_review=1,
+        source_mode=SourcingSourceMode.ONE_C_ONLY, results=[item],
+    )
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    selected_ids = [source["source_row_id"]]
+    running = main.tender_sourcing_runs.create_running(
+        workspace_path, workspace, source_mode="one_c_only", provider=None,
+        selected_ids=selected_ids, history_catalog_version=version,
+    )
+    projection = canonical_tender_projection(result.model_dump(mode="json"), [source], selected_ids)
+    main.tender_sourcing_runs.complete(
+        workspace_path, running["run_id"],
+        summary={"positions_total":1, "positions_processed":1, "positions_matched":0, "positions_review":1, "positions_without_offers":0},
+        catalog_version=version, history_catalog_version=version, rows=projection,
+    )
+    return running["run_id"]
+
+
+def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    run_id = _persist_history_review_run(main, repository, workspace)
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    initial = _api_request(main.app, "GET", base, headers=_auth_headers())
+    assert initial.status_code == 200, initial.text
+    assert _api_request(main.app, "GET", base, headers=_auth_headers("other-user")).status_code == 404
+    snapshot = initial.json()
+    assert snapshot["decision_revision"] == 0
+    assert len(snapshot["rows"][0]["candidates"]) == 1
+    candidate = snapshot["rows"][0]["candidates"][0]
+    assert candidate["confirmable"] is True
+    assert candidate["offer"]["title"] == "Плющ искусственный"
+    before_jobs = len(main.job_service.jobs)
+
+    confirm = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE",
+            "source_row_id":snapshot["rows"][0]["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"],
+            "expected_revision":0,
+        }, ensure_ascii=False).encode(),
+    )
+    assert confirm.status_code == 200, confirm.text
+    assert len(main.job_service.jobs) == before_jobs
+    confirmed = confirm.json()
+    assert confirmed["decision_revision"] == 1
+    assert len(confirmed["events"]) == 1
+    assert confirmed["events"][0]["actor"] == {"username":"tender-user", "role":"user"}
+    assert confirmed["effective"][snapshot["rows"][0]["source_row_id"]]["candidate_offer_id"] == candidate["candidate_offer_id"]
+    durable_run = main.tender_sourcing_runs.get_public(
+        repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id,
+    )
+    assert durable_run["rows"][0]["route"]["history_outcome"] == "REVIEW"
+    assert durable_run["rows"][0]["route"]["history_safe_basis"] is None
+
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+    monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
+    restored = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    assert restored["decision_revision"] == 1
+    assert restored["effective"][snapshot["rows"][0]["source_row_id"]]["decision_id"] == confirmed["effective"][snapshot["rows"][0]["source_row_id"]]["decision_id"]
+
+    export_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export"
+    included = _api_request(
+        main.app, "POST", export_endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert included.status_code == 202, included.text
+    included_job = _wait_tender_job(main, included.json()["id"])
+    assert included_job["status"] == "completed", included_job
+    record = included_job["result"]
+    assert record["historical_count"] == 1
+    assert record["automatic_historical_count"] == 0
+    assert record["human_confirmed_historical_count"] == 1
+    assert record["history_decision_revision"] == 1
+    assert record["history_decision_digest"] == confirmed["decision_digest"]
+    file_path, _record, release = main.tender_price_exports.acquire_download(
+        repository.workspace_root / workspace["tender_id"], workspace["tender_id"], record["export_id"], "username:tender-user",
+    )
+    try:
+        workbook = load_workbook(file_path, data_only=False)
+        sheet = workbook[TEMPLATE_SHEET]
+        assert Decimal(str(sheet["H2"].value)) == Decimal("123.450000")
+        assert sheet["H2"].fill.fgColor.rgb.endswith("FFF2CC")
+        assert "подтверждено пользователем" in sheet["H2"].comment.text.casefold()
+        assert "tender-user" not in sheet["H2"].comment.text
+        workbook.close()
+    finally:
+        release()
+
+    stale = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE",
+            "source_row_id":snapshot["rows"][0]["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"],
+            "expected_revision":0,
+        }).encode(),
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "TENDER_HISTORY_DECISIONS_STALE"
+
+    decision_id = restored["effective"][snapshot["rows"][0]["source_row_id"]]["decision_id"]
+    revoked = _api_request(
+        main.app, "POST", f"{base}/{decision_id}/revoke",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"decision":"REVOKE_HISTORY_CONFIRMATION","expected_revision":1}',
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["decision_revision"] == 2
+    assert len(revoked.json()["events"]) == 2
+    assert revoked.json()["effective"] == {}
+    no_history = _api_request(
+        main.app, "POST", export_endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":true}',
+    )
+    assert no_history.status_code == 409
+    assert no_history.json()["detail"]["code"] == "TENDER_EXPORT_NO_ELIGIBLE_PRICES"
+
+
+def test_d3_exact_candidate_projection_is_bounded_and_size_safe(tmp_path):
+    from averon_import.services.sourcing.models import (
+        HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent,
+        SourcingResult,
+    )
+
+    sources = []
+    results = []
+    ids = []
+    for index in range(370):
+        row_id = f"{index + 1:032x}"
+        ids.append(row_id)
+        source = {
+            "source_row_id":row_id, "excel_row":index + 2, "row_type":"item",
+            "name":f"Реальная позиция {index + 1}", "raw_unit":"шт", "article":"",
+            "manufacturer":"", "model":"", "quantity":"1", "quantity_trusted":True,
+            "unit_basis":parse_unit_basis("шт"),
+        }
+        sources.append(source)
+        provenance = {
+            "source":"one_c_history", "source_kind":"historical_purchase",
+            "snapshot_version":"history-snapshot-size", "history_item_id":f"item-{index}",
+            "selected_event_id":f"event-{index}", "purchase_date":"2025-04-16",
+            "price_basis":"gross_including_vat", "effective_unit_price_gross":"10.00",
+            "currency_basis":"company_default", "unit_family":"piece",
+        }
+        offer = Offer(
+            offer_id=f"one_c_history:item-{index}", provider="one_c_history", source_item_id=f"item-{index}",
+            title=source["name"], price=Decimal("10.00"), currency="RUB", price_unit="шт",
+            data_provenance=provenance,
+            history_retrieval_classification=HistoryRetrievalClassification.EXACT_NAME_UNIT,
+        )
+        match = MatchResult(offer=offer, decision=MatchDecision.REVIEW, rank=1, matched_attributes=["name", "unit"])
+        results.append(SourcingResult(
+            intent=ProductIntent(source_row_id=row_id, source_text=source["name"], normalized_name=source["name"], unit="шт"),
+            offers=[offer], match_results=[match],
+            route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW"},
+        ).model_dump(mode="json"))
+    projection = canonical_tender_projection({"results":results}, sources, ids)
+    run = {
+        "schema_version":1,"run_id":"a" * 32,"tender_id":"b" * 32,
+        "source_sha256":"c" * 64,"workspace_revision":1,"status":"completed",
+        "source_mode":"one_c_only","history_catalog_version":"history-snapshot-size",
+        "selected_source_row_ids":ids,"rows":projection,
+    }
+    encoded = json.dumps(run, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert all(len(row["history_review_candidates"]) == 1 for row in projection)
+    assert len(encoded) < MAX_TENDER_RUN_BYTES
+
+
+def test_d3_ambiguous_exact_choices_append_and_latest_confirmation_is_effective(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    run_id = _persist_history_review_run(main, repository, workspace, candidates=2)
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    candidates = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    choices = candidates["rows"][0]["candidates"]
+    assert len(choices) == 2 and all(choice["confirmable"] for choice in choices)
+    source_row_id = candidates["rows"][0]["source_row_id"]
+
+    def confirm(choice, revision):
+        return _api_request(
+            main.app, "POST", base,
+            headers={**_auth_headers(), "Content-Type":"application/json"},
+            body=json.dumps({
+                "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source_row_id,
+                "candidate_offer_id":choice["candidate_offer_id"], "expected_revision":revision,
+            }).encode(),
+        )
+
+    first = confirm(choices[0], 0)
+    assert first.status_code == 200
+    second = confirm(choices[1], 1)
+    assert second.status_code == 200
+    state = second.json()
+    assert state["decision_revision"] == 2
+    assert [event["decision_type"] for event in state["events"]] == ["CONFIRM_HISTORY_CANDIDATE"] * 2
+    assert state["effective"][source_row_id]["candidate_offer_id"] == choices[1]["candidate_offer_id"]
+
+
+def test_d3_confirmable_exact_article_and_hard_conflicts_fail_closed(tender_api, tmp_path):
+    main, repository = tender_api
+    article_workspace = _confirm_ivy_history_tender(main, repository, tmp_path, source_article="SKU-42")
+    article_run = _persist_history_review_run(
+        main, repository, article_workspace, classification="EXACT_ARTICLE",
+        offer_overrides={"article":"SKU-42"},
+    )
+    article_base = f"/api/manual-tenders/{article_workspace['tender_id']}/runs/{article_run}/history-decisions"
+    article_snapshot = _api_request(main.app, "GET", article_base, headers=_auth_headers()).json()
+    assert article_snapshot["rows"][0]["candidates"][0]["confirmable"] is True
+    repository.delete(article_workspace["tender_id"], "username:tender-user")
+
+    invalid_cases = [
+        ("article_mismatch", {"source_article":"SKU-SOURCE", "classification":"EXACT_NAME_UNIT", "offer_overrides":{"article":"SKU-OTHER"}}),
+        ("unit_mismatch", {"offer_overrides":{"price_unit":"кг"}, "provenance_overrides":{"unit_family":"kilogram"}}),
+        ("invalid_provenance", {"provenance_overrides":{"source":"untrusted"}}),
+        ("missing_price", {"offer_overrides":{"price":None}}),
+        ("future_date", {"provenance_overrides":{"purchase_date":"2999-01-01"}}),
+        ("non_rub", {"offer_overrides":{"currency":"USD"}, "provenance_overrides":{"currency_basis":"source"}}),
+        ("fuzzy", {"classification":"FUZZY"}),
+    ]
+    for _name, options in invalid_cases:
+        source_article = options.pop("source_article", "")
+        workspace = _confirm_ivy_history_tender(main, repository, tmp_path, source_article=source_article)
+        run_id = _persist_history_review_run(main, repository, workspace, **options)
+        base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+        state = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+        source_row_id = workspace["rows"][0]["source_row_id"]
+        offer_id = "one_c_history:history-item-1"
+        candidate = next((item for item in state["rows"][0]["candidates"] if item["candidate_offer_id"] == offer_id), None)
+        if candidate is not None:
+            assert candidate["confirmable"] is False, _name
+        response = _api_request(
+            main.app, "POST", base,
+            headers={**_auth_headers(), "Content-Type":"application/json"},
+            body=json.dumps({
+                "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source_row_id,
+                "candidate_offer_id":offer_id, "expected_revision":state["decision_revision"],
+            }).encode(),
+        )
+        if _name == "fuzzy":
+            assert response.status_code == 404
+        else:
+            assert response.status_code == 409, (_name, response.text)
+            assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
+        repository.delete(workspace["tender_id"], "username:tender-user")
+
+
+def test_d3_stored_confirmation_is_inactive_when_candidate_evidence_changes(tender_api, tmp_path):
+    import copy
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    run_id = _persist_history_review_run(main, repository, workspace)
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    confirmed = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({"decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":snapshot["rows"][0]["source_row_id"], "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0}).encode(),
+    )
+    assert confirmed.status_code == 200
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    original_run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
+    ledger_path = workspace_path / "history-decisions" / f"{run_id}.json"
+    original_ledger = ledger_path.read_bytes()
+    mutations = [
+        lambda run: run["rows"][0]["history_review_candidates"][0]["offer"].update(price="999.00"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["offer"].update(price_unit="кг"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["offer"].update(offer_id="changed-offer"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["offer"].update(retrieval_classification="FUZZY"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["price_provenance"].update(history_item_id="changed-item"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["price_provenance"].update(selected_event_id="changed-event"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["price_provenance"].update(purchase_date="2025-04-17"),
+        lambda run: run["rows"][0]["history_review_candidates"][0]["match"].update(offer_id="changed-match"),
+        lambda run: run["rows"][0].update(physical_excel_row=99),
+        lambda run: run.update(history_catalog_version="changed-snapshot"),
+    ]
+    for mutate in mutations:
+        ledger_path.write_bytes(original_ledger)
+        changed = copy.deepcopy(original_run)
+        mutate(changed)
+        try:
+            current = main.tender_history_decisions.get_snapshot(workspace_path, workspace, changed, workspace["tender_id"], run_id)
+        except TenderWorkspaceError as error:
+            assert error.code in {"TENDER_RUN_CORRELATION_FAILED", "TENDER_RESULT_CORRELATION_FAILED", "TENDER_RUN_WORKSPACE_MISMATCH"}
+        else:
+            assert current["effective"] == {}
+    ledger = json.loads(original_ledger)
+    ledger["events"][0]["evidence_fingerprint"] = "f" * 64
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    assert main.tender_history_decisions.get_snapshot(
+        workspace_path, workspace, original_run, workspace["tender_id"], run_id,
+    )["effective"] == {}
+    ledger_path.write_bytes(original_ledger)
+
+    for changed_workspace in (
+        {**workspace, "source_sha256":"f" * 64},
+        {**workspace, "revision":int(workspace["revision"]) + 1},
+    ):
+        with pytest.raises(TenderWorkspaceError) as mismatch:
+            main.tender_history_decisions.get_snapshot(
+                workspace_path, changed_workspace, original_run, workspace["tender_id"], run_id,
+            )
+        assert mismatch.value.code == "TENDER_RUN_WORKSPACE_MISMATCH"
+    with pytest.raises(TenderWorkspaceError):
+        main.tender_history_decisions.get_snapshot(
+            workspace_path, workspace, original_run, workspace["tender_id"], "d" * 32,
+        )
+    unknown = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":"e" * 32,
+            "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":1,
+        }).encode(),
+    )
+    assert unknown.status_code == 404
+
+
+def test_d3_human_history_ui_lifecycle_regression():
+    node = shutil.which("node")
+    assert node, "Node.js is required for the manual tender human-history UI regression"
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [node, str(root / "tests" / "js" / "manual_tender_history_decisions.cjs"), str(root / "averon_import" / "static" / "app.js")],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS: exact-only confirmation UI" in result.stdout
+
+
+def test_d3_export_fails_if_decision_set_changes_before_runner(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    run_id = _persist_history_review_run(main, repository, workspace)
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    candidates = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = candidates["rows"][0]["candidates"][0]
+    source_row_id = candidates["rows"][0]["source_row_id"]
+    confirmed = main.tender_history_decisions.confirm(
+        repository.workspace_root / workspace["tender_id"], workspace,
+        main.tender_sourcing_runs.get_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id),
+        tender_id=workspace["tender_id"], run_id=run_id, source_row_id=source_row_id,
+        candidate_offer_id=candidate["candidate_offer_id"], expected_revision=0,
+        actor_username="tender-user", actor_role="user",
+    )
+    original_submit = main.job_service.submit
+
+    def submit_after_decision_change(*args, **kwargs):
+        if kwargs.get("kind") == "manual_tender_price_export":
+            run = main.tender_sourcing_runs.get_public(repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id)
+            main.tender_history_decisions.confirm(
+                repository.workspace_root / workspace["tender_id"], workspace, run,
+                tender_id=workspace["tender_id"], run_id=run_id, source_row_id=source_row_id,
+                candidate_offer_id=candidate["candidate_offer_id"], expected_revision=confirmed["decision_revision"],
+                actor_username="tender-user", actor_role="user",
+            )
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(main.job_service, "submit", submit_after_decision_change)
+    response = _api_request(
+        main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert response.status_code == 202, response.text
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "failed", job
+    assert job["error_code"] == "TENDER_HISTORY_DECISIONS_CHANGED"
+    assert not list((repository.workspace_root / workspace["tender_id"] / "exports").glob("*.xlsx")) if (repository.workspace_root / workspace["tender_id"] / "exports").exists() else True
+
+
+def test_d3_history_confirmation_is_never_projected_for_fuzzy_or_mixed_mode(tmp_path):
+    from averon_import.services.sourcing.models import HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent, SourcingResult, SourcingSourceMode
+
+    source = {"source_row_id":"a" * 32, "excel_row":2, "row_type":"item", "name":"Source", "raw_unit":"шт"}
+    provenance = {"source":"one_c_history", "source_kind":"historical_purchase"}
+    offer = Offer(
+        offer_id="history:fuzzy", provider="one_c_history", source_item_id="item", title="Similar",
+        history_retrieval_classification=HistoryRetrievalClassification.FUZZY, data_provenance=provenance,
+    )
+    match = MatchResult(offer=offer, decision=MatchDecision.REVIEW, rank=1)
+    intent = ProductIntent(source_row_id=source["source_row_id"], source_text="Source")
+    one_c_review = SourcingResult(intent=intent, offers=[offer], match_results=[match], route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW"})
+    mixed_review = one_c_review.model_copy(update={"route":one_c_review.route.model_copy(update={"source_mode":SourcingSourceMode.ONE_C_THEN_PROVIDER})})
+    for result in (one_c_review, mixed_review):
+        row = canonical_tender_projection({"results":[result.model_dump(mode="json")]}, [source], [source["source_row_id"]])[0]
+        assert row["history_review_candidates"] == []
 
 
 def test_tender_price_resolver_uses_only_proven_etm_pricewnds(tender_api, tmp_path):

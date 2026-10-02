@@ -52,6 +52,7 @@ _PRICE_PROVENANCE_STRING_LIMITS = {
     "mirror_revision": 120,
 }
 _OMIT_PROVENANCE = object()
+_MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW = 3
 
 
 def _now() -> str:
@@ -291,6 +292,7 @@ class TenderSourcingRunStore:
         for _, path in terminal[:-MAX_TENDER_RUNS_PER_WORKSPACE]:
             try:
                 path.unlink(missing_ok=True)
+                (workspace_path / "history-decisions" / path.name).unlink(missing_ok=True)
             except OSError:
                 continue
 
@@ -331,6 +333,23 @@ def _safe_match(match: dict[str, Any] | None) -> dict[str, Any] | None:
     offer = match.get("offer") if isinstance(match.get("offer"), dict) else {}
     if isinstance(offer.get("offer_id"), str):
         safe["offer_id"] = offer["offer_id"][:180]
+    return safe
+
+
+def _safe_history_review_match(match: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key in ("decision",):
+        value = match.get(key)
+        if isinstance(value, str):
+            safe[key] = value[:40]
+    offer = match.get("offer") if isinstance(match.get("offer"), dict) else {}
+    offer_id = offer.get("offer_id")
+    if isinstance(offer_id, str):
+        safe["offer_id"] = offer_id[:180]
+    for key in ("matched_attributes", "supporting_attributes", "conflicting_attributes", "missing_attributes"):
+        values = match.get(key)
+        if isinstance(values, list):
+            safe[key] = [item[:80] for item in values[:20] if isinstance(item, str)]
     return safe
 
 
@@ -398,6 +417,7 @@ def canonical_tender_projection(
         source = rows_by_id[source_row_id]
         offer = result.get("recommended_offer") if isinstance(result.get("recommended_offer"), dict) else None
         matches = result.get("match_results") if isinstance(result.get("match_results"), list) else []
+        offers = result.get("offers") if isinstance(result.get("offers"), list) else []
         recommended_match = next(
             (item for item in matches if isinstance(item, dict) and offer and (item.get("offer") or {}).get("offer_id") == offer.get("offer_id")),
             None,
@@ -405,6 +425,42 @@ def canonical_tender_projection(
         if recommended_match is None and isinstance(result.get("review_candidate"), dict):
             recommended_match = result["review_candidate"]
         route = result.get("route") if isinstance(result.get("route"), dict) else {}
+        history_review_candidates: list[dict[str, Any]] = []
+        if route.get("source_mode") == "one_c_only" and route.get("final_source_kind") == "history_review":
+            match_by_offer_id = {
+                str((item.get("offer") or {}).get("offer_id") or ""): item
+                for item in matches
+                if isinstance(item, dict) and isinstance(item.get("offer"), dict)
+            }
+            for candidate in offers:
+                if not isinstance(candidate, dict):
+                    continue
+                classification = candidate.get("history_retrieval_classification")
+                if classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT"}:
+                    continue
+                candidate_match = match_by_offer_id.get(str(candidate.get("offer_id") or ""))
+                if not isinstance(candidate_match, dict) or candidate_match.get("decision") == "REJECT":
+                    continue
+                safe_candidate: dict[str, Any] = {}
+                for key, limit in (
+                    ("offer_id", 180), ("provider", 40), ("source_item_id", 180), ("title", 500),
+                    ("article", 180), ("manufacturer", 180), ("brand", 180), ("currency", 12),
+                    ("price_unit", 80), ("retrieved_at", 40),
+                ):
+                    value = candidate.get(key)
+                    if isinstance(value, str):
+                        safe_candidate[key] = value[:limit]
+                price_value = candidate.get("price")
+                if price_value is None or isinstance(price_value, (str, int, float)) and len(str(price_value)) <= 100:
+                    safe_candidate["price"] = price_value
+                safe_candidate["retrieval_classification"] = classification
+                history_review_candidates.append({
+                    "offer": safe_candidate,
+                    "price_provenance": _safe_price_provenance(candidate),
+                    "match": _safe_history_review_match(candidate_match),
+                })
+                if len(history_review_candidates) >= _MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW:
+                    break
         notices = result.get("notices") if isinstance(result.get("notices"), list) else []
         notice_codes = sorted({
             str(item.get("code")) for item in notices
@@ -431,6 +487,7 @@ def canonical_tender_projection(
                 if key in intent
             },
             "recommended_offer": safe_offer,
+            "history_review_candidates": history_review_candidates,
             "price_provenance": _safe_price_provenance(offer),
             "recommended_match": _safe_match(recommended_match),
             "provider_source": {

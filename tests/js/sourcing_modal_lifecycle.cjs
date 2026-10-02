@@ -22,6 +22,7 @@ const state = {sourcing: null};
 const context = vm.createContext({
   state,
   $: node,
+  $$: () => [],
   escapeHtml: (value) => String(value ?? ""),
   offerTitleHtml: (offer) => String(offer?.title || ""),
   historicalOfferPrice: () => "100 ₽ / шт",
@@ -30,6 +31,8 @@ const context = vm.createContext({
   renderSourcingDecision: () => "<decision>must-not-overstate</decision>",
   renderProductUnderstanding: () => "",
   renderSourcingRouteExplanation: () => "",
+  renderHumanHistoryDecisionAction: () => "",
+  bindHumanHistoryDecisionActions: () => {},
   renderSourcingResult: (result) => {
     context.backTarget = result;
     context.setSourcingModalPhase("project_result");

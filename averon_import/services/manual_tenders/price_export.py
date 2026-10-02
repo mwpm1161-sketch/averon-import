@@ -22,6 +22,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter, range_boundaries
 
+from averon_import.core.unit_normalization import normalize_unit_family
 from averon_import.services.one_c_history.xlsx_import import OneCImportError, preflight_xlsx
 
 from .parser import (
@@ -83,6 +84,7 @@ class TenderPriceDecision:
     source_kind: str | None
     historical: bool
     audit_summary: dict[str, Any]
+    human_confirmed: bool = False
 
     def safe_summary(self) -> dict[str, Any]:
         return {
@@ -94,6 +96,7 @@ class TenderPriceDecision:
             "total_price": str(self.total_price) if self.total_price is not None else None,
             "source_kind": self.source_kind,
             "historical": self.historical,
+            "authority": "HUMAN_CONFIRMED_HISTORY" if self.human_confirmed else ("AUTO_SAFE_HISTORY" if self.historical else None),
             "audit_summary": self.audit_summary,
         }
 
@@ -103,6 +106,7 @@ def _reason(
     row: dict[str, Any],
     *,
     historical: bool = False,
+    human_confirmed: bool = False,
     audit: dict[str, Any] | None = None,
 ) -> TenderPriceDecision:
     return TenderPriceDecision(
@@ -115,6 +119,7 @@ def _reason(
         source_kind="one_c_history" if historical else None,
         historical=historical,
         audit_summary=audit or {},
+        human_confirmed=human_confirmed,
     )
 
 
@@ -343,6 +348,128 @@ class TenderPriceResolver:
             audit_summary=audit,
         )
 
+    def resolve_human_history(
+        self,
+        source: dict[str, Any],
+        canonical: dict[str, Any],
+        run: dict[str, Any],
+        confirmation: dict[str, Any],
+        *,
+        include_historical_prices: bool,
+    ) -> TenderPriceDecision:
+        """Resolve an exact durable review candidate under separate human authority."""
+        candidate = confirmation.get("candidate") if isinstance(confirmation, dict) else None
+        if not isinstance(candidate, dict):
+            return _reason("HISTORY_CONFIRMATION_INVALID", source)
+        offer = candidate.get("offer") if isinstance(candidate.get("offer"), dict) else {}
+        provenance = candidate.get("price_provenance") if isinstance(candidate.get("price_provenance"), dict) else {}
+        match = candidate.get("match") if isinstance(candidate.get("match"), dict) else {}
+        route = canonical.get("route") if isinstance(canonical.get("route"), dict) else {}
+        audit: dict[str, Any] = {
+            "provider": offer.get("provider"),
+            "provenance_source": provenance.get("source"),
+            "match_decision": match.get("decision"),
+            "currency": offer.get("currency"),
+            "price_basis": provenance.get("price_basis"),
+            "purchase_date": provenance.get("purchase_date"),
+            "human_confirmation_id": confirmation.get("decision_id"),
+            "human_confirmation_fingerprint": confirmation.get("evidence_fingerprint"),
+        }
+        if (
+            run.get("source_mode") != "one_c_only"
+            or route.get("source_mode") != "one_c_only"
+            or route.get("final_source_kind") != "history_review"
+            or route.get("history_outcome") != "REVIEW"
+            or route.get("history_safe_basis") not in (None, "")
+            or not confirmation.get("decision_id")
+            or not confirmation.get("evidence_fingerprint")
+        ):
+            return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        if (
+            offer.get("provider") != "one_c_history"
+            or offer.get("retrieval_classification") not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT"}
+            or match.get("offer_id") != offer.get("offer_id")
+            or offer.get("offer_id") != confirmation.get("candidate_offer_id")
+        ):
+            return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        snapshot = str(run.get("history_catalog_version") or "")
+        if (
+            not snapshot
+            or confirmation.get("history_snapshot_version") != snapshot
+            or provenance.get("snapshot_version") != snapshot
+            or provenance.get("source") != "one_c_history"
+            or provenance.get("source_kind") != "historical_purchase"
+            or provenance.get("history_item_id") != offer.get("source_item_id")
+            or provenance.get("history_item_id") != confirmation.get("history_item_id")
+            or not provenance.get("selected_event_id")
+            or provenance.get("selected_event_id") != confirmation.get("selected_event_id")
+        ):
+            return _reason("PROVENANCE_MISMATCH", source, historical=True, human_confirmed=True, audit=audit)
+        if (
+            route.get("history_selected_event_id") not in (None, "", provenance.get("selected_event_id"))
+            or route.get("history_purchase_date") not in (None, "", provenance.get("purchase_date"))
+        ):
+            return _reason("PROVENANCE_MISMATCH", source, historical=True, human_confirmed=True, audit=audit)
+        purchase_date = str(provenance.get("purchase_date") or "")
+        try:
+            parsed_date = date.fromisoformat(purchase_date)
+        except ValueError:
+            return _reason("PROVENANCE_MISMATCH", source, historical=True, human_confirmed=True, audit=audit)
+        if parsed_date > datetime.now(timezone.utc).date():
+            return _reason("PROVENANCE_MISMATCH", source, historical=True, human_confirmed=True, audit=audit)
+        price = _bounded_decimal(offer.get("price"))
+        effective = _bounded_decimal(provenance.get("effective_unit_price_gross"))
+        if (
+            price is None or effective is None or price <= 0 or price != effective
+            or provenance.get("price_basis") != "gross_including_vat"
+        ):
+            return _reason("PRICE_BASIS_UNPROVEN", source, historical=True, human_confirmed=True, audit=audit)
+        if offer.get("currency") != "RUB" or provenance.get("currency_basis") not in {"source", "company_default"}:
+            return _reason("CURRENCY_UNSUPPORTED", source, historical=True, human_confirmed=True, audit=audit)
+        if not include_historical_prices:
+            return _reason("HISTORICAL_PRICE_NOT_INCLUDED", source, historical=True, human_confirmed=True, audit=audit)
+        if source.get("quantity_trusted") is not True:
+            return _reason("QUANTITY_UNTRUSTED", source, historical=True, human_confirmed=True, audit=audit)
+        quantity = _bounded_decimal(source.get("quantity"))
+        if quantity is None or quantity <= 0:
+            return _reason("QUANTITY_UNTRUSTED", source, historical=True, human_confirmed=True, audit=audit)
+        source_basis = source.get("unit_basis")
+        reparsed_source = parse_unit_basis(source.get("raw_unit"))
+        if not isinstance(source_basis, dict) or source_basis.get("trusted") is not True or reparsed_source.get("trusted") is not True:
+            return _reason("SOURCE_UNIT_UNTRUSTED", source, historical=True, human_confirmed=True, audit=audit)
+        basis_fields = ("raw_unit", "base_unit", "dimension", "scale", "conversion_basis", "trusted")
+        if any(source_basis.get(key) != reparsed_source.get(key) for key in basis_fields):
+            return _reason("UNIT_BASIS_UNPROVEN", source, historical=True, human_confirmed=True, audit=audit)
+        if reparsed_source.get("dimension") in _NON_CONVERTIBLE_UNIT_DIMENSIONS:
+            return _reason("SOURCE_UNIT_UNTRUSTED", source, historical=True, human_confirmed=True, audit=audit)
+        offer_basis = parse_unit_basis(offer.get("price_unit"))
+        if (
+            offer_basis.get("trusted") is not True
+            or offer_basis.get("dimension") in _NON_CONVERTIBLE_UNIT_DIMENSIONS
+            or not normalize_unit_family(offer.get("price_unit"))
+            or provenance.get("unit_family") != normalize_unit_family(offer.get("price_unit"))
+        ):
+            return _reason("OFFER_UNIT_UNTRUSTED", source, historical=True, human_confirmed=True, audit=audit)
+        if reparsed_source.get("dimension") != offer_basis.get("dimension") or reparsed_source.get("base_unit") != offer_basis.get("base_unit"):
+            return _reason("UNIT_INCOMPATIBLE", source, historical=True, human_confirmed=True, audit=audit)
+        try:
+            source_scale = Decimal(str(reparsed_source.get("scale")))
+            offer_scale = Decimal(str(offer_basis.get("scale")))
+            if source_scale <= 0 or offer_scale <= 0:
+                raise InvalidOperation
+            with localcontext() as context:
+                context.prec = 50
+                exported_price = (price * source_scale / offer_scale).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                total = (exported_price * quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, TypeError, ValueError):
+            return _reason("PRICE_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        audit.update({"source_unit": str(source.get("raw_unit") or ""), "offer_unit": str(offer.get("price_unit") or ""), "source_scale": str(source_scale), "offer_scale": str(offer_scale)})
+        return TenderPriceDecision(
+            source_row_id=str(source.get("source_row_id") or ""), excel_row=int(source.get("excel_row") or 0),
+            eligible=True, reason_code=None, source_unit_price=exported_price, total_price=total,
+            source_kind="one_c_history", historical=True, audit_summary=audit, human_confirmed=True,
+        )
+
     def resolve_run(
         self,
         workspace: dict[str, Any],
@@ -351,14 +478,20 @@ class TenderPriceResolver:
         tender_id: str,
         run_id: str,
         include_historical_prices: bool,
+        human_history_decisions: dict[str, dict[str, Any]] | None = None,
     ) -> list[TenderPriceDecision]:
         source_by_id, durable_by_id = self.validate_run(workspace, run, tender_id=tender_id, run_id=run_id)
         return [
-            self.resolve(
-                source_by_id[row_id],
-                durable_by_id[row_id],
-                run,
-                include_historical_prices=include_historical_prices,
+            (
+                self.resolve_human_history(
+                    source_by_id[row_id], durable_by_id[row_id], run,
+                    human_history_decisions[row_id], include_historical_prices=include_historical_prices,
+                )
+                if human_history_decisions and row_id in human_history_decisions
+                else self.resolve(
+                    source_by_id[row_id], durable_by_id[row_id], run,
+                    include_historical_prices=include_historical_prices,
+                )
             )
             for row_id in run["selected_source_row_ids"]
         ]
@@ -374,6 +507,8 @@ def summarize_decisions(decisions: list[TenderPriceDecision]) -> dict[str, Any]:
         "selected_count": len(decisions),
         "priced_count": len(eligible),
         "historical_count": sum(1 for item in eligible if item.historical),
+        "automatic_historical_count": sum(1 for item in eligible if item.historical and not item.human_confirmed),
+        "human_confirmed_historical_count": sum(1 for item in eligible if item.historical and item.human_confirmed),
         "blank_count": len(decisions) - len(eligible),
         "reason_counts": dict(sorted(reason_counts.items())),
     }
@@ -1626,6 +1761,7 @@ class TenderXlsxPriceExporter:
             allowed_cells = {price_header.coordinate, total_header.coordinate}
             target_comment_cells: set[str] = set()
             historical_count = 0
+            human_confirmed_history_count = 0
             for decision in decisions:
                 if not decision.eligible:
                     continue
@@ -1647,17 +1783,19 @@ class TenderXlsxPriceExporter:
                 allowed_cells.update((price_cell.coordinate, total_cell.coordinate))
                 if decision.historical:
                     historical_count += 1
+                    human_confirmed_history_count += int(decision.human_confirmed)
                     price_cell.fill = _HISTORICAL_FILL
                     total_cell.fill = _HISTORICAL_FILL
                     purchase_date = str((decision.audit_summary or {}).get("purchase_date") or "")
+                    human_note = " Совпадение позиции подтверждено пользователем." if decision.human_confirmed else ""
                     price_cell.comment = Comment(
                         f"Историческая цена по предыдущей покупке 1С от {purchase_date}. "
-                        "Не подтверждает текущую доступность и не является текущим предложением.",
+                        f"Не подтверждает текущую доступность и не является текущим предложением.{human_note}",
                         "Averon Import",
                     )
                     total_cell.comment = Comment(
                         f"Историческая стоимость по предыдущей покупке 1С от {purchase_date}. "
-                        "Не подтверждает текущую доступность и не является текущим предложением.",
+                        f"Не подтверждает текущую доступность и не является текущим предложением.{human_note}",
                         "Averon Import",
                     )
                     target_comment_cells.update((price_cell.coordinate, total_cell.coordinate))
@@ -1720,6 +1858,8 @@ class TenderXlsxPriceExporter:
                 "total": get_column_letter(total_column),
             },
             "historical_count": historical_count,
+            "automatic_historical_count": historical_count - human_confirmed_history_count,
+            "human_confirmed_historical_count": human_confirmed_history_count,
         }
 
 
@@ -1823,6 +1963,8 @@ class TenderPriceExportRepository:
         owner_id: str,
         allow_partial: bool,
         include_historical_prices: bool,
+        history_decision_revision: int = 0,
+        history_decision_digest: str = "",
         builder: TenderXlsxPriceExporter,
     ) -> dict[str, Any]:
         tender_id = str(workspace.get("tender_id") or "")
@@ -1852,6 +1994,8 @@ class TenderPriceExportRepository:
                 "export_policy_revision": TENDER_EXPORT_POLICY_REVISION,
                 "include_historical_prices": bool(include_historical_prices),
                 "allow_partial": bool(allow_partial),
+                "history_decision_revision": int(history_decision_revision),
+                "history_decision_digest": str(history_decision_digest),
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "filename": _safe_output_filename(str(workspace.get("filename") or "tender.xlsx")),
                 "output_file_sha256": _sha256_file(candidate),
@@ -1922,6 +2066,8 @@ class TenderPriceExportRepository:
                 "include_historical_prices", "allow_partial", "created_at",
                 "filename", "output_file_sha256", "target_sheet", "target_columns",
                 "selected_count", "priced_count", "historical_count", "blank_count",
+                "automatic_historical_count", "human_confirmed_historical_count",
+                "history_decision_revision", "history_decision_digest",
                 "reason_counts", "run_source_mode", "run_completed_at",
             )
         }

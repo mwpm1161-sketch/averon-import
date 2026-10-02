@@ -93,7 +93,7 @@ const state = {
   recentDocuments: [],
   pendingDocumentDelete: null,
   manual: {active: false, rows: []},
-  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null},
+  excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null,historyDecisionRevision:0,historyDecisionDigest:null},
 };
 
 const CRITICAL_FIELDS = ["quantity", "unit", "mass"];
@@ -1766,7 +1766,7 @@ function clearExcelTenderState() {
   const generation = (state.excelTender?.pollGeneration || 0) + 1;
   clearTenderExportFailure();
   if (state.excelTender?.filterTimer) clearTimeout(state.excelTender.filterTimer);
-  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null};
+  state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null,historyDecisionRevision:0,historyDecisionDigest:null};
   try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {}
   const file = $("#tender-xlsx-file");
   if (file) file.value = "";
@@ -1834,6 +1834,8 @@ function openExcelTenderImport() {
   state.excelTender.latestRuns = [];
   state.excelTender.latestExports = [];
   state.excelTender.selectedExportId = null;
+  state.excelTender.historyDecisionRevision = 0;
+  state.excelTender.historyDecisionDigest = null;
   state.excelTender.exportActive = false;
   state.excelTender.exportJobId = null;
   state.excelTender.selectedExportRunId = null;
@@ -2032,6 +2034,12 @@ function renderExcelTenderLatestRun() {
   const node = $("#tender-last-run");
   if (!node) return;
   const run = state.excelTender.latestRuns?.[0];
+  const openButton = $("#tender-open-latest-run");
+  const openable = state.excelTender.latestRuns?.find((item) => item.status === "completed");
+  if (openButton) {
+    openButton.hidden = !openable;
+    openButton.dataset.runId = openable?.run_id || "";
+  }
   if (!run) { node.textContent = "Последние запуски: пока нет."; return; }
   const modeLabels = {one_c_only:"Только история 1С", one_c_then_provider:"История 1С → поставщик", provider_only:"Только поставщик"};
   const summary = run.summary || {};
@@ -2041,6 +2049,76 @@ function renderExcelTenderLatestRun() {
     ? `${prefix}. Подбор был прерван перезапуском сервера. Запустите его повторно.`
     : run.status === "failed" ? `${prefix}. ${run.failure?.message || "Подбор не выполнен."}`
     : run.status === "running" ? `${prefix}. Подбор выполняется.` : prefix;
+}
+
+function applyTenderHistoryDecisionSnapshot(result, snapshot) {
+  if (!result || !snapshot || !Array.isArray(result.results)) return result;
+  const byRow = new Map((snapshot.rows || []).map((item) => [item.source_row_id, item]));
+  for (const item of result.results) {
+    const sourceRowId = item.intent?.source_row_id;
+    const decisionRow = byRow.get(sourceRowId);
+    if (!decisionRow) continue;
+    item.historyDecisionCandidates = decisionRow.candidates || [];
+    item.historyEffectiveDecision = decisionRow.effective_decision || null;
+  }
+  result.historyDecisionRevision = snapshot.decision_revision;
+  result.historyDecisionDigest = snapshot.decision_digest;
+  result.human_confirmed_count = Object.keys(snapshot.effective || {}).length;
+  state.excelTender.historyDecisionRevision = snapshot.decision_revision;
+  state.excelTender.historyDecisionDigest = snapshot.decision_digest;
+  return result;
+}
+
+async function openExcelTenderRunDetail(runId = null) {
+  const workspace = state.excelTender.workspace;
+  const selected = runId || state.excelTender.latestRuns?.find((item) => item.status === "completed")?.run_id;
+  if (!workspace || !selected) return;
+  const dialog = $("#sourcing-modal");
+  setSourcingModalPhase("project_result", "excel_tender");
+  $("#sourcing-subtitle").textContent = "Загружаем сохранённый подбор";
+  $("#sourcing-content").innerHTML = '<p class="hint">Загружаем неизменяемый результат и журнал подтверждений…</p>';
+  dialog.showModal();
+  try {
+    const base = `/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}/runs/${encodeURIComponent(selected)}`;
+    const [run, snapshot] = await Promise.all([api(base), api(`${base}/history-decisions`)]);
+    if (state.excelTender.workspace?.tender_id !== workspace.tender_id) return;
+    const decisionRows = new Map((snapshot.rows || []).map((item) => [item.source_row_id, item]));
+    const summary = run.summary || {};
+    const result = {
+      run_id: run.run_id, source_mode: run.source_mode, catalog_version: run.catalog_version || "",
+      positions_total: summary.positions_total || 0, positions_processed: summary.positions_processed || 0,
+      positions_matched: summary.positions_matched || 0, positions_alternatives: summary.positions_alternatives || 0,
+      positions_review: summary.positions_review || 0, positions_without_offers: summary.positions_without_offers || 0,
+      positions_history_matched: summary.positions_history_matched || 0,
+      positions_provider_matched: summary.positions_provider_matched || 0,
+      positions_fallback_called: summary.positions_fallback_called || 0,
+      positions_history_review: summary.positions_history_review || 0,
+      results: (run.rows || []).map((row) => {
+        const candidates = (row.history_review_candidates || []).map((candidate) => ({
+          ...candidate.offer,
+          history_retrieval_classification: candidate.offer?.retrieval_classification,
+          data_provenance: candidate.price_provenance || {},
+        }));
+        const matches = (row.history_review_candidates || []).map((candidate, index) => ({
+          ...(candidate.match || {}), offer: candidates[index],
+        }));
+        const decisionState = decisionRows.get(row.source_row_id);
+        return {
+          intent: {source_row_id:row.source_row_id, ...(row.identity || {}), source_text:row.identity?.normalized_name || ""},
+          route: row.route || {}, recommended_offer: row.recommended_offer || null,
+          review_candidate: matches[0] || null, offers: candidates, match_results: matches,
+          historyDecisionCandidates: decisionState?.candidates || [],
+          historyEffectiveDecision: decisionState?.effective_decision || null,
+        };
+      }),
+    };
+    applyTenderHistoryDecisionSnapshot(result, snapshot);
+    state.sourcing.result = result;
+    renderSourcingResult(result);
+  } catch (error) {
+    $("#sourcing-subtitle").textContent = "Не удалось загрузить сохранённый подбор";
+    $("#sourcing-content").innerHTML = `<p class="sourcing-warning">${escapeHtml(error.message || "Повторите попытку.")}</p>`;
+  }
 }
 
 async function refreshExcelTenderRuns(tenderId = state.excelTender.workspace?.tender_id) {
@@ -2333,7 +2411,14 @@ async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
       $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${job.status === "queued" ? "В очереди" : "Выполняется"}</b><strong>${completed} из ${total}</strong><small>${job.status === "queued" ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
     } else if (job.status === "completed") {
       $("#sourcing-subtitle").textContent = "Подбор тендера завершён";
-      renderSourcingResult(job.result);
+      const result = job.result;
+      if (result?.source_mode === "one_c_only" && result.run_id && state.excelTender.workspace?.tender_id === tenderId) {
+        try {
+          const endpoint = `/api/manual-tenders/${encodeURIComponent(tenderId)}/runs/${encodeURIComponent(result.run_id)}/history-decisions`;
+          applyTenderHistoryDecisionSnapshot(result, await api(endpoint));
+        } catch (_) {}
+      }
+      renderSourcingResult(result);
       void refreshExcelTenderRuns(tenderId);
       return;
     } else if (job.status === "failed") throw new Error(job.error || "Подбор не выполнен");
@@ -4252,9 +4337,10 @@ function renderProjectItemDetails(projectResult, item) {
     <h3>${escapeHtml(title)}</h3>
     ${route?.final_source_kind === "history_review" ? `<p class="history-review-explanation" role="status">${escapeHtml(historyPresentation.explanation)}</p>` : ""}
     <div class="offer-grid">${candidates.map((candidate) => historical
-      ? renderHistoricalOfferCard(candidate, {compact:true, route})
+      ? `<div class="history-candidate-wrapper">${renderHistoricalOfferCard(candidate, {compact:true, route})}${renderHumanHistoryDecisionAction(item, candidate)}</div>`
       : renderOfferCard(candidate, true, intent)).join("")}</div>`;
   $(".project-results-back").addEventListener("click", () => renderSourcingResult(projectResult));
+  bindHumanHistoryDecisionActions(projectResult, item);
 }
 
 function bindSourcingFilters(result) {
@@ -4270,6 +4356,64 @@ function bindProjectCandidateActions(result) {
     const item = result.results?.[itemIndex];
     if (item) renderProjectItemDetails(result, item);
   }));
+}
+
+function renderHumanHistoryDecisionAction(item, candidate) {
+  const offer = candidate?.offer || {};
+  const stateForCandidate = (item.historyDecisionCandidates || []).find((entry) => entry.candidate_offer_id === offer.offer_id);
+  if (!stateForCandidate) return "";
+  const effective = item.historyEffectiveDecision;
+  if (!stateForCandidate.confirmable) {
+    const explanations = {
+      HISTORY_CANDIDATE_SOURCE_CONFLICT: "Кандидат нельзя подтвердить из-за противоречия с исходными данными.",
+      HISTORY_CANDIDATE_UNIT_CONFLICT: "Единица измерения истории несовместима с исходной строкой.",
+      HISTORY_CANDIDATE_PRICE_INVALID: "В записи нет проверенной положительной исторической цены.",
+      HISTORY_CANDIDATE_CURRENCY_INVALID: "Валюта исторической цены не подтверждена как RUB.",
+      HISTORY_CANDIDATE_DATE_INVALID: "Дата покупки отсутствует или не прошла проверку.",
+    };
+    return `<p class="history-confirmation-blocked" role="status">${escapeHtml(explanations[stateForCandidate.reason_code] || "Кандидат не прошёл проверку и не может быть подтверждён.")}</p>`;
+  }
+  if (effective?.candidate_offer_id === offer.offer_id) {
+    return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
+  }
+  return `<div class="history-human-confirmation"><p>Это историческая закупка из 1С. Подтверждение удостоверяет только идентичность позиции; дата и цена остаются историческими.</p><button type="button" class="button secondary history-confirm-candidate" data-row-id="${escapeHtml(item.intent?.source_row_id || "")}" data-offer-id="${escapeHtml(offer.offer_id || "")}">Подтвердить эту запись</button></div>`;
+}
+
+function bindHumanHistoryDecisionActions(projectResult, item) {
+  const buttons = [
+    ...$$("#sourcing-content .history-confirm-candidate"),
+    ...$$("#sourcing-content .history-revoke-confirmation"),
+  ];
+  for (const button of buttons) {
+    button.addEventListener("click", async () => {
+      const workspace = state.excelTender.workspace;
+      const runId = projectResult.run_id;
+      if (!workspace || !runId) return;
+      const isRevoke = button.classList.contains("history-revoke-confirmation");
+      button.disabled = true;
+      const base = `/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}/runs/${encodeURIComponent(runId)}/history-decisions`;
+      try {
+        const response = await api(isRevoke ? `${base}/${encodeURIComponent(button.dataset.decisionId)}/revoke` : base, {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body:JSON.stringify(isRevoke
+            ? {decision:"REVOKE_HISTORY_CONFIRMATION", expected_revision:projectResult.historyDecisionRevision}
+            : {decision:"CONFIRM_HISTORY_CANDIDATE", source_row_id:button.dataset.rowId, candidate_offer_id:button.dataset.offerId, expected_revision:projectResult.historyDecisionRevision}),
+        });
+        applyTenderHistoryDecisionSnapshot(projectResult, response);
+        renderProjectItemDetails(projectResult, item);
+      } catch (error) {
+        if (error.code === "TENDER_HISTORY_DECISIONS_STALE") {
+          try {
+            const snapshot = await api(base);
+            applyTenderHistoryDecisionSnapshot(projectResult, snapshot);
+            renderProjectItemDetails(projectResult, item);
+          } catch (_) {}
+        }
+        toast(error.message || "Не удалось обновить подтверждение истории.", "error");
+        button.disabled = false;
+      }
+    });
+  }
 }
 
 function renderSourcingResult(result, row = null) {
@@ -4301,6 +4445,9 @@ function renderSourcingResult(result, row = null) {
     const providerMatched = sourcingCount(result.positions_provider_matched);
     const fallbackCalled = sourcingCount(result.positions_fallback_called);
     const historyReview = sourcingCount(result.positions_history_review);
+    const humanConfirmed = sourcingCount(result.human_confirmed_count);
+    const humanConfirmedCard = result.run_id
+      ? `<div class="human-history-count"><small>Подтверждено пользователем</small><b>${humanConfirmed}</b></div>` : "";
     const routeCoverage = routed
       ? `<div class="sourcing-route-coverage"><div><small>Совпадения в истории 1С</small><b>${historyMatched}</b></div><div><small>Совпадения у поставщика</small><b>${providerMatched}</b></div><div><small>Запущен поиск у поставщика</small><b>${fallbackCalled}</b></div><div><small>История требует проверки</small><b>${historyReview}</b></div></div>`
       : "";
@@ -4314,7 +4461,7 @@ function renderSourcingResult(result, row = null) {
       ? `<div><small>Проверить единицу цены</small><b>${unitConfirmation}</b></div>`
       : "";
     const runMeta = result.run_id ? `<div class="sourcing-run-meta"><span>Режим подбора: <b>${escapeHtml(sourcingModeLabel(resultMode))}</b></span><span>Поставщик: <b>${escapeHtml(result.provider_label || "Поставщик")}</b></span><span>Версия каталога: <b>${escapeHtml(result.catalog_version || "—")}</b></span><span>Запуск: <b>${escapeHtml(String(result.run_id).slice(0, 10))}</b></span><span>Время: <b>${escapeHtml(formatRecentTimestamp(result.run_completed_at || result.run_created_at))}</b></span></div>` : `<div class="sourcing-run-meta"><span>Режим подбора: <b>${escapeHtml(sourcingModeLabel(resultMode))}</b></span></div>`;
-    content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}${historyTotalsNote}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>${routed ? "Стоимость альтернатив у поставщика" : "Стоимость альтернатив"}</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}${unitConfirmationCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div></div>${routeCoverage}${renderProjectSourcingList(result)}`;
+    content.innerHTML = `${runMeta}${renderSourcingNotices(result.notices)}${historyTotalsNote}<div class="sourcing-project-summary"><div><small>Позиции</small><b>${result.positions_processed}/${result.positions_total}</b></div><div><small>Подтверждены</small><b>${result.positions_matched}</b></div><div><small>Альтернативы</small><b>${result.positions_alternatives || 0}</b></div><div><small>Позиции на проверке</small><b>${result.positions_review}</b></div><div><small>Без предложений</small><b>${result.positions_without_offers}</b></div><div><small>${confirmedLabel}</small><b>${formatProjectTotals(confirmedTotal, confirmedTotals, confirmedCurrency)}</b></div><div><small>${routed ? "Стоимость альтернатив у поставщика" : "Стоимость альтернатив"}</small><b>${formatProjectTotals(alternativeTotal, alternativeTotals, alternativeCurrency)}</b></div>${unpricedCard}${unitConfirmationCard}<div><small>Требуют проверки</small><b>${unresolved}</b></div>${humanConfirmedCard}</div>${routeCoverage}${renderProjectSourcingList(result)}`;
     bindSourcingFilters(result);
     bindProjectCandidateActions(result);
     return;
@@ -5520,6 +5667,7 @@ function setupEvents() {
   $("#tender-confirm-import").addEventListener("click", () => { void confirmExcelTenderImport(); });
   $("#tender-delete-workspace").addEventListener("click", () => { void deleteExcelTenderWorkspace(); });
   $("#tender-sourcing-button").addEventListener("click", openExcelTenderSourcing);
+  $("#tender-open-latest-run").addEventListener("click", (event) => { void openExcelTenderRunDetail(event.currentTarget.dataset.runId); });
   $("#tender-sourcing-submit").addEventListener("click", () => { void startExcelTenderSourcing(); });
   $("#tender-export-run").addEventListener("change", (event) => {
     clearTenderExportFailure();

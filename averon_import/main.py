@@ -102,6 +102,7 @@ from averon_import.services.manual_tenders.price_export import (
     TenderXlsxPriceExporter,
     summarize_decisions,
 )
+from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
 from averon_import.services.manual_tenders.parser import MAX_UPLOAD_BYTES as MAX_MANUAL_TENDER_UPLOAD_BYTES
 from averon_import.services.document_mutation import DocumentMutationLocks
 from averon_import.services.document_lifecycle import (
@@ -204,6 +205,7 @@ one_c_history_service = OneCHistoryImportService(one_c_history_repository, one_c
 tender_activity = TenderActivityRegistry()
 tender_repository = TenderWorkspaceRepository(DATA_DIR, tender_activity)
 tender_sourcing_runs = TenderSourcingRunStore(tender_repository)
+tender_history_decisions = TenderHistoryDecisionStore(tender_repository)
 tender_price_exports = TenderPriceExportRepository(tender_repository)
 tender_price_resolver = TenderPriceResolver()
 tender_xlsx_price_exporter = TenderXlsxPriceExporter()
@@ -2226,6 +2228,22 @@ class ManualTenderPriceExportRequest(BaseModel):
     allow_partial: StrictBool = False
 
 
+class ManualTenderHistoryConfirmationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["CONFIRM_HISTORY_CANDIDATE"]
+    source_row_id: StrictStr = Field(pattern=r"^[a-f0-9]{32}$")
+    candidate_offer_id: StrictStr = Field(min_length=1, max_length=180)
+    expected_revision: StrictInt = Field(ge=0)
+
+
+class ManualTenderHistoryRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["REVOKE_HISTORY_CONFIRMATION"]
+    expected_revision: StrictInt = Field(ge=0)
+
+
 def _tender_run_snapshot(tender_id: str, owner_id: str):
     path, metadata, lease = tender_repository.acquire_sourcing_workspace(tender_id, owner_id)
     return path, metadata, lease
@@ -2439,6 +2457,96 @@ def get_manual_tender_run(
             lease.release()
 
 
+@app.get(
+    "/api/manual-tenders/{tender_id}/runs/{run_id}/history-decisions",
+    dependencies=[Depends(require_authenticated)],
+)
+def get_manual_tender_history_decisions(
+    tender_id: str,
+    run_id: str,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    lease = None
+    try:
+        workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        return tender_history_decisions.get_snapshot(workspace_path, workspace, run, tender_id, run_id)
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+@app.post(
+    "/api/manual-tenders/{tender_id}/runs/{run_id}/history-decisions",
+    dependencies=[Depends(require_authenticated)],
+)
+def confirm_manual_tender_history_candidate(
+    tender_id: str,
+    run_id: str,
+    request: ManualTenderHistoryConfirmationRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    lease = None
+    try:
+        workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        return tender_history_decisions.confirm(
+            workspace_path, workspace, run,
+            tender_id=tender_id, run_id=run_id,
+            source_row_id=request.source_row_id,
+            candidate_offer_id=request.candidate_offer_id,
+            expected_revision=request.expected_revision,
+            actor_username=user.username, actor_role=user.role.value,
+        )
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+@app.post(
+    "/api/manual-tenders/{tender_id}/runs/{run_id}/history-decisions/{decision_id}/revoke",
+    dependencies=[Depends(require_authenticated)],
+)
+def revoke_manual_tender_history_confirmation(
+    tender_id: str,
+    run_id: str,
+    decision_id: str,
+    request: ManualTenderHistoryRevocationRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    lease = None
+    try:
+        workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        return tender_history_decisions.revoke(
+            workspace_path, workspace, run,
+            tender_id=tender_id, run_id=run_id, decision_id=decision_id,
+            expected_revision=request.expected_revision,
+            actor_username=user.username, actor_role=user.role.value,
+        )
+    except Exception as exc:
+        if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+
+
 def _price_export_confirmation_error(code: str, message: str, summary: dict[str, Any]) -> HTTPException:
     return HTTPException(409, detail={"code": code, "message": message, "summary": summary})
 
@@ -2454,11 +2562,15 @@ def _submit_manual_tender_price_export(
     try:
         workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(tender_id, owner_id)
         run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        decision_snapshot = tender_history_decisions.get_snapshot(
+            workspace_path, workspace, run, tender_id, run_id,
+        )
         # Resolve history once with consent to identify whether explicit consent
         # is needed, then resolve using only the submitted policy options.
         with_history = tender_price_resolver.resolve_run(
             workspace, run, tender_id=tender_id, run_id=run_id,
             include_historical_prices=True,
+            human_history_decisions=decision_snapshot["effective"],
         )
         history_summary = summarize_decisions(with_history)
         if (
@@ -2474,6 +2586,7 @@ def _submit_manual_tender_price_export(
         decisions = tender_price_resolver.resolve_run(
             workspace, run, tender_id=tender_id, run_id=run_id,
             include_historical_prices=request.include_historical_prices,
+            human_history_decisions=decision_snapshot["effective"],
         )
         summary = summarize_decisions(decisions)
         if summary["priced_count"] == 0:
@@ -2500,9 +2613,21 @@ def _submit_manual_tender_price_export(
                 source_sha256=source_sha, revision=revision,
             )
             current_run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+            current_history_decisions = tender_history_decisions.get_snapshot(
+                workspace_path, current_workspace, current_run, tender_id, run_id,
+            )
+            if (
+                current_history_decisions["decision_revision"] != decision_snapshot["decision_revision"]
+                or current_history_decisions["decision_digest"] != decision_snapshot["decision_digest"]
+            ):
+                raise TenderWorkspaceError(
+                    "Подтверждения истории изменились после проверки экспорта. Повторите экспорт.",
+                    409, "TENDER_HISTORY_DECISIONS_CHANGED",
+                )
             current_decisions = tender_price_resolver.resolve_run(
                 current_workspace, current_run, tender_id=tender_id, run_id=run_id,
                 include_historical_prices=request.include_historical_prices,
+                human_history_decisions=current_history_decisions["effective"],
             )
             current_summary = summarize_decisions(current_decisions)
             if current_summary["priced_count"] == 0 or (
@@ -2517,6 +2642,8 @@ def _submit_manual_tender_price_export(
                 workspace_path, current_workspace, current_run, current_decisions,
                 owner_id=owner_id, allow_partial=request.allow_partial,
                 include_historical_prices=request.include_historical_prices,
+                history_decision_revision=current_history_decisions["decision_revision"],
+                history_decision_digest=current_history_decisions["decision_digest"],
                 builder=tender_xlsx_price_exporter,
             )
             progress(1, 1, "Экспорт готов")
@@ -2529,6 +2656,8 @@ def _submit_manual_tender_price_export(
             "source_sha256": source_sha,
             "workspace_revision": revision,
             "policy_revision": "xlsx-price-export-v1",
+            "history_decision_revision": decision_snapshot["decision_revision"],
+            "history_decision_digest": decision_snapshot["decision_digest"],
             "allow_partial": request.allow_partial,
             "include_historical_prices": request.include_historical_prices,
         })
