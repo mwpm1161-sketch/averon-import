@@ -14,6 +14,7 @@ from averon_import.services.one_c_history.read_model import OneCHistoryReadError
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.one_c_history.xlsx_import import ParsedEvent, ParsedWorkbook
 from averon_import.services.sourcing.models import (
+    HistoryRetrievalClassification,
     MatchDecision,
     Offer,
     ProductIntent,
@@ -688,6 +689,107 @@ def test_fuzzy_retrieval_does_not_promote_similarity_to_safe_match(tmp_path):
 
     assert result.outcome == HistoryMatchOutcome.REVIEW
     assert result.selected_offer is None
+    assert result.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.FUZZY
+
+
+def test_exact_name_unit_precedes_noisy_fuzzy_neighbours_and_is_not_displaced_by_limit(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="exact:1", item_code=None, name="Плющ искусственный", article="", row=2, group_number=1),
+        _event(item_id="noise:1", item_code=None, name="Камень искусственный 3680х760х12 мм (белый)", article="", row=3, group_number=2),
+        _event(item_id="noise:2", item_code=None, name="Камень искусственный 3680х760х12 мм (черный)", article="", row=4, group_number=3),
+        _event(item_id="noise:3", item_code=None, name="Петрушка искусственная", article="", row=5, group_number=4),
+    ])
+    source = _intent(name="Плющ искусственный", article="", unit="шт")
+    qwen_resolved = source.model_copy(update={
+        "normalized_name": "Камень искусственный",
+        "search_queries": ["Камень искусственный 3680х760х12 мм"],
+    })
+
+    fallback = provider.lookup(source, source_intent=source, limit=1)
+    qwen = provider.lookup(qwen_resolved, source_intent=source, limit=1)
+
+    assert fallback.outcome == HistoryMatchOutcome.REVIEW
+    assert fallback.selected_offer is None
+    assert [offer.title for offer in fallback.candidates] == ["Плющ искусственный"]
+    assert [offer.source_item_id for offer in qwen.candidates] == [offer.source_item_id for offer in fallback.candidates]
+    assert qwen.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.EXACT_NAME_UNIT
+    assert "Камень искусственный" not in qwen.candidates[0].title
+
+
+def test_qwen_exact_looking_fuzzy_candidate_cannot_become_source_owned_safe_match(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="history:1", name="Клапан M-500", article="ART-001"),
+    ])
+    source = _intent(name="Иная исходная позиция", article="", unit="шт")
+    qwen_resolved = _intent(name="Клапан M-500", article="ART-001", unit="шт")
+
+    result = provider.lookup(qwen_resolved, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert len(result.candidates) == 1
+    assert result.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.FUZZY
+
+
+def test_exact_article_index_returns_bounded_exact_identity_with_classification(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="article:exact", name="Источник точный", article="ART-EXACT", row=2),
+        *[
+            _event(item_id=f"noise:{index}", item_code=None, name=f"Источник похожий {index}", article=f"OTHER-{index}", row=index + 3, group_number=index)
+            for index in range(30)
+        ],
+    ])
+
+    result = provider.lookup(_intent(name="Источник точный", article="ART-EXACT"), limit=1)
+
+    assert [offer.source_item_id for offer in result.candidates] == ["article:exact"]
+    assert result.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.EXACT_ARTICLE
+
+
+def test_exact_name_unit_ambiguity_returns_only_exact_candidates(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="exact:1", item_code=None, name="Одинаковое имя", article="", row=2, group_number=1),
+        _event(item_id="exact:2", item_code=None, name="Одинаковое имя", article="", row=3, group_number=2),
+        _event(item_id="noise:1", item_code=None, name="Одинаковое очень похожее имя", article="", row=4, group_number=3),
+    ])
+    source = _intent(name="Одинаковое имя", article="")
+
+    result = provider.lookup(source, source_intent=source, limit=20)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert {offer.source_item_id for offer in result.candidates} == {"exact:1", "exact:2"}
+    assert result.reason_code == "ambiguous_exact_name_identity"
+    assert result.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.EXACT_NAME_UNIT
+
+
+def test_exact_name_unit_without_usable_price_remains_review_and_is_still_retrieved(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="unpriced:1", item_code=None, name="Клапан M-500", article="", price_usable=False),
+    ])
+    source = _intent(name="Клапан M-500", article="")
+
+    result = provider.lookup(source, source_intent=source)
+
+    assert result.outcome == HistoryMatchOutcome.REVIEW
+    assert result.selected_offer is None
+    assert len(result.candidates) == 1
+    assert result.candidates[0].price is None
+    assert result.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.EXACT_NAME_UNIT
+
+
+def test_projection_builds_snapshot_local_retrieval_and_negative_collision_indexes(tmp_path):
+    _, provider = _provider(tmp_path, [
+        _event(item_id="exact:1", item_code=None, name="Клапан DN50", article="DN-50", row=2),
+        _event(item_id="collision:1", item_code=None, name="Клапан-DN50", article="OTHER", row=3, group_number=2),
+    ])
+    projection = provider._load_projection()
+
+    assert projection.exact_article_index["dn-50"]
+    assert projection.exact_name_unit_index[("клапан dn50", "piece")]
+    assert projection.loose_name_unit_item_ids[("клапанdn50", "piece")] == frozenset({"exact:1", "collision:1"})
+    assert projection.matcher_article_item_ids
+    with pytest.raises(TypeError):
+        projection.exact_article_index["new"] = ()
 
 
 def test_broader_existing_matcher_article_normalization_retrieves_but_does_not_make_safe(tmp_path):

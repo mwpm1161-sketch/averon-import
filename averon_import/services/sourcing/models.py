@@ -38,6 +38,15 @@ class HistorySafeMatchBasis(str, Enum):
     EXACT_SOURCE_NAME_UNIT = "EXACT_SOURCE_NAME_UNIT"
 
 
+class HistoryRetrievalClassification(str, Enum):
+    """How historical evidence was retrieved; this is separate from match safety."""
+
+    EXACT_ARTICLE = "EXACT_ARTICLE"
+    EXACT_NAME_UNIT = "EXACT_NAME_UNIT"
+    STRUCTURED = "STRUCTURED"
+    FUZZY = "FUZZY"
+
+
 class SourcingRouteMetadata(SourcingModel):
     source_mode: SourcingSourceMode
     final_source_kind: Literal["historical_purchase", "provider", "history_review", "none"]
@@ -221,6 +230,7 @@ class Offer(SourcingModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
     retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     data_provenance: dict[str, Any] = Field(default_factory=dict)
+    history_retrieval_classification: HistoryRetrievalClassification | None = None
 
     @field_validator("price", mode="before")
     @classmethod

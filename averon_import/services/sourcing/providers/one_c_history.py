@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 import re
 import threading
 import unicodedata
@@ -24,6 +27,7 @@ from averon_import.services.one_c_history.repository import OneCHistoryRepositor
 from averon_import.services.sourcing.matching import OfferMatcher
 from averon_import.services.sourcing.models import (
     HistorySafeMatchBasis,
+    HistoryRetrievalClassification,
     MatchDecision,
     MatchResult,
     Offer,
@@ -70,9 +74,21 @@ class HistoryLookupResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _IndexedVariant:
+    variant: OneCHistoryVariant
+    exact_name_key: str
+    name_key: str
+    characteristic_key: str
+    article_key: str
+    unit_family: str | None
+    matcher_article_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class _IndexedItem:
     item: OneCHistoryItem
     searchable_variants: tuple[OneCHistoryVariant, ...]
+    indexed_variants: tuple[_IndexedVariant, ...]
     selected_price_event: OneCHistoryEvent | None
 
 
@@ -80,6 +96,11 @@ class _IndexedItem:
 class _Projection:
     version: str
     items: tuple[_IndexedItem, ...]
+    exact_article_index: Mapping[str, tuple[tuple[int, int], ...]]
+    matcher_article_item_ids: Mapping[str, frozenset[str]]
+    exact_name_unit_index: Mapping[tuple[str, str], tuple[tuple[int, int], ...]]
+    loose_name_unit_item_ids: Mapping[tuple[str, str], frozenset[str]]
+    structured_identity_index: Mapping[tuple[str, str, str], tuple[tuple[int, int], ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +108,7 @@ class _RetrievedItem:
     indexed: _IndexedItem
     variant: OneCHistoryVariant
     score: float
+    classification: HistoryRetrievalClassification = HistoryRetrievalClassification.FUZZY
 
 
 def normalize_product_search_text(value: object) -> str:
@@ -176,17 +198,19 @@ def _best_variant(
 ) -> tuple[OneCHistoryVariant, float]:
     intent_name = normalize_product_search_text(intent.normalized_name)
     intent_article = normalize_product_search_text(intent.article)
+    intent_matcher_article = _matcher_article_key(intent.article)
     intent_model = normalize_product_search_text(intent.model)
-    best_variant = indexed.searchable_variants[0]
+    best_variant = indexed.indexed_variants[0]
     best_score = -1.0
-    for variant in indexed.searchable_variants:
-        name = normalize_product_search_text(variant.item_name)
-        characteristic = normalize_product_search_text(variant.characteristic)
-        article = normalize_product_search_text(variant.article or indexed.item.article)
+    for cached in indexed.indexed_variants:
+        variant = cached.variant
+        name = cached.name_key
+        characteristic = cached.characteristic_key
+        article = cached.article_key or normalize_product_search_text(indexed.item.article)
         score = 0.0
         if intent_article and article and intent_article == article:
             score = 1000.0
-        elif intent_article and article and _matcher_article_key(intent.article) == _matcher_article_key(article):
+        elif intent_article and article and intent_matcher_article == cached.matcher_article_key:
             # Broader matcher-equivalent identifiers are retrieval signals only.
             score = 990.0
         if intent_name and name and intent_name == name:
@@ -206,10 +230,10 @@ def _best_variant(
         if score > best_score or (
             score == best_score
             and (variant.first_source_row, variant.variant_id)
-            < (best_variant.first_source_row, best_variant.variant_id)
+            < (best_variant.variant.first_source_row, best_variant.variant.variant_id)
         ):
-            best_variant, best_score = variant, score
-    return best_variant, best_score
+            best_variant, best_score = cached, score
+    return best_variant.variant, best_score
 
 
 class OneCHistoryProvider:
@@ -258,6 +282,11 @@ class OneCHistoryProvider:
     @staticmethod
     def _build_projection(snapshot: OneCHistoryCatalogSnapshot) -> _Projection:
         indexed_items: list[_IndexedItem] = []
+        exact_article_index: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        matcher_article_item_ids: dict[str, set[str]] = defaultdict(set)
+        exact_name_unit_index: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+        loose_name_unit_item_ids: dict[tuple[str, str], set[str]] = defaultdict(set)
+        structured_identity_index: dict[tuple[str, str, str], list[tuple[int, int]]] = defaultdict(list)
         for item in snapshot.items:
             variants = item.variants or (
                 OneCHistoryVariant(
@@ -275,12 +304,58 @@ class OneCHistoryProvider:
                 ),
             )
             variants = tuple(sorted(variants, key=lambda variant: (variant.first_source_row, variant.variant_id)))
+            indexed_variants: list[_IndexedVariant] = []
+            item_index = len(indexed_items)
+            for variant_index, variant in enumerate(variants):
+                article = variant.article or item.article
+                manufacturer = variant.manufacturer or item.manufacturer
+                cached = _IndexedVariant(
+                    variant=variant,
+                    exact_name_key=normalize_exact_source_name(variant.item_name),
+                    name_key=normalize_product_search_text(variant.item_name),
+                    characteristic_key=normalize_product_search_text(variant.characteristic),
+                    article_key=normalize_product_search_text(article),
+                    unit_family=normalize_unit_family(variant.raw_unit),
+                    matcher_article_key=_matcher_article_key(article),
+                )
+                indexed_variants.append(cached)
+                ref = (item_index, variant_index)
+                if cached.article_key:
+                    exact_article_index[cached.article_key].append(ref)
+                canonical_matcher_article = _matcher_article_key(item.article)
+                if canonical_matcher_article:
+                    matcher_article_item_ids[canonical_matcher_article].add(item.item_id)
+                if cached.matcher_article_key:
+                    matcher_article_item_ids[cached.matcher_article_key].add(item.item_id)
+                if cached.exact_name_key and cached.unit_family:
+                    exact_name_unit_index[(cached.exact_name_key, cached.unit_family)].append(ref)
+                    loose_key = _loose_name_collision_key(variant.item_name)
+                    if loose_key:
+                        loose_name_unit_item_ids[(loose_key, cached.unit_family)].add(item.item_id)
+                model_key = normalize_exact_source_name(variant.characteristic)
+                manufacturer_key = normalize_exact_source_name(manufacturer)
+                if model_key and manufacturer_key and cached.unit_family:
+                    structured_identity_index[(manufacturer_key, model_key, cached.unit_family)].append(ref)
             indexed_items.append(_IndexedItem(
                 item=item,
                 searchable_variants=variants,
+                indexed_variants=tuple(indexed_variants),
                 selected_price_event=_usable_price_event(item.events),
             ))
-        return _Projection(snapshot.version, tuple(indexed_items))
+        item_sort_key = lambda ref: (
+            indexed_items[ref[0]].item.item_id,
+            indexed_items[ref[0]].indexed_variants[ref[1]].variant.first_source_row,
+            indexed_items[ref[0]].indexed_variants[ref[1]].variant.variant_id,
+        )
+        return _Projection(
+            snapshot.version,
+            tuple(indexed_items),
+            MappingProxyType({key: tuple(sorted(refs, key=item_sort_key)) for key, refs in exact_article_index.items()}),
+            MappingProxyType({key: frozenset(item_ids) for key, item_ids in matcher_article_item_ids.items()}),
+            MappingProxyType({key: tuple(sorted(refs, key=item_sort_key)) for key, refs in exact_name_unit_index.items()}),
+            MappingProxyType({key: frozenset(item_ids) for key, item_ids in loose_name_unit_item_ids.items()}),
+            MappingProxyType({key: tuple(sorted(refs, key=item_sort_key)) for key, refs in structured_identity_index.items()}),
+        )
 
     def stats(self) -> SourcingProviderRuntimeState:
         try:
@@ -344,7 +419,39 @@ class OneCHistoryProvider:
             return HistoryLookupResult(
                 HistoryMatchOutcome.NO_MATCH, False, reason_code="history_unavailable",
             )
-        offers, retrieved, top_score_tie_count = self._retrieve(projection, intent, bounded)
+        source_article_key = normalize_product_search_text(source_intent.article)
+        exact_name_key = normalize_exact_source_name(source_intent.normalized_name)
+        source_unit_family = normalize_unit_family(source_intent.unit)
+        retrieval_classification = HistoryRetrievalClassification.FUZZY
+        indexed_refs: tuple[tuple[int, int], ...] = ()
+        if source_article_key:
+            indexed_refs = projection.exact_article_index.get(source_article_key, ())
+            if indexed_refs:
+                retrieval_classification = HistoryRetrievalClassification.EXACT_ARTICLE
+        elif exact_name_key and source_unit_family:
+            indexed_refs = projection.exact_name_unit_index.get((exact_name_key, source_unit_family), ())
+            if indexed_refs:
+                retrieval_classification = HistoryRetrievalClassification.EXACT_NAME_UNIT
+            else:
+                manufacturer_key = normalize_exact_source_name(source_intent.manufacturer)
+                model_key = normalize_exact_source_name(source_intent.model)
+                if manufacturer_key and model_key:
+                    indexed_refs = projection.structured_identity_index.get(
+                        (manufacturer_key, model_key, source_unit_family),
+                    )
+                    if indexed_refs:
+                        retrieval_classification = HistoryRetrievalClassification.STRUCTURED
+
+        if indexed_refs:
+            retrieved, top_score_tie_count = self._retrieve_indexed(
+                projection,
+                indexed_refs,
+                retrieval_classification,
+                bounded,
+            )
+            offers = [self._to_offer(projection, candidate) for candidate in retrieved]
+        else:
+            offers, retrieved, top_score_tie_count = self._retrieve(projection, intent, bounded)
         if not offers:
             return HistoryLookupResult(
                 HistoryMatchOutcome.NO_MATCH, True, reason_code="no_candidates",
@@ -357,7 +464,16 @@ class OneCHistoryProvider:
 
         # A source-owned article is authoritative: if present, no name-only path
         # may rescue an article mismatch or unresolved strict article match.
-        if normalize_product_search_text(source_intent.article):
+        if source_article_key:
+            if retrieval_classification != HistoryRetrievalClassification.EXACT_ARTICLE:
+                return HistoryLookupResult(
+                    HistoryMatchOutcome.REVIEW,
+                    True,
+                    candidates=tuple(offers),
+                    match_results=tuple(matches),
+                    reason_code="source_article_not_found",
+                    catalog_version=projection.version,
+                )
             deterministic_matches = [match for match in matches if match.decision == MatchDecision.MATCH]
             if len(deterministic_matches) != 1:
                 return HistoryLookupResult(
@@ -410,38 +526,31 @@ class OneCHistoryProvider:
                 catalog_version=projection.version,
             )
 
-        exact_name_key = normalize_exact_source_name(source_intent.normalized_name)
-        source_unit_family = normalize_unit_family(source_intent.unit)
-        name_candidates = [
-            candidate for candidate in retrieved
-            if exact_name_key
-            and normalize_exact_source_name(candidate.variant.item_name) == exact_name_key
-            and source_unit_family is not None
-            and normalize_unit_family(candidate.variant.raw_unit) == source_unit_family
-            and candidate.indexed.selected_price_event is not None
-            and normalize_unit_family(candidate.indexed.selected_price_event.raw_unit) == source_unit_family
-        ]
-        strict_item_ids = {
-            item.item.item_id
-            for item in projection.items
-            if any(
-                normalize_exact_source_name(variant.item_name) == exact_name_key
-                and normalize_unit_family(variant.raw_unit) == source_unit_family
-                for variant in item.searchable_variants
+        if retrieval_classification != HistoryRetrievalClassification.EXACT_NAME_UNIT:
+            reason = (
+                "structured_identity_requires_review"
+                if retrieval_classification == HistoryRetrievalClassification.STRUCTURED
+                else "fuzzy_candidates_require_review"
             )
-        } if exact_name_key and source_unit_family else set()
-        loose_name_key = _loose_name_collision_key(source_intent.normalized_name)
-        loose_collision = any(
-            item.item.item_id not in strict_item_ids
-            and any(
-                _loose_name_collision_key(variant.item_name) == loose_name_key
-                and normalize_unit_family(variant.raw_unit) == source_unit_family
-                for variant in item.searchable_variants
+            return HistoryLookupResult(
+                HistoryMatchOutcome.REVIEW,
+                True,
+                candidates=tuple(offers),
+                match_results=tuple(matches),
+                reason_code=reason,
+                catalog_version=projection.version,
             )
-            for item in projection.items
-        ) if loose_name_key and source_unit_family else False
 
-        if len(name_candidates) != 1 or len(strict_item_ids) != 1 or loose_collision:
+        strict_refs = projection.exact_name_unit_index.get((exact_name_key, source_unit_family), ())
+        strict_item_ids = {
+            projection.items[item_index].item.item_id
+            for item_index, _variant_index in strict_refs
+        }
+        loose_name_key = _loose_name_collision_key(source_intent.normalized_name)
+        loose_ids = projection.loose_name_unit_item_ids.get((loose_name_key, source_unit_family), frozenset())
+        loose_collision = bool(loose_ids - strict_item_ids) if loose_name_key and source_unit_family else False
+
+        if len(strict_item_ids) != 1 or loose_collision:
             return HistoryLookupResult(
                 HistoryMatchOutcome.REVIEW,
                 True,
@@ -449,12 +558,15 @@ class OneCHistoryProvider:
                 match_results=tuple(matches),
                 reason_code=(
                     "ambiguous_exact_name_identity"
-                    if len(name_candidates) > 1 or len(strict_item_ids) != 1 or loose_collision
-                    else "exact_name_not_retrieved"
+                    if len(strict_item_ids) != 1
+                    else "loose_name_collision_requires_review"
                 ),
                 catalog_version=projection.version,
             )
-        selected_retrieval = name_candidates[0]
+        selected_retrieval = next(
+            candidate for candidate in retrieved
+            if candidate.indexed.item.item_id in strict_item_ids
+        )
         selected = match_by_offer.get(f"one_c_history:{selected_retrieval.indexed.item.item_id}")
         source_match = source_match_by_offer.get(f"one_c_history:{selected_retrieval.indexed.item.item_id}")
         if (
@@ -492,6 +604,31 @@ class OneCHistoryProvider:
             safe_basis=HistorySafeMatchBasis.EXACT_SOURCE_NAME_UNIT,
             catalog_version=projection.version,
         )
+
+    @staticmethod
+    def _retrieve_indexed(
+        projection: _Projection,
+        refs: tuple[tuple[int, int], ...],
+        classification: HistoryRetrievalClassification,
+        limit: int,
+    ) -> tuple[list[_RetrievedItem], int]:
+        by_item: dict[str, _RetrievedItem] = {}
+        for item_index, variant_index in refs:
+            indexed = projection.items[item_index]
+            variant = indexed.indexed_variants[variant_index].variant
+            by_item.setdefault(
+                indexed.item.item_id,
+                _RetrievedItem(indexed, variant, 1000.0, classification),
+            )
+        candidates = sorted(
+            by_item.values(),
+            key=lambda candidate: (
+                candidate.indexed.item.item_id,
+                candidate.variant.first_source_row,
+                candidate.variant.variant_id,
+            ),
+        )
+        return candidates[:limit], len(candidates)
 
     def _retrieve(
         self,
@@ -598,6 +735,7 @@ class OneCHistoryProvider:
             attributes=attributes,
             retrieved_at=datetime.now(timezone.utc),
             data_provenance=provenance,
+            history_retrieval_classification=candidate.classification,
         )
 
     @staticmethod
@@ -659,13 +797,7 @@ class OneCHistoryProvider:
         # The existing matcher intentionally normalizes punctuation in articles.
         # Treat its broader equivalences as ambiguity, never as a source merge.
         matcher_key = _matcher_article_key(intent.article)
-        matching_items = 0
-        if matcher_key:
-            for projected in projection.items:
-                item_articles = {projected.item.article}
-                item_articles.update(variant.article for variant in projected.searchable_variants)
-                if any(_matcher_article_key(article) == matcher_key for article in item_articles if article):
-                    matching_items += 1
+        matching_items = len(projection.matcher_article_item_ids.get(matcher_key, ())) if matcher_key else 0
         if matching_items != 1 or top_score_tie_count != 1:
             return False
         if not ("article" in match.matched_attributes):

@@ -11,6 +11,8 @@ function createSourcingState(overrides = {}) {
     sourceModeTouched: false,
     modeChangedAfterResult: false,
     requestGeneration: 0,
+    modalPhase: "closed",
+    modalContext: "none",
     ...overrides,
   };
 }
@@ -244,6 +246,7 @@ function clearProtectedMemory() {
 
 function clearSourcingProtectedState() {
   state.sourcing = createSourcingState();
+  setSourcingModalPhase("closed", "none");
   const select = $("#sourcing-source-mode");
   if (select) {
     select.value = "provider_only";
@@ -1116,6 +1119,23 @@ function openSourcingModal() {
   if (!state.sourcing.historyStatusLoaded) void loadSourcingHistoryStatus();
 }
 
+function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || "shared") {
+  if (!state.sourcing) return;
+  state.sourcing.modalPhase = phase;
+  state.sourcing.modalContext = phase === "closed" ? "none" : context;
+  const submit = $("#tender-sourcing-submit");
+  if (!submit) return;
+  const canLaunch = context === "excel_tender" && ["before_run", "failed"].includes(phase);
+  submit.hidden = !canLaunch;
+  if (canLaunch) {
+    submit.disabled = false;
+    submit.textContent = phase === "failed" ? "Повторить подбор" : "Запустить подбор по выбранным строкам";
+  } else {
+    submit.disabled = true;
+    submit.textContent = phase === "queued" ? "В очереди…" : "Подбираем…";
+  }
+}
+
 function sourcingModeLoadingCopy(mode) {
   return {
     one_c_then_provider: {
@@ -1761,7 +1781,7 @@ function clearExcelTenderState() {
   const previewPane = $("#tender-preview-pane");
   if (previewPane) previewPane.hidden = false;
   const sourcingSubmit = $("#tender-sourcing-submit");
-  if (sourcingSubmit) sourcingSubmit.hidden = true;
+  if (sourcingSubmit) setSourcingModalPhase("closed", "none");
 }
 
 function storeExcelTenderView(tenderId) {
@@ -1820,7 +1840,7 @@ function openExcelTenderImport() {
   state.excelTender.latestExports = [];
   state.excelTender.selectedExportId = null;
   state.excelTender.selectedIds = new Set();
-  $("#tender-sourcing-submit").hidden = true;
+  setSourcingModalPhase("closed", "none");
   $("#tender-preview-pane").hidden = false;
   $("#tender-workspace-pane").hidden = true;
   $("#tender-document-name").textContent = "Тендер из Excel";
@@ -2273,9 +2293,7 @@ function renderExcelTenderRows() {
 function openExcelTenderSourcing() {
   if (!state.excelTender.workspace || state.excelTender.sourcingActive) return;
   if (!state.excelTender.selectedIds.size) { toast("Выберите хотя бы одну позицию для подбора", "error"); return; }
-  $("#tender-sourcing-submit").hidden = false;
-  $("#tender-sourcing-submit").disabled = false;
-  $("#tender-sourcing-submit").textContent = "Запустить подбор по выбранным строкам";
+  setSourcingModalPhase("before_run", "excel_tender");
   $("#sourcing-subtitle").textContent = "Будут отправлены только выбранные строки Excel";
   $("#sourcing-content").innerHTML = '<p class="hint">Проверьте выбранный источник подбора и запустите задание.</p>';
   openSourcingModal();
@@ -2310,6 +2328,7 @@ async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
     const total = job.total || expectedTotal;
     const completed = Math.min(Number(job.current || 0), total || Number(job.current || 0));
     if (job.status === "queued" || job.status === "running") {
+      if ($("#sourcing-modal").open) setSourcingModalPhase(job.status, "excel_tender");
       $("#sourcing-subtitle").textContent = job.status === "queued" ? "Задание в очереди" : "Подбираем предложения";
       $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${job.status === "queued" ? "В очереди" : "Выполняется"}</b><strong>${completed} из ${total}</strong><small>${job.status === "queued" ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
     } else if (job.status === "completed") {
@@ -2338,10 +2357,8 @@ async function startExcelTenderSourcing() {
   const mode = state.sourcing.sourceMode;
   state.excelTender.sourcingActive = true;
   state.excelTender.jobId = "submitting";
+  setSourcingModalPhase("running", "excel_tender");
   renderExcelTenderRows();
-  const submit = $("#tender-sourcing-submit");
-  submit.disabled = true;
-  submit.textContent = "Запускаем подбор…";
   const modeSelect = $("#sourcing-source-mode");
   const wasModeDisabled = modeSelect.disabled;
   modeSelect.disabled = true;
@@ -2362,6 +2379,7 @@ async function startExcelTenderSourcing() {
     if (!isCurrent()) return;
     $("#sourcing-subtitle").textContent = "Подбор не выполнен";
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message || "Подбор не выполнен")}</div>`;
+    if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "excel_tender");
     if (error.message.includes("перезапуском сервера")) void refreshExcelTenderRuns(tenderId);
   } finally {
     modeSelect.disabled = state.excelTender.sourcingActive ? true : wasModeDisabled;
@@ -2369,8 +2387,6 @@ async function startExcelTenderSourcing() {
       state.excelTender.sourcingActive = false;
       state.excelTender.jobId = null;
       modeSelect.disabled = wasModeDisabled;
-      submit.disabled = false;
-      submit.textContent = "Запустить подбор по выбранным строкам";
       renderExcelTenderRows();
     }
   }
@@ -2446,6 +2462,7 @@ async function openManualUnderstanding(row) {
   state.sourcing.row = row;
   state.sourcing.result = null;
   state.sourcing.modeChangedAfterResult = false;
+  setSourcingModalPhase("running", "manual_understanding");
   renderSourcingHistoryControls();
   $("#sourcing-subtitle").textContent = "Разбираем ручную позицию…";
   $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>Product Understanding</b><small>Исходные поля останутся без изменений</small></div>`;
@@ -2455,6 +2472,7 @@ async function openManualUnderstanding(row) {
     $("#sourcing-subtitle").textContent = "Разбор ручной позиции завершён";
     $("#sourcing-content").innerHTML = `${renderSourcingNotices(response.notices)}${renderManualUnderstandingWarnings(response.warnings)}${renderProductUnderstanding(response.understanding)}`;
   } catch (error) {
+    if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "manual_understanding");
     $("#sourcing-subtitle").textContent = "Разбор не выполнен";
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
   }
@@ -3915,7 +3933,7 @@ function renderOfferCard(result, compact = false, intent = null) {
 
 function historicalOfferPrice(offer) {
   const amount = offer?.price;
-  if (amount === null || amount === undefined || amount === "") return "Цена в истории не указана";
+  if (amount === null || amount === undefined || amount === "") return "Цена в истории не указана" + (offer?.price_unit ? " / " + escapeHtml(offer.price_unit) : "");
   const currency = String(offer?.currency || "").trim();
   const value = formatMoney(amount, currency);
   const unit = offer?.price_unit ? ` / ${escapeHtml(offer.price_unit)}` : "";
@@ -3936,9 +3954,20 @@ function historicalOfferCounterparty(offer) {
 function renderHistoricalOfferCard(result, {compact = false, route = null} = {}) {
   const offer = result?.offer || result || {};
   const decision = result?.decision || "";
-  const explanation = result?.explanation || "";
-  return `<article class="offer-card historical-offer-card ${compact ? "compact" : "recommended"}">
-    <div class="offer-card-heading"><span class="technical-badge">История 1С</span>${decision ? renderSourcingDecision(decision) : ""}<b>${offerTitleHtml(offer)}</b></div>
+  const classification = offer.history_retrieval_classification || "";
+  const isReview = route?.final_source_kind === "history_review" || decision === "REVIEW" || decision === "ALTERNATIVE";
+  const exact = ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(classification);
+  const presentation = historyReviewPresentation([result], route);
+  const explanation = result?.explanation || (isReview ? presentation.explanation : "");
+  const retrievalBadge = exact && isReview
+    ? `<span class="history-evidence-badge">Требуется подтверждение</span>`
+    : classification === "FUZZY"
+      ? `<span class="history-fuzzy-badge">Похожее название · не подтверждено</span>`
+      : "";
+  const decisionBadge = retrievalBadge ? "" : decision ? renderSourcingDecision(decision) : "";
+  const retrievalClass = exact ? "exact-retrieval" : classification === "FUZZY" ? "fuzzy-discovery" : "";
+  return `<article class="offer-card historical-offer-card ${compact ? "compact" : "recommended"} ${retrievalClass}">
+    <div class="offer-card-heading"><span class="technical-badge">История 1С</span>${retrievalBadge}${decisionBadge}<b>${offerTitleHtml(offer)}</b></div>
     <div class="offer-price">${historicalOfferPrice(offer)}</div>
     <div class="offer-meta"><span>Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))}</span><span>Контрагент: ${escapeHtml(historicalOfferCounterparty(offer))}</span><span>Текущая доступность не подтверждена.</span></div>
     ${explanation ? `<p class="offer-explanation">${escapeHtml(explanation)}</p>` : ""}
@@ -4030,7 +4059,7 @@ function projectDecision(item) {
 function projectReason(item) {
   const route = item?.route;
   if (route?.final_source_kind === "historical_purchase") return "Найдено безопасное совпадение в истории закупок 1С";
-  if (route?.final_source_kind === "history_review") return "Исторический вариант требует проверки";
+  if (route?.final_source_kind === "history_review") return historyReviewPresentation(projectReviewCandidates(item), route).title;
   const match = projectMatch(item);
   if (!item.offers?.length) return "Точное предложение не найдено";
   if (match?.decision === "MATCH" || match?.decision === "LIKELY_MATCH") {
@@ -4075,6 +4104,18 @@ function projectResultView(item) {
 }
 
 function projectReviewCandidates(item) {
+  if (item?.route?.final_source_kind === "history_review" && Array.isArray(item.offers)) {
+    const offerMatches = new Map((item.match_results || []).map((match) => [match.offer?.offer_id, match]));
+    const exact = item.offers.filter((offer) => offer?.history_retrieval_classification
+      && offer.history_retrieval_classification !== "FUZZY");
+    const candidates = exact.length ? exact : item.offers.filter((offer) => offer?.history_retrieval_classification === "FUZZY");
+    if (candidates.length) {
+      return candidates.slice(0, 5).map((offer, index) => {
+        const match = offerMatches.get(offer.offer_id);
+        return match && match.decision !== "REJECT" ? match : {offer, decision:"REVIEW", rank:index + 1};
+      });
+    }
+  }
   const candidates = [];
   const seenOfferIds = new Set();
   const add = (candidate) => {
@@ -4090,6 +4131,42 @@ function projectReviewCandidates(item) {
     .sort((left, right) => Number(left.rank ?? Number.MAX_SAFE_INTEGER) - Number(right.rank ?? Number.MAX_SAFE_INTEGER))
     .forEach(add);
   return candidates.slice(0, 5);
+}
+
+function historyReviewPresentation(candidates, route = null) {
+  const exactNameUnit = candidates.filter((candidate) => candidate.offer?.history_retrieval_classification === "EXACT_NAME_UNIT");
+  const exact = candidates.filter((candidate) => ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(candidate.offer?.history_retrieval_classification));
+  const ambiguousRoute = ["ambiguous_exact_name_identity", "ambiguous_or_non_strict_evidence"].includes(route?.history_reason_code);
+  if (exactNameUnit.length) {
+    const ambiguous = exactNameUnit.length > 1 || ambiguousRoute;
+    const withoutPrice = exactNameUnit.some((candidate) => candidate.offer?.price === null || candidate.offer?.price === undefined);
+    return {
+      kind: ambiguous ? "ambiguous_exact" : "exact_name_unit",
+      title: ambiguous ? "Несколько точных вариантов — требуется выбор" : "Найдено точное название и единица измерения в истории 1С",
+      explanation: ambiguous
+        ? "Несколько записей совпадают по исходному названию и единице; идентичность каждой записи требует проверки." + (withoutPrice ? " В части записей нет цены, пригодной для расчёта." : "")
+        : "Автоматического подтверждения недостаточно: нужна дополнительная проверка идентичности товара." + (withoutPrice ? " Для этой исторической записи нет цены, пригодной для расчёта." : ""),
+    };
+  }
+  if (exact.length) {
+    const withoutPrice = exact.some((candidate) => candidate.offer?.price === null || candidate.offer?.price === undefined);
+    return {
+      kind: "exact_structured",
+      title: exact.length > 1 || ambiguousRoute ? "Несколько точных вариантов — требуется выбор" : "Точное основание в истории 1С требует проверки",
+      explanation: withoutPrice
+        ? "Для этой исторической записи нет цены, пригодной для расчёта."
+        : route?.history_reason_code === "ambiguous_or_non_strict_evidence"
+          ? "Несколько записей соответствуют исходному артикулу либо данных недостаточно для безопасного подтверждения."
+          : "Проверьте идентичность товара и детерминированные характеристики перед использованием исторической записи.",
+    };
+  }
+  return {
+    kind: "fuzzy",
+    title: "Похожие названия в истории 1С — совпадение не подтверждено",
+    explanation: route?.history_reason_code === "source_article_not_found"
+      ? "Точный исходный артикул не найден; похожие записи не подтверждают совпадение."
+      : "Похожие записи служат только для ориентира и не подтверждают идентичность товара.",
+  };
 }
 
 function projectHasReviewCandidates(item) {
@@ -4156,14 +4233,16 @@ function renderProjectSourcingList(result) {
 
 function renderProjectItemDetails(projectResult, item) {
   const content = $("#sourcing-content");
+  setSourcingModalPhase("position_detail");
   const intent = item.intent || {};
   const candidates = projectReviewCandidates(item);
   const route = item.route || null;
   const historical = route?.final_source_kind === "history_review" || route?.final_source_kind === "historical_purchase";
+  const historyPresentation = historyReviewPresentation(candidates, route);
   const sourceLabel = intent.normalized_name || intent.source_text || "Позиция без исходного текста";
   $("#sourcing-subtitle").textContent = "Проверка позиции";
   const title = route?.source_mode === "one_c_only" && route?.final_source_kind === "history_review"
-    ? "Найдены варианты в истории 1С — требуется проверка"
+    ? historyPresentation.title
     : "Варианты для проверки";
   content.innerHTML = `<button type="button" class="button text project-results-back">← К результатам подбора</button>
     <h3>Проверка позиции</h3>
@@ -4171,6 +4250,7 @@ function renderProjectItemDetails(projectResult, item) {
     ${renderProductUnderstanding(item.understanding)}
     ${renderSourcingRouteExplanation(route)}
     <h3>${escapeHtml(title)}</h3>
+    ${route?.final_source_kind === "history_review" ? `<p class="history-review-explanation" role="status">${escapeHtml(historyPresentation.explanation)}</p>` : ""}
     <div class="offer-grid">${candidates.map((candidate) => historical
       ? renderHistoricalOfferCard(candidate, {compact:true, route})
       : renderOfferCard(candidate, true, intent)).join("")}</div>`;
@@ -4194,6 +4274,7 @@ function bindProjectCandidateActions(result) {
 
 function renderSourcingResult(result, row = null) {
   const content = $("#sourcing-content");
+  if (state.sourcing.modalPhase !== "closed") setSourcingModalPhase("project_result");
   state.sourcing.result = result;
   state.sourcing.modeChangedAfterResult = state.sourcing.sourceMode !== sourcingResultMode(result);
   renderSourcingHistoryControls();
@@ -4249,12 +4330,12 @@ function renderSourcingResult(result, row = null) {
   const alternatives = (result.match_results || []).filter((item) => item !== best && item.decision !== "REJECT").slice(0, 5);
   const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
   $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
-  const historyCandidates = (result.match_results || []).filter((item) => item.decision !== "REJECT" && item.offer).slice(0, 5);
-  const candidateList = historyCandidates.length ? historyCandidates : (result.review_candidate ? [result.review_candidate] : []);
+  const candidateList = historyReview ? projectReviewCandidates(result) : [];
+  const historyPresentation = historyReviewPresentation(candidateList, route);
   const mainResult = historyUsed
     ? `<h3>Историческая цена закупки</h3>${renderHistoricalOfferCard(best || result.recommended_offer, {route})}`
     : historyReview
-      ? `<h3>Найдены варианты в истории 1С — требуется проверка</h3>${candidateList.length ? `<div class="offer-grid">${candidateList.map((item) => renderHistoricalOfferCard(item, {compact:true, route})).join("")}</div>` : `<div class="sourcing-warning">Исторические варианты требуют проверки.</div>`}`
+      ? `<h3>${escapeHtml(historyPresentation.title)}</h3><p class="history-review-explanation" role="status">${escapeHtml(historyPresentation.explanation)}</p>${candidateList.length ? `<div class="offer-grid">${candidateList.map((item) => renderHistoricalOfferCard(item, {compact:true, route})).join("")}</div>` : `<div class="sourcing-warning">Исторические варианты требуют проверки.</div>`}`
       : best ? `<h3>Рекомендуемое предложение</h3>${renderOfferCard(best, false, intent)}`
       : `<div class="sourcing-warning">${route?.final_source_kind === "none" && route?.fallback_status === "error"
         ? "Поиск у поставщика завершился ошибкой. Предложения не получены."
@@ -4270,7 +4351,7 @@ function renderSourcingResult(result, row = null) {
 }
 
 async function openSourcingForRow(row) {
-  $("#tender-sourcing-submit").hidden = true;
+  setSourcingModalPhase("running", "single_row");
   const sourcing = state.sourcing;
   const generation = ++sourcing.requestGeneration;
   const sourceMode = sourcing.sourceMode;
@@ -4291,12 +4372,12 @@ async function openSourcingForRow(row) {
   } catch (error) {
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     $("#sourcing-subtitle").textContent = "Поиск не выполнен";
+    setSourcingModalPhase("failed", "single_row");
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}<br><small>Можно продолжить с локальным каталогом после его наполнения.</small></div>`;
   }
 }
 
 async function runProjectSourcing(rows, documentId = null, submitButton = null) {
-  $("#tender-sourcing-submit").hidden = true;
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
   const previousButtonLabel = submitButton?.textContent;
   const previousButtonDisabled = submitButton?.disabled;
@@ -4305,6 +4386,7 @@ async function runProjectSourcing(rows, documentId = null, submitButton = null) 
     submitButton.textContent = "Запускаем подбор…";
   }
   const sourcing = state.sourcing;
+  setSourcingModalPhase("running", "project");
   const generation = ++sourcing.requestGeneration;
   const sourceMode = sourcing.sourceMode;
   sourcing.projectFilter = "all";
@@ -4331,6 +4413,7 @@ async function runProjectSourcing(rows, documentId = null, submitButton = null) 
   } catch (error) {
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     $("#sourcing-subtitle").textContent = "Подбор не выполнен";
+    if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "project");
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
   } finally {
     if (submitButton) {
@@ -4369,6 +4452,7 @@ async function pollSourcingJob(jobId, expectedTotal, isCurrent = () => true, onS
     const current = Math.min(Number(job.current || 0), total || Number(job.current || 0));
     $("#sourcing-subtitle").textContent = job.status === "queued" ? "Задание в очереди" : "Подбираем предложения";
     if (job.status === "running" || job.status === "queued") {
+      if ($("#sourcing-modal").open) setSourcingModalPhase(job.status);
       const queued = job.status === "queued";
       const statusLabel = queued ? "В очереди" : "Выполняется";
       $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${statusLabel}</b><strong>${current} из ${total}</strong><small>${queued ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
@@ -5607,7 +5691,8 @@ function setupEvents() {
   $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
   $("#sourcing-source-mode").addEventListener("change",handleSourcingModeChange);
   $("#sourcing-history-refresh").addEventListener("click",() => { void loadSourcingHistoryStatus(); });
-  $("#close-sourcing").addEventListener("click",()=>{ $("#tender-sourcing-submit").hidden = true; $("#sourcing-modal").close(); });
+  $("#sourcing-modal").addEventListener("close",() => setSourcingModalPhase("closed", "none"));
+  $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());
   $("#zoom-in").addEventListener("click",()=>setZoom(Math.min(1.8,state.zoom+.1))); $("#zoom-out").addEventListener("click",()=>setZoom(Math.max(.5,state.zoom-.1)));
   $("#clear-crop").addEventListener("click",()=>{state.crop=null;positionCropBox();$("#clear-crop").hidden=true;});

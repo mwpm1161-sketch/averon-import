@@ -62,6 +62,7 @@ def test_sourcing_mode_runtime_defaults_and_preserves_session_selection():
         "openSourcingModal",
         "handleSourcingModeChange",
         "clearSourcingProtectedState",
+        "setSourcingModalPhase",
     ))
     script = f"""
 const vm = require('vm');
@@ -169,7 +170,13 @@ def test_history_results_are_distinct_from_live_provider_offers_and_totals():
     assert "role=\"status\"" in app
     assert "В истории 1С нет безопасно подтверждённого совпадения, а поиск у поставщика завершился ошибкой." in route_copy
     assert "В истории 1С были варианты, требующие проверки; показан результат поставщика." in route_copy
-    assert "Найдены варианты в истории 1С — требуется проверка" in result_renderer
+    assert "historyReviewPresentation(candidateList, route)" in result_renderer
+    assert "Похожие названия в истории 1С — совпадение не подтверждено" in app
+    assert "Найдено точное название и единица измерения в истории 1С" in app
+    assert "Несколько точных вариантов — требуется выбор" in app
+    assert "Автоматического подтверждения недостаточно: нужна дополнительная проверка идентичности товара." in app
+    assert "Требуется подтверждение" in historical
+    assert "Похожее название · не подтверждено" in historical
     assert "Исторические цены 1С не включены в текущую стоимость поставщика." in result_renderer
     assert "positions_history_matched" in result_renderer
     assert "positions_provider_matched" in result_renderer
@@ -212,6 +219,40 @@ def test_sourcing_controls_and_historical_cards_fit_narrow_viewports():
     assert "@media (max-width:420px)" in css
     assert ".sourcing-route-coverage { grid-template-columns:repeat(2,minmax(0,1fr)); }" in css
     assert ".historical-offer-card.recommended" in css
+    assert ".historical-offer-card.exact-retrieval" in css
+    assert ".historical-offer-card.fuzzy-discovery" in css
+
+
+def test_sourcing_modal_phase_owns_excel_launch_visibility_and_review_back_navigation():
+    _html, app, _css = _sources()
+    helper = app.split("function setSourcingModalPhase", 1)[1].split("function sourcingModeLoadingCopy", 1)[0]
+    project_detail = app.split("function renderProjectItemDetails", 1)[1].split("function bindSourcingFilters", 1)[0]
+    result = app.split("function renderSourcingResult", 1)[1].split("async function openSourcingForRow", 1)[0]
+    excel_poll = app.split("async function pollExcelTenderJob", 1)[1].split("async function startExcelTenderSourcing", 1)[0]
+    excel_start = app.split("async function startExcelTenderSourcing", 1)[1].split("function parseManualPaste", 1)[0]
+
+    assert 'context === "excel_tender"' in helper
+    assert '["before_run", "failed"].includes(phase)' in helper
+    assert 'phase === "failed" ? "Повторить подбор"' in helper
+    assert 'setSourcingModalPhase("before_run", "excel_tender")' in app
+    assert 'setSourcingModalPhase("position_detail")' in project_detail
+    assert "renderSourcingResult(projectResult)" in project_detail
+    assert 'setSourcingModalPhase("project_result")' in result
+    assert 'setSourcingModalPhase(job.status, "excel_tender")' in excel_poll
+    assert 'setSourcingModalPhase("failed", "excel_tender")' in excel_start
+    assert 'addEventListener("close",() => setSourcingModalPhase("closed", "none"))' in app
+    assert 'tender-sourcing-submit").hidden =' not in app
+
+
+def test_sourcing_modal_and_historical_candidate_lifecycle_in_node():
+    script = ROOT / "tests" / "js" / "sourcing_modal_lifecycle.cjs"
+    completed = subprocess.run(
+        ["node", str(script), str(ROOT / "averon_import" / "static" / "app.js")],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert "PASS: exact-first history review and sourcing modal lifecycle" in completed.stdout
 
 
 def test_project_result_price_and_total_columns_wrap_without_hiding_facts():
