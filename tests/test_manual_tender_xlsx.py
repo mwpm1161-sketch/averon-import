@@ -1146,7 +1146,7 @@ def test_ui_exposes_excel_path_without_changing_manual_sourcing_and_clears_on_lo
     assert 'value="exclude">Продолжить без исторических цен' in template
     assert 'value="cancel">Отмена' in template
     assert "historical_decision_confirmed" in export_action
-    assert "chooseTenderHistoricalPricePolicy(summary)" in export_action
+    assert "chooseTenderHistoricalPricePolicy(summary, runId)" in export_action
     assert "body:JSON.stringify(options)" in export_action
     assert '"price"' not in export_action and "localStorage" not in export_action and "sessionStorage" not in export_action
     assert 'id="tender-export-run"' in template and 'id="tender-export-download"' in template
@@ -2407,6 +2407,25 @@ def test_d3_human_history_ui_lifecycle_regression():
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert expected in result.stdout
+
+
+def test_excel_tender_export_run_pinning_ui_regression():
+    node = shutil.which("node")
+    assert node, "Node.js is required for the Excel Tender export run-pinning regression"
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            node,
+            str(root / "tests" / "js" / "excel_tender_export_run_pinning.cjs"),
+            str(root / "averon_import" / "static" / "app.js"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS: Excel Tender run pinning" in result.stdout
 
 
 def test_d3_export_fails_if_decision_set_changes_before_runner(tender_api, tmp_path, monkeypatch):

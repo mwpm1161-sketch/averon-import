@@ -2084,6 +2084,8 @@ async function openExcelTenderRunDetail(runId = null) {
     const base = `/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}/runs/${encodeURIComponent(selected)}`;
     const [run, snapshot] = await Promise.all([api(base), api(`${base}/history-decisions`)]);
     if (state.excelTender.workspace?.tender_id !== workspace.tender_id) return;
+    state.excelTender.selectedExportRunId = selected;
+    renderExcelTenderExportControls();
     const decisionRows = new Map((snapshot.rows || []).map((item) => [item.source_row_id, item]));
     const summary = run.summary || {};
     const result = {
@@ -2152,13 +2154,13 @@ function renderExcelTenderExportControls() {
   state.excelTender.selectedExportRunId = selectedRun || null;
   runSelect.innerHTML = completed.map((run) => {
     const when = run.completed_at ? new Date(run.completed_at).toLocaleString("ru-RU") : "";
-    return `<option value="${escapeHtml(run.run_id)}">${escapeHtml(modes[run.source_mode] || "Подбор")} · ${escapeHtml(when)} · ${escapeHtml(String(run.run_id).slice(0,8))}</option>`;
+    return `<option value="${escapeHtml(run.run_id)}">${escapeHtml(modes[run.source_mode] || "Подбор")} · ${escapeHtml(when)} · запуск ${escapeHtml(String(run.run_id).slice(0,8))}</option>`;
   }).join("");
   runSelect.value = selectedRun;
   runSelect.disabled = !completed.length || state.excelTender.exportActive || state.excelTender.sourcingActive;
   button.disabled = !selectedRun || state.excelTender.exportActive || state.excelTender.sourcingActive;
   button.textContent = state.excelTender.exportActive ? "Формируем Excel…" : "Скачать Excel с ценами";
-  const artifacts = state.excelTender.latestExports || [];
+  const artifacts = (state.excelTender.latestExports || []).filter((item) => item.run_id === selectedRun);
   const selectedArtifact = artifacts.some((item) => item.export_id === state.excelTender.selectedExportId)
     ? state.excelTender.selectedExportId : artifacts[0]?.export_id || "";
   state.excelTender.selectedExportId = selectedArtifact || null;
@@ -2186,12 +2188,13 @@ async function refreshExcelTenderExports(tenderId = state.excelTender.workspace?
   }
 }
 
-function tenderExportConfirmationSummary(summary) {
+function tenderExportConfirmationSummary(summary, runId = state.excelTender.selectedExportRunId) {
   const selected = Number(summary?.selected_count || 0);
   const priced = Number(summary?.priced_count || 0);
   const blank = Number(summary?.blank_count || 0);
   const historical = Number(summary?.historical_count || 0);
-  return `Позиции: ${selected}; с ценой: ${priced}; без цены: ${blank}; исторические цены 1С: ${historical}.`;
+  const shortRunId = runId ? String(runId).slice(0,8) : "—";
+  return `Запуск: ${shortRunId}. Позиции: ${selected}; с ценой: ${priced}; без цены: ${blank}; исторические цены 1С: ${historical}.`;
 }
 
 function clearTenderExportFailure() {
@@ -2219,11 +2222,11 @@ function showTenderExportFailure(error) {
   panel.hidden = false;
 }
 
-function chooseTenderHistoricalPricePolicy(summary) {
+function chooseTenderHistoricalPricePolicy(summary, runId = state.excelTender.selectedExportRunId) {
   const dialog = $("#tender-history-confirmation-modal");
   const summaryNode = $("#tender-history-confirmation-summary");
   if (!dialog || typeof dialog.showModal !== "function") return Promise.resolve("cancel");
-  if (summaryNode) summaryNode.textContent = tenderExportConfirmationSummary(summary);
+  if (summaryNode) summaryNode.textContent = tenderExportConfirmationSummary(summary, runId);
   dialog.returnValue = "cancel";
   return new Promise((resolve) => {
     dialog.addEventListener("close", () => {
@@ -2260,14 +2263,14 @@ async function startExcelTenderPriceExport() {
       } catch (error) {
         const summary = error.payload?.detail?.summary || {};
         if (error.code === "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED" && !options.include_historical_prices) {
-          const choice = await chooseTenderHistoricalPricePolicy(summary);
+          const choice = await chooseTenderHistoricalPricePolicy(summary, runId);
           if (choice === "cancel") throw new Error("Экспорт отменён.");
           if (choice === "include") options.include_historical_prices = true;
           else options.historical_decision_confirmed = true;
           continue;
         }
         if (error.code === "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED" && !options.allow_partial) {
-          const accepted = confirm(`Часть строк останется без цены. Продолжить частичный экспорт?\n\n${tenderExportConfirmationSummary(summary)}`);
+          const accepted = confirm(`Часть строк останется без цены. Продолжить частичный экспорт?\n\n${tenderExportConfirmationSummary(summary, runId)}`);
           if (!accepted) throw new Error("Экспорт отменён.");
           options.allow_partial = true;
           continue;
@@ -2419,6 +2422,11 @@ async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
           const endpoint = `/api/manual-tenders/${encodeURIComponent(tenderId)}/runs/${encodeURIComponent(result.run_id)}/history-decisions`;
           applyTenderHistoryDecisionSnapshot(result, await api(endpoint));
         } catch (_) {}
+      }
+      if (!current()) return;
+      if (result?.run_id) {
+        state.excelTender.selectedExportRunId = result.run_id;
+        state.excelTender.selectedExportId = null;
       }
       renderSourcingResult(result);
       void refreshExcelTenderRuns(tenderId);
