@@ -863,10 +863,11 @@ class _ApiResponse:
 def _api_request(app, method, path, *, headers=None, body=b""):
     sent = False
     messages = []
+    route_path, separator, query_string = path.partition("?")
     scope = {
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-        "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
-        "query_string": b"", "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
+        "method": method, "scheme": "http", "path": route_path, "raw_path": route_path.encode(),
+        "query_string": query_string.encode() if separator else b"", "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
         "client": ("127.0.0.1", 12345), "server": ("127.0.0.1", 8765),
     }
     async def receive():
@@ -967,6 +968,88 @@ def test_api_auth_template_preview_confirm_owner_isolation_and_delete(tender_api
     deleted = _api_request(main.app, "DELETE", f"/api/manual-tenders/{workspace['tender_id']}", headers=_auth_headers())
     assert deleted.status_code == 200 and deleted.json()["deleted"] is True
     main.job_service.executor.shutdown(wait=True)
+
+
+def test_recent_tender_collection_is_owner_scoped_safe_non_touching_and_cleans_expired(tender_api, tmp_path):
+    main, repository = tender_api
+    owner_a_old = _confirm_tender_for_owner(main, repository, tmp_path, "username:user-a", "a-old.xlsx")
+    owner_a_new = _confirm_tender_for_owner(main, repository, tmp_path, "username:user-a", "a-new.xlsx")
+    owner_a_latest = _confirm_tender_for_owner(main, repository, tmp_path, "username:user-a", "a-latest.xlsx")
+    owner_b = _confirm_tender_for_owner(main, repository, tmp_path, "username:user-b", "b-only.xlsx")
+
+    old_access = datetime.now(timezone.utc) - timedelta(hours=2)
+    new_access = datetime.now(timezone.utc) - timedelta(hours=1)
+    for workspace, last_access in ((owner_a_old, old_access), (owner_a_new, new_access), (owner_a_latest, new_access)):
+        metadata_path = repository.workspace_root / workspace["tender_id"] / "workspace.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["last_access_at"] = last_access.isoformat()
+        repository._atomic_json(metadata_path, metadata)
+
+    unauthenticated = _api_request(main.app, "GET", "/api/manual-tenders?limit=10")
+    assert unauthenticated.status_code == 401
+    invalid_limit = _api_request(main.app, "GET", "/api/manual-tenders?limit=21", headers=_auth_headers("user-a"))
+    assert invalid_limit.status_code == 422
+
+    before = {
+        workspace["tender_id"]: json.loads((repository.workspace_root / workspace["tender_id"] / "workspace.json").read_text(encoding="utf-8"))["last_access_at"]
+        for workspace in (owner_a_old, owner_a_new, owner_a_latest, owner_b)
+    }
+    listed_a = _api_request(main.app, "GET", "/api/manual-tenders?limit=10", headers=_auth_headers("user-a"))
+    assert listed_a.status_code == 200
+    payload_a = listed_a.json()
+    assert payload_a["active_count"] == 3
+    assert payload_a["limit"] == MAX_WORKSPACES_PER_USER
+    assert [item["tender_id"] for item in payload_a["tenders"]] == [owner_a_latest["tender_id"], owner_a_new["tender_id"], owner_a_old["tender_id"]]
+    assert {item["filename"] for item in payload_a["tenders"]} == {"a-old.xlsx", "a-new.xlsx", "a-latest.xlsx"}
+    assert all(item["item_count"] == 1 for item in payload_a["tenders"])
+    limited = _api_request(main.app, "GET", "/api/manual-tenders?limit=1", headers=_auth_headers("user-a"))
+    assert limited.status_code == 200
+    assert limited.json()["active_count"] == 3 and len(limited.json()["tenders"]) == 1
+    assert all(set(item) <= {"tender_id", "filename", "sheet_name", "item_count", "created_at", "last_access_at", "absolute_expires_at", "revision"} for item in payload_a["tenders"])
+    encoded_a = json.dumps(payload_a)
+    assert str(repository.root) not in encoded_a
+    for forbidden in ("owner_id", "source_manifest", "rows", "run", "decisions", "exports", "global_count"):
+        assert forbidden not in encoded_a
+    after_list = {
+        workspace["tender_id"]: json.loads((repository.workspace_root / workspace["tender_id"] / "workspace.json").read_text(encoding="utf-8"))["last_access_at"]
+        for workspace in (owner_a_old, owner_a_new, owner_a_latest, owner_b)
+    }
+    assert after_list == before, "listing summaries must not refresh idle TTL"
+
+    listed_b = _api_request(main.app, "GET", "/api/manual-tenders", headers=_auth_headers("user-b"))
+    assert listed_b.status_code == 200
+    assert listed_b.json()["active_count"] == 1
+    assert [item["tender_id"] for item in listed_b.json()["tenders"]] == [owner_b["tender_id"]]
+    assert owner_a_old["tender_id"] not in json.dumps(listed_b.json())
+
+    guessed_open = _api_request(main.app, "GET", f"/api/manual-tenders/{owner_a_old['tender_id']}", headers=_auth_headers("user-b"))
+    guessed_delete = _api_request(main.app, "DELETE", f"/api/manual-tenders/{owner_a_old['tender_id']}", headers=_auth_headers("user-b"))
+    assert guessed_open.status_code == guessed_delete.status_code == 404
+    assert (repository.workspace_root / owner_a_old["tender_id"]).exists()
+
+    opened = _api_request(main.app, "GET", f"/api/manual-tenders/{owner_a_old['tender_id']}", headers=_auth_headers("user-a"))
+    assert opened.status_code == 200
+    opened_access = opened.json()["last_access_at"]
+    assert datetime.fromisoformat(opened_access) > datetime.fromisoformat(before[owner_a_old["tender_id"]])
+
+    lease = main.tender_activity.acquire(owner_a_new["tender_id"])
+    try:
+        busy_delete = _api_request(main.app, "DELETE", f"/api/manual-tenders/{owner_a_new['tender_id']}", headers=_auth_headers("user-a"))
+        assert busy_delete.status_code == 409
+        assert busy_delete.json()["detail"]["code"] == "TENDER_WORKSPACE_BUSY"
+        assert (repository.workspace_root / owner_a_new["tender_id"]).exists()
+    finally:
+        lease.release()
+
+    expired_path = repository.workspace_root / owner_a_old["tender_id"] / "workspace.json"
+    expired_metadata = json.loads(expired_path.read_text(encoding="utf-8"))
+    expired_metadata["last_access_at"] = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    repository._atomic_json(expired_path, expired_metadata)
+    after_cleanup = _api_request(main.app, "GET", "/api/manual-tenders", headers=_auth_headers("user-a"))
+    assert after_cleanup.status_code == 200
+    assert after_cleanup.json()["active_count"] == 2
+    assert [item["tender_id"] for item in after_cleanup.json()["tenders"]] == [owner_a_latest["tender_id"], owner_a_new["tender_id"]]
+    assert not (repository.workspace_root / owner_a_old["tender_id"]).exists()
 
 
 def test_api_confirmation_returns_typed_invalid_rows_error(tender_api, tmp_path):
@@ -1192,6 +1275,20 @@ def _confirm_synthetic_tender(main, repository, tmp_path, *, count=1, official=F
         parser_version=analysis["parser_version"], mapping=analysis["mapping"], analysis=analysis,
     )
     return repository.confirm(preview["preview_id"], "username:tender-user")
+
+
+def _confirm_tender_for_owner(main, repository, tmp_path, owner_id, filename):
+    path = tmp_path / f"owner-bound-{uuid.uuid4().hex}.xlsx"
+    payload = _official(path)
+    digest = hashlib.sha256(payload).hexdigest()
+    preview = repository.reserve_preview(owner_id, filename, len(payload), digest)
+    source_path = repository.write_preview_source(preview["preview_id"], payload)
+    analysis = main.tender_parser.parse(source_path, tender_id=preview["preview_id"])
+    repository.update_preview(
+        preview["preview_id"], owner_id, status="ready",
+        parser_version=analysis["parser_version"], mapping=analysis["mapping"], analysis=analysis,
+    )
+    return repository.confirm(preview["preview_id"], owner_id)
 
 
 def _fake_tender_sourcing_service(monkeypatch, main, *, catalog_version="catalog-v1"):
@@ -2426,6 +2523,25 @@ def test_excel_tender_export_run_pinning_ui_regression():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS: Excel Tender run pinning" in result.stdout
+
+
+def test_recent_tender_lifecycle_ui_regression():
+    node = shutil.which("node")
+    assert node, "Node.js is required for recent tender UI lifecycle regression"
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            node,
+            str(root / "tests" / "js" / "recent_tender_lifecycle.cjs"),
+            str(root / "averon_import" / "static" / "app.js"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS: recent tender reload" in result.stdout
 
 
 def test_d3_export_fails_if_decision_set_changes_before_runner(tender_api, tmp_path, monkeypatch):

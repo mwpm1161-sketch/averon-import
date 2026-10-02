@@ -653,6 +653,17 @@ def confirm_manual_tender_preview(preview_id: str, user: CurrentUser = Depends(r
         raise _tender_http_error(exc) from exc
 
 
+@app.get("/api/manual-tenders", dependencies=[Depends(require_authenticated)])
+def list_manual_tenders(
+    limit: int = Query(default=10, ge=1, le=20),
+    user: CurrentUser = Depends(require_authenticated),
+):
+    try:
+        return tender_repository.list_public_workspaces(_tender_owner_key(user), limit=limit)
+    except Exception as exc:
+        raise _tender_http_error(exc) from exc
+
+
 @app.get("/api/manual-tenders/{tender_id}", dependencies=[Depends(require_authenticated)])
 def get_manual_tender(tender_id: str, user: CurrentUser = Depends(require_authenticated)):
     try:

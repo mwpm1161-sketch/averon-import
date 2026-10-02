@@ -92,6 +92,11 @@ const state = {
     },
   },
   recentDocuments: [],
+  recentExcelTenders: [],
+  recentExcelTendersActiveCount: 0,
+  recentExcelTendersLimit: null,
+  recentExcelTendersError: null,
+  recentExcelTendersRequest: 0,
   pendingDocumentDelete: null,
   manual: {active: false, rows: []},
   excelTender: {previewId:null,jobId:null,pollGeneration:0,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null,historyDecisionRevision:0,historyDecisionDigest:null},
@@ -339,6 +344,15 @@ function isCurrentDocumentNavigation(generation) {
 function clearProtectedUi() {
   $("#recent-documents-list").replaceChildren();
   $("#recent-documents-panel").hidden = true;
+  state.recentExcelTenders = [];
+  state.recentExcelTendersActiveCount = 0;
+  state.recentExcelTendersLimit = null;
+  state.recentExcelTendersError = null;
+  state.recentExcelTendersRequest += 1;
+  const recentTendersList = $("#recent-tenders-list");
+  if (recentTendersList) recentTendersList.replaceChildren();
+  const recentTendersPanel = $("#recent-tenders-panel");
+  if (recentTendersPanel) recentTendersPanel.hidden = true;
   $("#thumbnail-grid").replaceChildren();
   $("#result-head").replaceChildren();
   $("#result-body").replaceChildren();
@@ -869,6 +883,15 @@ async function boot() {
         clearOneCHistoryProtectedState();
         clearSourcingProtectedState();
         clearExcelTenderState();
+        state.recentExcelTenders = [];
+        state.recentExcelTendersActiveCount = 0;
+        state.recentExcelTendersLimit = null;
+        state.recentExcelTendersError = null;
+        state.recentExcelTendersRequest += 1;
+        const recentTendersList = $("#recent-tenders-list");
+        if (recentTendersList) recentTendersList.replaceChildren();
+        const recentTendersPanel = $("#recent-tenders-panel");
+        if (recentTendersPanel) recentTendersPanel.hidden = true;
       }
       state.currentUser = currentUser;
       state.authMode = authMode;
@@ -911,6 +934,7 @@ async function boot() {
       initializeExportColumns();
       loadManualDraft();
       try { await loadRecentDocuments(); } catch (_) { state.recentDocuments = []; renderRecentDocuments(); }
+      try { await loadRecentExcelTenders(); } catch (_) { renderRecentExcelTenders(); }
       if (generation !== state.authGeneration) return;
       const manualDraftActive = state.manual.active;
       if (manualDraftActive) openManualWorkspace();
@@ -1762,6 +1786,7 @@ function returnToStartFromManual() {
   state.manual.active = false;
   saveManualDraft();
   setView("upload");
+  void loadRecentExcelTenders().catch(() => {});
 }
 
 function clearExcelTenderState() {
@@ -2005,7 +2030,20 @@ async function confirmExcelTenderImport() {
   try {
     const workspace = await api(`/api/manual-tenders/previews/${encodeURIComponent(previewId)}/confirm`, {method:"POST"});
     openExcelTenderWorkspace(workspace);
-  } catch (error) { toast(error.message || "Не удалось импортировать позиции", "error"); }
+  } catch (error) {
+    if (error?.code === "TENDER_WORKSPACE_QUOTA") {
+      setView("upload");
+      await loadRecentExcelTenders().catch(() => {});
+      const count = state.recentExcelTendersActiveCount;
+      const limit = state.recentExcelTendersLimit;
+      const message = Number.isInteger(limit) && count >= limit
+        ? `Достигнут лимит активных тендеров (${count} из ${limit}). Удалите ненужный тендер в разделе «Недавние тендеры».`
+        : error.message || "Достигнут лимит активных тендеров. Удалите ненужный тендер или повторите позже.";
+      toast(message, "error");
+      return;
+    }
+    toast(error.message || "Не удалось импортировать позиции", "error");
+  }
 }
 
 function openExcelTenderWorkspace(workspace, {persist = true} = {}) {
@@ -2385,11 +2423,14 @@ function openExcelTenderSourcing() {
 async function deleteExcelTenderWorkspace() {
   const workspace = state.excelTender.workspace;
   if (!workspace || !confirm("Удалить рабочее пространство этого тендера? Исходный файл будет удалён вместе с ним.")) return;
+  const tenderId = workspace.tender_id;
   try {
-    await api(`/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}`, {method:"DELETE"});
+    await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}`, {method:"DELETE"});
     clearExcelTenderState();
     setView("upload");
-  } catch (error) { toast(error.message || "Не удалось удалить тендер", "error"); }
+    removeRecentExcelTenderFromState(tenderId);
+    await loadRecentExcelTenders().catch(() => {});
+  } catch (error) { toast(recentTenderErrorMessage(error, "Не удалось удалить тендер"), "error"); }
 }
 
 async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
@@ -2603,6 +2644,108 @@ async function loadRecentDocuments() {
   const payload = await api("/api/documents?limit=50");
   state.recentDocuments = Array.isArray(payload?.documents) ? payload.documents : [];
   renderRecentDocuments();
+}
+
+async function loadRecentExcelTenders() {
+  const request = ++state.recentExcelTendersRequest;
+  const generation = state.authGeneration;
+  const userId = String(state.currentUser?.user_id || state.currentUser?.username || "");
+  try {
+    const payload = await api("/api/manual-tenders?limit=10");
+    if (request !== state.recentExcelTendersRequest || generation !== state.authGeneration
+      || state.authState !== "authenticated"
+      || userId !== String(state.currentUser?.user_id || state.currentUser?.username || "")) return;
+    state.recentExcelTenders = Array.isArray(payload?.tenders) ? payload.tenders : [];
+    state.recentExcelTendersActiveCount = Number.isInteger(payload?.active_count) ? payload.active_count : state.recentExcelTenders.length;
+    state.recentExcelTendersLimit = Number.isInteger(payload?.limit) ? payload.limit : null;
+    state.recentExcelTendersError = null;
+    renderRecentExcelTenders();
+  } catch (error) {
+    if (request === state.recentExcelTendersRequest && generation === state.authGeneration
+      && state.authState === "authenticated"
+      && userId === String(state.currentUser?.user_id || state.currentUser?.username || "")) {
+      state.recentExcelTendersError = "Не удалось загрузить недавние тендеры. Нажмите «Обновить».";
+      renderRecentExcelTenders();
+    }
+    throw error;
+  }
+}
+
+function removeRecentExcelTenderFromState(tenderId) {
+  const before = state.recentExcelTenders.length;
+  state.recentExcelTenders = state.recentExcelTenders.filter((item) => item.tender_id !== tenderId);
+  if (state.recentExcelTenders.length !== before) {
+    state.recentExcelTendersActiveCount = Math.max(0, state.recentExcelTendersActiveCount - 1);
+  }
+  renderRecentExcelTenders();
+}
+
+function recentTenderErrorMessage(error, fallback = "Операция с тендером не выполнена.") {
+  if (error?.code === "TENDER_WORKSPACE_BUSY") {
+    return "Тендер сейчас используется. Повторите удаление после завершения операции.";
+  }
+  return error?.message || fallback;
+}
+
+function renderRecentExcelTenders() {
+  const panel = $("#recent-tenders-panel");
+  const list = $("#recent-tenders-list");
+  const count = $("#recent-tenders-count");
+  if (!panel || !list || !count) return;
+  panel.hidden = state.authState !== "authenticated";
+  const limit = Number.isInteger(state.recentExcelTendersLimit) ? state.recentExcelTendersLimit : "—";
+  count.textContent = `Активные тендеры: ${state.recentExcelTendersActiveCount} из ${limit}`;
+  if (state.recentExcelTendersError) {
+    list.innerHTML = `<p class="recent-tender-empty">${escapeHtml(state.recentExcelTendersError)}</p>`;
+    return;
+  }
+  if (!state.recentExcelTenders.length) {
+    list.innerHTML = '<p class="recent-tender-empty">Сохранённых тендеров пока нет.</p>';
+    return;
+  }
+  list.innerHTML = state.recentExcelTenders.map((item) => {
+    const tenderId = escapeHtml(item.tender_id);
+    const filename = item.filename || "Тендер из Excel";
+    const sheet = item.sheet_name ? ` · лист ${item.sheet_name}` : "";
+    const meta = `${Number(item.item_count) || 0} позиций · ${formatRecentTimestamp(item.last_access_at)}${sheet}`;
+    return `<div class="recent-tender-item"><div class="recent-tender-copy"><b>${escapeHtml(filename)}</b><small>${escapeHtml(meta)}</small></div><div class="recent-tender-actions"><button class="button ghost recent-tender-open" type="button" data-tender-id="${tenderId}">Открыть</button><button class="button ghost recent-tender-delete" type="button" data-tender-id="${tenderId}" data-tender-name="${escapeHtml(filename)}">Удалить</button></div></div>`;
+  }).join("");
+  list.querySelectorAll(".recent-tender-open").forEach((button) => button.addEventListener("click", () => {
+    openRecentExcelTender(button.dataset.tenderId);
+  }));
+  list.querySelectorAll(".recent-tender-delete").forEach((button) => button.addEventListener("click", () => {
+    void deleteRecentExcelTender(button.dataset.tenderId, button.dataset.tenderName || "Тендер из Excel");
+  }));
+}
+
+async function openRecentExcelTender(tenderId) {
+  const generation = state.authGeneration;
+  const userId = String(state.currentUser?.user_id || state.currentUser?.username || "");
+  try {
+    const workspace = await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}`);
+    if (generation !== state.authGeneration || state.authState !== "authenticated"
+      || userId !== String(state.currentUser?.user_id || state.currentUser?.username || "")) return;
+    openExcelTenderWorkspace(workspace);
+  } catch (error) {
+    toast(recentTenderErrorMessage(error, "Не удалось открыть тендер"), "error");
+  }
+}
+
+async function deleteRecentExcelTender(tenderId, filename) {
+  if (!tenderId || !confirm(`Удалить тендер «${filename}»? Исходный Excel, запуски подбора, подтверждения и готовые экспорты этого тендера будут удалены.`)) return;
+  try {
+    await api(`/api/manual-tenders/${encodeURIComponent(tenderId)}`, {method:"DELETE"});
+    if (state.excelTender.workspace?.tender_id === tenderId) clearExcelTenderState();
+    removeRecentExcelTenderFromState(tenderId);
+    await loadRecentExcelTenders().catch(() => {});
+  } catch (error) {
+    toast(recentTenderErrorMessage(error), "error");
+  }
+}
+
+function returnToStartFromExcelTender() {
+  setView("upload");
+  void loadRecentExcelTenders().catch(() => {});
 }
 
 function formatRecentTimestamp(value) {
@@ -5836,7 +5979,7 @@ function setupEvents() {
   $("#download-tender-template").addEventListener("click", () => { void downloadExcelTenderTemplate(); });
   $("#tender-retry-upload").addEventListener("click", () => $("#tender-xlsx-file").click());
   $("#tender-xlsx-file").addEventListener("change", (event) => { void uploadExcelTender(event.target.files?.[0]); });
-  $("#tender-back-to-start").addEventListener("click", () => setView("upload"));
+  $("#tender-back-to-start").addEventListener("click", returnToStartFromExcelTender);
   $("#tender-map-submit").addEventListener("click", () => { void submitExcelTenderMapping(); });
   $("#tender-mapping-controls").addEventListener("change", (event) => {
     if (event.target.id !== "tender-map-header") return;
@@ -5897,6 +6040,7 @@ function setupEvents() {
   ["dragleave","drop"].forEach((name)=>drop.addEventListener(name,(e)=>{e.preventDefault();drop.classList.remove("drag");}));
   drop.addEventListener("drop",(e)=>uploadFile(e.dataTransfer.files[0]));
   $("#refresh-recent-documents").addEventListener("click",()=>loadRecentDocuments().catch((e)=>toast(e.message,"error")));
+  $("#refresh-recent-tenders").addEventListener("click",()=>loadRecentExcelTenders().catch(()=>{}));
   const deleteDocumentModal = $("#delete-document-modal");
   deleteDocumentModal.addEventListener("close", () => { state.pendingDocumentDelete = null; });
   $("#close-delete-document").addEventListener("click", () => deleteDocumentModal.close());

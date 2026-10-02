@@ -70,6 +70,20 @@ button { cursor: pointer; }
 .recent-document-item b { font-size:13px; }.recent-document-item small { color:var(--muted); margin-top:4px; font-size:11px; }
 .recent-document-item.unavailable { opacity:.7; }
 .recent-document-actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
+.recent-tenders { max-width:1200px; margin:0 auto 28px; padding:22px; }
+.recent-tenders .panel-heading { align-items:center; margin-bottom:14px; }
+.recent-tenders-list { display:grid; gap:8px; }
+.recent-tender-item { display:flex; align-items:center; gap:14px; min-width:0; padding:12px 14px; border:1px solid var(--line); border-radius:11px; background:#fff; }
+.recent-tender-copy { min-width:0; flex:1; }
+.recent-tender-copy b,.recent-tender-copy small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.recent-tender-copy b { font-size:13px; }
+.recent-tender-copy small { color:var(--muted); margin-top:4px; font-size:11px; }
+.recent-tender-actions { display:flex; gap:8px; flex-shrink:0; }
+.recent-tender-empty { margin:0; padding:10px 2px; color:var(--muted); font-size:13px; }
+@media(max-width:640px) {
+  .recent-tender-item { align-items:flex-start; flex-direction:column; }
+  .recent-tender-actions { width:100%; justify-content:flex-end; }
+}
 .recent-document-trash { width:36px; height:36px; padding:0; display:inline-grid; place-items:center; color:#68717d; }
 .recent-document-trash svg { width:17px; height:17px; }
 .recent-document-trash:hover:not(:disabled) { color:#a12c32; border-color:#e8b9bc; background:#fff8f8; }

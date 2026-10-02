@@ -208,6 +208,45 @@ class TenderWorkspaceRepository:
                         continue
         return {"previews_removed": removed_preview, "workspaces_removed": removed_workspaces}
 
+    def list_public_workspaces(self, owner_id: str, limit: int = 10) -> dict[str, Any]:
+        """Return owner-scoped workspace summaries without refreshing idle TTL."""
+        bounded_limit = max(1, min(int(limit), 20))
+        self.cleanup()
+        now = _now()
+        owned: list[tuple[float, float, str, dict[str, Any]]] = []
+        with self._lock:
+            for path in self._workspace_dirs():
+                try:
+                    metadata = self._metadata(path)
+                    if metadata.get("owner_id") != owner_id:
+                        continue
+                    created_at = datetime.fromisoformat(metadata["created_at"])
+                    last_access_at = datetime.fromisoformat(metadata["last_access_at"])
+                    absolute_expires_at = datetime.fromisoformat(metadata["absolute_expires_at"])
+                    if absolute_expires_at <= now or last_access_at + timedelta(seconds=IDLE_TTL_SECONDS) <= now:
+                        continue
+                    counts = metadata.get("counts")
+                    item_count = int(counts.get("item", 0)) if isinstance(counts, dict) else 0
+                    summary = _sanitize_public_payload({
+                        "tender_id": path.name,
+                        "filename": metadata["filename"],
+                        "sheet_name": metadata["sheet_name"],
+                        "item_count": max(0, item_count),
+                        "created_at": metadata["created_at"],
+                        "last_access_at": metadata["last_access_at"],
+                        "absolute_expires_at": metadata["absolute_expires_at"],
+                        "revision": metadata.get("revision"),
+                    })
+                    owned.append((last_access_at.timestamp(), created_at.timestamp(), path.name, summary))
+                except (TenderWorkspaceError, OSError, KeyError, TypeError, ValueError):
+                    continue
+        owned.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        return {
+            "tenders": [item[3] for item in owned[:bounded_limit]],
+            "active_count": len(owned),
+            "limit": MAX_WORKSPACES_PER_USER,
+        }
+
     def reserve_preview(self, owner_id: str, filename: str, size: int, digest: str) -> dict[str, Any]:
         if not filename.casefold().endswith(".xlsx") or filename.casefold().endswith(".xlsm"):
             raise TenderWorkspaceError("Поддерживаются только файлы .xlsx.", 400, "TENDER_XLSX_REQUIRED")
