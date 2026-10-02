@@ -378,6 +378,14 @@
     </form>
   </dialog>
 
+  <dialog class="modal" id="tender-history-confirmation-modal" aria-labelledby="tender-history-confirmation-title">
+    <form method="dialog" class="modal-card tender-history-confirm-card">
+      <div class="modal-header"><div><span class="eyebrow">Экспорт в Excel</span><h2 id="tender-history-confirmation-title">Исторические цены 1С</h2><p id="tender-history-confirmation-summary"></p></div><button class="icon-button" value="cancel" aria-label="Отменить экспорт">×</button></div>
+      <p>Исторические цены относятся к предыдущим покупкам, не подтверждают текущую доступность и будут отмечены в книге.</p>
+      <div class="modal-footer"><button class="button ghost" value="cancel">Отмена</button><button class="button secondary" value="exclude">Продолжить без исторических цен</button><button class="button primary" value="include">Включить исторические цены</button></div>
+    </form>
+  </dialog>
+
   <dialog class="modal" id="support-report-modal">
     <form class="modal-card support-report-card" id="support-report-form">
       <div class="modal-header"><div><span class="eyebrow">Обратная связь</span><h2 id="support-report-title">Сообщить о проблеме</h2><p id="support-report-intro">Опишите ошибку экспорта, чтобы администратор мог её проверить.</p></div><button class="icon-button" type="button" id="close-support-report" aria-label="Закрыть">×</button></div>

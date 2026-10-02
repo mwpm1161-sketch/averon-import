@@ -2222,6 +2222,7 @@ class ManualTenderPriceExportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     include_historical_prices: StrictBool = False
+    historical_decision_confirmed: StrictBool = False
     allow_partial: StrictBool = False
 
 
@@ -2460,10 +2461,14 @@ def _submit_manual_tender_price_export(
             include_historical_prices=True,
         )
         history_summary = summarize_decisions(with_history)
-        if history_summary["historical_count"] and not request.include_historical_prices:
+        if (
+            history_summary["historical_count"]
+            and not request.include_historical_prices
+            and not request.historical_decision_confirmed
+        ):
             raise _price_export_confirmation_error(
                 "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED",
-                "В выбранном запуске есть исторические цены 1С. Подтвердите их отдельное включение.",
+                "В выбранном запуске есть исторические цены 1С. Выберите, включать их или продолжить без них.",
                 history_summary,
             )
         decisions = tender_price_resolver.resolve_run(

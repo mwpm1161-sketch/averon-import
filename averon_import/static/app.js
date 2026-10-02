@@ -2093,6 +2093,20 @@ function tenderExportConfirmationSummary(summary) {
   return `Позиции: ${selected}; с ценой: ${priced}; без цены: ${blank}; исторические цены 1С: ${historical}.`;
 }
 
+function chooseTenderHistoricalPricePolicy(summary) {
+  const dialog = $("#tender-history-confirmation-modal");
+  const summaryNode = $("#tender-history-confirmation-summary");
+  if (!dialog || typeof dialog.showModal !== "function") return Promise.resolve("cancel");
+  if (summaryNode) summaryNode.textContent = tenderExportConfirmationSummary(summary);
+  dialog.returnValue = "cancel";
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      resolve(["include", "exclude"].includes(dialog.returnValue) ? dialog.returnValue : "cancel");
+    }, {once:true});
+    dialog.showModal();
+  });
+}
+
 async function startExcelTenderPriceExport() {
   const workspace = state.excelTender.workspace;
   const runId = state.excelTender.selectedExportRunId;
@@ -2119,9 +2133,10 @@ async function startExcelTenderPriceExport() {
       } catch (error) {
         const summary = error.payload?.detail?.summary || {};
         if (error.code === "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED" && !options.include_historical_prices) {
-          const accepted = confirm(`Запуск содержит ${summary.historical_count || 0} исторических цен 1С. Они относятся к предыдущим покупкам, не подтверждают текущую доступность и будут явно отмечены в книге. Включить их?\n\n${tenderExportConfirmationSummary(summary)}`);
-          if (!accepted) throw new Error("Экспорт отменён.");
-          options.include_historical_prices = true;
+          const choice = await chooseTenderHistoricalPricePolicy(summary);
+          if (choice === "cancel") throw new Error("Экспорт отменён.");
+          if (choice === "include") options.include_historical_prices = true;
+          else options.historical_decision_confirmed = true;
           continue;
         }
         if (error.code === "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED" && !options.allow_partial) {

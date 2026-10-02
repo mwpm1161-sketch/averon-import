@@ -265,7 +265,15 @@ class TenderPriceResolver:
             if not include_historical_prices:
                 return _reason("HISTORICAL_PRICE_NOT_INCLUDED", source, historical=True, audit=audit)
         else:
-            if final_kind != "provider" or not exact_offer_match:
+            source_mode = str(run.get("source_mode") or "")
+            routed_provider = source_mode == "one_c_then_provider"
+            # The direct provider_only path intentionally returns no OneC route;
+            # one_c_then_provider still needs its explicit live-provider route.
+            if (
+                source_mode not in {"provider_only", "one_c_then_provider"}
+                or (routed_provider and final_kind != "provider")
+                or not exact_offer_match
+            ):
                 return _reason("MATCH_NOT_EXPORTABLE", source, audit=audit)
             if not isinstance(match, dict) or match.get("decision") not in _LIVE_DECISIONS:
                 return _reason("MATCH_NOT_EXPORTABLE", source, audit=audit)
@@ -1027,6 +1035,11 @@ class TenderXlsxPriceExporter:
                         "Не подтверждает текущую доступность и не является текущим предложением.",
                         "Averon Import",
                     )
+                    total_cell.comment = Comment(
+                        f"Историческая стоимость по предыдущей покупке 1С от {purchase_date}. "
+                        "Не подтверждает текущую доступность и не является текущим предложением.",
+                        "Averon Import",
+                    )
             if historical_count:
                 price_header.comment = Comment(
                     "Исторические цены 1С отмечены цветом. Они отражают предыдущие покупки, "
@@ -1077,20 +1090,6 @@ class TenderXlsxPriceExporter:
             },
             "historical_count": historical_count,
         }
-
-
-def _canonical_xml(element: Any) -> Any:
-    if element is None:
-        return None
-    tag = getattr(element, "tag", None)
-    if tag is None:
-        return str(element)
-    return (
-        tag,
-        tuple(sorted((str(key), str(value)) for key, value in element.attrib.items())),
-        (element.text or "").strip(),
-        tuple(_canonical_xml(child) for child in list(element)),
-    )
 
 
 class TenderPriceExportRepository:
@@ -1368,14 +1367,6 @@ class TenderPriceExportRepository:
                             break
 
         return file_path, record, release
-
-
-def _safe_output_filename(original: str) -> str:
-    basename = Path(str(original or "tender.xlsx").replace("\\", "/")).name
-    stem = Path(basename).stem
-    stem = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", stem).strip(" ._")
-    stem = re.sub(r"\s+", " ", stem)[:110] or "Тендер"
-    return f"{stem}_Averon_цены.xlsx"
 
 
 __all__ = [

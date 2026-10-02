@@ -12,7 +12,7 @@ import shutil
 import time
 import uuid
 import zipfile
-from copy import copy
+from copy import copy, deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -1139,6 +1139,12 @@ def test_ui_exposes_excel_path_without_changing_manual_sourcing_and_clears_on_lo
     assert "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED" in script
     assert "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED" in script
     export_action = script[script.index("async function startExcelTenderPriceExport()") : script.index("async function pollExcelTenderPriceExport(")]
+    assert 'id="tender-history-confirmation-modal"' in template
+    assert 'value="include">Включить исторические цены' in template
+    assert 'value="exclude">Продолжить без исторических цен' in template
+    assert 'value="cancel">Отмена' in template
+    assert "historical_decision_confirmed" in export_action
+    assert "chooseTenderHistoricalPricePolicy(summary)" in export_action
     assert "body:JSON.stringify(options)" in export_action
     assert '"price"' not in export_action and "localStorage" not in export_action and "sessionStorage" not in export_action
     assert 'id="tender-export-run"' in template and 'id="tender-export-download"' in template
@@ -1712,6 +1718,237 @@ def _persist_price_export_run(main, repository, workspace, source_row, *, provid
         main.tender_sourcing_runs, repository, workspace, result,
         source_row=source_row, source_mode=mode,
     )
+
+
+def _persist_mixed_price_export_run(main, repository, workspace, source_rows):
+    from averon_import.services.sourcing.models import (
+        HistorySafeMatchBasis, ProjectSourcingResult, SourcingSourceMode,
+    )
+
+    history_provenance = {
+        "source":"one_c_history", "source_kind":"historical_purchase",
+        "snapshot_version":"history-snapshot-v9", "history_item_id":"history-item-1",
+        "selected_event_id":"history-event-1", "purchase_date":"2025-01-24",
+        "price_basis":"gross_including_vat", "effective_unit_price_gross":"1234.5600",
+        "currency_basis":"RUB", "unit_family":"count",
+    }
+    historical = _project_result_with_offer(
+        source_rows[0], provider="one_c_history", provenance=history_provenance,
+        source_mode="one_c_only",
+    ).results[0]
+    historical_route = historical.route.model_copy(update={
+        "history_safe_basis": HistorySafeMatchBasis.EXACT_ARTICLE,
+        "history_catalog_version":"history-snapshot-v9",
+        "history_selected_event_id":"history-event-1",
+        "history_purchase_date":"2025-01-24",
+        "history_outcome":"SAFE_MATCH",
+    })
+    historical = historical.model_copy(update={"route":historical_route})
+    provider_result = _project_result_with_offer(
+        source_rows[1], provider="etm_ipro", provenance={
+            "source":"etm_ipro", "catalog_version":"etm-catalog-v4",
+            "source_item_id":"synthetic-source-item", "price_field":"pricewnds",
+        }, source_mode="one_c_then_provider",
+    ).results[0]
+    result = ProjectSourcingResult(
+        positions_total=2, positions_processed=2, positions_matched=2,
+        source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+        results=[historical, provider_result],
+    )
+    selected_ids = [row["source_row_id"] for row in source_rows]
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    running = main.tender_sourcing_runs.create_running(
+        workspace_path, workspace, source_mode="one_c_then_provider", provider="etm_ipro",
+        selected_ids=selected_ids, history_catalog_version="history-snapshot-v9",
+    )
+    projected = canonical_tender_projection(result.model_dump(mode="json"), source_rows, selected_ids)
+    main.tender_sourcing_runs.complete(
+        workspace_path, running["run_id"], summary={
+            "positions_total":2, "positions_processed":2, "positions_matched":2,
+            "positions_review":0, "positions_without_offers":0,
+        }, catalog_version="etm-catalog-v4", history_catalog_version="history-snapshot-v9",
+        rows=projected,
+    )
+    return running["run_id"]
+
+
+def test_provider_only_real_unrouted_sourcing_shape_is_exportable_through_api(tender_api, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from averon_import.services.sourcing.models import (
+        MatchDecision, MatchResult, Offer, ProjectSourcingResult, SourcingResult, SourcingSourceMode,
+    )
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, official=True)
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    provenance = {
+        "source":"etm_ipro", "catalog_version":"fake-etm-catalog-v1",
+        "source_item_id":"fake-etm-item-1", "price_field":"pricewnds",
+    }
+
+    class ProviderOnlyService:
+        def provider(self, provider_key=None):
+            assert provider_key == "etm_ipro"
+            return SimpleNamespace(key="etm_ipro", label="Fake ETM")
+
+        def search_project(self, rows, *, progress=None, **_kwargs):
+            results = []
+            for row in rows:
+                offer = Offer(
+                    offer_id="etm_ipro:fake-offer-1", provider="etm_ipro",
+                    source_item_id="fake-etm-item-1", title="Synthetic provider offer",
+                    price=Decimal("125.50"), currency="RUB", price_unit="шт",
+                    data_provenance=provenance,
+                )
+                match = MatchResult(offer=offer, decision=MatchDecision.MATCH, rank=1)
+                # This is the actual provider_only shape: the normal sourcing path
+                # has no routed OneC metadata to persist for provider results.
+                results.append(SourcingResult(
+                    intent=build_fallback_intent(row), recommended_offer=offer,
+                    match_results=[match],
+                ))
+            if progress:
+                progress(len(rows), len(rows), "test")
+            return ProjectSourcingResult(
+                positions_total=len(rows), positions_processed=len(rows),
+                positions_matched=len(rows), source_mode=SourcingSourceMode.PROVIDER_ONLY,
+                provider_key="etm_ipro", provider_label="Fake ETM", results=results,
+            )
+
+    service = ProviderOnlyService()
+    monkeypatch.setattr(main, "sourcing_service", service)
+    monkeypatch.setattr(main, "sourcing_runtime", SimpleNamespace(service=service))
+    started = _post_tender_sourcing(main, workspace["tender_id"], {
+        "source_row_ids":[source["source_row_id"]], "source_mode":"provider_only", "provider":"etm_ipro",
+    })
+    assert started.status_code == 202, started.text
+    sourcing_job = _wait_tender_job(main, started.json()["id"])
+    assert sourcing_job["status"] == "completed", sourcing_job
+    run_id = sourcing_job["result"]["run_id"]
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    durable_run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
+    canonical = durable_run["rows"][0]
+    assert canonical["route"] == {}
+    assert canonical["provider_source"]["kind"] is None
+
+    export = _api_request(
+        main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":false,"allow_partial":false}',
+    )
+    assert export.status_code == 202, export.text
+    export_job = _wait_tender_job(main, export.json()["id"])
+    assert export_job["status"] == "completed", export_job.get("error") or export_job
+    assert export_job["result"]["priced_count"] == 1
+    file_path, _record, release = main.tender_price_exports.acquire_download(
+        workspace_path, workspace["tender_id"], export_job["result"]["export_id"], "username:tender-user",
+    )
+    try:
+        workbook = load_workbook(file_path, data_only=False)
+        sheet = workbook[TEMPLATE_SHEET]
+        assert Decimal(str(sheet["H2"].value)) == Decimal("125.500000")
+        assert Decimal(str(sheet["I2"].value)) == Decimal("251.00")
+        workbook.close()
+    finally:
+        release()
+
+    bad_provenance_run = deepcopy(durable_run)
+    bad_provenance_run["rows"][0]["price_provenance"]["price_field"] = "price"
+    bad_provenance = main.tender_price_resolver.resolve_run(
+        workspace, bad_provenance_run, tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=False,
+    )[0]
+    assert not bad_provenance.eligible and bad_provenance.reason_code == "PRICE_BASIS_UNPROVEN"
+
+    missing_route_mixed_run = deepcopy(durable_run)
+    missing_route_mixed_run["source_mode"] = "one_c_then_provider"
+    missing_route_decision = main.tender_price_resolver.resolve_run(
+        workspace, missing_route_mixed_run, tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=False,
+    )[0]
+    assert not missing_route_decision.eligible
+    assert missing_route_decision.reason_code == "MATCH_NOT_EXPORTABLE"
+
+
+def test_mixed_history_export_can_exclude_history_and_continue_with_provider(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=2)
+    source_rows = [row for row in workspace["rows"] if row["row_type"] == "item"]
+    assert len(source_rows) == 2
+    run_id = _persist_mixed_price_export_run(main, repository, workspace, source_rows)
+    endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export"
+
+    def post(payload):
+        return _api_request(
+            main.app, "POST", endpoint,
+            headers={**_auth_headers(), "Content-Type":"application/json"},
+            body=json.dumps(payload).encode("utf-8"),
+        )
+
+    not_decided = post({"include_historical_prices":False, "allow_partial":False})
+    assert not_decided.status_code == 409
+    assert not_decided.json()["detail"]["code"] == "TENDER_EXPORT_HISTORICAL_CONFIRMATION_REQUIRED"
+
+    excluded_but_not_partial = post({
+        "include_historical_prices":False,
+        "historical_decision_confirmed":True,
+        "allow_partial":False,
+    })
+    assert excluded_but_not_partial.status_code == 409
+    detail = excluded_but_not_partial.json()["detail"]
+    assert detail["code"] == "TENDER_EXPORT_PARTIAL_CONFIRMATION_REQUIRED"
+    assert detail["summary"]["priced_count"] == 1
+    assert detail["summary"]["reason_counts"]["HISTORICAL_PRICE_NOT_INCLUDED"] == 1
+
+    excluded = post({
+        "include_historical_prices":False,
+        "historical_decision_confirmed":True,
+        "allow_partial":True,
+    })
+    assert excluded.status_code == 202, excluded.text
+    excluded_job = _wait_tender_job(main, excluded.json()["id"])
+    assert excluded_job["status"] == "completed", excluded_job.get("error") or excluded_job
+    excluded_record = excluded_job["result"]
+    assert excluded_record["priced_count"] == 1
+    assert excluded_record["historical_count"] == 0
+    assert excluded_record["reason_counts"]["HISTORICAL_PRICE_NOT_INCLUDED"] == 1
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    file_path, _record, release = main.tender_price_exports.acquire_download(
+        workspace_path, workspace["tender_id"], excluded_record["export_id"], "username:tender-user",
+    )
+    try:
+        workbook = load_workbook(file_path, data_only=False)
+        sheet = workbook[TEMPLATE_SHEET]
+        assert sheet["H2"].value is None and sheet["I2"].value is None
+        assert isinstance(sheet["H3"].value, (int, float, Decimal))
+        assert isinstance(sheet["I3"].value, (int, float, Decimal))
+        workbook.close()
+    finally:
+        release()
+
+    included = post({"include_historical_prices":True, "allow_partial":False})
+    assert included.status_code == 202, included.text
+    included_job = _wait_tender_job(main, included.json()["id"])
+    assert included_job["status"] == "completed", included_job
+    included_record = included_job["result"]
+    assert included_record["priced_count"] == 2
+    assert included_record["historical_count"] == 1
+    included_path, _record, release = main.tender_price_exports.acquire_download(
+        workspace_path, workspace["tender_id"], included_record["export_id"], "username:tender-user",
+    )
+    try:
+        workbook = load_workbook(included_path, data_only=False)
+        sheet = workbook[TEMPLATE_SHEET]
+        assert isinstance(sheet["H2"].value, (int, float, Decimal))
+        assert isinstance(sheet["I2"].value, (int, float, Decimal))
+        assert isinstance(sheet["H3"].value, (int, float, Decimal))
+        assert isinstance(sheet["I3"].value, (int, float, Decimal))
+        assert sheet["H2"].comment and "2025-01-24" in sheet["H2"].comment.text
+        assert sheet["I2"].comment and "2025-01-24" in sheet["I2"].comment.text
+        workbook.close()
+    finally:
+        release()
 
 
 def test_tender_price_export_target_collision_uses_semantic_empty_cells(tmp_path):
@@ -2465,7 +2702,7 @@ def test_historical_price_export_with_consent_is_visibly_marked(tender_api, tmp_
     )
     assert response.status_code == 202, response.text
     job = _wait_tender_job(main, response.json()["id"])
-    assert job["status"] == "completed", job
+    assert job["status"] == "completed", job.get("error") or job
     assert job["result"]["historical_count"] == 1
     workspace_path = repository.workspace_root / workspace["tender_id"]
     file_path, _record, release = main.tender_price_exports.acquire_download(
@@ -2474,8 +2711,12 @@ def test_historical_price_export_with_consent_is_visibly_marked(tender_api, tmp_
     try:
         workbook = load_workbook(file_path, data_only=False)
         sheet = workbook[TEMPLATE_SHEET]
+        assert isinstance(sheet["H2"].value, (int, float, Decimal))
+        assert isinstance(sheet["I2"].value, (int, float, Decimal))
         assert sheet["H2"].comment and "2025-01-24" in sheet["H2"].comment.text
         assert len(sheet["H2"].comment.text) > 75
+        assert sheet["I2"].comment and "2025-01-24" in sheet["I2"].comment.text
+        assert len(sheet["I2"].comment.text) > 75
         assert sheet["H2"].fill.fill_type == "solid"
         assert sheet["H1"].comment and len(sheet["H1"].comment.text) > 75
         workbook.close()

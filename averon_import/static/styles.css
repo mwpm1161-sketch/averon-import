@@ -254,6 +254,7 @@ button { cursor: pointer; }
 .page-inspection-canvas img { display:block; max-width:none; }
 .page-inspection-crop { position:absolute; border:2px solid #2779a8; background:rgba(67,157,204,.10); pointer-events:none; }
 .modal-card { width:min(900px,calc(100vw - 80px)); max-height:calc(100vh - 70px); overflow:auto; border-radius:20px; background:#fff; box-shadow:0 30px 80px rgba(0,0,0,.22); padding:27px; }
+.tender-history-confirm-card { width:min(650px,calc(100vw - 36px)); }
 .modal-header { display:flex; align-items:flex-start; gap:20px; border-bottom:1px solid var(--line); padding-bottom:20px; margin-bottom:22px; }
 .modal-header h2 { margin:7px 0 5px; }.modal-header p { margin:0; color:var(--muted); }
 .icon-button { margin-left:auto; width:35px; height:35px; border:1px solid var(--line); background:#fff; border-radius:9px; font-size:20px; }
