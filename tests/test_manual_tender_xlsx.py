@@ -2397,12 +2397,16 @@ def test_d3_human_history_ui_lifecycle_regression():
     node = shutil.which("node")
     assert node, "Node.js is required for the manual tender human-history UI regression"
     root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        [node, str(root / "tests" / "js" / "manual_tender_history_decisions.cjs"), str(root / "averon_import" / "static" / "app.js")],
-        capture_output=True, text=True, timeout=20, check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS: exact-only confirmation UI" in result.stdout
+    for script, expected in (
+        ("manual_tender_history_decisions.cjs", "PASS: exact-only confirmation UI"),
+        ("excel_tender_review_navigation.cjs", "PASS: Excel Tender review sequence"),
+    ):
+        result = subprocess.run(
+            [node, str(root / "tests" / "js" / script), str(root / "averon_import" / "static" / "app.js")],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert expected in result.stdout
 
 
 def test_d3_export_fails_if_decision_set_changes_before_runner(tender_api, tmp_path, monkeypatch):

@@ -458,7 +458,8 @@ def test_project_review_rows_expose_existing_candidates_without_network_actions(
     assert 'projectDecision(item) === "REVIEW"' in app_js
     assert 'candidate.decision === "REJECT"' in app_js
     assert "Посмотреть варианты" in app_js
-    assert "data-project-item-index" in app_js
+    assert "data-project-source-row-id" in app_js
+    assert "candidate.intent?.source_row_id === sourceRowId" in app_js
     assert "item.review_candidate" in app_js
     assert "item.match_results" in app_js
     assert "slice(0, 5)" in app_js

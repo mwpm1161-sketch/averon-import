@@ -22,7 +22,7 @@ const state = {sourcing: null};
 const context = vm.createContext({
   state,
   $: node,
-  $$: () => [],
+  $$: selector => selector.includes(".project-results-back") ? [node(".project-results-back")] : [],
   escapeHtml: (value) => String(value ?? ""),
   offerTitleHtml: (offer) => String(offer?.title || ""),
   historicalOfferPrice: () => "100 ₽ / шт",
@@ -31,6 +31,7 @@ const context = vm.createContext({
   renderSourcingDecision: () => "<decision>must-not-overstate</decision>",
   renderProductUnderstanding: () => "",
   renderSourcingRouteExplanation: () => "",
+  isExcelTenderProjectResult: () => false,
   renderHumanHistoryDecisionAction: () => "",
   bindHumanHistoryDecisionActions: () => {},
   renderSourcingResult: (result) => {

@@ -41,6 +41,7 @@ const context = {
   $$:selector=>selector.includes("history-confirm") ? [button] : [],
   escapeHtml:escaped,
   historicalOfferDate:()=>"2025-04-16",
+  isExcelTenderProjectResult:()=>false,
   encodeURIComponent,
   toast:()=>{toastCount+=1;},
   renderProjectItemDetails:()=>{detailRenders+=1;},

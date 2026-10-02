@@ -13,6 +13,7 @@ function createSourcingState(overrides = {}) {
     requestGeneration: 0,
     modalPhase: "closed",
     modalContext: "none",
+    reviewDetailNavigation: {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false},
     ...overrides,
   };
 }
@@ -1123,6 +1124,7 @@ function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || 
   if (!state.sourcing) return;
   state.sourcing.modalPhase = phase;
   state.sourcing.modalContext = phase === "closed" ? "none" : context;
+  if (phase === "closed") state.sourcing.reviewDetailNavigation = {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false};
   const submit = $("#tender-sourcing-submit");
   if (!submit) return;
   const canLaunch = context === "excel_tender" && ["before_run", "failed"].includes(phase);
@@ -4276,7 +4278,7 @@ function renderProjectResultRow(view, itemIndex) {
     ? `<small class="project-result-secondary">Альтернатива: ${offerTitleHtml(item.recommended_offer)}</small>`
     : "";
   const inspectCandidates = projectHasReviewCandidates(item)
-    ? `<button type="button" class="button text project-review-candidates" data-project-item-index="${itemIndex}">Посмотреть варианты</button>`
+    ? `<button type="button" class="button text project-review-candidates" data-project-source-row-id="${escapeHtml(item.intent?.source_row_id || "")}">Посмотреть варианты</button>`
     : "";
   const historicalReview = route?.final_source_kind === "history_review";
   const offerCell = !offer ? "Нет подтверждённого предложения"
@@ -4320,6 +4322,16 @@ function renderProjectItemDetails(projectResult, item) {
   const content = $("#sourcing-content");
   setSourcingModalPhase("position_detail");
   const intent = item.intent || {};
+  const sourceRowId = intent.source_row_id || "";
+  const excelTenderProject = isExcelTenderProjectResult(projectResult);
+  if (excelTenderProject) {
+    const detail = state.sourcing.reviewDetailNavigation || (state.sourcing.reviewDetailNavigation = {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false});
+    if (detail.sourceRowId !== sourceRowId) {
+      detail.sourceRowId = sourceRowId;
+      detail.showCompletion = false;
+      detail.showEarlierActionableHint = false;
+    }
+  }
   const candidates = projectReviewCandidates(item);
   const route = item.route || null;
   const historical = route?.final_source_kind === "history_review" || route?.final_source_kind === "historical_purchase";
@@ -4336,10 +4348,18 @@ function renderProjectItemDetails(projectResult, item) {
     ${renderSourcingRouteExplanation(route)}
     <h3>${escapeHtml(title)}</h3>
     ${route?.final_source_kind === "history_review" ? `<p class="history-review-explanation" role="status">${escapeHtml(historyPresentation.explanation)}</p>` : ""}
+    ${excelTenderProject ? renderProjectReviewNavigation(projectResult, sourceRowId) : ""}
     <div class="offer-grid">${candidates.map((candidate) => historical
       ? `<div class="history-candidate-wrapper">${renderHistoricalOfferCard(candidate, {compact:true, route})}${renderHumanHistoryDecisionAction(item, candidate)}</div>`
       : renderOfferCard(candidate, true, intent)).join("")}</div>`;
-  $(".project-results-back").addEventListener("click", () => renderSourcingResult(projectResult));
+  for (const button of $$("#sourcing-content .project-results-back")) {
+    button.addEventListener("click", () => {
+      if (excelTenderProject && state.sourcing.reviewDetailNavigation?.requestPending) return;
+      if (excelTenderProject) state.sourcing.reviewDetailNavigation.showCompletion = false;
+      renderSourcingResult(projectResult);
+    });
+  }
+  if (excelTenderProject) bindProjectReviewNavigation(projectResult, sourceRowId);
   bindHumanHistoryDecisionActions(projectResult, item);
 }
 
@@ -4352,10 +4372,85 @@ function bindSourcingFilters(result) {
 
 function bindProjectCandidateActions(result) {
   $("#sourcing-content").querySelectorAll(".project-review-candidates").forEach((button) => button.addEventListener("click", () => {
-    const itemIndex = Number(button.dataset.projectItemIndex);
-    const item = result.results?.[itemIndex];
+    const sourceRowId = button.dataset.projectSourceRowId;
+    const item = result.results?.find((candidate) => candidate.intent?.source_row_id === sourceRowId);
     if (item) renderProjectItemDetails(result, item);
   }));
+}
+
+function isExcelTenderProjectResult(result) {
+  return state.sourcing?.modalContext === "excel_tender"
+    && Boolean(result?.run_id)
+    && Array.isArray(result?.results);
+}
+
+function projectReviewSequence(result) {
+  const sequence = [];
+  for (const item of result?.results || []) {
+    const route = item?.route || {};
+    const decision = projectDecision(item);
+    if (route.final_source_kind === "historical_purchase" || route.history_outcome === "SAFE_MATCH" || decision === "HISTORY_SAFE_MATCH") continue;
+    if (route.final_source_kind !== "history_review" && decision !== "REVIEW") continue;
+    const sourceRowId = item?.intent?.source_row_id;
+    if (!sourceRowId) continue;
+    sequence.push({sourceRowId, item});
+  }
+  return sequence;
+}
+
+function projectReviewPosition(result, sourceRowId) {
+  return projectReviewSequence(result).findIndex((entry) => entry.sourceRowId === sourceRowId);
+}
+
+function nextProjectReviewItem(result, sourceRowId, direction) {
+  const sequence = projectReviewSequence(result);
+  const position = sequence.findIndex((entry) => entry.sourceRowId === sourceRowId);
+  if (position < 0 || ![-1, 1].includes(direction)) return null;
+  return sequence[position + direction]?.item || null;
+}
+
+function nextActionableHistoryReviewItem(result, sourceRowId) {
+  const sequence = projectReviewSequence(result);
+  const currentPosition = sequence.findIndex((entry) => entry.sourceRowId === sourceRowId);
+  const ordered = currentPosition < 0 ? sequence : sequence.slice(currentPosition + 1);
+  return ordered.find(({item}) => !item.historyEffectiveDecision
+    && item.route?.final_source_kind === "history_review"
+    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable))?.item || null;
+}
+
+function hasActionableHistoryReviewItem(result) {
+  return projectReviewSequence(result).some(({item}) => !item.historyEffectiveDecision
+    && item.route?.final_source_kind === "history_review"
+    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable));
+}
+
+function renderProjectReviewNavigation(result, sourceRowId) {
+  const sequence = projectReviewSequence(result);
+  const position = sequence.findIndex((entry) => entry.sourceRowId === sourceRowId);
+  if (position < 0) return "";
+  const detail = state.sourcing.reviewDetailNavigation;
+  const busy = Boolean(detail?.requestPending && detail.sourceRowId === sourceRowId);
+  const complete = Boolean(detail?.showCompletion && detail.sourceRowId === sourceRowId);
+  const completion = complete
+    ? `<div class="project-review-completion" role="status">Все доступные для подтверждения позиции просмотрены.</div><button type="button" class="button text project-results-back">← К результатам подбора</button>`
+    : detail?.showEarlierActionableHint && detail.sourceRowId === sourceRowId
+      ? `<div class="project-review-completion" role="status">Дальше доступных для подтверждения позиций нет. Используйте «Предыдущая», чтобы вернуться к оставшимся.</div>`
+      : "";
+  return `<nav class="project-review-navigation" aria-label="Навигация по позициям на проверке"><button type="button" class="button text project-review-previous"${position === 0 || busy ? " disabled" : ""}>← Предыдущая</button><span>Проверка позиции ${position + 1} из ${sequence.length}</span><button type="button" class="button text project-review-next"${position === sequence.length - 1 || busy ? " disabled" : ""}>Следующая →</button></nav>${completion}`;
+}
+
+function bindProjectReviewNavigation(result, sourceRowId) {
+  const detail = state.sourcing.reviewDetailNavigation;
+  if (!detail || detail.sourceRowId !== sourceRowId || detail.requestPending) return;
+  for (const [selector, direction] of [[".project-review-previous", -1], [".project-review-next", 1]]) {
+    for (const button of $$("#sourcing-content " + selector)) {
+      button.addEventListener("click", () => {
+        if (detail.requestPending || detail.sourceRowId !== sourceRowId || button.disabled) return;
+        const target = nextProjectReviewItem(result, sourceRowId, direction);
+        if (target) renderProjectItemDetails(result, target);
+      });
+    }
+  }
 }
 
 function renderHumanHistoryDecisionAction(item, candidate) {
@@ -4376,22 +4471,39 @@ function renderHumanHistoryDecisionAction(item, candidate) {
   if (effective?.candidate_offer_id === offer.offer_id) {
     return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
   }
-  return `<div class="history-human-confirmation"><p>Это историческая закупка из 1С. Подтверждение удостоверяет только идентичность позиции; дата и цена остаются историческими.</p><button type="button" class="button secondary history-confirm-candidate" data-row-id="${escapeHtml(item.intent?.source_row_id || "")}" data-offer-id="${escapeHtml(offer.offer_id || "")}">Подтвердить эту запись</button></div>`;
+  const identity = `data-row-id="${escapeHtml(item.intent?.source_row_id || "")}" data-offer-id="${escapeHtml(offer.offer_id || "")}"`;
+  return `<div class="history-human-confirmation"><p>Это историческая закупка из 1С. Подтверждение удостоверяет только идентичность позиции; дата и цена остаются историческими.</p><div class="history-confirmation-actions"><button type="button" class="button secondary history-confirm-candidate" ${identity}>Подтвердить эту запись</button><button type="button" class="button primary history-confirm-and-next" ${identity}>Подтвердить и далее</button></div></div>`;
 }
 
 function bindHumanHistoryDecisionActions(projectResult, item) {
   const buttons = [
     ...$$("#sourcing-content .history-confirm-candidate"),
+    ...$$("#sourcing-content .history-confirm-and-next"),
     ...$$("#sourcing-content .history-revoke-confirmation"),
   ];
   for (const button of buttons) {
     button.addEventListener("click", async () => {
       const workspace = state.excelTender.workspace;
       const runId = projectResult.run_id;
+      const sourceRowId = item.intent?.source_row_id || "";
       if (!workspace || !runId) return;
+      if (button.disabled) return;
       const isRevoke = button.classList.contains("history-revoke-confirmation");
+      const advanceAfterConfirm = button.classList.contains("history-confirm-and-next");
+      const excelTenderProject = isExcelTenderProjectResult(projectResult);
+      const detail = state.sourcing?.reviewDetailNavigation;
+      if (excelTenderProject && (!detail || detail.sourceRowId !== sourceRowId || detail.requestPending)) return;
+      if (excelTenderProject) {
+        detail.requestPending = true;
+        for (const pendingButton of $$("#sourcing-content .history-confirm-candidate, #sourcing-content .history-confirm-and-next, #sourcing-content .history-revoke-confirmation, #sourcing-content .project-review-previous, #sourcing-content .project-review-next, #sourcing-content .project-results-back")) {
+          pendingButton.disabled = true;
+        }
+      }
       button.disabled = true;
       const base = `/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}/runs/${encodeURIComponent(runId)}/history-decisions`;
+      let shouldToast = false;
+      let toastMessage = "";
+      let renderedCurrent = false;
       try {
         const response = await api(isRevoke ? `${base}/${encodeURIComponent(button.dataset.decisionId)}/revoke` : base, {
           method:"POST", headers:{"Content-Type":"application/json"},
@@ -4400,18 +4512,76 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
             : {decision:"CONFIRM_HISTORY_CANDIDATE", source_row_id:button.dataset.rowId, candidate_offer_id:button.dataset.offerId, expected_revision:projectResult.historyDecisionRevision}),
         });
         applyTenderHistoryDecisionSnapshot(projectResult, response);
-        renderProjectItemDetails(projectResult, item);
+        const detailStillCurrent = !excelTenderProject || (
+          state.sourcing?.result === projectResult
+          && state.sourcing?.reviewDetailNavigation?.sourceRowId === sourceRowId
+          && state.sourcing?.modalContext === "excel_tender"
+          && $("#sourcing-modal")?.open !== false
+        );
+        if (!detailStillCurrent) return;
+        if (excelTenderProject) detail.requestPending = false;
+        if (isRevoke && excelTenderProject) {
+          detail.showCompletion = false;
+          detail.showEarlierActionableHint = false;
+        }
+        if (advanceAfterConfirm && !isRevoke && excelTenderProject
+          && item.historyEffectiveDecision?.candidate_offer_id === button.dataset.offerId) {
+          const next = nextActionableHistoryReviewItem(projectResult, sourceRowId);
+          if (next) {
+            detail.showCompletion = false;
+            detail.showEarlierActionableHint = false;
+            renderProjectItemDetails(projectResult, next);
+          } else {
+            const earlierActionableRemains = hasActionableHistoryReviewItem(projectResult);
+            detail.showCompletion = !earlierActionableRemains;
+            detail.showEarlierActionableHint = earlierActionableRemains;
+            renderProjectItemDetails(projectResult, item);
+          }
+        } else {
+          renderProjectItemDetails(projectResult, item);
+        }
+        renderedCurrent = true;
       } catch (error) {
+        toastMessage = error.message || "Не удалось обновить подтверждение истории.";
         if (error.code === "TENDER_HISTORY_DECISIONS_STALE") {
           try {
             const snapshot = await api(base);
             applyTenderHistoryDecisionSnapshot(projectResult, snapshot);
-            renderProjectItemDetails(projectResult, item);
+            const detailStillCurrent = !excelTenderProject || (
+              state.sourcing?.result === projectResult
+              && state.sourcing?.reviewDetailNavigation?.sourceRowId === sourceRowId
+              && state.sourcing?.modalContext === "excel_tender"
+              && $("#sourcing-modal")?.open !== false
+            );
+            if (detailStillCurrent) {
+              if (excelTenderProject) detail.requestPending = false;
+              renderProjectItemDetails(projectResult, item);
+              renderedCurrent = true;
+            }
           } catch (_) {}
         }
-        toast(error.message || "Не удалось обновить подтверждение истории.", "error");
-        button.disabled = false;
+        shouldToast = true;
+        if (!renderedCurrent) {
+          if (excelTenderProject && state.sourcing?.reviewDetailNavigation?.sourceRowId === sourceRowId) {
+            detail.requestPending = false;
+            renderProjectItemDetails(projectResult, item);
+            renderedCurrent = true;
+          } else if (!excelTenderProject) {
+            button.disabled = false;
+          }
+        }
+      } finally {
+        if (excelTenderProject && state.sourcing?.reviewDetailNavigation?.sourceRowId === sourceRowId) {
+          detail.requestPending = false;
+          if (!renderedCurrent) {
+            const currentItem = projectResult.results?.find((row) => row.intent?.source_row_id === sourceRowId);
+            if (currentItem && state.sourcing?.result === projectResult && $("#sourcing-modal")?.open !== false) {
+              renderProjectItemDetails(projectResult, currentItem);
+            }
+          }
+        }
       }
+      if (shouldToast) toast(toastMessage || "Не удалось обновить подтверждение истории.", "error");
     });
   }
 }
@@ -4419,6 +4589,7 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
 function renderSourcingResult(result, row = null) {
   const content = $("#sourcing-content");
   if (state.sourcing.modalPhase !== "closed") setSourcingModalPhase("project_result");
+  if (state.sourcing.result !== result) state.sourcing.reviewDetailNavigation = {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false};
   state.sourcing.result = result;
   state.sourcing.modeChangedAfterResult = state.sourcing.sourceMode !== sourcingResultMode(result);
   renderSourcingHistoryControls();

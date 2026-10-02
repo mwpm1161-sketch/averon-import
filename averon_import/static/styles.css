@@ -414,6 +414,11 @@ button { cursor: pointer; }
 .history-human-confirmation { display:grid; gap:8px; padding:12px; border:1px solid #dbe4ee; border-radius:12px; background:#f8fafc; color:#334155; font-size:13px; }
 .history-human-confirmation p { margin:0; line-height:1.45; }
 .history-human-confirmation span { color:#475569; }
+.history-confirmation-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.project-review-navigation { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:14px 0; padding:9px 12px; border:1px solid #e2e8f0; border-radius:11px; background:#f8fafc; color:#475569; font-size:13px; }
+.project-review-navigation > span { text-align:center; font-weight:600; }
+.project-review-navigation button:disabled { opacity:.45; cursor:default; }
+.project-review-completion { margin:10px 0; padding:10px 12px; border-radius:10px; background:#eff6ff; color:#1e3a5f; font-size:13px; }
 .history-confirmation-blocked { margin:8px 0; padding:10px 12px; border-radius:10px; background:#fff7ed; color:#9a3412; font-size:12px; }
 .sourcing-project-summary .human-history-count { border-color:#cbd5e1; background:#f8fafc; }
 .tender-sourcing-toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
