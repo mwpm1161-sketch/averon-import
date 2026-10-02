@@ -392,6 +392,15 @@ def _canonical_xml(element: Any) -> Any:
     return tag, attributes, text, children
 
 
+def _dimension_style_fingerprint(sheet: Any, dimension: Any, row: int, column: int) -> str | None:
+    style = getattr(dimension, "_style", None)
+    if style is None:
+        return None
+    cell = sheet.cell(row, column)
+    cell._style = copy(style)
+    return _style_fingerprint(cell)
+
+
 def _workbook_snapshot(path: Path) -> dict[str, Any]:
     workbook = load_workbook(path, data_only=False, read_only=False, keep_links=False)
     try:
@@ -420,7 +429,7 @@ def _workbook_snapshot(path: Path) -> dict[str, Any]:
                     "hidden": bool(dimension.hidden),
                     "outlineLevel": int(dimension.outlineLevel or 0),
                     "collapsed": bool(dimension.collapsed),
-                    "style": int(dimension.style or 0),
+                    "style": _dimension_style_fingerprint(sheet, dimension, index, 1),
                     "thickTop": bool(dimension.thickTop),
                     "thickBottom": bool(dimension.thickBot),
                 }
@@ -438,7 +447,7 @@ def _workbook_snapshot(path: Path) -> dict[str, Any]:
                     "bestFit": bool(dimension.bestFit),
                     "outlineLevel": int(dimension.outlineLevel or 0),
                     "collapsed": bool(dimension.collapsed),
-                    "style": int(dimension.style or 0),
+                    "style": _dimension_style_fingerprint(sheet, dimension, 1, minimum),
                     "customWidth": bool(dimension.customWidth),
                 }
                 for column in range(minimum, maximum + 1):
@@ -460,6 +469,17 @@ def _workbook_snapshot(path: Path) -> dict[str, Any]:
                 "name": sheet.title,
                 "state": sheet.sheet_state,
                 "cells": cells,
+                "defined_names": sorted(
+                    [
+                        {
+                            "name": name,
+                            "attr_text": str(defined.attr_text or ""),
+                            "type": str(defined.type or ""),
+                        }
+                        for name, defined in sheet.defined_names.items()
+                    ],
+                    key=lambda item: item["name"],
+                ),
                 "merged_ranges": sorted(str(item) for item in sheet.merged_cells.ranges),
                 "tables": sorted(tables, key=lambda item: (item["name"], item["ref"])),
                 "auto_filter": _canonical_xml(sheet.auto_filter.to_tree()),
@@ -488,13 +508,28 @@ def _workbook_snapshot(path: Path) -> dict[str, Any]:
                 },
             })
         names = [
-            {"name": name, "attr_text": str(defined.attr_text or ""), "type": str(defined.type or "")}
+            {
+                "scope": "workbook",
+                "name": name,
+                "attr_text": str(defined.attr_text or ""),
+                "type": str(defined.type or ""),
+            }
             for name, defined in workbook.defined_names.items()
         ]
+        names.extend(
+            {
+                "scope": sheet.title,
+                "name": name,
+                "attr_text": str(defined.attr_text or ""),
+                "type": str(defined.type or ""),
+            }
+            for sheet in workbook.worksheets
+            for name, defined in sheet.defined_names.items()
+        )
         return {
             "sheet_order": list(workbook.sheetnames),
             "sheets": sheets,
-            "defined_names": sorted(names, key=lambda item: item["name"]),
+            "defined_names": sorted(names, key=lambda item: (item["scope"], item["name"])),
             "calculation": _canonical_xml(workbook.calculation.to_tree()) if workbook.calculation else None,
         }
     finally:
@@ -518,28 +553,219 @@ def _package_snapshot(path: Path) -> dict[str, Any]:
                 continue
             root = ElementTree.fromstring(archive.read(actual_name))
             values = []
+            identifiers: set[str] = set()
             rel_folder = posixpath.dirname(lower_name)
             base_folder = rel_folder[:-len("/_rels")] if rel_folder.endswith("/_rels") else ("" if rel_folder == "_rels" else rel_folder)
             for node in root.iter():
                 if node.tag.endswith("Relationship"):
+                    identifier = str(node.attrib.get("Id", ""))
                     target = str(node.attrib.get("Target", ""))
+                    relationship_type = str(node.attrib.get("Type", ""))
                     target_mode = str(node.attrib.get("TargetMode", ""))
-                    if target and target_mode.casefold() != "external":
-                        target = posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join(base_folder, target))
+                    if (
+                        not identifier
+                        or identifier in identifiers
+                        or not target
+                        or not relationship_type
+                        or target_mode.casefold() not in {"", "external"}
+                    ):
+                        raise TenderWorkspaceError(
+                            "Связь компонента XLSX имеет неверный формат.",
+                            409,
+                            "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+                        )
+                    identifiers.add(identifier)
+                    if target_mode.casefold() != "external":
+                        target = posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join(base_folder, target)).casefold()
+                        if target.startswith("../") or target not in names:
+                            raise TenderWorkspaceError(
+                                "Связь XLSX указывает на отсутствующий компонент.",
+                                409,
+                                "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+                            )
                     values.append((
-                        str(node.attrib.get("Id", "")),
-                        str(node.attrib.get("Type", "")),
+                        identifier,
+                        relationship_type,
                         target,
-                        target_mode,
+                        target_mode.casefold(),
                     ))
             relationships[lower_name] = sorted(values)
+        relationship_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        for lower_name, actual_name in names.items():
+            if not lower_name.endswith(".xml") or lower_name.endswith(".rels"):
+                continue
+            root = ElementTree.fromstring(archive.read(actual_name))
+            if lower_name == "[content_types].xml":
+                continue
+            if lower_name == "_rels/.rels":
+                continue
+            folder, filename = posixpath.split(lower_name)
+            rel_part = f"{folder}/_rels/{filename}.rels" if folder else f"_rels/{filename}.rels"
+            rel_ids = {
+                relationship[0]
+                for relationship in relationships.get(rel_part, [])
+            }
+            for element in root.iter():
+                for attribute, value in element.attrib.items():
+                    if attribute.startswith(relationship_namespace) and value not in rel_ids:
+                        raise TenderWorkspaceError(
+                            "Ссылка XML на relationship XLSX не имеет соответствия.",
+                            409,
+                            "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+                        )
+        effective_types: dict[str, str | None] = {}
+        override_types: dict[str, str] = {}
+        default_types: dict[str, str] = {}
+        for extension, content_type in defaults:
+            previous = default_types.get(extension)
+            if previous is not None:
+                raise TenderWorkspaceError(
+                    "Типы компонентов XLSX заданы неоднозначно.",
+                    409,
+                    "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+                )
+            default_types[extension] = content_type
+        for part_name, content_type in overrides:
+            previous = override_types.get(part_name)
+            if previous is not None:
+                raise TenderWorkspaceError(
+                    "Типы компонентов XLSX заданы неоднозначно.",
+                    409,
+                    "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+                )
+            override_types[part_name] = content_type
+        for lower_name in names:
+            if lower_name == "[content_types].xml":
+                continue
+            extension = lower_name.rsplit("/", 1)[-1].rsplit(".", 1)
+            extension_key = extension[-1].casefold() if len(extension) == 2 else ""
+            effective_types[lower_name] = override_types.get(
+                f"/{lower_name}", default_types.get(extension_key),
+            )
+        table_semantics = {
+            name: _canonical_xml(ElementTree.fromstring(archive.read(actual_name)))
+            for name, actual_name in names.items()
+            if re.fullmatch(r"xl/tables/table\d+\.xml", name)
+        }
         return {
             "names": names,
             "defaults": sorted(defaults),
             "overrides": sorted(overrides),
+            "effective_types": effective_types,
             "relationships": relationships,
+            "table_semantics": table_semantics,
             "opaque_hashes": {key: hashlib.sha256(archive.read(actual)).hexdigest() for key, actual in names.items()},
         }
+
+
+def _relationship_edges(values: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str]]:
+    """Normalize package relationships, whose IDs may be reassigned on save."""
+    return sorted((relationship_type, target, target_mode) for _identifier, relationship_type, target, target_mode in values)
+
+
+def _docprops_semantics(path: Path, part_name: str) -> Any:
+    with zipfile.ZipFile(path) as archive:
+        names = {item.filename.casefold(): item.filename for item in archive.infolist()}
+        actual_name = names.get(part_name)
+        if actual_name is None:
+            return None
+        root = ElementTree.fromstring(archive.read(actual_name))
+        if part_name == "docprops/core.xml":
+            # Saving a workbook legitimately advances its modified timestamp.
+            for child in list(root):
+                if child.tag.endswith("}modified"):
+                    root.remove(child)
+        return _canonical_xml(root)
+
+
+def _cell_values_by_sheet(snapshot: dict[str, Any]) -> dict[str, dict[str, tuple[Any, str]]]:
+    return {
+        sheet["name"]: {
+            coordinate: (cell["value"], cell["data_type"])
+            for coordinate, cell in sheet["cells"].items()
+        }
+        for sheet in snapshot["sheets"]
+    }
+
+
+def _validate_shared_string_conversion(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    allowed_cells: set[str],
+    target_sheet: str | None,
+) -> None:
+    old_sheets = _cell_values_by_sheet(before)
+    new_sheets = _cell_values_by_sheet(after)
+    if set(old_sheets) != set(new_sheets):
+        raise TenderWorkspaceError(
+            "Общая таблица строк XLSX изменила исходные значения.",
+            409,
+            "TENDER_EXPORT_PRESERVATION_FAILED",
+        )
+    for sheet_name, old_cells in old_sheets.items():
+        for coordinate, old_value in old_cells.items():
+            if sheet_name == target_sheet and coordinate in allowed_cells:
+                continue
+            if new_sheets[sheet_name].get(coordinate) != old_value:
+                raise TenderWorkspaceError(
+                    "Общая таблица строк XLSX изменила исходные значения.",
+                    409,
+                    "TENDER_EXPORT_PRESERVATION_FAILED",
+                )
+
+
+def _generated_docprops_are_safe(path: Path, added_parts: set[str], source_snapshot: dict[str, Any]) -> bool:
+    if not added_parts:
+        return True
+    structural_names = {str(sheet["name"]) for sheet in source_snapshot["sheets"]}
+    for sheet in source_snapshot["sheets"]:
+        structural_names.update(str(table["name"]) for table in sheet["tables"])
+    source_values = {
+        str(cell["value"])
+        for sheet in source_snapshot["sheets"]
+        for cell in sheet["cells"].values()
+        if isinstance(cell["value"], str) and cell["value"]
+    } - structural_names
+    allowed_app_fields = {
+        "Application", "DocSecurity", "ScaleCrop", "HeadingPairs", "TitlesOfParts",
+        "Manager", "Company", "LinksUpToDate", "SharedDoc", "HyperlinksChanged", "AppVersion",
+    }
+    allowed_core_fields = {
+        "creator", "lastModifiedBy", "created", "modified", "title", "subject",
+        "description", "identifier", "language", "category", "keywords", "revision",
+        "version", "contentStatus",
+    }
+    allowed_variant_fields = {
+        "variant", "vector", "lpstr", "lpwstr", "i1", "i2", "i4", "i8",
+        "ui1", "ui2", "ui4", "ui8", "r4", "r8", "decimal", "bool",
+        "filetime", "blob", "oblob", "empty", "null", "cy", "error",
+    }
+    with zipfile.ZipFile(path) as archive:
+        names = {item.filename.casefold(): item.filename for item in archive.infolist()}
+        for part in added_parts:
+            actual_name = names.get(part)
+            if actual_name is None:
+                return False
+            root = ElementTree.fromstring(archive.read(actual_name))
+            if part == "docprops/app.xml":
+                allowed = allowed_app_fields
+                if not str(root.tag).endswith("}Properties"):
+                    return False
+            elif part == "docprops/core.xml":
+                allowed = allowed_core_fields
+                if not str(root.tag).endswith("}coreProperties"):
+                    return False
+            else:
+                return False
+            for element in root.iter():
+                tag = str(element.tag).rsplit("}", 1)[-1]
+                if element is not root and tag not in allowed and tag not in allowed_variant_fields:
+                    return False
+                value = (element.text or "").strip()
+                if value in source_values:
+                    return False
+    return True
 
 
 def _worksheet_part_map(archive: zipfile.ZipFile) -> dict[str, str]:
@@ -726,26 +952,92 @@ def _restore_empty_shared_string_cells(source_path: Path, output_path: Path, all
             pass
 
 
-def _verify_package_roundtrip(source: Path, output: Path) -> None:
+def _verify_package_roundtrip(
+    source: Path,
+    output: Path,
+    *,
+    target_sheet: str | None = None,
+    allowed_cells: set[str] | None = None,
+    target_comment_cells: set[str] | None = None,
+    semantic_before: dict[str, Any] | None = None,
+    semantic_after: dict[str, Any] | None = None,
+) -> None:
     before = _package_snapshot(source)
     after = _package_snapshot(output)
     source_names = set(before["names"])
     output_names = set(after["names"])
+    allowed_cells = allowed_cells or set()
+    target_comment_cells = target_comment_cells or set()
+
+    # Shared-string indices and inline strings are alternate encodings of the
+    # same cells.  Verify the cell values first, including formula text and
+    # empty shared-string placeholders restored by the exporter.
+    removed_shared_strings = "xl/sharedstrings.xml" in source_names - output_names
+    if removed_shared_strings:
+        semantic_before = semantic_before or _workbook_snapshot(source)
+        semantic_after = semantic_after or _workbook_snapshot(output)
+        _validate_shared_string_conversion(
+            semantic_before,
+            semantic_after,
+            allowed_cells=allowed_cells,
+            target_sheet=target_sheet,
+        )
+
+    target_sheet_rel: str | None = None
+    if target_sheet:
+        try:
+            with zipfile.ZipFile(source) as source_zip, zipfile.ZipFile(output) as output_zip:
+                source_sheet_parts = _worksheet_part_map(source_zip)
+                output_sheet_parts = _worksheet_part_map(output_zip)
+            if source_sheet_parts.get(target_sheet) != output_sheet_parts.get(target_sheet):
+                raise TenderWorkspaceError(
+                    "Связь целевого листа XLSX изменилась.",
+                    409,
+                    "TENDER_EXPORT_PRESERVATION_FAILED",
+                )
+            sheet_part = source_sheet_parts[target_sheet]
+            sheet_dir, sheet_file = posixpath.split(sheet_part)
+            target_sheet_rel = f"{sheet_dir}/_rels/{sheet_file}.rels".casefold()
+        except (KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+            raise TenderWorkspaceError(
+                "Не удалось проверить связи листа XLSX.",
+                409,
+                "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+            ) from exc
+
     permitted_added = {
-        name for name in output_names - source_names
-        if re.fullmatch(r"xl/comments/comment\d+\.xml", name)
-        or re.fullmatch(r"xl/drawings/commentsdrawing\d+\.vml", name)
-        or re.fullmatch(r"xl/worksheets/_rels/sheet\d+\.xml\.rels", name)
+        name
+        for name in output_names - source_names
+        if (
+            target_comment_cells
+            and (
+                re.fullmatch(r"xl/comments/comment\d+\.xml", name)
+                or re.fullmatch(r"xl/drawings/commentsdrawing\d+\.vml", name)
+                or name == target_sheet_rel
+            )
+        ) or name in {"docprops/app.xml", "docprops/core.xml"}
     }
     permitted_removed = {name for name in source_names - output_names if name == "xl/sharedstrings.xml"}
     if output_names - source_names != permitted_added or source_names - output_names != permitted_removed:
         raise TenderWorkspaceError("Структура XLSX изменилась за пределами разрешённых выходных данных.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+
+    generated_docprops = {
+        name for name in permitted_added
+        if name in {"docprops/app.xml", "docprops/core.xml"}
+    }
+    if not _generated_docprops_are_safe(output, generated_docprops, semantic_before or _workbook_snapshot(source)):
+        raise TenderWorkspaceError(
+            "В метаданных XLSX появились неожиданные данные.",
+            409,
+            "TENDER_EXPORT_PRESERVATION_FAILED",
+        )
 
     mutable_parts = {
         "[content_types].xml", "xl/workbook.xml", "xl/styles.xml",
         "xl/sharedstrings.xml", "xl/_rels/workbook.xml.rels", "_rels/.rels",
         "docprops/core.xml", "docprops/app.xml",
     }
+    mutable_parts.update(name for name in source_names if re.fullmatch(r"xl/tables/table\d+\.xml", name))
     for name in source_names & output_names:
         if (
             name in mutable_parts
@@ -758,40 +1050,140 @@ def _verify_package_roundtrip(source: Path, output: Path) -> None:
         if before["opaque_hashes"][name] != after["opaque_hashes"][name]:
             raise TenderWorkspaceError("Компонент XLSX изменился за пределами разрешённых выходных данных.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
 
-    old_types = set(before["defaults"] + before["overrides"])
-    new_types = set(after["defaults"] + after["overrides"])
-    if not old_types <= new_types:
-        raise TenderWorkspaceError("Типы исходных компонентов XLSX изменились.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
-    added_types = new_types - old_types
-    if any(
-        item[0] != "vml"
-        and not item[0].startswith("/xl/comments/comment")
-        for item in added_types
-    ):
-        raise TenderWorkspaceError("В XLSX появились неожиданные типы компонентов.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+    if before["table_semantics"] != after["table_semantics"]:
+        raise TenderWorkspaceError(
+            "Определение таблицы XLSX изменилось.",
+            409,
+            "TENDER_EXPORT_PRESERVATION_FAILED",
+        )
+
+    for name in source_names - {"[content_types].xml"}:
+        if name not in output_names:
+            if name == "xl/sharedstrings.xml" and removed_shared_strings:
+                continue
+            raise TenderWorkspaceError("Из XLSX исчез исходный компонент.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+        if before["effective_types"].get(name) != after["effective_types"].get(name):
+            raise TenderWorkspaceError("Изменился тип исходного компонента XLSX.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+    for name in permitted_added:
+        expected_type = None
+        if name == "docprops/app.xml":
+            expected_type = "application/vnd.openxmlformats-officedocument.extended-properties+xml"
+        elif name == "docprops/core.xml":
+            expected_type = "application/vnd.openxmlformats-package.core-properties+xml"
+        elif re.fullmatch(r"xl/comments/comment\d+\.xml", name):
+            expected_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"
+        elif re.fullmatch(r"xl/drawings/commentsdrawing\d+\.vml", name):
+            expected_type = "application/vnd.openxmlformats-officedocument.vmlDrawing"
+        elif name == target_sheet_rel:
+            expected_type = "application/vnd.openxmlformats-package.relationships+xml"
+        if expected_type is None or after["effective_types"].get(name) != expected_type:
+            raise TenderWorkspaceError("Появился компонент XLSX с неожиданным типом.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+    for package in (before, after):
+        for part, content_type in package["effective_types"].items():
+            if content_type is None:
+                raise TenderWorkspaceError(
+                    "Для компонента XLSX не определён тип содержимого.",
+                    409,
+                    "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+                )
+        package_names = set(package["names"])
+        if any(part_name.lstrip("/") not in package_names for part_name, _kind in package["overrides"]):
+            raise TenderWorkspaceError(
+                "Тип содержимого ссылается на отсутствующий компонент XLSX.",
+                409,
+                "TENDER_EXPORT_PRESERVATION_UNSUPPORTED",
+            )
+
+    # Existing document metadata may be reserialized, but its meaning remains
+    # protected.  Only the modified timestamp is expected to advance on save.
+    for name in {"docprops/app.xml", "docprops/core.xml"} & source_names:
+        if _docprops_semantics(source, name) != _docprops_semantics(output, name):
+            raise TenderWorkspaceError("Изменились исходные метаданные XLSX.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+
+    # New historical comments are allowed only on the exact target cells, and
+    # their relationship parts must remain attached to the selected sheet.
+    if target_comment_cells:
+        if not target_sheet or not any(re.fullmatch(r"xl/comments/comment\d+\.xml", name) for name in output_names):
+            raise TenderWorkspaceError("Комментарии цены не связаны с целевым листом.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+        if semantic_before is None:
+            semantic_before = _workbook_snapshot(source)
+        if semantic_after is None:
+            semantic_after = _workbook_snapshot(output)
+        original_sheets = {sheet["name"]: sheet for sheet in semantic_before["sheets"]}
+        output_sheets = {sheet["name"]: sheet for sheet in semantic_after["sheets"]}
+        if target_sheet not in output_sheets:
+            raise TenderWorkspaceError("Целевой лист комментариев не найден.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+        original_cells = original_sheets[target_sheet]["cells"]
+        output_cells = output_sheets[target_sheet]["cells"]
+        if any(
+            coordinate not in output_cells
+            or output_cells[coordinate].get("comment") is None
+            for coordinate in target_comment_cells
+        ):
+            raise TenderWorkspaceError("Исторические комментарии XLSX не сохранены.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+        if any(
+            cell.get("comment") is not None
+            and cell.get("comment") != original_cells.get(coordinate, {}).get("comment")
+            and coordinate not in target_comment_cells
+            for coordinate, cell in output_cells.items()
+        ):
+            raise TenderWorkspaceError("В XLSX появился посторонний комментарий.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
 
     for part, original in before["relationships"].items():
         current = after["relationships"].get(part)
         if current is None:
             raise TenderWorkspaceError("Связи XLSX изменились за пределами разрешённых выходных данных.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
-        if part == "xl/_rels/workbook.xml.rels":
-            # openpyxl may assign different relationship IDs to the workbook's
-            # style/theme parts; the workbook references those IDs and both
-            # sides are validated semantically, so compare their destinations.
-            original = sorted(item[1:] for item in original)
-            current = sorted(item[1:] for item in current)
-            if current != original:
-                raise TenderWorkspaceError("Связи книги XLSX изменились за пределами разрешённых выходных данных.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
-            continue
-        additions = [
-            item for item in current if item not in original
-            and item[1].endswith(("/comments", "/vmlDrawing", "/sharedStrings"))
-        ]
-        filtered = [item for item in current if item not in additions]
-        if filtered != original:
+        original_edges = _relationship_edges(original)
+        current_edges = _relationship_edges(current)
+        if part == "xl/_rels/workbook.xml.rels" and removed_shared_strings:
+            shared_edge = next((
+                edge for edge in original_edges
+                if edge[0].endswith("/sharedStrings") and edge[1].casefold() == "xl/sharedstrings.xml" and edge[2] == ""
+            ), None)
+            if shared_edge is None:
+                raise TenderWorkspaceError("Связь общей таблицы строк XLSX повреждена.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+            original_edges.remove(shared_edge)
+        expected_edges = list(original_edges)
+        if part == "_rels/.rels":
+            if "docprops/core.xml" in generated_docprops:
+                expected_edges.append((
+                    "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
+                    after["names"]["docprops/core.xml"].casefold(), "",
+                ))
+            if "docprops/app.xml" in generated_docprops:
+                expected_edges.append((
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
+                    after["names"]["docprops/app.xml"].casefold(), "",
+                ))
+        if part == target_sheet_rel and target_comment_cells:
+            if any(re.fullmatch(r"xl/comments/comment\d+\.xml", name) for name in output_names):
+                comments_part = next(name for name in output_names if re.fullmatch(r"xl/comments/comment\d+\.xml", name))
+                expected_edges.append((
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+                    comments_part,
+                    "",
+                ))
+            if any(re.fullmatch(r"xl/drawings/commentsdrawing\d+\.vml", name) for name in output_names):
+                vml_part = next(name for name in output_names if re.fullmatch(r"xl/drawings/commentsdrawing\d+\.vml", name))
+                expected_edges.append((
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing",
+                    vml_part,
+                    "",
+                ))
+        if sorted(current_edges) != sorted(expected_edges):
             raise TenderWorkspaceError("Связи XLSX изменились за пределами разрешённых выходных данных.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
     for part, current in after["relationships"].items():
-        if part not in before["relationships"] and not any(item[1].endswith(("/comments", "/vmlDrawing", "/sharedStrings")) for item in current):
+        if part in before["relationships"]:
+            continue
+        if part != target_sheet_rel or not target_comment_cells:
+            raise TenderWorkspaceError("В XLSX появились неожиданные связи.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+        edges = _relationship_edges(current)
+        permitted_edges = {
+            (item_type, target, mode)
+            for item_type, target, mode in edges
+            if item_type.endswith(("/comments", "/vmlDrawing"))
+        }
+        if len(permitted_edges) != len(edges) or not permitted_edges:
             raise TenderWorkspaceError("В XLSX появились неожиданные связи.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
 
 
@@ -1005,6 +1397,7 @@ class TenderXlsxPriceExporter:
             price_header.number_format = "0.000000"
             total_header.number_format = "0.00"
             allowed_cells = {price_header.coordinate, total_header.coordinate}
+            target_comment_cells: set[str] = set()
             historical_count = 0
             for decision in decisions:
                 if not decision.eligible:
@@ -1040,12 +1433,14 @@ class TenderXlsxPriceExporter:
                         "Не подтверждает текущую доступность и не является текущим предложением.",
                         "Averon Import",
                     )
+                    target_comment_cells.update((price_cell.coordinate, total_cell.coordinate))
             if historical_count:
                 price_header.comment = Comment(
                     "Исторические цены 1С отмечены цветом. Они отражают предыдущие покупки, "
                     "не подтверждают текущую доступность и не являются текущим предложением.",
                     "Averon Import",
                 )
+                target_comment_cells.add(price_header.coordinate)
 
             target_letters = (get_column_letter(price_column), get_column_letter(total_column))
             for letter, width in zip(target_letters, (20, 20), strict=True):
@@ -1081,7 +1476,15 @@ class TenderXlsxPriceExporter:
             allowed_cells=allowed_cells,
             target_columns={price_column, total_column},
         )
-        _verify_package_roundtrip(source_path, output_path)
+        _verify_package_roundtrip(
+            source_path,
+            output_path,
+            target_sheet=target_sheet,
+            allowed_cells=allowed_cells,
+            target_comment_cells=target_comment_cells,
+            semantic_before=before,
+            semantic_after=after,
+        )
         return {
             "target_sheet": target_sheet,
             "target_columns": {

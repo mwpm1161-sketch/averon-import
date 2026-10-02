@@ -420,8 +420,16 @@ class TenderWorkbookParser:
                 max_cell_bytes=MAX_ANALYSIS_DATA_BYTES - rows_json_bytes,
             )
             with zipfile.ZipFile(path) as archive:
-                package_names = [item.filename.casefold() for item in archive.infolist()]
+                package_items = list(archive.infolist())
+                package_names = [item.filename.casefold() for item in package_items]
             sensitive_parts = [name for name in package_names if any(token in name for token in ("/pivot", "/slicer", "/embedding", "/querytables", "/activex", "customxml", "/drawings/"))]
+            with zipfile.ZipFile(path) as archive:
+                for item in package_items:
+                    if not item.filename.casefold().endswith(".xml"):
+                        continue
+                    root = ElementTree.fromstring(archive.read(item))
+                    if any(str(node.tag).rsplit("}", 1)[-1] == "extLst" for node in root.iter()):
+                        sensitive_parts.append(f"{item.filename.casefold()}#unknown-extension-list")
             manifest["unsupported_preservation_sensitive_objects"] = sorted(set(sensitive_parts))[:200]
             warnings = []
             if not is_official and any("цена" in _header_key(_cell_text(sheet.cell(header_row, column).value)) or "сумма" in _header_key(_cell_text(sheet.cell(header_row, column).value)) for column in range(logical_edge + 1, min(sheet.max_column, logical_edge + 30) + 1)):

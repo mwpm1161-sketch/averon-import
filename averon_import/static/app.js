@@ -1744,6 +1744,7 @@ function returnToStartFromManual() {
 
 function clearExcelTenderState() {
   const generation = (state.excelTender?.pollGeneration || 0) + 1;
+  clearTenderExportFailure();
   if (state.excelTender?.filterTimer) clearTimeout(state.excelTender.filterTimer);
   state.excelTender = {previewId:null,jobId:null,pollGeneration:generation,preview:null,workspace:null,selectedIds:new Set(),filterTimer:null,sourcingActive:false,exportActive:false,exportJobId:null,selectedExportRunId:null,latestRuns:[],latestExports:[],selectedExportId:null};
   try { sessionStorage.removeItem(EXCEL_TENDER_VIEW_KEY); } catch (_) {}
@@ -2093,6 +2094,31 @@ function tenderExportConfirmationSummary(summary) {
   return `Позиции: ${selected}; с ценой: ${priced}; без цены: ${blank}; исторические цены 1С: ${historical}.`;
 }
 
+function clearTenderExportFailure() {
+  const panel = $("#tender-export-failure");
+  const message = $("#tender-export-failure-message");
+  if (panel) panel.hidden = true;
+  if (message) message.textContent = "";
+}
+
+function safeTenderExportErrorMessage(error) {
+  const message = String(error?.message || "").replace(/\s+/g, " ").trim();
+  const unsafe = !message || message.length > 240
+    || /(?:[A-Za-z]:\\|\\\\[^\\\s]+\\|(?:^|\s)\/[^\s]+|Traceback|Error:|Exception:|\.py:\d+)/i.test(message)
+    || /(api[-_ ]?key|authorization|secret|token|password)/i.test(message);
+  return unsafe
+    ? "Не удалось безопасно проверить копию исходной книги. Повторите экспорт; если ошибка повторится, обратитесь к администратору."
+    : message;
+}
+
+function showTenderExportFailure(error) {
+  const panel = $("#tender-export-failure");
+  const message = $("#tender-export-failure-message");
+  if (!panel || !message) return;
+  message.textContent = safeTenderExportErrorMessage(error);
+  panel.hidden = false;
+}
+
 function chooseTenderHistoricalPricePolicy(summary) {
   const dialog = $("#tender-history-confirmation-modal");
   const summaryNode = $("#tender-history-confirmation-summary");
@@ -2118,6 +2144,7 @@ async function startExcelTenderPriceExport() {
     && state.excelTender.exportActive;
   state.excelTender.exportActive = true;
   state.excelTender.exportJobId = "submitting";
+  clearTenderExportFailure();
   const status = $("#tender-export-status");
   if (status) status.textContent = "Проверяем цены и ограничения экспорта…";
   renderExcelTenderExportControls();
@@ -2152,7 +2179,14 @@ async function startExcelTenderPriceExport() {
     state.excelTender.exportJobId = job.id;
     await pollExcelTenderPriceExport(job.id, tenderId, generation);
   } catch (error) {
-    if (current() && status) status.textContent = error.message || "Не удалось сформировать экспорт.";
+    if (current()) {
+      if (error.message === "Экспорт отменён.") {
+        if (status) status.textContent = error.message;
+      } else {
+        showTenderExportFailure(error);
+        if (status) status.textContent = "Экспорт не выполнен.";
+      }
+    }
   } finally {
     if (current()) {
       state.excelTender.exportActive = false;
@@ -2173,6 +2207,7 @@ async function pollExcelTenderPriceExport(jobId, tenderId, generation) {
     if (!current()) return;
     const status = $("#tender-export-status");
     if (job.status === "completed") {
+      clearTenderExportFailure();
       const record = job.result;
       if (!record || !/^[a-f0-9]{32}$/.test(record.export_id || "")) throw new Error("Сервер вернул некорректный результат экспорта.");
       state.excelTender.latestExports = [record, ...(state.excelTender.latestExports || []).filter((item) => item.export_id !== record.export_id)].slice(0, 3);
@@ -5403,6 +5438,7 @@ function setupEvents() {
   $("#tender-sourcing-button").addEventListener("click", openExcelTenderSourcing);
   $("#tender-sourcing-submit").addEventListener("click", () => { void startExcelTenderSourcing(); });
   $("#tender-export-run").addEventListener("change", (event) => {
+    clearTenderExportFailure();
     state.excelTender.selectedExportRunId = event.target.value || null;
     renderExcelTenderExportControls();
   });
@@ -5411,6 +5447,7 @@ function setupEvents() {
     renderExcelTenderExportControls();
   });
   $("#tender-export-button").addEventListener("click", () => { void startExcelTenderPriceExport(); });
+  $("#tender-export-retry").addEventListener("click", () => { void startExcelTenderPriceExport(); });
   $("#tender-export-download").addEventListener("click", () => { void downloadExcelTenderPriceExport(); });
   $("#tender-row-search").addEventListener("input", () => {
     if (state.excelTender.filterTimer) clearTimeout(state.excelTender.filterTimer);

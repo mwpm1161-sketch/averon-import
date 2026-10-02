@@ -107,6 +107,10 @@ button { cursor: pointer; }
 .tender-price-export-controls { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
 .tender-price-export-controls .field-label { margin:0 2px 0 0; font-size:11px; }
 .tender-price-export-controls select { min-width:180px; max-width:320px; padding:8px; border:1px solid var(--line-strong); border-radius:8px; background:#fff; }
+.tender-export-failure { width:100%; display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px 16px; padding:13px 14px; border:1px solid #e2a7a0; border-radius:10px; background:#fff5f3; color:#7a271a; }
+.tender-export-failure[hidden] { display:none; }
+.tender-export-failure strong { display:block; font-size:13px; }
+.tender-export-failure p { margin:4px 0 0; color:#7f3b32; font-size:12px; line-height:1.4; }
 .tender-price-export .hint { margin:0; font-size:11px; }
 .tender-panel { padding:22px; }
 .tender-file-icon { background:#176b4c; }

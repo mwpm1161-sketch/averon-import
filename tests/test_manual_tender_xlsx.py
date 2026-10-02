@@ -2788,12 +2788,15 @@ def test_price_export_failure_admission_and_queue_expiry_release_leases(tender_a
     export_dir = repository.workspace_root / workspace["tender_id"] / "exports"
     monkeypatch.setattr(
         main.tender_xlsx_price_exporter, "write",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic export failure")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TenderWorkspaceError("Книга не прошла проверку сохранения.", 409, "TENDER_EXPORT_PRESERVATION_FAILED")
+        ),
     )
     failed = post()
     assert failed.status_code == 202
     failed_job = _wait_tender_job(main, failed.json()["id"])
     assert failed_job["status"] == "failed"
+    assert failed_job["error_code"] == "TENDER_EXPORT_PRESERVATION_FAILED"
     assert not repository.activity.active(workspace["tender_id"])
     assert not list(export_dir.glob("*.json")) and not list(export_dir.glob("*.xlsx"))
 
@@ -2831,3 +2834,265 @@ def test_price_export_failure_admission_and_queue_expiry_release_leases(tender_a
     assert not list(export_dir.glob("*.json")) and not list(export_dir.glob("*.xlsx"))
     release_blocker.set()
     expiry_jobs.executor.shutdown(wait=True)
+
+
+def test_external_xlsx_noop_roundtrip_accepts_equivalent_ooxml_encodings(tmp_path):
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.price_export import (
+        _verify_package_roundtrip,
+        _workbook_snapshot,
+        _verify_semantic_roundtrip,
+    )
+
+    source = tmp_path / "external-source.xlsx"
+    output = tmp_path / "external-output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "External source"
+    sheet.append(["Description", "Quantity"])
+    sheet.append(["A source row", 4])
+    from openpyxl.worksheet.table import Table
+    sheet.add_table(Table(displayName="ExternalTable", ref="A1:B2"))
+    workbook.save(source)
+    workbook.close()
+
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    content_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    ET.register_namespace("", main_ns)
+    ET.register_namespace("r", office_rel_ns)
+    ET.register_namespace("pkg", rel_ns)
+
+    with zipfile.ZipFile(source, "r") as archive:
+        parts = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    # Model an external producer: shared strings rather than inline strings,
+    # no generated document properties, alternate relationship IDs and a
+    # prefixed table namespace. All are valid equivalent OOXML encodings.
+    sheet_root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+    shared_values = []
+    shared_index = {}
+    for cell in sheet_root.iter(f"{{{main_ns}}}c"):
+        inline = cell.find(f"{{{main_ns}}}is")
+        if inline is None:
+            continue
+        text_node = inline.find(f"{{{main_ns}}}t")
+        value = text_node.text if text_node is not None and text_node.text is not None else ""
+        if value not in shared_index:
+            shared_index[value] = len(shared_values)
+            shared_values.append(value)
+        cell.attrib["t"] = "s"
+        cell.remove(inline)
+        ET.SubElement(cell, f"{{{main_ns}}}v").text = str(shared_index[value])
+    parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet_root, encoding="utf-8", xml_declaration=True)
+    sst = ET.Element(f"{{{main_ns}}}sst", {"count":str(len(shared_values)), "uniqueCount":str(len(shared_values))})
+    for value in shared_values:
+        item = ET.SubElement(sst, f"{{{main_ns}}}si")
+        ET.SubElement(item, f"{{{main_ns}}}t").text = value
+    parts["xl/sharedStrings.xml"] = ET.tostring(sst, encoding="utf-8", xml_declaration=True)
+
+    workbook_rels_name = "xl/_rels/workbook.xml.rels"
+    workbook_rels = ET.fromstring(parts[workbook_rels_name])
+    original_to_new = {}
+    for index, relation in enumerate(workbook_rels.findall(f"{{{rel_ns}}}Relationship"), start=1):
+        old = relation.attrib["Id"]
+        new = f"externalRel{index}"
+        original_to_new[old] = new
+        relation.attrib["Id"] = new
+    ET.SubElement(workbook_rels, f"{{{rel_ns}}}Relationship", {
+        "Id":"externalSharedStrings",
+        "Type":f"{office_rel_ns}/sharedStrings",
+        "Target":"sharedStrings.xml",
+    })
+    parts[workbook_rels_name] = ET.tostring(workbook_rels, encoding="utf-8", xml_declaration=True)
+    workbook_root = ET.fromstring(parts["xl/workbook.xml"])
+    for element in workbook_root.iter():
+        relation_id = element.attrib.get(f"{{{office_rel_ns}}}id")
+        if relation_id in original_to_new:
+            element.attrib[f"{{{office_rel_ns}}}id"] = original_to_new[relation_id]
+    parts["xl/workbook.xml"] = ET.tostring(workbook_root, encoding="utf-8", xml_declaration=True)
+
+    table_name = next(name for name in parts if name.casefold().startswith("xl/tables/table") and name.endswith(".xml"))
+    table_root = ET.fromstring(parts[table_name])
+    table_namespace = table_root.tag.split("}", 1)[0][1:]
+    ET.register_namespace("tblx", table_namespace)
+    parts[table_name] = ET.tostring(table_root, encoding="utf-8", xml_declaration=True)
+
+    package_rels_name = "_rels/.rels"
+    package_rels = ET.fromstring(parts[package_rels_name])
+    parts[package_rels_name] = ET.tostring(package_rels, encoding="utf-8", xml_declaration=True)
+    content_types = ET.fromstring(parts["[Content_Types].xml"])
+    for child in list(content_types):
+        if child.tag.endswith("Override") and child.attrib.get("PartName", "").casefold() in {"/docprops/app.xml", "/docprops/core.xml"}:
+            content_types.remove(child)
+    ET.SubElement(content_types, f"{{{content_ns}}}Override", {
+        "PartName":"/xl/sharedStrings.xml",
+        "ContentType":"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+    })
+    parts["[Content_Types].xml"] = ET.tostring(content_types, encoding="utf-8", xml_declaration=True)
+    for name in ("docProps/app.xml", "docProps/core.xml"):
+        parts.pop(name, None)
+    package_rels = ET.fromstring(parts[package_rels_name])
+    for child in list(package_rels):
+        if child.attrib.get("Type", "").endswith(("/extended-properties", "/metadata/core-properties")):
+            package_rels.remove(child)
+    parts[package_rels_name] = ET.tostring(package_rels, encoding="utf-8", xml_declaration=True)
+    with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+
+    assert "xl/sharedStrings.xml" in zipfile.ZipFile(source).namelist()
+    assert not any(name.casefold().startswith("docprops/") for name in zipfile.ZipFile(source).namelist())
+    with zipfile.ZipFile(source) as archive:
+        source_ids = {
+            item.attrib["Id"]
+            for item in ET.fromstring(archive.read(workbook_rels_name)).findall(f"{{{rel_ns}}}Relationship")
+        }
+    opened = load_workbook(source)
+    opened.save(output)
+    opened.close()
+    with zipfile.ZipFile(output) as archive:
+        output_ids = {
+            item.attrib["Id"]
+            for item in ET.fromstring(archive.read(workbook_rels_name)).findall(f"{{{rel_ns}}}Relationship")
+        }
+    assert source_ids != output_ids
+    before = _workbook_snapshot(source)
+    after = _workbook_snapshot(output)
+    _verify_semantic_roundtrip(before, after, target_sheet="External source", allowed_cells=set(), target_columns=set())
+    _verify_package_roundtrip(source, output, semantic_before=before, semantic_after=after)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["cell_value", "formula", "style", "row_style", "column_style", "merge", "defined_name_target", "defined_name_scope"],
+)
+def test_export_semantic_verifier_rejects_source_changes(tmp_path, mutation):
+    from openpyxl.styles import PatternFill
+    from openpyxl.workbook.defined_name import DefinedName
+    from averon_import.services.manual_tenders.price_export import _verify_semantic_roundtrip, _workbook_snapshot
+
+    source = tmp_path / "semantic-source.xlsx"
+    output = tmp_path / "semantic-output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Source value"
+    workbook.defined_names.add(DefinedName("SourceTarget", attr_text="'Sheet'!$A$1"))
+    workbook.save(source)
+    workbook.close()
+    before = _workbook_snapshot(source)
+
+    workbook = load_workbook(source)
+    sheet = workbook["Sheet"]
+    if mutation == "cell_value":
+        sheet["A1"] = "Changed source value"
+    elif mutation == "formula":
+        sheet["A1"] = "=1+1"
+    elif mutation == "style":
+        sheet["A1"].fill = PatternFill(fill_type="solid", fgColor="FFFF0000")
+    elif mutation == "row_style":
+        sheet.row_dimensions[1].fill = PatternFill(fill_type="solid", fgColor="FFFF0000")
+    elif mutation == "column_style":
+        sheet.column_dimensions["A"].fill = PatternFill(fill_type="solid", fgColor="FFFF0000")
+    elif mutation == "merge":
+        sheet.merge_cells("C3:D3")
+    elif mutation == "defined_name_target":
+        workbook.defined_names["SourceTarget"].attr_text = "'Sheet'!$B$1"
+    elif mutation == "defined_name_scope":
+        del workbook.defined_names["SourceTarget"]
+        sheet.defined_names.add(DefinedName("SourceTarget", attr_text="'Sheet'!$A$1"))
+    workbook.save(output)
+    workbook.close()
+    with pytest.raises(TenderWorkspaceError) as error:
+        _verify_semantic_roundtrip(
+            before, _workbook_snapshot(output), target_sheet="Sheet", allowed_cells=set(), target_columns=set(),
+        )
+    assert error.value.code == "TENDER_EXPORT_PRESERVATION_FAILED"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["table_ref", "table_column_name_order", "relationship_target", "relationship_type", "effective_content_type", "opaque_loss"],
+)
+def test_export_package_verifier_rejects_ooxml_mutations(tmp_path, mutation):
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.price_export import _verify_package_roundtrip
+
+    source = tmp_path / "package-source.xlsx"
+    output = tmp_path / "package-output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Description", "Quantity"])
+    sheet.append(["A source row", 4])
+    from openpyxl.worksheet.table import Table
+    sheet.add_table(Table(displayName="PackageTable", ref="A1:B2"))
+    workbook.save(source)
+    workbook.close()
+    opened = load_workbook(source)
+    opened.save(output)
+    opened.close()
+
+    def entries(path):
+        with zipfile.ZipFile(path) as archive:
+            return {item.filename: archive.read(item.filename) for item in archive.infolist()}
+
+    parts = entries(output)
+    if mutation in {"table_ref", "table_column_name_order"}:
+        name = next(part for part in parts if re.fullmatch(r"xl/tables/table\d+\.xml", part, re.IGNORECASE))
+        root = ET.fromstring(parts[name])
+        if mutation == "table_ref":
+            root.attrib["ref"] = "A1:B1"
+        else:
+            columns = next(node for node in root.iter() if node.tag.endswith("tableColumns"))
+            first, second = list(columns)
+            first.attrib["name"], second.attrib["name"] = second.attrib["name"], first.attrib["name"]
+        parts[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    elif mutation in {"relationship_target", "relationship_type"}:
+        name = "xl/_rels/workbook.xml.rels"
+        root = ET.fromstring(parts[name])
+        relation = next(node for node in root.iter() if node.tag.endswith("Relationship") and node.attrib.get("Type", "").endswith("/worksheet"))
+        if mutation == "relationship_target":
+            relation.attrib["Target"] = "worksheets/missing-sheet.xml"
+        else:
+            relation.attrib["Type"] = "urn:unexpected:worksheet"
+        parts[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    elif mutation == "effective_content_type":
+        name = "[Content_Types].xml"
+        root = ET.fromstring(parts[name])
+        override = next(node for node in root if node.tag.endswith("Override") and node.attrib.get("PartName", "").casefold() == "/xl/workbook.xml")
+        override.attrib["ContentType"] = "application/x-unexpected-workbook"
+        parts[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    elif mutation == "opaque_loss":
+        parts["custom/opaque.bin"] = b"source-owned opaque package data"
+        types = ET.fromstring(parts["[Content_Types].xml"])
+        ET.SubElement(types, "{http://schemas.openxmlformats.org/package/2006/content-types}Default", {
+            "Extension":"bin", "ContentType":"application/vnd.example.opaque",
+        })
+        parts["[Content_Types].xml"] = ET.tostring(types, encoding="utf-8", xml_declaration=True)
+        # The source includes an opaque part the ordinary workbook writer drops.
+        source_parts = entries(source)
+        source_parts.update({key: value for key, value in parts.items() if key in {"custom/opaque.bin", "[Content_Types].xml"}})
+        with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, payload in source_parts.items():
+                archive.writestr(name, payload)
+        parts.pop("custom/opaque.bin")
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+
+    with pytest.raises(TenderWorkspaceError) as error:
+        _verify_package_roundtrip(source, output)
+    assert error.value.code in {"TENDER_EXPORT_PRESERVATION_FAILED", "TENDER_EXPORT_PRESERVATION_UNSUPPORTED"}
+
+
+def test_export_failure_panel_is_visible_safe_and_retryable():
+    root = Path(__file__).resolve().parents[1]
+    template = (root / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
+    script = (root / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="tender-export-failure" role="alert" aria-live="assertive" hidden' in template
+    assert "Не удалось создать Excel" in template and "Повторить экспорт" in template
+    assert 'id="tender-export-retry"' in template
+    assert "function safeTenderExportErrorMessage(error)" in script
+    assert "function showTenderExportFailure(error)" in script
+    assert '$("#tender-export-retry").addEventListener("click", () => { void startExcelTenderPriceExport(); })' in script
+    assert "localStorage" not in script[script.index("function safeTenderExportErrorMessage(error)"):script.index("function chooseTenderHistoricalPricePolicy")]

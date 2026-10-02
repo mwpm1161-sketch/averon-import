@@ -146,6 +146,10 @@
                 <label class="field-label" for="tender-export-run">Завершённый запуск</label>
                 <select class="input" id="tender-export-run" aria-label="Запуск для выгрузки цен"></select>
                 <button class="button secondary" type="button" id="tender-export-button">Скачать Excel с ценами</button>
+                <div class="tender-export-failure" id="tender-export-failure" role="alert" aria-live="assertive" hidden>
+                  <div><strong>Не удалось создать Excel</strong><p id="tender-export-failure-message"></p></div>
+                  <button class="button secondary" type="button" id="tender-export-retry">Повторить экспорт</button>
+                </div>
                 <label class="field-label" for="tender-export-artifact">Готовый экспорт</label>
                 <select class="input" id="tender-export-artifact" aria-label="Ранее подготовленный экспорт"></select>
                 <button class="button ghost" type="button" id="tender-export-download" disabled>Скачать готовый файл</button>
