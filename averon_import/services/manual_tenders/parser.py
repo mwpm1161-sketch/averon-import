@@ -38,6 +38,24 @@ MAX_ANALYSIS_DATA_BYTES = 7 * 1024 * 1024
 PARSER_VERSION = 1
 MAX_PREVIEW_ROWS = 15
 
+_SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_SAFE_INERT_EXTENSIONS = {
+    ("xl/styles.xml", "{EB79DEF2-80B8-43e5-95BD-54CBDDF9020C}"): (
+        f"{{http://schemas.microsoft.com/office/spreadsheetml/2009/9/main}}slicerStyles",
+        {"defaultSlicerStyle"},
+    ),
+    ("xl/styles.xml", "{9260A510-F301-46a8-8635-F512D64BE5F5}"): (
+        f"{{http://schemas.microsoft.com/office/spreadsheetml/2010/11/main}}timelineStyles",
+        {"defaultTimelineStyle"},
+    ),
+    ("xl/theme/theme1.xml", "{05A4C25C-085E-4340-85A3-A5531E510DB2}"): (
+        f"{{http://schemas.microsoft.com/office/thememl/2012/main}}themeFamily",
+        {"id", "name", "vid"},
+    ),
+}
+_ACTIVE_PRESERVATION_RELATIONSHIPS = ("/pivot", "/slicer", "/timeline")
+
 FIELD_ALIASES: dict[str, set[str]] = {
     "resource_code": {"кодресурса", "ресурсныйкод", "нсиресурса", "номресурса", "сметкодресурса", "номсметкодресурса", "noсметкодресурса"},
     "name": {"наименование", "название", "наименованиепозиции", "описание", "ресурс", "наименованиересурса", "товар"},
@@ -71,6 +89,91 @@ def _safe_xml(data: bytes, error_message: str) -> ElementTree.Element:
         return ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
         raise TenderParseError(error_message) from exc
+
+
+def _known_inert_extension_list(part_name: str, root: ElementTree.Element) -> ElementTree.Element | None:
+    """Return a narrowly validated inert extension list, if this part has one."""
+    part = part_name.casefold()
+    expected_root = {
+        "xl/styles.xml": f"{{{_SPREADSHEET_NS}}}styleSheet",
+        "xl/theme/theme1.xml": f"{{{_DRAWING_NS}}}theme",
+    }.get(part)
+    if expected_root is None or root.tag != expected_root:
+        return None
+    ext_lists = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "extLst"]
+    if not ext_lists:
+        return None
+    if len(ext_lists) != 1 or ext_lists[0] not in list(root):
+        return None
+    ext_list = ext_lists[0]
+    ext_qname = f"{{{_SPREADSHEET_NS if part == 'xl/styles.xml' else _DRAWING_NS}}}ext"
+    if ext_list.tag != f"{{{_SPREADSHEET_NS if part == 'xl/styles.xml' else _DRAWING_NS}}}extLst" or ext_list.attrib:
+        return None
+    if (ext_list.text or "").strip():
+        return None
+    extensions = list(ext_list)
+    if not extensions:
+        return None
+    for extension in extensions:
+        uri = extension.attrib.get("uri")
+        spec = _SAFE_INERT_EXTENSIONS.get((part, str(uri or "")))
+        if extension.tag != ext_qname or set(extension.attrib) != {"uri"} or spec is None:
+            return None
+        expected_child, expected_attributes = spec
+        children = list(extension)
+        if len(children) != 1 or children[0].tag != expected_child or list(children[0]):
+            return None
+        child = children[0]
+        if (extension.text or "").strip() or (extension.tail or "").strip() or (child.text or "").strip() or (child.tail or "").strip():
+            return None
+        if set(child.attrib) != expected_attributes:
+            return None
+        if any(
+            not value or len(value) > 256 or any(ord(character) < 32 for character in value)
+            for value in child.attrib.values()
+        ):
+            return None
+    return ext_list
+
+
+def _package_preservation_inventory(path: Path) -> tuple[dict[str, bytes], list[str]]:
+    """Identify preservation-sensitive parts and validated inert extLst payloads."""
+    extensions: dict[str, bytes] = {}
+    unsupported: list[str] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            names = {item.filename.casefold(): item.filename for item in infos}
+            for lower_name in names:
+                sensitive = any(token in lower_name for token in (
+                    "/pivot", "/slicer", "/timeline", "/embedding", "/querytables", "/activex", "customxml",
+                ))
+                if "/drawings/" in lower_name and not re.fullmatch(
+                    r"xl/drawings/commentsdrawing\d+\.vml", lower_name,
+                ):
+                    sensitive = True
+                if sensitive:
+                    unsupported.append(lower_name)
+
+            for item in infos:
+                lower_name = item.filename.casefold()
+                if lower_name.endswith(".rels"):
+                    root = _safe_xml(archive.read(item), "Метаданные XLSX повреждены.")
+                    for relation in root.iter():
+                        relationship_type = str(relation.attrib.get("Type", "")).casefold()
+                        if any(token in relationship_type for token in _ACTIVE_PRESERVATION_RELATIONSHIPS):
+                            unsupported.append(f"{lower_name}#active-feature-relationship")
+                elif lower_name.endswith(".xml"):
+                    root = _safe_xml(archive.read(item), "Компонент XML XLSX повреждён.")
+                    if any(node.tag.rsplit("}", 1)[-1] == "extLst" for node in root.iter()):
+                        ext_list = _known_inert_extension_list(lower_name, root)
+                        if ext_list is None:
+                            unsupported.append(f"{lower_name}#unknown-extension-list")
+                        else:
+                            extensions[lower_name] = ElementTree.tostring(ext_list, encoding="utf-8")
+    except (OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise TenderParseError("Архив XLSX повреждён или не поддерживается.") from exc
+    return extensions, sorted(set(unsupported))[:200]
 
 
 def preflight_tender_xlsx(path: Path) -> None:
@@ -419,18 +522,8 @@ class TenderWorkbookParser:
                 workbook, digest, sheet, headers, header_row,
                 max_cell_bytes=MAX_ANALYSIS_DATA_BYTES - rows_json_bytes,
             )
-            with zipfile.ZipFile(path) as archive:
-                package_items = list(archive.infolist())
-                package_names = [item.filename.casefold() for item in package_items]
-            sensitive_parts = [name for name in package_names if any(token in name for token in ("/pivot", "/slicer", "/embedding", "/querytables", "/activex", "customxml", "/drawings/"))]
-            with zipfile.ZipFile(path) as archive:
-                for item in package_items:
-                    if not item.filename.casefold().endswith(".xml"):
-                        continue
-                    root = ElementTree.fromstring(archive.read(item))
-                    if any(str(node.tag).rsplit("}", 1)[-1] == "extLst" for node in root.iter()):
-                        sensitive_parts.append(f"{item.filename.casefold()}#unknown-extension-list")
-            manifest["unsupported_preservation_sensitive_objects"] = sorted(set(sensitive_parts))[:200]
+            _extension_payloads, sensitive_parts = _package_preservation_inventory(path)
+            manifest["unsupported_preservation_sensitive_objects"] = sensitive_parts
             warnings = []
             if not is_official and any("цена" in _header_key(_cell_text(sheet.cell(header_row, column).value)) or "сумма" in _header_key(_cell_text(sheet.cell(header_row, column).value)) for column in range(logical_edge + 1, min(sheet.max_column, logical_edge + 30) + 1)):
                 warnings.append({"code": "DISTANT_PRICE_COLUMNS", "message": "В книге обнаружены существующие служебные столбцы с ценовыми заголовками вне основной таблицы. Они не будут изменены."})

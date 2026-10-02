@@ -3085,6 +3085,280 @@ def test_export_package_verifier_rejects_ooxml_mutations(tmp_path, mutation):
     assert error.value.code in {"TENDER_EXPORT_PRESERVATION_FAILED", "TENDER_EXPORT_PRESERVATION_UNSUPPORTED"}
 
 
+def _rewrite_xlsx_parts(path, transform):
+    with zipfile.ZipFile(path) as archive:
+        parts = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    transform(parts)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+
+
+def _add_known_xlsx_extensions(parts):
+    from xml.etree import ElementTree as ET
+
+    spreadsheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    drawing_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    styles = ET.fromstring(parts["xl/styles.xml"])
+    styles_ext = ET.SubElement(styles, f"{{{spreadsheet_ns}}}extLst")
+    slicer = ET.SubElement(styles_ext, f"{{{spreadsheet_ns}}}ext", {"uri": "{EB79DEF2-80B8-43e5-95BD-54CBDDF9020C}"})
+    ET.SubElement(slicer, "{http://schemas.microsoft.com/office/spreadsheetml/2009/9/main}slicerStyles", {"defaultSlicerStyle": "DefaultSlicerStyle1"})
+    timeline = ET.SubElement(styles_ext, f"{{{spreadsheet_ns}}}ext", {"uri": "{9260A510-F301-46a8-8635-F512D64BE5F5}"})
+    ET.SubElement(timeline, "{http://schemas.microsoft.com/office/spreadsheetml/2010/11/main}timelineStyles", {"defaultTimelineStyle": "DefaultTimelineStyle1"})
+    parts["xl/styles.xml"] = ET.tostring(styles, encoding="utf-8", xml_declaration=True)
+
+    theme_part = next(name for name in parts if name.casefold() == "xl/theme/theme1.xml")
+    theme = ET.fromstring(parts[theme_part])
+    theme_ext = ET.SubElement(theme, f"{{{drawing_ns}}}extLst")
+    family = ET.SubElement(theme_ext, f"{{{drawing_ns}}}ext", {"uri": "{05A4C25C-085E-4340-85A3-A5531E510DB2}"})
+    ET.SubElement(family, "{http://schemas.microsoft.com/office/thememl/2012/main}themeFamily", {
+        "id": "{00000000-0000-0000-0000-000000000001}", "name": "SyntheticTheme", "vid": "{00000000-0000-0000-0000-000000000002}",
+    })
+    parts[theme_part] = ET.tostring(theme, encoding="utf-8", xml_declaration=True)
+
+
+def test_known_inert_extensions_are_accepted_and_preserved_with_source_docprops(tmp_path):
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.parser import _package_preservation_inventory
+    from averon_import.services.manual_tenders.price_export import (
+        _restore_source_owned_package_metadata,
+        _verify_package_roundtrip,
+    )
+
+    source = tmp_path / "known-extensions.xlsx"
+    output = tmp_path / "known-extensions-output.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["Наименование", "Количество"])
+    workbook.active.append(["Тестовая позиция", 1])
+    workbook.save(source)
+    workbook.close()
+    _rewrite_xlsx_parts(source, _add_known_xlsx_extensions)
+
+    # Give the source-owned properties distinct values so their exact bytes
+    # must survive openpyxl's save.
+    with zipfile.ZipFile(source) as archive:
+        app_name = next(name for name in archive.namelist() if name.casefold() == "docprops/app.xml")
+        core_name = next(name for name in archive.namelist() if name.casefold() == "docprops/core.xml")
+        app_bytes = archive.read(app_name)
+        core_bytes = archive.read(core_name)
+    app_root = ET.fromstring(app_bytes)
+    core_root = ET.fromstring(core_bytes)
+    for node in app_root.iter():
+        if node.tag.endswith("}Application"):
+            node.text = "SourceApplicationMetadata"
+        elif node.tag.endswith("}AppVersion"):
+            node.text = "17.42"
+    app_ns = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+    vt_ns = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+    headings = ET.SubElement(app_root, f"{{{app_ns}}}HeadingPairs")
+    heading_vector = ET.SubElement(headings, f"{{{vt_ns}}}vector", {"size": "2", "baseType": "variant"})
+    first_heading = ET.SubElement(heading_vector, f"{{{vt_ns}}}variant")
+    ET.SubElement(first_heading, f"{{{vt_ns}}}lpstr").text = "Synthetic heading"
+    second_heading = ET.SubElement(heading_vector, f"{{{vt_ns}}}variant")
+    ET.SubElement(second_heading, f"{{{vt_ns}}}i4").text = "1"
+    titles = ET.SubElement(app_root, f"{{{app_ns}}}TitlesOfParts")
+    title_vector = ET.SubElement(titles, f"{{{vt_ns}}}vector", {"size": "1", "baseType": "lpstr"})
+    ET.SubElement(title_vector, f"{{{vt_ns}}}lpstr").text = "Synthetic title"
+    for node in core_root.iter():
+        if node.tag.endswith("}creator"):
+            node.text = "SourceCreatorMetadata"
+        elif node.tag.endswith("}lastModifiedBy"):
+            node.text = "SourceEditorMetadata"
+        elif node.tag.endswith("}created"):
+            node.text = "2001-02-03T04:05:06Z"
+    ET.SubElement(core_root, "{http://schemas.openxmlformats.org/package/2006/metadata/core-properties}lastPrinted").text = "2002-03-04T05:06:07Z"
+    app_bytes = ET.tostring(app_root, encoding="utf-8", xml_declaration=True)
+    core_bytes = ET.tostring(core_root, encoding="utf-8", xml_declaration=True)
+    _rewrite_xlsx_parts(source, lambda parts: parts.update({app_name: app_bytes, core_name: core_bytes}))
+
+    parser = TenderWorkbookParser().parse(source)
+    assert parser["manifest"]["unsupported_preservation_sensitive_objects"] == []
+    source_extensions, unsupported = _package_preservation_inventory(source)
+    assert not unsupported
+    assert set(source_extensions) == {"xl/styles.xml", "xl/theme/theme1.xml"}
+
+    workbook = load_workbook(source)
+    workbook.save(output)
+    workbook.close()
+    _restore_source_owned_package_metadata(source, output)
+    with zipfile.ZipFile(output) as archive:
+        assert archive.read(app_name) == app_bytes
+        assert archive.read(core_name) == core_bytes
+    output_extensions, output_unsupported = _package_preservation_inventory(output)
+    assert not output_unsupported
+    assert set(output_extensions) == set(source_extensions)
+    _verify_package_roundtrip(source, output)
+
+
+def test_export_package_verifier_rejects_dropped_known_extension_lists(tmp_path):
+    from averon_import.services.manual_tenders.price_export import _verify_package_roundtrip
+
+    source = tmp_path / "known-extension-source.xlsx"
+    output = tmp_path / "known-extension-dropped.xlsx"
+    workbook = Workbook()
+    workbook.save(source)
+    workbook.close()
+    _rewrite_xlsx_parts(source, _add_known_xlsx_extensions)
+    workbook = load_workbook(source)
+    workbook.save(output)
+    workbook.close()
+    with pytest.raises(TenderWorkspaceError) as error:
+        _verify_package_roundtrip(source, output)
+    assert error.value.code == "TENDER_EXPORT_PRESERVATION_FAILED"
+
+
+def test_newly_generated_docprops_allow_standard_values_but_reject_unexpected_fields(tmp_path):
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.price_export import (
+        _generated_docprops_are_safe,
+        _workbook_snapshot,
+    )
+
+    source = tmp_path / "no-docprops-source.xlsx"
+    output = tmp_path / "generated-docprops.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["Наименование", "Количество"])
+    workbook.active.append(["Синтетическая строка", 1])
+    workbook.save(source)
+    workbook.close()
+    workbook = load_workbook(source)
+    workbook.save(output)
+    workbook.close()
+    source_snapshot = _workbook_snapshot(source)
+    assert _generated_docprops_are_safe(output, {"docprops/app.xml", "docprops/core.xml"}, source_snapshot)
+
+    with zipfile.ZipFile(output) as archive:
+        app_name = next(name for name in archive.namelist() if name.casefold() == "docprops/app.xml")
+        app_bytes = archive.read(app_name)
+    app_root = ET.fromstring(app_bytes)
+    ET.SubElement(app_root, "{urn:unexpected}EmbeddedSourceData").text = "unexpected"
+    malicious = ET.tostring(app_root, encoding="utf-8", xml_declaration=True)
+    _rewrite_xlsx_parts(output, lambda parts: parts.update({app_name: malicious}))
+    assert not _generated_docprops_are_safe(output, {"docprops/app.xml"}, source_snapshot)
+
+
+@pytest.mark.parametrize("extension_mutation", ["unknown_uri", "unexpected_child"])
+def test_unknown_or_malformed_extension_lists_fail_closed(tmp_path, extension_mutation):
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.parser import _package_preservation_inventory
+
+    path = tmp_path / f"bad-extension-{extension_mutation}.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["Наименование", "Количество"])
+    workbook.active.append(["Тестовая позиция", 1])
+    workbook.save(path)
+    workbook.close()
+
+    def mutate(parts):
+        root = ET.fromstring(parts["xl/styles.xml"])
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        ext_list = ET.SubElement(root, f"{{{ns}}}extLst")
+        if extension_mutation == "unknown_uri":
+            extension = ET.SubElement(ext_list, f"{{{ns}}}ext", {"uri": "{00000000-0000-0000-0000-000000000000}"})
+            ET.SubElement(extension, "{urn:unknown-extension}extra")
+        else:
+            extension = ET.SubElement(ext_list, f"{{{ns}}}ext", {"uri": "{EB79DEF2-80B8-43e5-95BD-54CBDDF9020C}"})
+            ET.SubElement(extension, "{urn:unexpected}customChild")
+        parts["xl/styles.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    _rewrite_xlsx_parts(path, mutate)
+    extensions, unsupported = _package_preservation_inventory(path)
+    assert extensions == {}
+    assert "xl/styles.xml#unknown-extension-list" in unsupported
+    parsed = TenderWorkbookParser().parse(path)
+    assert "xl/styles.xml#unknown-extension-list" in parsed["manifest"]["unsupported_preservation_sensitive_objects"]
+
+
+@pytest.mark.parametrize(
+    "active_part,relationship_type",
+    [
+        ("xl/slicers/slicer1.xml", None),
+        ("xl/timelines/timeline1.xml", None),
+        ("xl/pivotTables/pivotTable1.xml", None),
+        (None, "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main/slicer"),
+    ],
+)
+def test_known_style_extensions_reject_active_slicer_timeline_or_pivot_objects(tmp_path, active_part, relationship_type):
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.parser import _package_preservation_inventory
+
+    path = tmp_path / "active-object.xlsx"
+    workbook = Workbook()
+    workbook.save(path)
+    workbook.close()
+
+    def mutate(parts):
+        _add_known_xlsx_extensions(parts)
+        if active_part:
+            parts[active_part] = b"<?xml version='1.0' encoding='UTF-8'?><activeObject/>"
+        if relationship_type:
+            rel_name = "xl/worksheets/_rels/sheet1.xml.rels"
+            rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+            root = ET.Element(f"{{{rel_ns}}}Relationships")
+            ET.SubElement(root, f"{{{rel_ns}}}Relationship", {
+                "Id": "rIdActive", "Type": relationship_type, "Target": "../worksheets/sheet1.xml",
+            })
+            parts[rel_name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    _rewrite_xlsx_parts(path, mutate)
+    _extensions, unsupported = _package_preservation_inventory(path)
+    assert any("active" in item.casefold() or any(token in item.casefold() for token in ("slicer", "timeline", "pivot")) for item in unsupported)
+
+
+def test_added_target_comments_follow_sheet_relationships_and_preserve_other_sheet_comment(tmp_path):
+    from averon_import.services.manual_tenders.price_export import (
+        _restore_source_owned_package_metadata,
+        _verify_package_roundtrip,
+        _workbook_snapshot,
+    )
+
+    source = tmp_path / "comments-source.xlsx"
+    output = tmp_path / "comments-output.xlsx"
+    workbook = Workbook()
+    other = workbook.active
+    other.title = "Other"
+    other["B2"] = "Unchanged"
+    other["B2"].comment = Comment("Existing note", "Source author")
+    target = workbook.create_sheet("Target")
+    target["A1"] = "Header"
+    target["F2"] = None
+    workbook.save(source)
+    workbook.close()
+    before = _workbook_snapshot(source)
+
+    workbook = load_workbook(source)
+    workbook["Target"]["F2"].comment = Comment("New export note", "Averon Import")
+    workbook.save(output)
+    workbook.close()
+    _restore_source_owned_package_metadata(source, output)
+    after = _workbook_snapshot(output)
+    _verify_package_roundtrip(
+        source,
+        output,
+        target_sheet="Target",
+        allowed_cells={"F2"},
+        target_comment_cells={"F2"},
+        semantic_before=before,
+        semantic_after=after,
+    )
+
+    with zipfile.ZipFile(output) as archive:
+        from averon_import.services.manual_tenders.price_export import _package_snapshot, _worksheet_relationship_part_map
+        package = _package_snapshot(output)
+        rel_parts = _worksheet_relationship_part_map(output)
+        target_comments = {
+            target for _rid, rel_type, target, mode in package["relationships"][rel_parts["Target"]]
+            if rel_type.casefold().endswith("/comments") and not mode
+        }
+        other_comments = {
+            target for _rid, rel_type, target, mode in package["relationships"][rel_parts["Other"]]
+            if rel_type.casefold().endswith("/comments") and not mode
+        }
+        assert len(target_comments) == len(other_comments) == 1
+        assert target_comments.isdisjoint(other_comments)
+        assert any(name.casefold().endswith("comment1.xml") for name in archive.namelist())
+
+
 def test_export_failure_panel_is_visible_safe_and_retryable():
     root = Path(__file__).resolve().parents[1]
     template = (root / "averon_import" / "templates" / "index.html").read_text(encoding="utf-8")
