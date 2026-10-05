@@ -396,6 +396,26 @@ def _safe_price_provenance(offer: dict[str, Any] | None) -> dict[str, Any]:
     return safe
 
 
+def _has_compact_fuzzy_history_provenance(
+    offer: dict[str, Any], safe_offer: dict[str, Any], safe_provenance: dict[str, Any],
+) -> bool:
+    """Only encode fixed fuzzy-v1 tokens when they match source facts."""
+    provenance = offer.get("data_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    required = {
+        "source": "one_c_history",
+        "source_kind": "historical_purchase",
+        "price_basis": "gross_including_vat",
+    }
+    return (
+        offer.get("provider") == "one_c_history"
+        and safe_offer.get("provider") == "one_c_history"
+        and all(provenance.get(key) == value for key, value in required.items())
+        and all(safe_provenance.get(key) == value for key, value in required.items())
+    )
+
+
 def canonical_tender_projection(
     result_payload: dict[str, Any],
     source_rows: list[dict[str, Any]],
@@ -491,6 +511,13 @@ def canonical_tender_projection(
                 safe_provenance = _safe_price_provenance(candidate)
                 safe_match = _safe_history_review_match(candidate_match)
                 if classification == "FUZZY":
+                    # fuzzy_v1 stores compact fixed tokens. Check both the
+                    # original source facts and their sanitized projection
+                    # before encoding so invalid provenance cannot be laundered.
+                    if not _has_compact_fuzzy_history_provenance(
+                        candidate, safe_candidate, safe_provenance,
+                    ):
+                        continue
                     safe_provenance = {
                         key: value for key, value in safe_provenance.items()
                         if key not in {"normalizer_revision", "normalized_name_signature"}
