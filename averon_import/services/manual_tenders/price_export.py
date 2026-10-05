@@ -374,6 +374,7 @@ class TenderPriceResolver:
             "purchase_date": provenance.get("purchase_date"),
             "human_confirmation_id": confirmation.get("decision_id"),
             "human_confirmation_fingerprint": confirmation.get("evidence_fingerprint"),
+            "human_confirmation_basis": confirmation.get("confirmation_basis"),
         }
         if (
             run.get("source_mode") != "one_c_only"
@@ -385,13 +386,33 @@ class TenderPriceResolver:
             or not confirmation.get("evidence_fingerprint")
         ):
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        retrieval_classification = offer.get("retrieval_classification")
+        confirmation_basis = confirmation.get("confirmation_basis")
         if (
             offer.get("provider") != "one_c_history"
-            or offer.get("retrieval_classification") not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT"}
+            or retrieval_classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}
+            or (retrieval_classification == "NORMALIZED_NAME_UNIT" and confirmation_basis != "NORMALIZED_CONFIRMATION")
+            or (retrieval_classification != "NORMALIZED_NAME_UNIT" and confirmation_basis != "EXACT_CONFIRMATION")
             or match.get("offer_id") != offer.get("offer_id")
             or offer.get("offer_id") != confirmation.get("candidate_offer_id")
         ):
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        if retrieval_classification == "NORMALIZED_NAME_UNIT":
+            from averon_import.services.sourcing.history_identity import (
+                HISTORY_IDENTITY_NORMALIZER_REVISION,
+                history_name_signature,
+                history_name_signature_digest,
+            )
+
+            source_signature = history_name_signature(source.get("name"))
+            candidate_signature = history_name_signature(offer.get("title"))
+            if (
+                not source_signature
+                or source_signature != candidate_signature
+                or provenance.get("normalizer_revision") != HISTORY_IDENTITY_NORMALIZER_REVISION
+                or provenance.get("normalized_name_signature") != history_name_signature_digest(source.get("name"))
+            ):
+                return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
         snapshot = str(run.get("history_catalog_version") or "")
         if (
             not snapshot

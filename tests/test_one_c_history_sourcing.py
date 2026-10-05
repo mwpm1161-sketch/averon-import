@@ -716,6 +716,75 @@ def test_exact_name_unit_precedes_noisy_fuzzy_neighbours_and_is_not_displaced_by
     assert "Камень искусственный" not in qwen.candidates[0].title
 
 
+def test_d4a_normalized_name_unit_index_precedes_fuzzy_without_auto_safe_or_full_scan(tmp_path, monkeypatch):
+    events = [
+        _event(item_id="ivy:history", item_code="ivy", name="Плющ искусственный", article="", row=2),
+        *[
+            _event(
+                item_id=f"noise:{index}", item_code=f"noise-{index}",
+                name=f"Камень искусственный {index} 3680x760x12 мм", article="",
+                row=index + 3, group_number=index + 1,
+            )
+            for index in range(30)
+        ],
+    ]
+    _, provider = _provider(tmp_path, events)
+    original_retrieve = provider._retrieve
+    fuzzy_calls = 0
+
+    def count_fuzzy(*args, **kwargs):
+        nonlocal fuzzy_calls
+        fuzzy_calls += 1
+        return original_retrieve(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "_retrieve", count_fuzzy)
+    source = _intent(name="Искусственный плющ", article="", unit="шт")
+    qwen_resolved = source.model_copy(update={
+        "normalized_name":"Камень искусственный",
+        "search_queries":["Камень искусственный 3680x760x12 мм"],
+    })
+    fallback = provider.lookup(source, source_intent=source, limit=1)
+    qwen = provider.lookup(qwen_resolved, source_intent=source, limit=1)
+
+    assert fallback.outcome == HistoryMatchOutcome.REVIEW
+    assert fallback.selected_offer is None and fallback.safe_basis is None
+    assert fallback.reason_code == "normalized_name_unit_requires_review"
+    assert [offer.source_item_id for offer in fallback.candidates] == ["ivy:history"]
+    assert fallback.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.NORMALIZED_NAME_UNIT
+    assert [offer.source_item_id for offer in qwen.candidates] == ["ivy:history"]
+    assert qwen.candidates[0].history_retrieval_classification == HistoryRetrievalClassification.NORMALIZED_NAME_UNIT
+    assert fuzzy_calls == 0
+    assert provider._projection_build_count == 1
+
+
+def test_d4a_normalized_name_unit_ambiguity_and_unit_article_gates(tmp_path):
+    _, ambiguous_provider = _provider(tmp_path / "ambiguous", [
+        _event(item_id="ivy-a", item_code="ivy-a", name="Плющ декоративный искусственный", article="", row=2, group_number=1),
+        _event(item_id="ivy-b", item_code="ivy-b", name="Декоративный плющ искусственный", article="", row=3, group_number=2),
+    ])
+    source = _intent(name="Искусственный плющ декоративный", article="", unit="шт")
+    ambiguous = ambiguous_provider.lookup(source, source_intent=source, limit=1)
+    assert ambiguous.outcome == HistoryMatchOutcome.REVIEW
+    assert ambiguous.reason_code == "ambiguous_normalized_name_identity"
+    assert ambiguous.selected_offer is None and ambiguous.safe_basis is None
+    assert len(ambiguous.candidates) == 1
+    assert ambiguous.candidates[0].source_item_id in {"ivy-a", "ivy-b"}
+    assert all(offer.history_retrieval_classification == HistoryRetrievalClassification.NORMALIZED_NAME_UNIT for offer in ambiguous.candidates)
+
+    _, unit_provider = _provider(tmp_path / "unit", [
+        _event(item_id="ivy-kg", item_code="ivy-kg", name="Плющ искусственный", article="", unit="кг", row=2),
+    ])
+    incompatible = unit_provider.lookup(_intent(name="Искусственный плющ", article="", unit="шт"))
+    assert all(offer.history_retrieval_classification != HistoryRetrievalClassification.NORMALIZED_NAME_UNIT for offer in incompatible.candidates)
+
+    _, article_provider = _provider(tmp_path / "article", [
+        _event(item_id="ivy-article", item_code="ivy-article", name="Плющ искусственный", article="HISTORY-ART", row=2),
+    ])
+    article_source = _intent(name="Искусственный плющ", article="SOURCE-ART", unit="шт")
+    article_result = article_provider.lookup(article_source, source_intent=article_source)
+    assert all(offer.history_retrieval_classification != HistoryRetrievalClassification.NORMALIZED_NAME_UNIT for offer in article_result.candidates)
+
+
 def test_qwen_exact_looking_fuzzy_candidate_cannot_become_source_owned_safe_match(tmp_path):
     _, provider = _provider(tmp_path, [
         _event(item_id="history:1", name="Клапан M-500", article="ART-001"),
@@ -1251,16 +1320,17 @@ def test_provider_only_cached_result_cannot_satisfy_one_c_only(tmp_path):
     assert live.stats_calls == 1
 
 
-def test_one_c_then_provider_review_falls_back_once_without_mixing_history_candidates(tmp_path):
-    service, _, _, live = _routed_service(tmp_path, [_event(name="Кабель", article="")])
+def test_one_c_then_provider_normalized_review_falls_back_once_without_mixing_history_candidates(tmp_path):
+    service, _, _, live = _routed_service(tmp_path, [_event(name="Плющ искусственный", article="")])
 
     result = service.search_row_routed(
-        _row("Кабель"),
+        _row("Искусственный плющ"),
         source_mode="one_c_then_provider",
         ai_rerank=False,
     )
 
     assert result.route.history_outcome == "REVIEW"
+    assert result.route.history_reason_code == "normalized_name_unit_requires_review"
     assert result.route.fallback_called is True
     assert result.route.fallback_status == "completed"
     assert result.route.final_source_kind == "provider"

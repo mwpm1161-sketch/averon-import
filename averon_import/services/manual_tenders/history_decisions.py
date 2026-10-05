@@ -23,7 +23,7 @@ from .repository import TenderWorkspaceError, TenderWorkspaceRepository
 MAX_HISTORY_DECISION_EVENTS_PER_RUN = 1000
 MAX_HISTORY_DECISION_LEDGER_BYTES = 2 * 1024 * 1024
 _ID_RE = re.compile(r"^[a-f0-9]{32}$")
-_HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT"}
+_HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}
 _OFFER_FIELDS = {
     "offer_id", "provider", "source_item_id", "title", "article", "manufacturer",
     "brand", "price", "currency", "price_unit", "retrieved_at", "retrieval_classification",
@@ -31,6 +31,7 @@ _OFFER_FIELDS = {
 _PROVENANCE_FIELDS = {
     "source", "source_kind", "snapshot_version", "history_item_id", "selected_event_id",
     "purchase_date", "price_basis", "effective_unit_price_gross", "currency_basis", "unit_family",
+    "normalizer_revision", "normalized_name_signature",
 }
 _MATCH_FIELDS = {
     "decision", "offer_id", "matched_attributes", "supporting_attributes",
@@ -118,7 +119,7 @@ def _candidate_fingerprint(
     offer = candidate["offer"]
     provenance = candidate["price_provenance"]
     match = candidate["match"]
-    return _sha256({
+    evidence = {
         "tender_id": tender_id,
         "workspace_revision": int(workspace["revision"]),
         "source_sha256": workspace["source_sha256"],
@@ -145,7 +146,21 @@ def _candidate_fingerprint(
             for key in ("title", "article", "manufacturer", "brand", "source_item_id")
         },
         "match_evidence": match,
-    })
+    }
+    # Preserve byte-for-byte fingerprints for existing exact decisions. New
+    # normalized decisions bind their explicit authority and normalizer proof.
+    if offer.get("retrieval_classification") == "NORMALIZED_NAME_UNIT":
+        evidence.update({
+            "confirmation_basis": "NORMALIZED_CONFIRMATION",
+            "normalizer_revision": provenance.get("normalizer_revision"),
+            "normalized_name_signature": provenance.get("normalized_name_signature"),
+        })
+    return _sha256(evidence)
+
+
+def _confirmation_basis(candidate: dict[str, Any]) -> str:
+    offer = candidate.get("offer") if isinstance(candidate.get("offer"), dict) else {}
+    return "NORMALIZED_CONFIRMATION" if offer.get("retrieval_classification") == "NORMALIZED_NAME_UNIT" else "EXACT_CONFIRMATION"
 
 
 def _candidate_gate(
@@ -251,8 +266,26 @@ def _candidate_gate(
         return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
     if classification == "EXACT_ARTICLE" and (not source_article or source_article != candidate_article):
         return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
-    if classification == "EXACT_NAME_UNIT" and _identity(source.get("name")) != _identity(offer.get("title")):
-        return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
+    if classification == "EXACT_NAME_UNIT":
+        if _identity(source.get("name")) != _identity(offer.get("title")):
+            return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
+    elif classification == "NORMALIZED_NAME_UNIT":
+        from averon_import.services.sourcing.history_identity import (
+            HISTORY_IDENTITY_NORMALIZER_REVISION,
+            history_name_signature,
+            history_name_signature_digest,
+        )
+
+        source_signature = history_name_signature(source.get("name"))
+        candidate_signature = history_name_signature(offer.get("title"))
+        if (
+            _identity(source.get("name")) == _identity(offer.get("title"))
+            or not source_signature
+            or source_signature != candidate_signature
+            or provenance.get("normalizer_revision") != HISTORY_IDENTITY_NORMALIZER_REVISION
+            or provenance.get("normalized_name_signature") != history_name_signature_digest(source.get("name"))
+        ):
+            return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
     for source_key, offer_key in (("manufacturer", "manufacturer"),):
         source_value = _identity(source.get(source_key))
         candidate_value = _identity(offer.get(offer_key))
@@ -339,12 +372,14 @@ class TenderHistoryDecisionStore:
                         "source_row_id", "candidate_offer_id", "evidence_fingerprint", "history_snapshot_version",
                         "history_item_id", "selected_event_id",
                     }
+                    allowed_with_basis = allowed | {"confirmation_basis"}
                     required = ("source_row_id", "candidate_offer_id", "evidence_fingerprint", "history_snapshot_version", "history_item_id", "selected_event_id")
                     if (
-                        set(event) != allowed
+                        set(event) not in (allowed, allowed_with_basis)
                         or any(not isinstance(event.get(key), str) or not event[key] or len(event[key]) > 200 for key in required)
                         or not _ID_RE.fullmatch(event["source_row_id"])
                         or not re.fullmatch(r"[a-f0-9]{64}", event["evidence_fingerprint"])
+                        or event.get("confirmation_basis") not in (None, "NORMALIZED_CONFIRMATION")
                     ):
                         raise ValueError("confirmation shape")
                     confirm_ids.add(decision_id)
@@ -414,12 +449,14 @@ class TenderHistoryDecisionStore:
                     "reason_code": reason,
                     "evidence_fingerprint": fingerprint,
                     "decision": None,
+                    "confirmation_basis": _confirmation_basis(candidate),
                 }
                 candidate_details.append(detail)
                 if reason is None and fingerprint:
                     for index, event in enumerate(events):
                         if (
                             event["decision_type"] == "CONFIRM_HISTORY_CANDIDATE"
+                            and event.get("confirmation_basis", "EXACT_CONFIRMATION") == _confirmation_basis(candidate)
                             and event.get("source_row_id") == row_id
                             and event.get("candidate_offer_id") == candidate_id
                             and event.get("evidence_fingerprint") == fingerprint
@@ -439,6 +476,7 @@ class TenderHistoryDecisionStore:
                 "selected_event_id": event["selected_event_id"],
                 "created_at": event["created_at"],
                 "candidate": candidate,
+                "confirmation_basis": event.get("confirmation_basis", "EXACT_CONFIRMATION"),
             }
             effective[row_id] = item
             for detail in candidates_by_row.get(row_id, []):
@@ -509,6 +547,8 @@ class TenderHistoryDecisionStore:
                 "history_item_id": provenance["history_item_id"],
                 "selected_event_id": provenance["selected_event_id"],
             }
+            if _confirmation_basis(candidate) == "NORMALIZED_CONFIRMATION":
+                event["confirmation_basis"] = "NORMALIZED_CONFIRMATION"
             ledger = self._read(ledger_path, tender_id, run_id)
             self._append(ledger_path, ledger, event)
             return self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)

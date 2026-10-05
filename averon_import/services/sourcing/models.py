@@ -43,6 +43,7 @@ class HistoryRetrievalClassification(str, Enum):
 
     EXACT_ARTICLE = "EXACT_ARTICLE"
     EXACT_NAME_UNIT = "EXACT_NAME_UNIT"
+    NORMALIZED_NAME_UNIT = "NORMALIZED_NAME_UNIT"
     STRUCTURED = "STRUCTURED"
     FUZZY = "FUZZY"
 

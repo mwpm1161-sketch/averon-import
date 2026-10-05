@@ -77,6 +77,7 @@ const makeOffer = (offer_id, classification, title) => ({
 });
 const exactOne = makeOffer("exact-1", "EXACT_NAME_UNIT", "Точная запись");
 const exactTwo = makeOffer("exact-2", "EXACT_NAME_UNIT", "Вторая точная запись");
+const normalizedOne = makeOffer("normalized-1", "NORMALIZED_NAME_UNIT", "Плющ искусственный");
 const fuzzy = makeOffer("fuzzy-1", "FUZZY", "Похожая запись");
 const historyItem = (offers, reason = "history_requires_review") => ({
   route: {final_source_kind: "history_review", source_mode: "one_c_only", history_reason_code: reason},
@@ -92,6 +93,25 @@ assert.equal(context.historyReviewPresentation(uniqueCandidates, unique.route).t
 const exactCard = context.renderHistoricalOfferCard(uniqueCandidates[0], {route: unique.route});
 assert(exactCard.includes("Требуется подтверждение"));
 assert(!exactCard.includes("must-not-overstate"), "exact history review must not be labeled as an alternative");
+
+const normalizedPrimary = historyItem([fuzzy, normalizedOne]);
+const normalizedCandidates = context.projectReviewCandidates(normalizedPrimary);
+assert.deepEqual(Array.from(normalizedCandidates, item => item.offer.offer_id), ["normalized-1"],
+  "normalized candidates take precedence over fuzzy neighbours");
+const normalizedPresentation = context.historyReviewPresentation(normalizedCandidates, normalizedPrimary.route);
+assert.equal(normalizedPresentation.title, "Совпадает после нормализации названия и единицы");
+assert.equal(normalizedPresentation.explanation,
+  "Формулировка отличается, но нормализованное название и единица измерения совпадают. Проверьте запись перед подтверждением.");
+const normalizedCard = context.renderHistoricalOfferCard(normalizedCandidates[0], {route: normalizedPrimary.route});
+assert(normalizedCard.includes("Сильное совпадение"));
+assert(normalizedCard.includes("normalized-retrieval"));
+assert(!normalizedCard.includes("Точное название"));
+
+const rejectedNormalized = historyItem([normalizedOne]);
+rejectedNormalized.match_results = [{offer:normalizedOne, decision:"REJECT", rank:1}];
+assert.deepEqual(Array.from(context.projectReviewCandidates(rejectedNormalized)), [],
+  "a real REJECT result must not become a synthetic REVIEW card");
+
 const unpricedCard = context.renderHistoricalOfferCard({
   offer: {...exactOne, price: null}, decision: "REVIEW",
 }, {route: unique.route});

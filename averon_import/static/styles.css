@@ -418,9 +418,11 @@ button { cursor: pointer; }
 .offer-card.recommended { border-color:#7dd3fc; background:linear-gradient(135deg,#f0f9ff,#fff); }
 .historical-offer-card.recommended { border-color:#cbd5e1; background:#f8fafc; }
 .historical-offer-card.exact-retrieval { border-color:#bfdbfe; background:#eff6ff; }
+.historical-offer-card.normalized-retrieval { border-color:#bfdbfe; background:#eff6ff; }
 .historical-offer-card.fuzzy-discovery { border-color:#e2e8f0; background:#f8fafc; }
 .history-evidence-badge, .history-fuzzy-badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 8px; font-size:11px; font-weight:700; }
 .history-evidence-badge { color:#1e40af; background:#dbeafe; }
+.history-normalized-badge { display:inline-flex; align-items:center; border-radius:999px; padding:5px 8px; font-size:11px; font-weight:700; color:#1e40af; background:#dbeafe; }
 .history-fuzzy-badge { color:#475569; background:#e2e8f0; }
 .history-review-explanation { margin:6px 0 14px; color:#475569; font-size:13px; line-height:1.5; }
 .history-candidate-wrapper { min-width:0; }

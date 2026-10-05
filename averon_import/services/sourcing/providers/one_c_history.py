@@ -35,6 +35,11 @@ from averon_import.services.sourcing.models import (
     SourcingProviderCapabilities,
     SourcingProviderRuntimeState,
 )
+from averon_import.services.sourcing.history_identity import (
+    HISTORY_IDENTITY_NORMALIZER_REVISION,
+    history_name_signature,
+    history_name_signature_digest,
+)
 from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy
 
 
@@ -82,6 +87,8 @@ class _IndexedVariant:
     article_key: str
     unit_family: str | None
     matcher_article_key: str
+    normalized_name_signature: str | None
+    normalized_unit_family: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +108,7 @@ class _Projection:
     exact_name_unit_index: Mapping[tuple[str, str], tuple[tuple[int, int], ...]]
     loose_name_unit_item_ids: Mapping[tuple[str, str], frozenset[str]]
     structured_identity_index: Mapping[tuple[str, str, str], tuple[tuple[int, int], ...]]
+    normalized_name_unit_index: Mapping[tuple[str, str], tuple[tuple[int, int], ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +295,7 @@ class OneCHistoryProvider:
         exact_name_unit_index: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         loose_name_unit_item_ids: dict[tuple[str, str], set[str]] = defaultdict(set)
         structured_identity_index: dict[tuple[str, str, str], list[tuple[int, int]]] = defaultdict(list)
+        normalized_name_unit_index: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         for item in snapshot.items:
             variants = item.variants or (
                 OneCHistoryVariant(
@@ -317,6 +326,8 @@ class OneCHistoryProvider:
                     article_key=normalize_product_search_text(article),
                     unit_family=normalize_unit_family(variant.raw_unit),
                     matcher_article_key=_matcher_article_key(article),
+                    normalized_name_signature=history_name_signature(variant.item_name),
+                    normalized_unit_family=_trusted_identity_unit_family(variant.raw_unit),
                 )
                 indexed_variants.append(cached)
                 ref = (item_index, variant_index)
@@ -336,6 +347,14 @@ class OneCHistoryProvider:
                 manufacturer_key = normalize_exact_source_name(manufacturer)
                 if model_key and manufacturer_key and cached.unit_family:
                     structured_identity_index[(manufacturer_key, model_key, cached.unit_family)].append(ref)
+                if (
+                    cached.normalized_name_signature
+                    and cached.normalized_unit_family
+                    and item.provenance_valid
+                    and not item.integrity_conflicts
+                    and variant.provenance_valid
+                ):
+                    normalized_name_unit_index[(cached.normalized_name_signature, cached.normalized_unit_family)].append(ref)
             indexed_items.append(_IndexedItem(
                 item=item,
                 searchable_variants=variants,
@@ -355,6 +374,7 @@ class OneCHistoryProvider:
             MappingProxyType({key: tuple(sorted(refs, key=item_sort_key)) for key, refs in exact_name_unit_index.items()}),
             MappingProxyType({key: frozenset(item_ids) for key, item_ids in loose_name_unit_item_ids.items()}),
             MappingProxyType({key: tuple(sorted(refs, key=item_sort_key)) for key, refs in structured_identity_index.items()}),
+            MappingProxyType({key: tuple(sorted(refs, key=item_sort_key)) for key, refs in normalized_name_unit_index.items()}),
         )
 
     def stats(self) -> SourcingProviderRuntimeState:
@@ -433,14 +453,23 @@ class OneCHistoryProvider:
             if indexed_refs:
                 retrieval_classification = HistoryRetrievalClassification.EXACT_NAME_UNIT
             else:
-                manufacturer_key = normalize_exact_source_name(source_intent.manufacturer)
-                model_key = normalize_exact_source_name(source_intent.model)
-                if manufacturer_key and model_key:
-                    indexed_refs = projection.structured_identity_index.get(
-                        (manufacturer_key, model_key, source_unit_family),
+                source_identity_family = _trusted_identity_unit_family(source_intent.unit)
+                source_signature = history_name_signature(source_intent.normalized_name)
+                if source_signature and source_identity_family:
+                    indexed_refs = projection.normalized_name_unit_index.get(
+                        (source_signature, source_identity_family),
                     )
                     if indexed_refs:
-                        retrieval_classification = HistoryRetrievalClassification.STRUCTURED
+                        retrieval_classification = HistoryRetrievalClassification.NORMALIZED_NAME_UNIT
+                if not indexed_refs:
+                    manufacturer_key = normalize_exact_source_name(source_intent.manufacturer)
+                    model_key = normalize_exact_source_name(source_intent.model)
+                    if manufacturer_key and model_key:
+                        indexed_refs = projection.structured_identity_index.get(
+                            (manufacturer_key, model_key, source_unit_family),
+                        )
+                        if indexed_refs:
+                            retrieval_classification = HistoryRetrievalClassification.STRUCTURED
 
         if indexed_refs:
             retrieved, top_score_tie_count = self._retrieve_indexed(
@@ -461,6 +490,23 @@ class OneCHistoryProvider:
         source_matches = self.matcher.match(source_intent, offers)
         match_by_offer = {match.offer.offer_id: match for match in matches}
         source_match_by_offer = {match.offer.offer_id: match for match in source_matches}
+
+        if retrieval_classification == HistoryRetrievalClassification.NORMALIZED_NAME_UNIT:
+            # This class grants review evidence only.  Its label and ordering
+            # depend on source-owned fields, never on an AI-resolved intent.
+            matches = source_matches
+            return HistoryLookupResult(
+                HistoryMatchOutcome.REVIEW,
+                True,
+                candidates=tuple(offers),
+                match_results=tuple(matches),
+                reason_code=(
+                    "ambiguous_normalized_name_identity"
+                    if top_score_tie_count > 1
+                    else "normalized_name_unit_requires_review"
+                ),
+                catalog_version=projection.version,
+            )
 
         # A source-owned article is authoritative: if present, no name-only path
         # may rescue an article mismatch or unresolved strict article match.
@@ -713,6 +759,9 @@ class OneCHistoryProvider:
             "currency_basis": currency_basis,
             "unit_family": unit_family,
         }
+        if candidate.classification == HistoryRetrievalClassification.NORMALIZED_NAME_UNIT:
+            provenance["normalizer_revision"] = HISTORY_IDENTITY_NORMALIZER_REVISION
+            provenance["normalized_name_signature"] = history_name_signature_digest(variant.item_name)
         attributes = {}
         if characteristic:
             attributes["characteristic"] = characteristic
@@ -920,3 +969,14 @@ __all__ = [
     "normalize_product_search_text",
     "normalize_exact_source_name",
 ]
+
+
+def _trusted_identity_unit_family(raw_unit: object) -> str | None:
+    # Import locally to keep the general 1C read model independent from the
+    # tender parser while applying the same strict conversion contract.
+    from averon_import.services.manual_tenders.parser import parse_unit_basis
+
+    basis = parse_unit_basis(raw_unit)
+    if basis.get("trusted") is not True or basis.get("dimension") in {"package", "set"}:
+        return None
+    return normalize_unit_family(raw_unit)

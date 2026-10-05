@@ -30,6 +30,7 @@ _PRICE_PROVENANCE_FIELDS = {
         "source", "source_kind", "snapshot_version", "history_item_id",
         "selected_event_id", "purchase_date", "price_basis",
         "effective_unit_price_gross", "currency_basis", "unit_family",
+        "normalizer_revision", "normalized_name_signature",
     ),
     "lemana_b2b": ("source", "product_item", "mirror_revision"),
 }
@@ -48,6 +49,8 @@ _PRICE_PROVENANCE_STRING_LIMITS = {
     "effective_unit_price_gross": 80,
     "currency_basis": 80,
     "unit_family": 80,
+    "normalizer_revision": 80,
+    "normalized_name_signature": 64,
     "product_item": 180,
     "mirror_revision": 120,
 }
@@ -436,7 +439,7 @@ def canonical_tender_projection(
                 if not isinstance(candidate, dict):
                     continue
                 classification = candidate.get("history_retrieval_classification")
-                if classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT"}:
+                if classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}:
                     continue
                 candidate_match = match_by_offer_id.get(str(candidate.get("offer_id") or ""))
                 if not isinstance(candidate_match, dict) or candidate_match.get("decision") == "REJECT":

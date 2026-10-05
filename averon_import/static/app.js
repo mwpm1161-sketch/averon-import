@@ -4195,15 +4195,18 @@ function renderHistoricalOfferCard(result, {compact = false, route = null} = {})
   const classification = offer.history_retrieval_classification || "";
   const isReview = route?.final_source_kind === "history_review" || decision === "REVIEW" || decision === "ALTERNATIVE";
   const exact = ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(classification);
+  const normalized = classification === "NORMALIZED_NAME_UNIT";
   const presentation = historyReviewPresentation([result], route);
   const explanation = result?.explanation || (isReview ? presentation.explanation : "");
-  const retrievalBadge = exact && isReview
+  const retrievalBadge = normalized && isReview
+    ? `<span class="history-normalized-badge">Сильное совпадение</span>`
+    : exact && isReview
     ? `<span class="history-evidence-badge">Требуется подтверждение</span>`
     : classification === "FUZZY"
       ? `<span class="history-fuzzy-badge">Похожее название · не подтверждено</span>`
       : "";
   const decisionBadge = retrievalBadge ? "" : decision ? renderSourcingDecision(decision) : "";
-  const retrievalClass = exact ? "exact-retrieval" : classification === "FUZZY" ? "fuzzy-discovery" : "";
+  const retrievalClass = normalized ? "normalized-retrieval" : exact ? "exact-retrieval" : classification === "FUZZY" ? "fuzzy-discovery" : "";
   return `<article class="offer-card historical-offer-card ${compact ? "compact" : "recommended"} ${retrievalClass}">
     <div class="offer-card-heading"><span class="technical-badge">История 1С</span>${retrievalBadge}${decisionBadge}<b>${offerTitleHtml(offer)}</b></div>
     <div class="offer-price">${historicalOfferPrice(offer)}</div>
@@ -4344,13 +4347,15 @@ function projectResultView(item) {
 function projectReviewCandidates(item) {
   if (item?.route?.final_source_kind === "history_review" && Array.isArray(item.offers)) {
     const offerMatches = new Map((item.match_results || []).map((match) => [match.offer?.offer_id, match]));
+    const normalized = item.offers.filter((offer) => offer?.history_retrieval_classification === "NORMALIZED_NAME_UNIT");
     const exact = item.offers.filter((offer) => offer?.history_retrieval_classification
-      && offer.history_retrieval_classification !== "FUZZY");
-    const candidates = exact.length ? exact : item.offers.filter((offer) => offer?.history_retrieval_classification === "FUZZY");
+      && ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(offer.history_retrieval_classification));
+    const candidates = normalized.length ? normalized : exact.length ? exact : item.offers.filter((offer) => offer?.history_retrieval_classification === "FUZZY");
     if (candidates.length) {
-      return candidates.slice(0, 5).map((offer, index) => {
+      return candidates.slice(0, 5).flatMap((offer, index) => {
         const match = offerMatches.get(offer.offer_id);
-        return match && match.decision !== "REJECT" ? match : {offer, decision:"REVIEW", rank:index + 1};
+        if (match?.decision === "REJECT") return [];
+        return [match || {offer, decision:"REVIEW", rank:index + 1}];
       });
     }
   }
@@ -4372,9 +4377,17 @@ function projectReviewCandidates(item) {
 }
 
 function historyReviewPresentation(candidates, route = null) {
+  const normalized = candidates.filter((candidate) => candidate.offer?.history_retrieval_classification === "NORMALIZED_NAME_UNIT");
   const exactNameUnit = candidates.filter((candidate) => candidate.offer?.history_retrieval_classification === "EXACT_NAME_UNIT");
   const exact = candidates.filter((candidate) => ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(candidate.offer?.history_retrieval_classification));
   const ambiguousRoute = ["ambiguous_exact_name_identity", "ambiguous_or_non_strict_evidence"].includes(route?.history_reason_code);
+  if (normalized.length) {
+    return {
+      kind: "normalized_name_unit",
+      title: "Совпадает после нормализации названия и единицы",
+      explanation: "Формулировка отличается, но нормализованное название и единица измерения совпадают. Проверьте запись перед подтверждением.",
+    };
+  }
   if (exactNameUnit.length) {
     const ambiguous = exactNameUnit.length > 1 || ambiguousRoute;
     const withoutPrice = exactNameUnit.some((candidate) => candidate.offer?.price === null || candidate.offer?.price === undefined);

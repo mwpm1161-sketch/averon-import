@@ -15,7 +15,7 @@ if (actionSource.includes("setInterval") || actionSource.includes("localStorage"
   throw new Error("History decisions must not add polling or persist confirmation/password state in browser storage");
 }
 
-const candidate = {offer:{offer_id:"one_c_history:item-1",title:"Плющ искусственный",price:"123.45",currency:"RUB",price_unit:"шт"},decision:null};
+const candidate = {offer:{offer_id:"one_c_history:item-1",title:"Плющ искусственный",price:"123.45",currency:"RUB",price_unit:"шт",history_retrieval_classification:"NORMALIZED_NAME_UNIT"},decision:null};
 const eligible = {candidate_offer_id:candidate.offer.offer_id,offer:candidate.offer,confirmable:true,evidence_fingerprint:"f".repeat(64)};
 const item = {intent:{source_row_id:"a".repeat(32)},historyDecisionCandidates:[eligible],historyEffectiveDecision:null};
 const escaped = value => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
@@ -60,10 +60,10 @@ const context = {
 };
 vm.runInNewContext(`${snippet}; globalThis.renderAction=renderHumanHistoryDecisionAction; globalThis.apply=applyTenderHistoryDecisionSnapshot; globalThis.bind=bindHumanHistoryDecisionActions;`, context);
 
-const exact = context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"});
-if (!exact.includes("Подтвердить эту запись")) throw new Error("Eligible exact candidate should expose the explicit confirmation action");
+const normalized = context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"});
+if (!normalized.includes("Подтвердить эту запись") || !normalized.includes("Подтвердить и далее")) throw new Error("Server-approved normalized candidate should expose both ordinary confirmation actions");
 item.historyDecisionCandidates = [{...eligible,confirmable:false,reason_code:"HISTORY_CANDIDATE_SOURCE_CONFLICT"}];
-if (context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"}).includes("Подтвердить эту запись")) throw new Error("Conflicted exact candidate must not expose confirmation");
+if (context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"}).includes("Подтвердить эту запись")) throw new Error("Non-confirmable normalized candidate must not expose confirmation");
 item.historyDecisionCandidates = [eligible];
 if (context.renderAction(item, {offer:{...candidate.offer,offer_id:"fuzzy",history_retrieval_classification:"FUZZY"},decision:"REVIEW"}) !== "") throw new Error("Fuzzy candidate must not expose confirmation");
 
@@ -73,5 +73,5 @@ button.handlers.click().then(() => {
   if (postCount !== 1 || getCount !== 1) throw new Error(`Expected one mutation and a stale-state refresh; got POST=${postCount}, GET=${getCount}`);
   if (result.historyDecisionRevision !== 1 || item.historyEffectiveDecision?.decision_id !== "b".repeat(32)) throw new Error("Stale response did not refresh durable decision state");
   if (detailRenders !== 1 || toastCount !== 1) throw new Error(`Stale decision UI did not re-render and explain the refresh: renders=${detailRenders}, toast=${toastCount}`);
-  process.stdout.write("PASS: exact-only confirmation UI, typed body, stale revision refresh, no polling/storage\n");
+  process.stdout.write("PASS: exact-and-normalized-only confirmation UI, typed body, stale revision refresh, no polling/storage\n");
 }).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

@@ -2184,6 +2184,120 @@ def _persist_history_review_run(
     return running["run_id"]
 
 
+def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(tender_api, tmp_path, monkeypatch):
+    from averon_import.services.sourcing.history_identity import (
+        HISTORY_IDENTITY_NORMALIZER_REVISION,
+        history_name_signature_digest,
+    )
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_history_review_run(
+        main, repository, workspace,
+        classification="NORMALIZED_NAME_UNIT",
+        offer_overrides={"title":"Искусственный плющ"},
+        provenance_overrides={
+            "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
+            "normalized_name_signature":history_name_signature_digest(source["name"]),
+        },
+    )
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    assert candidate["offer"]["retrieval_classification"] == "NORMALIZED_NAME_UNIT"
+    assert candidate["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
+    assert candidate["confirmable"] is True
+
+    run = main.tender_sourcing_runs.get_public(
+        repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id,
+    )
+    assert run["rows"][0]["route"]["history_outcome"] == "REVIEW"
+    assert run["rows"][0]["route"]["history_safe_basis"] is None
+
+    confirmed_response = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE",
+            "source_row_id":snapshot["rows"][0]["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"],
+            "expected_revision":0,
+        }).encode(),
+    )
+    assert confirmed_response.status_code == 200, confirmed_response.text
+    confirmed = confirmed_response.json()
+    assert confirmed["events"][0]["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
+    assert confirmed["effective"][source["source_row_id"]]["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
+
+    monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
+    restored = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    assert restored["effective"][source["source_row_id"]]["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
+
+    export_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export"
+    included = _api_request(
+        main.app, "POST", export_endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert included.status_code == 202, included.text
+    exported = _wait_tender_job(main, included.json()["id"])
+    assert exported["status"] == "completed", exported
+    assert exported["result"]["automatic_historical_count"] == 0
+    assert exported["result"]["human_confirmed_historical_count"] == 1
+
+    decision_id = restored["effective"][source["source_row_id"]]["decision_id"]
+    revoked = _api_request(
+        main.app, "POST", f"{base}/{decision_id}/revoke",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"decision":"REVOKE_HISTORY_CONFIRMATION","expected_revision":1}',
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["effective"] == {}
+
+
+@pytest.mark.parametrize("provenance_override", [
+    {"normalizer_revision":"normalized-name-unit-old"},
+    {"normalized_name_signature":"f" * 64},
+])
+def test_d4a_normalized_history_candidate_recomputes_server_evidence(tender_api, tmp_path, provenance_override):
+    from averon_import.services.sourcing.history_identity import (
+        HISTORY_IDENTITY_NORMALIZER_REVISION,
+        history_name_signature_digest,
+    )
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    provenance = {
+        "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
+        "normalized_name_signature":history_name_signature_digest(source["name"]),
+    }
+    provenance.update(provenance_override)
+    run_id = _persist_history_review_run(
+        main, repository, workspace,
+        classification="NORMALIZED_NAME_UNIT",
+        offer_overrides={"title":"Искусственный плющ"},
+        provenance_overrides=provenance,
+    )
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    assert snapshot["rows"][0]["candidates"][0]["confirmable"] is False
+    response = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE",
+            "source_row_id":source["source_row_id"],
+            "candidate_offer_id":"one_c_history:history-item-1",
+            "expected_revision":0,
+        }).encode(),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
+
+
 def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_path, monkeypatch):
     main, repository = tender_api
     workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
@@ -2290,7 +2404,11 @@ def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_
     assert no_history.json()["detail"]["code"] == "TENDER_EXPORT_NO_ELIGIBLE_PRICES"
 
 
-def test_d3_exact_candidate_projection_is_bounded_and_size_safe(tmp_path):
+def test_d3_exact_and_normalized_candidate_projection_is_bounded_and_size_safe(tmp_path):
+    from averon_import.services.sourcing.history_identity import (
+        HISTORY_IDENTITY_NORMALIZER_REVISION,
+        history_name_signature_digest,
+    )
     from averon_import.services.sourcing.models import (
         HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent,
         SourcingResult,
@@ -2315,12 +2433,14 @@ def test_d3_exact_candidate_projection_is_bounded_and_size_safe(tmp_path):
             "selected_event_id":f"event-{index}", "purchase_date":"2025-04-16",
             "price_basis":"gross_including_vat", "effective_unit_price_gross":"10.00",
             "currency_basis":"company_default", "unit_family":"piece",
+            "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
+            "normalized_name_signature":history_name_signature_digest(source["name"]),
         }
         offer = Offer(
             offer_id=f"one_c_history:item-{index}", provider="one_c_history", source_item_id=f"item-{index}",
-            title=source["name"], price=Decimal("10.00"), currency="RUB", price_unit="шт",
+            title=f"Позиция реальная {index + 1}", price=Decimal("10.00"), currency="RUB", price_unit="шт",
             data_provenance=provenance,
-            history_retrieval_classification=HistoryRetrievalClassification.EXACT_NAME_UNIT,
+            history_retrieval_classification=HistoryRetrievalClassification.NORMALIZED_NAME_UNIT,
         )
         match = MatchResult(offer=offer, decision=MatchDecision.REVIEW, rank=1, matched_attributes=["name", "unit"])
         results.append(SourcingResult(
@@ -2495,7 +2615,7 @@ def test_d3_human_history_ui_lifecycle_regression():
     assert node, "Node.js is required for the manual tender human-history UI regression"
     root = Path(__file__).resolve().parents[1]
     for script, expected in (
-        ("manual_tender_history_decisions.cjs", "PASS: exact-only confirmation UI"),
+        ("manual_tender_history_decisions.cjs", "PASS: exact-and-normalized-only confirmation UI"),
         ("excel_tender_review_navigation.cjs", "PASS: Excel Tender review sequence"),
     ):
         result = subprocess.run(
