@@ -23,6 +23,7 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter, range_boundaries
 
 from averon_import.core.unit_normalization import normalize_unit_family
+from averon_import.services.sourcing.history_identity import history_model_characteristic_conflicts
 from averon_import.services.one_c_history.xlsx_import import OneCImportError, preflight_xlsx
 
 from .parser import (
@@ -397,6 +398,11 @@ class TenderPriceResolver:
             or offer.get("offer_id") != confirmation.get("candidate_offer_id")
         ):
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        history_characteristic = offer.get("history_characteristic", "")
+        if not isinstance(history_characteristic, str) or len(history_characteristic) > 300:
+            return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        if history_model_characteristic_conflicts(source.get("model"), history_characteristic):
+            return _reason("HISTORY_CANDIDATE_SOURCE_CONFLICT", source, historical=True, human_confirmed=True, audit=audit)
         if retrieval_classification == "NORMALIZED_NAME_UNIT":
             from averon_import.services.sourcing.history_identity import (
                 HISTORY_IDENTITY_NORMALIZER_REVISION,

@@ -6,8 +6,11 @@ const applyEnd = source.indexOf("async function openExcelTenderRunDetail", apply
 const actionRenderStart = source.indexOf("function renderHumanHistoryDecisionAction(item, candidate) {");
 const actionBindStart = source.indexOf("function bindHumanHistoryDecisionActions(projectResult, item) {");
 const actionEnd = source.indexOf("function renderSourcingResult(result, row = null) {", actionBindStart);
-if ([applyStart, applyEnd, actionRenderStart, actionBindStart, actionEnd].some(index => index < 0)) throw new Error("Human history decision UI functions were not found");
-const snippet = [source.slice(applyStart, applyEnd), source.slice(actionRenderStart, actionBindStart), source.slice(actionBindStart, actionEnd)].join("\n");
+const projectCandidatesStart = source.indexOf("function projectReviewCandidates(item) {");
+const historyPresentationStart = source.indexOf("function historyReviewPresentation(candidates, route = null) {");
+const historyPresentationEnd = source.indexOf("function projectHasReviewCandidates(item) {", historyPresentationStart);
+if ([applyStart, applyEnd, actionRenderStart, actionBindStart, actionEnd, projectCandidatesStart, historyPresentationStart, historyPresentationEnd].some(index => index < 0)) throw new Error("Human history decision UI functions were not found");
+const snippet = [source.slice(applyStart, applyEnd), source.slice(actionRenderStart, actionBindStart), source.slice(actionBindStart, actionEnd), source.slice(projectCandidatesStart, historyPresentationStart), source.slice(historyPresentationStart, historyPresentationEnd)].join("\n");
 const actionStart = source.indexOf("function bindHumanHistoryDecisionActions(projectResult, item) {");
 const actionBindEnd = source.indexOf("function renderSourcingResult(result, row = null) {", actionStart);
 const actionSource = source.slice(actionStart, actionBindEnd);
@@ -58,7 +61,7 @@ const context = {
     return snapshot;
   },
 };
-vm.runInNewContext(`${snippet}; globalThis.renderAction=renderHumanHistoryDecisionAction; globalThis.apply=applyTenderHistoryDecisionSnapshot; globalThis.bind=bindHumanHistoryDecisionActions;`, context);
+vm.runInNewContext(`${snippet}; globalThis.renderAction=renderHumanHistoryDecisionAction; globalThis.apply=applyTenderHistoryDecisionSnapshot; globalThis.bind=bindHumanHistoryDecisionActions; globalThis.reviewCandidates=projectReviewCandidates; globalThis.historyPresentation=historyReviewPresentation;`, context);
 
 const normalized = context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"});
 if (!normalized.includes("Подтвердить эту запись") || !normalized.includes("Подтвердить и далее")) throw new Error("Server-approved normalized candidate should expose both ordinary confirmation actions");
@@ -67,11 +70,22 @@ if (context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"}).includ
 item.historyDecisionCandidates = [eligible];
 if (context.renderAction(item, {offer:{...candidate.offer,offer_id:"fuzzy",history_retrieval_classification:"FUZZY"},decision:"REVIEW"}) !== "") throw new Error("Fuzzy candidate must not expose confirmation");
 
+const normalizedChoices = [
+  {offer:{...candidate.offer,history_retrieval_classification:"NORMALIZED_NAME_UNIT"}},
+  {offer:{...candidate.offer,offer_id:"one_c_history:item-2",history_retrieval_classification:"NORMALIZED_NAME_UNIT"}},
+];
+const ambiguousMany = context.historyPresentation(normalizedChoices, null);
+if (ambiguousMany.title !== "Несколько совпадений после нормализации — требуется выбор" || !ambiguousMany.explanation.includes("Проверьте характеристики и выберите нужную запись")) throw new Error("Multiple normalized history candidates need explicit choice wording");
+const ambiguousReason = context.historyPresentation([normalizedChoices[0]], {history_reason_code:"ambiguous_normalized_name_identity"});
+if (ambiguousReason.title !== "Несколько совпадений после нормализации — требуется выбор") throw new Error("Normalized ambiguity reason must use explicit choice wording");
+const rejected = {route:{final_source_kind:"history_review"},offers:[normalizedChoices[0].offer],match_results:[{offer:normalizedChoices[0].offer,decision:"REJECT"}],review_candidate:{offer:normalizedChoices[0].offer,decision:"REJECT"}};
+if (context.reviewCandidates(rejected).length !== 0) throw new Error("A rejected history match must not be synthesized as a REVIEW card");
+
 const result = {run_id:"c".repeat(32),historyDecisionRevision:0,results:[item]};
 context.bind(result,item);
 button.handlers.click().then(() => {
   if (postCount !== 1 || getCount !== 1) throw new Error(`Expected one mutation and a stale-state refresh; got POST=${postCount}, GET=${getCount}`);
   if (result.historyDecisionRevision !== 1 || item.historyEffectiveDecision?.decision_id !== "b".repeat(32)) throw new Error("Stale response did not refresh durable decision state");
   if (detailRenders !== 1 || toastCount !== 1) throw new Error(`Stale decision UI did not re-render and explain the refresh: renders=${detailRenders}, toast=${toastCount}`);
-  process.stdout.write("PASS: exact-and-normalized-only confirmation UI, typed body, stale revision refresh, no polling/storage\n");
+  process.stdout.write("PASS: exact-and-normalized-only confirmation UI, ambiguity wording, reject exclusion, typed body, stale revision refresh, no polling/storage\n");
 }).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

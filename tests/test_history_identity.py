@@ -1,8 +1,17 @@
 from averon_import.services.sourcing.history_identity import (
     HISTORY_IDENTITY_NORMALIZER_REVISION,
+    history_model_characteristic_conflicts,
     history_name_signature,
     history_name_signature_digest,
 )
+
+
+def test_explicit_history_model_comparison_is_conservative_and_missing_aware():
+    assert history_model_characteristic_conflicts("", "25-60") is False
+    assert history_model_characteristic_conflicts("25-40", "") is False
+    assert history_model_characteristic_conflicts(" 25-40 ", "25-40") is False
+    for source, history in (("25-40", "25-60"), ("M-500", "M-501"), ("DN50", "DN51"), ("AB-001", "AB-1"), ("Е-50", "Ё-50"), ("25-40", "\n")):
+        assert history_model_characteristic_conflicts(source, history) is True
 
 
 def test_history_identity_revision_and_safe_descriptive_reordering():

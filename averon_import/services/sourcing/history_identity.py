@@ -38,6 +38,31 @@ _RELATION_WORDS = frozenset({"для", "по", "из", "с", "без", "к", "о
 _NEGATION_WORDS = frozenset({"не", "ни", "анти"})
 
 
+def history_model_characteristic_conflicts(source_model: object, history_characteristic: object) -> bool:
+    """Compare identifiers conservatively; only empty/whitespace evidence is missing."""
+
+    def identifier(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        if len(normalized) > 300 or any(unicodedata.category(char) == "Cc" for char in normalized):
+            return None
+        return " ".join(normalized.split())
+
+    def present(value: object) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip()) or any(unicodedata.category(char) == "Cc" for char in value)
+        return value not in (None, "")
+
+    source_present = present(source_model)
+    history_present = present(history_characteristic)
+    if not source_present or not history_present:
+        return False
+    source_key = identifier(source_model)
+    history_key = identifier(history_characteristic)
+    return source_key is None or history_key is None or source_key != history_key
+
+
 def _decimal_text(value: str) -> str | None:
     try:
         number = Decimal(value.replace(",", "."))

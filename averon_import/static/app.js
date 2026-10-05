@@ -4382,10 +4382,13 @@ function historyReviewPresentation(candidates, route = null) {
   const exact = candidates.filter((candidate) => ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(candidate.offer?.history_retrieval_classification));
   const ambiguousRoute = ["ambiguous_exact_name_identity", "ambiguous_or_non_strict_evidence"].includes(route?.history_reason_code);
   if (normalized.length) {
+    const ambiguous = normalized.length > 1 || route?.history_reason_code === "ambiguous_normalized_name_identity";
     return {
-      kind: "normalized_name_unit",
-      title: "Совпадает после нормализации названия и единицы",
-      explanation: "Формулировка отличается, но нормализованное название и единица измерения совпадают. Проверьте запись перед подтверждением.",
+      kind: ambiguous ? "ambiguous_normalized_name_unit" : "normalized_name_unit",
+      title: ambiguous ? "Несколько совпадений после нормализации — требуется выбор" : "Совпадает после нормализации названия и единицы",
+      explanation: ambiguous
+        ? "Несколько записей имеют совместимые нормализованные названия и единицы. Проверьте характеристики и выберите нужную запись."
+        : "Формулировка отличается, но нормализованное название и единица измерения совпадают. Проверьте запись перед подтверждением.",
     };
   }
   if (exactNameUnit.length) {

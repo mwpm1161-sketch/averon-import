@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from averon_import.core.unit_normalization import normalize_unit_family
+from averon_import.services.sourcing.history_identity import history_model_characteristic_conflicts
 
 from .parser import parse_unit_basis
 from .repository import TenderWorkspaceError, TenderWorkspaceRepository
@@ -27,6 +28,7 @@ _HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}
 _OFFER_FIELDS = {
     "offer_id", "provider", "source_item_id", "title", "article", "manufacturer",
     "brand", "price", "currency", "price_unit", "retrieved_at", "retrieval_classification",
+    "history_characteristic",
 }
 _PROVENANCE_FIELDS = {
     "source", "source_kind", "snapshot_version", "history_item_id", "selected_event_id",
@@ -93,6 +95,7 @@ def _public_review_candidate(candidate: Any) -> tuple[dict[str, Any], dict[str, 
         "offer_id":180, "provider":40, "source_item_id":180, "title":500,
         "article":180, "manufacturer":180, "brand":180, "currency":12,
         "price_unit":80, "retrieved_at":40, "retrieval_classification":40,
+        "history_characteristic":300,
     }
     for key, limit in limits.items():
         value = raw_offer.get(key)
@@ -155,6 +158,9 @@ def _candidate_fingerprint(
             "normalizer_revision": provenance.get("normalizer_revision"),
             "normalized_name_signature": provenance.get("normalized_name_signature"),
         })
+        history_characteristic = offer.get("history_characteristic")
+        if isinstance(history_characteristic, str) and history_characteristic.strip():
+            evidence["history_characteristic"] = history_characteristic
     return _sha256(evidence)
 
 
@@ -185,6 +191,10 @@ def _candidate_gate(
         "price_unit":80, "retrieved_at":40, "retrieval_classification":40,
     }
     if any(not isinstance(offer.get(key), str) or len(offer[key]) > limit for key, limit in required_offer_strings.items()):
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+    if "history_characteristic" in offer and (
+        not isinstance(offer["history_characteristic"], str) or len(offer["history_characteristic"]) > 300
+    ):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if offer.get("price") is not None and (not isinstance(offer.get("price"), (str, int, float)) or isinstance(offer.get("price"), bool) or len(str(offer["price"])) > 100):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
@@ -217,6 +227,8 @@ def _candidate_gate(
         return "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
     if offer.get("provider") != "one_c_history" or provenance.get("source") != "one_c_history" or provenance.get("source_kind") != "historical_purchase":
         return "HISTORY_CANDIDATE_PROVENANCE_INVALID", None
+    if history_model_characteristic_conflicts(source.get("model"), offer.get("history_characteristic", "")):
+        return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
     if match.get("offer_id") != offer.get("offer_id") or match.get("decision") == "REJECT":
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if match.get("conflicting_attributes"):

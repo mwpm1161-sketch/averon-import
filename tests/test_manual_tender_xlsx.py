@@ -2090,16 +2090,17 @@ def test_tender_price_export_target_collision_uses_semantic_empty_cells(tmp_path
         assert error.value.code == "TENDER_EXPORT_TARGET_OCCUPIED"
 
 
-def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article=""):
+def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article="", source_name="Плющ искусственный", source_model=""):
     path = tmp_path / f"ivy-{uuid.uuid4().hex}.xlsx"
     _official(path, include_required=False)
     workbook = load_workbook(path)
     sheet = workbook[TEMPLATE_SHEET]
     sheet["A2"] = "R-IVY"
-    sheet["B2"] = "Плющ искусственный"
+    sheet["B2"] = source_name
     sheet["C2"] = "шт"
     sheet["D2"] = 2
     sheet["E2"] = source_article or None
+    sheet["G2"] = source_model or None
     workbook.save(path)
     workbook.close()
     payload = path.read_bytes()
@@ -2116,7 +2117,7 @@ def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article=""
 
 def _persist_history_review_run(
     main, repository, workspace, *, candidates=1, classification="EXACT_NAME_UNIT",
-    offer_overrides=None, provenance_overrides=None,
+    offer_overrides=None, provenance_overrides=None, offer_attributes=None,
 ):
     from averon_import.services.sourcing.models import (
         HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent,
@@ -2150,6 +2151,7 @@ def _persist_history_review_run(
         offer = Offer(
             offer_id=f"one_c_history:{item_id}", provider="one_c_history", source_item_id=item_id,
             **offer_values,
+            attributes=offer_attributes or {},
             data_provenance=provenance,
             history_retrieval_classification=classification,
         )
@@ -2298,6 +2300,186 @@ def test_d4a_normalized_history_candidate_recomputes_server_evidence(tender_api,
     assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
 
 
+@pytest.mark.parametrize(("classification", "source_article", "history_characteristic", "expected"), [
+    ("NORMALIZED_NAME_UNIT", "", "25-40", True),
+    ("NORMALIZED_NAME_UNIT", "", "25-60", False),
+    ("EXACT_NAME_UNIT", "", "25-60", False),
+    ("EXACT_ARTICLE", "SKU-42", "25-60", False),
+    ("NORMALIZED_NAME_UNIT", "", "", True),
+])
+def test_d4a_model_characteristic_candidate_gate_is_consistent(tender_api, tmp_path, monkeypatch, classification, source_article, history_characteristic, expected):
+    from averon_import.services.sourcing.history_identity import (
+        HISTORY_IDENTITY_NORMALIZER_REVISION,
+        history_name_signature_digest,
+    )
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path, source_article=source_article,
+        source_name="Насос циркуляционный", source_model="25-40",
+    )
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    normalized = classification == "NORMALIZED_NAME_UNIT"
+    provenance = ({
+        "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
+        "normalized_name_signature":history_name_signature_digest(source["name"]),
+    } if normalized else {})
+    offer_overrides = {
+        "title":"Циркуляционный насос" if normalized else source["name"],
+        "article":source_article,
+    }
+    run_id = _persist_history_review_run(
+        main, repository, workspace, classification=classification,
+        offer_overrides=offer_overrides, provenance_overrides=provenance,
+        offer_attributes={"characteristic":history_characteristic} if history_characteristic else {},
+    )
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    assert candidate["offer"]["history_characteristic"] == history_characteristic
+    assert candidate["confirmable"] is expected
+    if not expected:
+        assert candidate["reason_code"] == "HISTORY_CANDIDATE_SOURCE_CONFLICT"
+        assert candidate["evidence_fingerprint"] is None
+        response = _api_request(
+            main.app, "POST", base,
+            headers={**_auth_headers(), "Content-Type":"application/json"},
+            body=json.dumps({
+                "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+                "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+            }).encode(),
+        )
+        assert response.status_code == 409
+        assert _api_request(main.app, "GET", base, headers=_auth_headers()).json()["events"] == []
+    elif classification == "NORMALIZED_NAME_UNIT" and history_characteristic:
+        from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+        monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
+        restarted = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+        assert restarted["rows"][0]["candidates"][0]["offer"]["history_characteristic"] == "25-40"
+        assert restarted["rows"][0]["candidates"][0]["confirmable"] is True
+        assert restarted["rows"][0]["candidates"][0]["evidence_fingerprint"] == candidate["evidence_fingerprint"]
+
+
+def test_d4a_normalized_fingerprint_binds_history_characteristic(tender_api, tmp_path):
+    import copy
+    from averon_import.services.sourcing.history_identity import (
+        HISTORY_IDENTITY_NORMALIZER_REVISION,
+        history_name_signature_digest,
+    )
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_history_review_run(
+        main, repository, workspace, classification="NORMALIZED_NAME_UNIT",
+        offer_overrides={"title":"Искусственный плющ"},
+        offer_attributes={"characteristic":"25-40"},
+        provenance_overrides={
+            "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
+            "normalized_name_signature":history_name_signature_digest(source["name"]),
+        },
+    )
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    before = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = before["rows"][0]["candidates"][0]
+    assert candidate["confirmable"] is True
+    confirm = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+        }).encode(),
+    )
+    assert confirm.status_code == 200
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
+    tampered = copy.deepcopy(run)
+    tampered["rows"][0]["history_review_candidates"][0]["offer"]["history_characteristic"] = "25-41"
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+    restarted_store = TenderHistoryDecisionStore(repository)
+    changed = restarted_store.get_snapshot(workspace_path, workspace, tampered, workspace["tender_id"], run_id)
+    changed_candidate = changed["rows"][0]["candidates"][0]
+    assert changed_candidate["confirmable"] is True
+    assert changed_candidate["evidence_fingerprint"] != candidate["evidence_fingerprint"]
+    assert changed["effective"] == {}
+
+
+def test_d4a_export_rechecks_explicit_history_model_conflict(tender_api, tmp_path):
+    import copy
+    from averon_import.services.manual_tenders.price_export import TenderPriceResolver
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path, source_name="Насос циркуляционный", source_model="25-40",
+    )
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_history_review_run(
+        main, repository, workspace,
+        offer_overrides={"title":source["name"]},
+        offer_attributes={"characteristic":"25-40"},
+    )
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    confirmed = _api_request(
+        main.app, "POST", base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+        }).encode(),
+    )
+    assert confirmed.status_code == 200
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
+    canonical = next(row for row in run["rows"] if row["source_row_id"] == source["source_row_id"])
+    forged_confirmation = copy.deepcopy(confirmed.json()["effective"][source["source_row_id"]])
+    forged_confirmation["candidate"]["offer"]["history_characteristic"] = "25-60"
+    decision = TenderPriceResolver().resolve_human_history(
+        source, canonical, run, forged_confirmation, include_historical_prices=True,
+    )
+    assert decision.eligible is False
+    assert decision.source_unit_price is None
+    assert decision.reason_code == "HISTORY_CANDIDATE_SOURCE_CONFLICT"
+
+
+def test_d4a_exact_fingerprint_remains_compatible_with_legacy_candidate_contract():
+    import copy
+    from averon_import.services.manual_tenders.history_decisions import _candidate_fingerprint
+
+    common = {
+        "tender_id":"a" * 32,
+        "workspace":{"revision":1,"source_sha256":"b" * 64},
+        "run":{"run_id":"c" * 32,"history_catalog_version":"snapshot"},
+        "source":{"source_row_id":"d" * 32,"name":"Насос","model":"25-40"},
+        "canonical":{"physical_excel_row":2},
+        "candidate":{
+            "offer":{"retrieval_classification":"EXACT_NAME_UNIT","offer_id":"one_c_history:item","title":"Насос","article":"","manufacturer":"","brand":"","source_item_id":"item","price":"10","currency":"RUB","price_unit":"шт"},
+            "price_provenance":{"history_item_id":"item","selected_event_id":"event","purchase_date":"2025-01-01","price_basis":"gross_including_vat","effective_unit_price_gross":"10","currency_basis":"source","unit_family":"piece"},
+            "match":{"decision":"REVIEW","offer_id":"one_c_history:item","matched_attributes":[],"supporting_attributes":[],"conflicting_attributes":[],"missing_attributes":[]},
+        },
+    }
+    old_fingerprint = _candidate_fingerprint(**common)
+    enriched = copy.deepcopy(common)
+    enriched["candidate"]["offer"]["history_characteristic"] = "25-40"
+    assert _candidate_fingerprint(**enriched) == old_fingerprint
+
+    normalized_legacy = copy.deepcopy(common)
+    normalized_legacy["candidate"]["offer"]["retrieval_classification"] = "NORMALIZED_NAME_UNIT"
+    normalized_legacy["candidate"]["price_provenance"].update({
+        "normalizer_revision":"normalized-name-unit-v1",
+        "normalized_name_signature":"e" * 64,
+    })
+    normalized_fingerprint = _candidate_fingerprint(**normalized_legacy)
+    normalized_empty = copy.deepcopy(normalized_legacy)
+    normalized_empty["candidate"]["offer"]["history_characteristic"] = ""
+    assert _candidate_fingerprint(**normalized_empty) == normalized_fingerprint
+    normalized_with_characteristic = copy.deepcopy(normalized_legacy)
+    normalized_with_characteristic["candidate"]["offer"]["history_characteristic"] = "25-40"
+    assert _candidate_fingerprint(**normalized_with_characteristic) != normalized_fingerprint
+
+
 def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_path, monkeypatch):
     main, repository = tender_api
     workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
@@ -2439,6 +2621,7 @@ def test_d3_exact_and_normalized_candidate_projection_is_bounded_and_size_safe(t
         offer = Offer(
             offer_id=f"one_c_history:item-{index}", provider="one_c_history", source_item_id=f"item-{index}",
             title=f"Позиция реальная {index + 1}", price=Decimal("10.00"), currency="RUB", price_unit="шт",
+            attributes={"characteristic":"техническая характеристика", "unit_family":"ignored-by-projection"},
             data_provenance=provenance,
             history_retrieval_classification=HistoryRetrievalClassification.NORMALIZED_NAME_UNIT,
         )
@@ -2457,7 +2640,18 @@ def test_d3_exact_and_normalized_candidate_projection_is_bounded_and_size_safe(t
     }
     encoded = json.dumps(run, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert all(len(row["history_review_candidates"]) == 1 for row in projection)
+    assert all(row["history_review_candidates"][0]["offer"]["history_characteristic"] == "техническая характеристика" for row in projection)
+    assert all("attributes" not in row["history_review_candidates"][0]["offer"] for row in projection)
+    assert len(encoded) < 1024 * 1024
     assert len(encoded) < MAX_TENDER_RUN_BYTES
+
+    oversized_result = dict(results[0])
+    oversized_result["offers"] = [{
+        **results[0]["offers"][0],
+        "attributes":{"characteristic":"x" * 301},
+    }]
+    oversized = canonical_tender_projection({"results":[oversized_result]}, sources[:1], ids[:1])
+    assert oversized[0]["history_review_candidates"] == []
 
 
 def test_d3_ambiguous_exact_choices_append_and_latest_confirmation_is_effective(tender_api, tmp_path):

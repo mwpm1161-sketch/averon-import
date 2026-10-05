@@ -453,6 +453,12 @@ def canonical_tender_projection(
                     value = candidate.get(key)
                     if isinstance(value, str):
                         safe_candidate[key] = value[:limit]
+                if candidate.get("provider") == "one_c_history":
+                    attributes = candidate.get("attributes") if isinstance(candidate.get("attributes"), dict) else {}
+                    characteristic = attributes.get("characteristic", "")
+                    if not isinstance(characteristic, str) or len(characteristic) > 300:
+                        continue
+                    safe_candidate["history_characteristic"] = characteristic
                 price_value = candidate.get("price")
                 if price_value is None or isinstance(price_value, (str, int, float)) and len(str(price_value)) <= 100:
                     safe_candidate["price"] = price_value
