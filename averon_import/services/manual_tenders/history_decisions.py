@@ -20,6 +20,10 @@ from averon_import.services.sourcing.history_identity import history_model_chara
 
 from .parser import parse_unit_basis
 from .repository import TenderWorkspaceError, TenderWorkspaceRepository
+from .history_fuzzy_eligibility import (
+    MAX_FUZZY_RETRIEVAL_RANK,
+    fuzzy_confirmation_eligibility_reason,
+)
 
 MAX_HISTORY_DECISION_EVENTS_PER_RUN = 1000
 MAX_HISTORY_DECISION_LEDGER_BYTES = 2 * 1024 * 1024
@@ -68,10 +72,13 @@ def _expand_review_candidate(candidate: Any) -> dict[str, Any]:
         offer_id, source_item_id, title, article, manufacturer, characteristic,
         price, currency, price_unit, retrieved_at,
     ) = identity
-    source_token, source_kind_token, snapshot, history_item_id, event_id, purchase_date, price_basis_token, effective_price, currency_basis, unit_family = provenance_values
+    source_token, source_kind_token, snapshot, history_item_id, event_id, purchase_date, price_basis_token, effective_price, currency_basis_token, unit_family = provenance_values
     decision, match_offer_id_matches, conflicts, missing = match_values
     if not isinstance(match_offer_id_matches, bool):
         return {}
+    currency_basis = "source" if currency_basis_token == "s" else (
+        "company_default" if currency_basis_token == "d" else currency_basis_token
+    )
     return {
         "offer": {
             "offer_id":offer_id, "provider":"one_c_history", "source_item_id":source_item_id,
@@ -87,7 +94,8 @@ def _expand_review_candidate(candidate: Any) -> dict[str, Any]:
             "selected_event_id":event_id, "purchase_date":purchase_date,
             "price_basis":"gross_including_vat" if price_basis_token == "gross" else price_basis_token,
             "effective_unit_price_gross":effective_price,
-            "currency_basis":currency_basis, "unit_family":unit_family,
+            "currency_basis":currency_basis,
+            "unit_family":unit_family,
         },
         "match": {
             "decision":decision, "offer_id":offer_id if match_offer_id_matches else "",
@@ -272,7 +280,7 @@ def _candidate_gate(
     if classification == "FUZZY":
         expected_candidate_keys.add("retrieval_rank")
         rank = candidate.get("retrieval_rank")
-        if isinstance(rank, bool) or not isinstance(rank, int) or not 1 <= rank <= 3:
+        if isinstance(rank, bool) or not isinstance(rank, int) or not 1 <= rank <= MAX_FUZZY_RETRIEVAL_RANK:
             return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if set(candidate) != expected_candidate_keys:
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
@@ -330,6 +338,15 @@ def _candidate_gate(
         return "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
     if offer.get("provider") != "one_c_history" or provenance.get("source") != "one_c_history" or provenance.get("source_kind") != "historical_purchase":
         return "HISTORY_CANDIDATE_PROVENANCE_INVALID", None
+    if classification == "FUZZY":
+        fuzzy_reason = fuzzy_confirmation_eligibility_reason(
+            source, offer, provenance, match, route,
+            expected_snapshot_version=run.get("history_catalog_version"),
+            physical_excel_row=canonical.get("physical_excel_row"),
+            retrieval_rank=candidate.get("retrieval_rank"),
+        )
+        if fuzzy_reason is not None:
+            return fuzzy_reason, None
     if history_model_characteristic_conflicts(source.get("model"), offer.get("history_characteristic", "")):
         return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
     if match.get("offer_id") != offer.get("offer_id") or match.get("decision") == "REJECT":

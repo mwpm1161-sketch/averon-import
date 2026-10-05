@@ -2118,7 +2118,7 @@ def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article=""
 
 def _persist_history_review_run(
     main, repository, workspace, *, candidates=1, classification="EXACT_NAME_UNIT",
-    offer_overrides=None, provenance_overrides=None, offer_attributes=None,
+    offer_overrides=None, provenance_overrides=None, offer_attributes=None, candidate_specs=None,
 ):
     from averon_import.services.sourcing.models import (
         HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent,
@@ -2134,6 +2134,7 @@ def _persist_history_review_run(
     offers = []
     matches = []
     for index in range(candidates):
+        spec = candidate_specs[index] if candidate_specs and index < len(candidate_specs) else {}
         item_id = f"history-item-{index + 1}"
         event_id = f"history-event-{index + 1}"
         provenance = {
@@ -2144,22 +2145,26 @@ def _persist_history_review_run(
             "currency_basis":"company_default", "unit_family":"piece",
         }
         provenance.update(provenance_overrides or {})
+        provenance.update(spec.get("provenance_overrides") or {})
         offer_values = {
             "title":source["name"], "article":"", "manufacturer":"", "brand":"",
             "price":Decimal("123.4500"), "currency":"RUB", "price_unit":"шт",
         }
         offer_values.update(offer_overrides or {})
+        offer_values.update(spec.get("offer_overrides") or {})
         offer = Offer(
             offer_id=f"one_c_history:{item_id}", provider="one_c_history", source_item_id=item_id,
             **offer_values,
-            attributes=offer_attributes or {},
+            attributes={**(offer_attributes or {}), **(spec.get("offer_attributes") or {})},
             data_provenance=provenance,
             history_retrieval_classification=classification,
         )
         offers.append(offer)
         matches.append(MatchResult(
-            offer=offer, decision=MatchDecision.REVIEW, rank=index + 1,
-            matched_attributes=["name", "unit"],
+            offer=offer, decision=MatchDecision(spec.get("decision", "REVIEW")), rank=index + 1,
+            matched_attributes=spec.get("matched_attributes", ["name", "unit"]),
+            conflicting_attributes=spec.get("conflicting_attributes", []),
+            missing_attributes=spec.get("missing_attributes", []),
         ))
     route = SourcingRouteMetadata(
         source_mode=SourcingSourceMode.ONE_C_ONLY, final_source_kind="history_review",
@@ -2918,9 +2923,7 @@ def test_d3_history_confirmation_is_never_projected_for_fuzzy_or_mixed_mode(tmp_
     one_c_review = SourcingResult(intent=intent, offers=[offer], match_results=[match], route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW"})
     mixed_review = one_c_review.model_copy(update={"route":one_c_review.route.model_copy(update={"source_mode":SourcingSourceMode.ONE_C_THEN_PROVIDER})})
     local_history_row = canonical_tender_projection({"results":[one_c_review.model_dump(mode="json")]}, [source], [source["source_row_id"]])[0]
-    assert len(local_history_row["history_review_candidates"]) == 1
-    from averon_import.services.manual_tenders.history_decisions import _expand_review_candidate
-    assert _expand_review_candidate(local_history_row["history_review_candidates"][0])["offer"]["retrieval_classification"] == "FUZZY"
+    assert local_history_row["history_review_candidates"] == []
     mixed_row = canonical_tender_projection({"results":[mixed_review.model_dump(mode="json")]}, [source], [source["source_row_id"]])[0]
     assert mixed_row["history_review_candidates"] == []
 
@@ -3024,29 +3027,18 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
 def test_d4b_fuzzy_server_gate_rejects_hard_conflicts(tender_api, tmp_path, case):
     main, repository = tender_api
     source_options = {}
-    offer_overrides = {"title":"Плющ декоративный"}
+    offer_overrides = {"title":"Плющ декоративный", "article":"", "manufacturer":""}
     provenance_overrides = {}
     offer_attributes = {}
     if case in {"article_mismatch", "article_missing"}:
         source_options["source_article"] = "SOURCE-ARTICLE"
-        offer_overrides["article"] = "OTHER-ARTICLE" if case == "article_mismatch" else ""
+        offer_overrides["article"] = "SOURCE-ARTICLE"
     elif case == "manufacturer_mismatch":
         source_options["source_manufacturer"] = "Maker A"
-        offer_overrides["manufacturer"] = "Maker B"
+        offer_overrides["manufacturer"] = "Maker A"
     elif case == "model_mismatch":
         source_options["source_model"] = "25-40"
-        offer_attributes["characteristic"] = "25-60"
-    elif case == "unit_mismatch":
-        offer_overrides["price_unit"] = "кг"
-        provenance_overrides["unit_family"] = "kilogram"
-    elif case == "snapshot_mismatch":
-        provenance_overrides["snapshot_version"] = "another-snapshot"
-    elif case == "price_mismatch":
-        offer_overrides["price"] = Decimal("99.00")
-    elif case == "future_date":
-        provenance_overrides["purchase_date"] = "2999-01-01"
-    elif case == "non_rub":
-        offer_overrides["currency"] = "USD"
+        offer_attributes["characteristic"] = "25-40"
 
     workspace = _confirm_ivy_history_tender(main, repository, tmp_path, **source_options)
     source = next(row for row in workspace["rows"] if row["row_type"] == "item")
@@ -3150,6 +3142,63 @@ def test_d4b_preprojection_bad_fuzzy_provenance_is_not_confirmable_or_exportable
     assert not export_dir.exists() or not list(export_dir.iterdir())
 
 
+@pytest.mark.parametrize("case", [
+    "reject", "alternative", "likely_match", "match_conflict", "article_mismatch", "article_missing",
+    "manufacturer_conflict", "model_conflict", "unit_conflict", "price_mismatch", "nonpositive_price",
+    "non_rub", "net_price", "future_date", "snapshot_mismatch", "item_mismatch", "event_missing",
+])
+def test_d4b_projection_drops_non_actionable_fuzzy_candidates(tender_api, tmp_path, case):
+    main, repository = tender_api
+    source_options = {}
+    offer_overrides = {"title":"Similar historical item"}
+    provenance_overrides = {}
+    offer_attributes = {}
+    match_options = {}
+    if case in {"reject", "alternative", "likely_match"}:
+        match_options["decision"] = {"reject":"REJECT", "alternative":"ALTERNATIVE", "likely_match":"LIKELY_MATCH"}[case]
+    elif case == "match_conflict":
+        match_options["conflicting_attributes"] = ["article"]
+    elif case in {"article_mismatch", "article_missing"}:
+        source_options["source_article"] = "SOURCE-ARTICLE"
+        offer_overrides["article"] = "OTHER-ARTICLE" if case == "article_mismatch" else ""
+    elif case == "manufacturer_conflict":
+        source_options["source_manufacturer"] = "Maker A"
+        offer_overrides["manufacturer"] = "Maker B"
+    elif case == "model_conflict":
+        source_options["source_model"] = "25-40"
+        offer_attributes["characteristic"] = "25-60"
+    elif case == "unit_conflict":
+        offer_overrides["price_unit"] = "кг"
+        provenance_overrides["unit_family"] = "kilogram"
+    elif case == "price_mismatch":
+        offer_overrides["price"] = Decimal("99.00")
+    elif case == "nonpositive_price":
+        offer_overrides["price"] = Decimal("0")
+    elif case == "non_rub":
+        offer_overrides["currency"] = "USD"
+    elif case == "net_price":
+        provenance_overrides["price_basis"] = "net_excluding_vat"
+    elif case == "future_date":
+        provenance_overrides["purchase_date"] = "2999-01-01"
+    elif case == "snapshot_mismatch":
+        provenance_overrides["snapshot_version"] = "different-snapshot"
+    elif case == "item_mismatch":
+        provenance_overrides["history_item_id"] = "different-item"
+    elif case == "event_missing":
+        provenance_overrides["selected_event_id"] = ""
+
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path, **source_options)
+    run_id = _persist_history_review_run(
+        main, repository, workspace, classification="FUZZY",
+        offer_overrides=offer_overrides, provenance_overrides=provenance_overrides,
+        offer_attributes=offer_attributes, candidate_specs=[match_options],
+    )
+    run = main.tender_sourcing_runs.get_public(
+        repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id,
+    )
+    assert run["rows"][0]["history_review_candidates"] == [], case
+
+
 def test_d4b_fuzzy_candidate_outside_persisted_set_cannot_be_confirmed(tender_api, tmp_path):
     main, repository = tender_api
     workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
@@ -3193,6 +3242,61 @@ def test_d4b_ambiguous_fuzzy_confirmation_binds_the_clicked_candidate(tender_api
     assert response.json()["events"][0]["evidence_fingerprint"] == selected["fuzzy_evidence_fingerprint"]
 
 
+def test_d4b_actionable_fuzzy_slot_selection_preserves_rank_five_and_confirms(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path, source_name="Зажим троса 8 мм",
+        source_article="ROPE-8", source_manufacturer="Maker A",
+    )
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_history_review_run(
+        main, repository, workspace, candidates=8, classification="FUZZY",
+        candidate_specs=[
+            {"offer_overrides":{"title":"Зажим троса 2 мм", "article":"ROPE-2"}, "decision":"ALTERNATIVE"},
+            {"offer_overrides":{"title":"Зажим троса 3 мм", "article":"ROPE-8"}, "decision":"LIKELY_MATCH"},
+            {"offer_overrides":{"title":"Зажим для троса 4мм", "article":"ROPE-8"}},
+            {"offer_overrides":{"title":"Зажим троса подходящего типа", "article":""}},
+            {"offer_overrides":{"title":"Зажим для троса 8мм", "article":"ROPE-8", "manufacturer":"Maker A"}},
+            {"offer_overrides":{"title":"Зажим троса с конфликтом", "article":"ROPE-8"}, "conflicting_attributes":["article"]},
+            {"offer_overrides":{"title":"Зажим троса другой марки", "article":"ROPE-8", "manufacturer":"Maker B"}},
+            {"offer_overrides":{"title":"Зажим троса ещё один вариант", "article":"ROPE-8", "manufacturer":"Maker A"}},
+        ],
+    )
+    endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", endpoint, headers=_auth_headers()).json()
+    candidates = snapshot["rows"][0]["candidates"]
+    assert [candidate["retrieval_rank"] for candidate in candidates] == [3, 5, 8]
+    candidate = next(candidate for candidate in candidates if candidate["offer"]["title"] == "Зажим для троса 8мм")
+    assert candidate["retrieval_rank"] == 5
+    assert candidate["offer"]["title"] == "Зажим для троса 8мм"
+    assert candidate["confirmable_for_explicit_fuzzy"] is True
+    response = _api_request(
+        main.app, "POST", endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+            "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":True,
+        }).encode(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["events"][0]["candidate_offer_id"] == candidate["candidate_offer_id"]
+    assert response.json()["events"][0]["evidence_fingerprint"] == candidate["fuzzy_evidence_fingerprint"]
+    import copy
+    tampered_effective = copy.deepcopy(response.json()["effective"][source["source_row_id"]])
+    tampered_effective["candidate"]["match"]["conflicting_attributes"] = ["article"]
+    run = main.tender_sourcing_runs.get_public(
+        repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id,
+    )
+    export_decision = main.tender_price_resolver.resolve_run(
+        workspace, run, tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=True,
+        human_history_decisions={source["source_row_id"]:tampered_effective},
+    )[0]
+    assert not export_decision.eligible
+    assert export_decision.reason_code == "HISTORY_CANDIDATE_SOURCE_CONFLICT"
+
+
 def test_d4b_fuzzy_projection_keeps_only_three_ranked_candidates_when_no_strong_candidate_exists():
     import copy
     from averon_import.services.sourcing.models import HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent, SourcingResult
@@ -3214,7 +3318,7 @@ def test_d4b_fuzzy_projection_keeps_only_three_ranked_candidates_when_no_strong_
     result = SourcingResult(
         intent=ProductIntent(source_row_id=source["source_row_id"], source_text=source["name"], normalized_name=source["name"], unit="шт"),
         offers=fuzzy, match_results=matches,
-        route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW"},
+        route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW", "history_catalog_version":"snapshot"},
     ).model_dump(mode="json")
     projected = canonical_tender_projection({"results":[result]}, [source], [source["source_row_id"]])[0]["history_review_candidates"]
     assert [candidate["fuzzy_v1"]["rank"] for candidate in projected] == [1, 2, 3]
@@ -3242,7 +3346,7 @@ def test_d4b_fuzzy_projection_keeps_only_three_ranked_candidates_when_no_strong_
             {"results":[malformed_result]}, [source], [source["source_row_id"]],
         )[0]["history_review_candidates"]
         assert [candidate["fuzzy_v1"]["identity"][0] for candidate in candidates] == [
-            "one_c_history:item-2", "one_c_history:item-3",
+            "one_c_history:item-2", "one_c_history:item-3", "one_c_history:item-4",
         ], (key, value)
 
     strong = fuzzy[0].model_copy(update={"history_retrieval_classification":HistoryRetrievalClassification.NORMALIZED_NAME_UNIT})
@@ -3305,6 +3409,7 @@ def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candida
             route={
                 "source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW",
                 "history_reason_code":"fuzzy_candidates_require_review", "history_candidate_count":20,
+                "history_catalog_version":"2026-10-shared-history-snapshot-v1",
             },
         ).model_dump(mode="json"))
 
@@ -3333,6 +3438,7 @@ def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candida
                 "history_safe_basis", "history_catalog_version", "fallback_called",
             }
     assert sizes[1] < sizes[2] < sizes[3]
+    assert sizes[3] <= 1_015_909
     assert sizes[3] < MAX_TENDER_RUN_BYTES
     assert MAX_TENDER_RUN_BYTES == 1024 * 1024
     print(f"D4B 370-row fuzzy run bytes: one={sizes[1]}, two={sizes[2]}, three={sizes[3]}")

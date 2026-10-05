@@ -100,7 +100,8 @@ if (!normalized.includes("Подтвердить эту запись") || !norma
 item.historyDecisionCandidates = [{...eligible,confirmable:false,reason_code:"HISTORY_CANDIDATE_SOURCE_CONFLICT"}];
 if (context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"}).includes("Подтвердить эту запись")) throw new Error("Non-confirmable normalized candidate must not expose confirmation");
 item.historyDecisionCandidates = [eligible];
-if (context.renderAction(item, {offer:{...candidate.offer,offer_id:"fuzzy",history_retrieval_classification:"FUZZY"},decision:"REVIEW"}) !== "") throw new Error("Fuzzy candidate must not expose confirmation");
+const unprojectedFuzzyMarkup = context.renderAction(item, {offer:{...candidate.offer,offer_id:"fuzzy",history_retrieval_classification:"FUZZY"},decision:"REVIEW"});
+if (!unprojectedFuzzyMarkup.includes("Этот вариант показан для сравнения, но не доступен для подтверждения.") || unprojectedFuzzyMarkup.includes("Сравнить и подтвердить")) throw new Error("A transient fuzzy candidate needs a neutral unavailable diagnostic");
 
 const normalizedChoices = [
   {offer:{...candidate.offer,history_retrieval_classification:"NORMALIZED_NAME_UNIT"}},
@@ -114,6 +115,18 @@ const rejected = {route:{final_source_kind:"history_review"},offers:[normalizedC
 if (context.reviewCandidates(rejected).length !== 0) throw new Error("A rejected history match must not be synthesized as a REVIEW card");
 const fuzzyPresentation = context.historyPresentation([{offer:fuzzyOffer,decision:"REVIEW"}], {final_source_kind:"history_review"});
 if (fuzzyPresentation.title !== "Похожие позиции в истории 1С — требуется ручное сравнение" || fuzzyPresentation.explanation !== "Автоматически подтвердить совпадение нельзя. Сравните исходную позицию с записью истории.") throw new Error("Fuzzy-only presentation must clearly require manual comparison");
+const laterFuzzyOffer = {...fuzzyOffer,offer_id:"one_c_history:rank-8",source_item_id:"rank-8",title:"Поздний actionable вариант",retrieval_classification:"FUZZY"};
+const transientFuzzyOffers = Array.from({length:8}, (_,index)=>({...fuzzyOffer,offer_id:`one_c_history:transient-${index+1}`,history_retrieval_classification:"FUZZY"}));
+const laterFuzzyState = {...fuzzyEligible,candidate_offer_id:laterFuzzyOffer.offer_id,offer:laterFuzzyOffer,retrieval_rank:8};
+const lateRankProject = {
+  route:{final_source_kind:"history_review"}, offers:transientFuzzyOffers,
+  match_results:transientFuzzyOffers.map((offer,index)=>({offer,decision:"REVIEW",rank:index+1})),
+  historyDecisionCandidates:[laterFuzzyState],
+};
+const visibleLateRank = context.reviewCandidates(lateRankProject);
+const lateRankCard = visibleLateRank.find(candidate=>candidate.offer.offer_id===laterFuzzyOffer.offer_id);
+if (!lateRankCard || lateRankCard.rank !== 8) throw new Error("A persisted actionable fuzzy candidate beyond the first five must remain visible with its original rank");
+if (!context.renderAction({...item,historyDecisionCandidates:[laterFuzzyState]},lateRankCard).includes("Сравнить и подтвердить")) throw new Error("A persisted late-rank fuzzy candidate must retain its explicit compare action");
 
 async function runUiLifecycle() {
   context.state.sourcing.result = result;

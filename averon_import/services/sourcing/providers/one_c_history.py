@@ -40,10 +40,11 @@ from averon_import.services.sourcing.history_identity import (
     history_name_signature,
     history_name_signature_digest,
 )
+from averon_import.services.sourcing.history_policy import MAX_FUZZY_RETRIEVAL_RANK
 from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy
 
 
-_MAX_PROVIDER_LIMIT = 50
+_MAX_PROVIDER_LIMIT = MAX_FUZZY_RETRIEVAL_RANK
 _MIN_FUZZY_SCORE = 58
 _COMPANY_DEFAULT_HISTORY_CURRENCY = "RUB"
 _MATCHER_ARTICLE_TRANSLATION = str.maketrans({

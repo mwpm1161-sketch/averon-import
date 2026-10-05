@@ -18,6 +18,9 @@ from .repository import (
     TenderWorkspaceError,
     TenderWorkspaceRepository,
 )
+from .history_fuzzy_eligibility import (
+    fuzzy_confirmation_eligibility_reason,
+)
 
 _RUN_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Z0-9_-]{1,80}$")
@@ -416,6 +419,77 @@ def _has_compact_fuzzy_history_provenance(
     )
 
 
+def _compact_fuzzy_projection_candidate(
+    candidate: dict[str, Any],
+    candidate_match: dict[str, Any],
+    source: dict[str, Any],
+    route: dict[str, Any],
+    retrieval_rank: Any,
+) -> dict[str, Any] | None:
+    """Build a compact fuzzy slot only when its static confirmation evidence is sound."""
+    safe_candidate: dict[str, Any] = {}
+    for key, limit in (
+        ("offer_id", 180), ("provider", 40), ("source_item_id", 180), ("title", 500),
+        ("article", 180), ("manufacturer", 180), ("currency", 12),
+        ("price_unit", 80), ("retrieved_at", 40),
+    ):
+        value = candidate.get(key)
+        if isinstance(value, str):
+            safe_candidate[key] = value[:limit]
+    attributes = candidate.get("attributes") if isinstance(candidate.get("attributes"), dict) else {}
+    characteristic = attributes.get("characteristic", "")
+    if not isinstance(characteristic, str) or len(characteristic) > 300:
+        return None
+    safe_candidate["history_characteristic"] = characteristic
+    price_value = candidate.get("price")
+    if price_value is None or isinstance(price_value, (str, int, float)) and len(str(price_value)) <= 100:
+        safe_candidate["price"] = price_value
+    safe_candidate["retrieval_classification"] = "FUZZY"
+    safe_provenance = _safe_price_provenance(candidate)
+    safe_match = _safe_history_review_match(candidate_match)
+    if not _has_compact_fuzzy_history_provenance(candidate, safe_candidate, safe_provenance):
+        return None
+    reason = fuzzy_confirmation_eligibility_reason(
+        source, safe_candidate, safe_provenance, safe_match, route,
+        expected_snapshot_version=route.get("history_catalog_version"),
+        physical_excel_row=source.get("excel_row"), retrieval_rank=retrieval_rank,
+    )
+    if reason is not None:
+        return None
+    safe_provenance = {
+        key: value for key, value in safe_provenance.items()
+        if key not in {"normalizer_revision", "normalized_name_signature"}
+    }
+    safe_match = {
+        key: safe_match.get(key, [])
+        for key in ("decision", "offer_id", "conflicting_attributes", "missing_attributes")
+    }
+    return {"fuzzy_v1": {
+        "classification": "FUZZY",
+        "provider": "1c",
+        "identity": [
+            safe_candidate.get("offer_id"), safe_candidate.get("source_item_id"),
+            safe_candidate.get("title"), safe_candidate.get("article", ""),
+            safe_candidate.get("manufacturer", ""), safe_candidate.get("history_characteristic", ""),
+            safe_candidate.get("price"), safe_candidate.get("currency"),
+            safe_candidate.get("price_unit"), safe_candidate.get("retrieved_at"),
+        ],
+        "provenance": [
+            "1c", "purchase", safe_provenance.get("snapshot_version"),
+            safe_provenance.get("history_item_id"), safe_provenance.get("selected_event_id"),
+            safe_provenance.get("purchase_date"), "gross",
+            safe_provenance.get("effective_unit_price_gross"),
+            "s" if safe_provenance.get("currency_basis") == "source" else "d",
+            safe_provenance.get("unit_family"),
+        ],
+        "match": [
+            safe_match.get("decision"), safe_match.get("offer_id") == safe_candidate.get("offer_id"),
+            safe_match.get("conflicting_attributes", []), safe_match.get("missing_attributes", []),
+        ],
+        "rank": retrieval_rank,
+    }}
+
+
 def canonical_tender_projection(
     result_payload: dict[str, Any],
     source_rows: list[dict[str, Any]],
@@ -457,18 +531,20 @@ def canonical_tender_projection(
             }
             strong_candidates = []
             fuzzy_candidates = []
+            fuzzy_retrieval_rank = 0
             for candidate in offers:
                 if not isinstance(candidate, dict):
                     continue
                 classification = candidate.get("history_retrieval_classification")
+                if classification == "FUZZY":
+                    fuzzy_retrieval_rank += 1
                 candidate_match = match_by_offer_id.get(str(candidate.get("offer_id") or ""))
                 if not isinstance(candidate_match, dict) or candidate_match.get("decision") == "REJECT":
                     continue
-                entry = (candidate, candidate_match)
                 if classification in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}:
-                    strong_candidates.append(entry)
+                    strong_candidates.append((candidate, candidate_match))
                 elif classification == "FUZZY":
-                    fuzzy_candidates.append(entry)
+                    fuzzy_candidates.append((candidate, candidate_match, fuzzy_retrieval_rank))
 
             # Strong evidence remains the only durable confirmation set whenever
             # it exists. Weak candidates are retained only for fuzzy-only review.
@@ -476,14 +552,6 @@ def canonical_tender_projection(
                 (candidate, candidate_match, None)
                 for candidate, candidate_match in strong_candidates[:_MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW]
             ]
-            if not selected_candidates:
-                selected_candidates = [
-                    (candidate, candidate_match, rank)
-                    for rank, (candidate, candidate_match) in enumerate(
-                        fuzzy_candidates[:_MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW], start=1,
-                    )
-                ]
-
             for candidate, candidate_match, retrieval_rank in selected_candidates:
                 classification = candidate.get("history_retrieval_classification")
                 safe_candidate: dict[str, Any] = {}
@@ -492,8 +560,7 @@ def canonical_tender_projection(
                     ("article", 180), ("manufacturer", 180), ("currency", 12),
                     ("price_unit", 80), ("retrieved_at", 40),
                 )
-                if classification != "FUZZY":
-                    identity_fields = identity_fields[:6] + (("brand", 180),) + identity_fields[6:]
+                identity_fields = identity_fields[:6] + (("brand", 180),) + identity_fields[6:]
                 for key, limit in identity_fields:
                     value = candidate.get(key)
                     if isinstance(value, str):
@@ -510,55 +577,25 @@ def canonical_tender_projection(
                 safe_candidate["retrieval_classification"] = classification
                 safe_provenance = _safe_price_provenance(candidate)
                 safe_match = _safe_history_review_match(candidate_match)
-                if classification == "FUZZY":
-                    # fuzzy_v1 stores compact fixed tokens. Check both the
-                    # original source facts and their sanitized projection
-                    # before encoding so invalid provenance cannot be laundered.
-                    if not _has_compact_fuzzy_history_provenance(
-                        candidate, safe_candidate, safe_provenance,
-                    ):
-                        continue
-                    safe_provenance = {
-                        key: value for key, value in safe_provenance.items()
-                        if key not in {"normalizer_revision", "normalized_name_signature"}
-                    }
-                    safe_match = {
-                        key: safe_match.get(key, [])
-                        for key in ("decision", "offer_id", "conflicting_attributes", "missing_attributes")
-                    }
                 durable_candidate = {
                     "offer": safe_candidate,
                     "price_provenance": safe_provenance,
                     "match": safe_match,
                 }
-                if retrieval_rank is not None:
-                    # A versioned positional schema keeps realistic 370-row
-                    # fuzzy runs below the unchanged byte cap while retaining
-                    # every identity, commercial, provenance, and conflict fact.
-                    durable_candidate = {"fuzzy_v1": {
-                        "classification": "FUZZY",
-                        "provider": "1c",
-                        "identity": [
-                            safe_candidate.get("offer_id"), safe_candidate.get("source_item_id"),
-                            safe_candidate.get("title"), safe_candidate.get("article", ""),
-                            safe_candidate.get("manufacturer", ""), safe_candidate.get("history_characteristic", ""),
-                            safe_candidate.get("price"), safe_candidate.get("currency"),
-                            safe_candidate.get("price_unit"), safe_candidate.get("retrieved_at"),
-                        ],
-                        "provenance": [
-                            "1c", "purchase", safe_provenance.get("snapshot_version"),
-                            safe_provenance.get("history_item_id"), safe_provenance.get("selected_event_id"),
-                            safe_provenance.get("purchase_date"), "gross",
-                            safe_provenance.get("effective_unit_price_gross"), safe_provenance.get("currency_basis"),
-                            safe_provenance.get("unit_family"),
-                        ],
-                        "match": [
-                            safe_match.get("decision"), safe_match.get("offer_id") == safe_candidate.get("offer_id"),
-                            safe_match.get("conflicting_attributes", []), safe_match.get("missing_attributes", []),
-                        ],
-                        "rank": retrieval_rank,
-                    }}
                 history_review_candidates.append(durable_candidate)
+
+            if not selected_candidates:
+                # Allocate the three durable fuzzy slots by eligibility while
+                # retaining each candidate's original retrieval rank.
+                for candidate, candidate_match, retrieval_rank in fuzzy_candidates:
+                    compact = _compact_fuzzy_projection_candidate(
+                        candidate, candidate_match, source, route, retrieval_rank,
+                    )
+                    if compact is None:
+                        continue
+                    history_review_candidates.append(compact)
+                    if len(history_review_candidates) == _MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW:
+                        break
         notices = result.get("notices") if isinstance(result.get("notices"), list) else []
         notice_codes = sorted({
             str(item.get("code")) for item in notices

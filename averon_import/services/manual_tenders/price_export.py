@@ -38,6 +38,10 @@ from .parser import (
     preflight_tender_xlsx,
 )
 from .repository import MAX_TENDER_STORAGE_BYTES, TenderWorkspaceError, TenderWorkspaceRepository
+from .history_fuzzy_eligibility import (
+    MAX_FUZZY_RETRIEVAL_RANK,
+    fuzzy_confirmation_eligibility_reason,
+)
 
 TENDER_EXPORT_POLICY_REVISION = "xlsx-price-export-v1"
 MAX_TENDER_EXPORT_BYTES = 10 * 1024 * 1024
@@ -405,7 +409,7 @@ class TenderPriceResolver:
                 or confirmation.get("identity_assertion") != "SAME_PRODUCT_V1"
                 or isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), bool)
                 or not isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), int)
-                or not 1 <= confirmation["candidate"]["retrieval_rank"] <= 3
+                or not 1 <= confirmation["candidate"]["retrieval_rank"] <= MAX_FUZZY_RETRIEVAL_RANK
                 or match.get("decision") != "REVIEW"
             ))
             or (retrieval_classification != "FUZZY" and confirmation_basis == "FUZZY_MANUAL_CONFIRMATION")
@@ -413,6 +417,15 @@ class TenderPriceResolver:
             or offer.get("offer_id") != confirmation.get("candidate_offer_id")
         ):
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
+        if retrieval_classification == "FUZZY":
+            fuzzy_reason = fuzzy_confirmation_eligibility_reason(
+                source, offer, provenance, match, route,
+                expected_snapshot_version=run.get("history_catalog_version"),
+                physical_excel_row=canonical.get("physical_excel_row"),
+                retrieval_rank=candidate.get("retrieval_rank"),
+            )
+            if fuzzy_reason is not None:
+                return _reason(fuzzy_reason, source, historical=True, human_confirmed=True, audit=audit)
         history_characteristic = offer.get("history_characteristic", "")
         if not isinstance(history_characteristic, str) or len(history_characteristic) > 300:
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)

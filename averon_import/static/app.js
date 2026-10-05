@@ -4357,11 +4357,35 @@ function projectReviewCandidates(item) {
       && ["EXACT_ARTICLE", "EXACT_NAME_UNIT", "STRUCTURED"].includes(offer.history_retrieval_classification));
     const candidates = normalized.length ? normalized : exact.length ? exact : item.offers.filter((offer) => offer?.history_retrieval_classification === "FUZZY");
     if (candidates.length) {
-      return candidates.slice(0, 5).flatMap((offer, index) => {
+      const projected = candidates.slice(0, 5).flatMap((offer, index) => {
         const match = offerMatches.get(offer.offer_id);
         if (match?.decision === "REJECT") return [];
         return [match || {offer, decision:"REVIEW", rank:index + 1}];
       });
+      if (!normalized.length && !exact.length) {
+        const seenOfferIds = new Set(projected.map((candidate) => String(candidate.offer?.offer_id || "")));
+        for (const durable of item.historyDecisionCandidates || []) {
+          const offer = durable?.offer;
+          const offerId = String(offer?.offer_id || "");
+          if (
+            offer?.retrieval_classification !== "FUZZY"
+            || !offerId
+            || seenOfferIds.has(offerId)
+          ) continue;
+          seenOfferIds.add(offerId);
+          projected.push({
+            ...durable,
+            offer: {
+              ...offer,
+              history_retrieval_classification:"FUZZY",
+              data_provenance:durable.price_provenance || {},
+            },
+            decision:durable.match?.decision || "REVIEW",
+            rank:durable.retrieval_rank,
+          });
+        }
+      }
+      return projected;
     }
   }
   const candidates = [];
@@ -4627,10 +4651,14 @@ function bindProjectReviewNavigation(result, sourceRowId) {
 function renderHumanHistoryDecisionAction(item, candidate) {
   const offer = candidate?.offer || {};
   const stateForCandidate = (item.historyDecisionCandidates || []).find((entry) => entry.candidate_offer_id === offer.offer_id);
-  if (!stateForCandidate) return "";
+  const fuzzy = offer.history_retrieval_classification === "FUZZY";
+  if (!stateForCandidate) {
+    return fuzzy
+      ? `<p class="history-confirmation-blocked" role="status">Этот вариант показан для сравнения, но не доступен для подтверждения.</p>`
+      : "";
+  }
   const effective = item.historyEffectiveDecision;
   const sourceRowId = item.intent?.source_row_id || "";
-  const fuzzy = offer.history_retrieval_classification === "FUZZY";
   if (effective?.candidate_offer_id === offer.offer_id) {
     return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
   }
