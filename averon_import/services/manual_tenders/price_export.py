@@ -410,7 +410,6 @@ class TenderPriceResolver:
                 or isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), bool)
                 or not isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), int)
                 or not 1 <= confirmation["candidate"]["retrieval_rank"] <= MAX_FUZZY_RETRIEVAL_RANK
-                or match.get("decision") != "REVIEW"
             ))
             or (retrieval_classification != "FUZZY" and confirmation_basis == "FUZZY_MANUAL_CONFIRMATION")
             or match.get("offer_id") != offer.get("offer_id")

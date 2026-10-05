@@ -332,8 +332,6 @@ def _candidate_gate(
     if classification == "FUZZY":
         if confirmation_mode != "EXPLICIT_FUZZY_IDENTITY" or explicit_identity_assertion is not True:
             return "HISTORY_CANDIDATE_EXPLICIT_ASSERTION_REQUIRED", None
-        if match.get("decision") != "REVIEW":
-            return "HISTORY_CANDIDATE_MATCH_NOT_REVIEW", None
     elif confirmation_mode is not None or explicit_identity_assertion:
         return "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
     if offer.get("provider") != "one_c_history" or provenance.get("source") != "one_c_history" or provenance.get("source_kind") != "historical_purchase":

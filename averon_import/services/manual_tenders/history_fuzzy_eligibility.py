@@ -19,6 +19,11 @@ from averon_import.services.sourcing.history_policy import MAX_FUZZY_RETRIEVAL_R
 from .parser import parse_unit_basis
 
 
+# These matcher outcomes can be considered only for FUZZY retrieval through
+# the explicit identity-confirmation flow. They never change retrieval trust.
+FUZZY_CONFIRMABLE_MATCH_DECISIONS = frozenset({"MATCH", "LIKELY_MATCH", "REVIEW"})
+
+
 def _identity(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -60,8 +65,8 @@ def fuzzy_confirmation_eligibility_reason(
         or not 1 <= retrieval_rank <= MAX_FUZZY_RETRIEVAL_RANK
     ):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID"
-    if match.get("decision") != "REVIEW":
-        return "HISTORY_CANDIDATE_MATCH_NOT_REVIEW"
+    if match.get("decision") not in FUZZY_CONFIRMABLE_MATCH_DECISIONS:
+        return "HISTORY_CANDIDATE_MATCH_NOT_CONFIRMABLE"
     conflicts = match.get("conflicting_attributes")
     if not isinstance(conflicts, list) or conflicts:
         return "HISTORY_CANDIDATE_SOURCE_CONFLICT"

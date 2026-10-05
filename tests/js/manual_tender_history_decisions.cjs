@@ -93,7 +93,7 @@ const context = {
     return getCount === 1 ? snapshot : {decision_revision:1,decision_digest:"d".repeat(64),effective:{},rows:[{source_row_id:sourceRowId,candidates:[fuzzyEligible],effective_decision:null}]};
   },
 };
-vm.runInNewContext(`${snippet}; globalThis.renderAction=renderHumanHistoryDecisionAction; globalThis.apply=applyTenderHistoryDecisionSnapshot; globalThis.bind=bindHumanHistoryDecisionActions; globalThis.reviewCandidates=projectReviewCandidates; globalThis.historyPresentation=historyReviewPresentation;`, context);
+vm.runInNewContext(`${snippet}; globalThis.renderAction=renderHumanHistoryDecisionAction; globalThis.apply=applyTenderHistoryDecisionSnapshot; globalThis.bind=bindHumanHistoryDecisionActions; globalThis.reviewCandidates=projectReviewCandidates; globalThis.historyPresentation=historyReviewPresentation; globalThis.nextActionable=nextActionableHistoryReviewItem;`, context);
 
 const normalized = context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"});
 if (!normalized.includes("Подтвердить эту запись") || !normalized.includes("Подтвердить и далее")) throw new Error("Server-approved normalized candidate should expose both ordinary confirmation actions");
@@ -102,6 +102,20 @@ if (context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"}).includ
 item.historyDecisionCandidates = [eligible];
 const unprojectedFuzzyMarkup = context.renderAction(item, {offer:{...candidate.offer,offer_id:"fuzzy",history_retrieval_classification:"FUZZY"},decision:"REVIEW"});
 if (!unprojectedFuzzyMarkup.includes("Этот вариант показан для сравнения, но не доступен для подтверждения.") || unprojectedFuzzyMarkup.includes("Сравнить и подтвердить")) throw new Error("A transient fuzzy candidate needs a neutral unavailable diagnostic");
+for (const decision of ["MATCH", "LIKELY_MATCH"]) {
+  const actionable = {...fuzzyEligible,match:{...fuzzyEligible.match,decision},confirmable_for_explicit_fuzzy:true};
+  const markup = context.renderAction({...item,historyDecisionCandidates:[actionable]}, {offer:fuzzyOffer,decision});
+  if (!markup.includes("Сравнить и подтвердить") || markup.includes("Точное совпадение") || markup.includes("Автоматически подтверждено")) {
+    throw new Error(`FUZZY ${decision} must use the existing explicit compare action without automatic-match wording`);
+  }
+  const navigation = {results:[
+    {intent:{source_row_id:"current-row"},route:{final_source_kind:"history_review",history_outcome:"REVIEW"},historyDecisionCandidates:[]},
+    {intent:{source_row_id:sourceRowId},route:{final_source_kind:"history_review",history_outcome:"REVIEW"},historyDecisionCandidates:[actionable],historyEffectiveDecision:null},
+  ]};
+  if (context.nextActionable(navigation,"current-row") !== navigation.results[1]) {
+    throw new Error(`Fast review navigation must use server-authorized FUZZY ${decision} candidates`);
+  }
+}
 
 const normalizedChoices = [
   {offer:{...candidate.offer,history_retrieval_classification:"NORMALIZED_NAME_UNIT"}},
