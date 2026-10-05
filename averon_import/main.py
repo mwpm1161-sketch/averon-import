@@ -2246,6 +2246,8 @@ class ManualTenderHistoryConfirmationRequest(BaseModel):
     source_row_id: StrictStr = Field(pattern=r"^[a-f0-9]{32}$")
     candidate_offer_id: StrictStr = Field(min_length=1, max_length=180)
     expected_revision: StrictInt = Field(ge=0)
+    confirmation_mode: Literal["EXPLICIT_FUZZY_IDENTITY"] | None = None
+    explicit_identity_assertion: StrictBool | None = None
 
 
 class ManualTenderHistoryRevocationRequest(BaseModel):
@@ -2515,6 +2517,8 @@ def confirm_manual_tender_history_candidate(
             source_row_id=request.source_row_id,
             candidate_offer_id=request.candidate_offer_id,
             expected_revision=request.expected_revision,
+            confirmation_mode=request.confirmation_mode,
+            explicit_identity_assertion=request.explicit_identity_assertion,
             actor_username=user.username, actor_role=user.role.value,
         )
     except Exception as exc:

@@ -2090,7 +2090,7 @@ def test_tender_price_export_target_collision_uses_semantic_empty_cells(tmp_path
         assert error.value.code == "TENDER_EXPORT_TARGET_OCCUPIED"
 
 
-def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article="", source_name="Плющ искусственный", source_model=""):
+def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article="", source_name="Плющ искусственный", source_model="", source_manufacturer=""):
     path = tmp_path / f"ivy-{uuid.uuid4().hex}.xlsx"
     _official(path, include_required=False)
     workbook = load_workbook(path)
@@ -2100,6 +2100,7 @@ def _confirm_ivy_history_tender(main, repository, tmp_path, *, source_article=""
     sheet["C2"] = "шт"
     sheet["D2"] = 2
     sheet["E2"] = source_article or None
+    sheet["F2"] = source_manufacturer or None
     sheet["G2"] = source_model or None
     workbook.save(path)
     workbook.close()
@@ -2725,7 +2726,8 @@ def test_d3_confirmable_exact_article_and_hard_conflicts_fail_closed(tender_api,
             }).encode(),
         )
         if _name == "fuzzy":
-            assert response.status_code == 404
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
         else:
             assert response.status_code == 409, (_name, response.text)
             assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
@@ -2809,7 +2811,7 @@ def test_d3_human_history_ui_lifecycle_regression():
     assert node, "Node.js is required for the manual tender human-history UI regression"
     root = Path(__file__).resolve().parents[1]
     for script, expected in (
-        ("manual_tender_history_decisions.cjs", "PASS: exact-and-normalized-only confirmation UI"),
+        ("manual_tender_history_decisions.cjs", "PASS: strong confirmation unchanged; fuzzy compare/assertion/two-step"),
         ("excel_tender_review_navigation.cjs", "PASS: Excel Tender review sequence"),
     ):
         result = subprocess.run(
@@ -2912,9 +2914,359 @@ def test_d3_history_confirmation_is_never_projected_for_fuzzy_or_mixed_mode(tmp_
     intent = ProductIntent(source_row_id=source["source_row_id"], source_text="Source")
     one_c_review = SourcingResult(intent=intent, offers=[offer], match_results=[match], route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW"})
     mixed_review = one_c_review.model_copy(update={"route":one_c_review.route.model_copy(update={"source_mode":SourcingSourceMode.ONE_C_THEN_PROVIDER})})
-    for result in (one_c_review, mixed_review):
-        row = canonical_tender_projection({"results":[result.model_dump(mode="json")]}, [source], [source["source_row_id"]])[0]
-        assert row["history_review_candidates"] == []
+    local_history_row = canonical_tender_projection({"results":[one_c_review.model_dump(mode="json")]}, [source], [source["source_row_id"]])[0]
+    assert len(local_history_row["history_review_candidates"]) == 1
+    from averon_import.services.manual_tenders.history_decisions import _expand_review_candidate
+    assert _expand_review_candidate(local_history_row["history_review_candidates"][0])["offer"]["retrieval_classification"] == "FUZZY"
+    mixed_row = canonical_tender_projection({"results":[mixed_review.model_dump(mode="json")]}, [source], [source["source_row_id"]])[0]
+    assert mixed_row["history_review_candidates"] == []
+
+
+def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_export_revoke(tender_api, tmp_path, monkeypatch):
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+    from averon_import.services.manual_tenders.sourcing import TenderSourcingRunStore
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_history_review_run(
+        main, repository, workspace, classification="FUZZY",
+        offer_overrides={"title":"Плющ декоративный"},
+    )
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    assert candidate["offer"]["retrieval_classification"] == "FUZZY"
+    assert candidate["retrieval_rank"] == 1
+    assert candidate["confirmable"] is False
+    assert candidate["confirmable_for_explicit_fuzzy"] is True
+    assert candidate["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+    assert len(candidate["fuzzy_evidence_fingerprint"]) == 64
+
+    normal_body = {
+        "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+        "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+    }
+    for extra in ({}, {"confirmation_mode":"EXPLICIT_FUZZY_IDENTITY"}, {
+        "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":False,
+    }):
+        response = _api_request(
+            main.app, "POST", base, headers={**_auth_headers(), "Content-Type":"application/json"},
+            body=json.dumps({**normal_body, **extra}).encode(),
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
+
+    confirmed = _api_request(
+        main.app, "POST", base, headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({**normal_body, "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":True}).encode(),
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    payload = confirmed.json()
+    assert payload["events"][0]["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+    assert payload["events"][0]["identity_assertion"] == "SAME_PRODUCT_V1"
+    effective = payload["effective"][source["source_row_id"]]
+    assert effective["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+    assert effective["identity_assertion"] == "SAME_PRODUCT_V1"
+
+    # Reload both durable stores to prove there is no dependency on transient job memory.
+    monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
+    monkeypatch.setattr(main, "tender_sourcing_runs", TenderSourcingRunStore(repository))
+    run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
+    restored = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    assert restored["effective"][source["source_row_id"]]["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+    resolved = main.tender_price_resolver.resolve_run(
+        workspace, run, tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=True, human_history_decisions=restored["effective"],
+    )
+    assert len(resolved) == 1 and resolved[0].eligible
+    assert resolved[0].safe_summary()["authority"] == "HUMAN_CONFIRMED_HISTORY"
+    assert resolved[0].audit_summary["human_confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+
+    export_response = _api_request(
+        main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert export_response.status_code == 202, export_response.text
+    exported = _wait_tender_job(main, export_response.json()["id"])
+    assert exported["status"] == "completed", exported
+    assert exported["result"]["human_confirmed_historical_count"] == 1
+    export_files = list((workspace_path / "exports").glob("*.xlsx"))
+    assert len(export_files) == 1
+    exported_workbook = load_workbook(export_files[0])
+    try:
+        fuzzy_comment = exported_workbook[TEMPLATE_SHEET]["H2"].comment.text
+        assert "Совпадение позиции явно подтверждено пользователем." in fuzzy_comment
+        assert "tender-user" not in fuzzy_comment
+    finally:
+        exported_workbook.close()
+
+    decision_id = restored["effective"][source["source_row_id"]]["decision_id"]
+    revoked = _api_request(
+        main.app, "POST", f"{base}/{decision_id}/revoke",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"decision":"REVOKE_HISTORY_CONFIRMATION","expected_revision":1}',
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["effective"] == {}
+
+
+@pytest.mark.parametrize("case", [
+    "reject", "alternative", "article_mismatch", "article_missing", "manufacturer_mismatch", "model_mismatch",
+    "unit_mismatch", "corrupt_provenance", "snapshot_mismatch", "event_mismatch", "price_mismatch",
+    "future_date", "non_rub", "net_price",
+])
+def test_d4b_fuzzy_server_gate_rejects_hard_conflicts(tender_api, tmp_path, case):
+    main, repository = tender_api
+    source_options = {}
+    offer_overrides = {"title":"Плющ декоративный"}
+    provenance_overrides = {}
+    offer_attributes = {}
+    if case in {"article_mismatch", "article_missing"}:
+        source_options["source_article"] = "SOURCE-ARTICLE"
+        offer_overrides["article"] = "OTHER-ARTICLE" if case == "article_mismatch" else ""
+    elif case == "manufacturer_mismatch":
+        source_options["source_manufacturer"] = "Maker A"
+        offer_overrides["manufacturer"] = "Maker B"
+    elif case == "model_mismatch":
+        source_options["source_model"] = "25-40"
+        offer_attributes["characteristic"] = "25-60"
+    elif case == "unit_mismatch":
+        offer_overrides["price_unit"] = "кг"
+        provenance_overrides["unit_family"] = "kilogram"
+    elif case == "corrupt_provenance":
+        provenance_overrides["source"] = "untrusted"
+    elif case == "snapshot_mismatch":
+        provenance_overrides["snapshot_version"] = "another-snapshot"
+    elif case == "price_mismatch":
+        offer_overrides["price"] = Decimal("99.00")
+    elif case == "future_date":
+        provenance_overrides["purchase_date"] = "2999-01-01"
+    elif case == "non_rub":
+        offer_overrides["currency"] = "USD"
+    elif case == "net_price":
+        provenance_overrides["price_basis"] = "net_excluding_vat"
+
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path, **source_options)
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    run_id = _persist_history_review_run(
+        main, repository, workspace, classification="FUZZY", offer_overrides=offer_overrides,
+        provenance_overrides=provenance_overrides, offer_attributes=offer_attributes,
+    )
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run_path = main.tender_sourcing_runs._path(workspace_path, run_id)
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    candidate_projection = run["rows"][0]["history_review_candidates"][0]["fuzzy_v1"]
+    if case == "reject":
+        candidate_projection["match"][0] = "REJECT"
+    elif case == "alternative":
+        candidate_projection["match"][0] = "ALTERNATIVE"
+    elif case == "event_mismatch":
+        run["rows"][0]["route"]["history_selected_event_id"] = "different-event"
+    elif case in {"article_mismatch", "article_missing"}:
+        candidate_projection["identity"][3] = "OTHER-ARTICLE" if case == "article_mismatch" else ""
+    elif case == "manufacturer_mismatch":
+        candidate_projection["identity"][4] = "Maker B"
+    elif case == "model_mismatch":
+        candidate_projection["identity"][5] = "25-60"
+    elif case == "unit_mismatch":
+        candidate_projection["identity"][8] = "кг"
+        candidate_projection["provenance"][9] = "kilogram"
+    elif case == "corrupt_provenance":
+        candidate_projection["provenance"][0] = "untrusted"
+    elif case == "snapshot_mismatch":
+        candidate_projection["provenance"][2] = "another-snapshot"
+    elif case == "price_mismatch":
+        candidate_projection["identity"][6] = "99.00"
+    elif case == "future_date":
+        candidate_projection["provenance"][5] = "2999-01-01"
+    elif case == "non_rub":
+        candidate_projection["identity"][7] = "USD"
+    elif case == "net_price":
+        candidate_projection["provenance"][6] = "net_excluding_vat"
+    run_path.write_text(json.dumps(run, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+    base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    assert candidate["confirmable_for_explicit_fuzzy"] is False, case
+    response = _api_request(
+        main.app, "POST", base, headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+            "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":True,
+        }).encode(),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE"
+
+
+def test_d4b_fuzzy_candidate_outside_persisted_set_cannot_be_confirmed(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    run_id = _persist_history_review_run(main, repository, workspace, classification="FUZZY")
+    endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    response = _api_request(
+        main.app, "POST", endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":workspace["rows"][0]["source_row_id"],
+            "candidate_offer_id":"one_c_history:not-persisted", "expected_revision":0,
+            "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":True,
+        }).encode(),
+    )
+    assert response.status_code == 404
+
+
+def test_d4b_ambiguous_fuzzy_confirmation_binds_the_clicked_candidate(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
+    run_id = _persist_history_review_run(
+        main, repository, workspace, candidates=3, classification="FUZZY",
+        offer_overrides={"title":"Плющ декоративный"},
+    )
+    endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", endpoint, headers=_auth_headers()).json()
+    candidates = snapshot["rows"][0]["candidates"]
+    assert [candidate["retrieval_rank"] for candidate in candidates] == [1, 2, 3]
+    selected = candidates[1]
+    response = _api_request(
+        main.app, "POST", endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":snapshot["rows"][0]["source_row_id"],
+            "candidate_offer_id":selected["candidate_offer_id"], "expected_revision":0,
+            "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":True,
+        }).encode(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["events"][0]["candidate_offer_id"] == selected["candidate_offer_id"]
+    assert response.json()["events"][0]["evidence_fingerprint"] == selected["fuzzy_evidence_fingerprint"]
+
+
+def test_d4b_fuzzy_projection_keeps_only_three_ranked_candidates_when_no_strong_candidate_exists():
+    from averon_import.services.sourcing.models import HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent, SourcingResult
+
+    source = {"source_row_id":"a" * 32, "excel_row":2, "row_type":"item", "name":"Source item", "raw_unit":"шт"}
+    provenance = {
+        "source":"one_c_history", "source_kind":"historical_purchase", "snapshot_version":"snapshot",
+        "history_item_id":"history-item", "selected_event_id":"history-event", "purchase_date":"2025-04-16",
+        "price_basis":"gross_including_vat", "effective_unit_price_gross":"10.00",
+        "currency_basis":"company_default", "unit_family":"piece",
+    }
+    fuzzy = [Offer(
+        offer_id=f"one_c_history:item-{index}", provider="one_c_history", source_item_id=f"item-{index}",
+        title=f"Similar source product {index}", price=Decimal("10.00"), currency="RUB", price_unit="шт",
+        attributes={"characteristic":"safe bounded specification"}, data_provenance={**provenance, "history_item_id":f"item-{index}", "selected_event_id":f"event-{index}"},
+        history_retrieval_classification=HistoryRetrievalClassification.FUZZY,
+    ) for index in range(1, 5)]
+    matches = [MatchResult(offer=offer, decision=MatchDecision.REVIEW, rank=index) for index, offer in enumerate(fuzzy, start=1)]
+    result = SourcingResult(
+        intent=ProductIntent(source_row_id=source["source_row_id"], source_text=source["name"], normalized_name=source["name"], unit="шт"),
+        offers=fuzzy, match_results=matches,
+        route={"source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW"},
+    ).model_dump(mode="json")
+    projected = canonical_tender_projection({"results":[result]}, [source], [source["source_row_id"]])[0]["history_review_candidates"]
+    assert [candidate["fuzzy_v1"]["rank"] for candidate in projected] == [1, 2, 3]
+    assert all(candidate["fuzzy_v1"]["classification"] == "FUZZY" for candidate in projected)
+    assert all(candidate["fuzzy_v1"]["provider"] == "1c" for candidate in projected)
+    from averon_import.services.manual_tenders.history_decisions import _expand_review_candidate
+    assert all(_expand_review_candidate(candidate)["offer"]["retrieval_classification"] == "FUZZY" for candidate in projected)
+
+    strong = fuzzy[0].model_copy(update={"history_retrieval_classification":HistoryRetrievalClassification.NORMALIZED_NAME_UNIT})
+    strong_result = {**result, "offers":[strong.model_dump(mode="json"), *[offer.model_dump(mode="json") for offer in fuzzy[1:]]],
+        "match_results":[matches[0].model_copy(update={"offer":strong}).model_dump(mode="json"), *[match.model_dump(mode="json") for match in matches[1:]]]}
+    strong_projection = canonical_tender_projection({"results":[strong_result]}, [source], [source["source_row_id"]])[0]["history_review_candidates"]
+    assert len(strong_projection) == 1
+    assert strong_projection[0]["offer"]["retrieval_classification"] == "NORMALIZED_NAME_UNIT"
+    assert "retrieval_rank" not in strong_projection[0]
+
+
+def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candidates():
+    from averon_import.services.sourcing.models import HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent, SourcingResult
+
+    sources = []
+    source_ids = []
+    result_rows = []
+    for row_index in range(370):
+        row_id = f"{row_index + 1:032x}"
+        source_ids.append(row_id)
+        source = {
+            "source_row_id":row_id, "excel_row":row_index + 2, "row_type":"item",
+            "name":f"Позиция для закупки промышленного оборудования номер {row_index + 1:03d}",
+            "raw_unit":"шт", "article":"", "manufacturer":"", "model":"",
+            "quantity":"12", "quantity_trusted":True, "unit_basis":parse_unit_basis("шт"),
+        }
+        sources.append(source)
+        offers = []
+        matches = []
+        for rank in range(1, 4):
+            item_id = f"history-item-{row_index + 1:03d}-{rank}"
+            event_id = f"history-event-{row_index + 1:03d}-{rank}"
+            provenance = {
+                "source":"one_c_history", "source_kind":"historical_purchase",
+                "snapshot_version":"2026-10-shared-history-snapshot-v1", "history_item_id":item_id,
+                "selected_event_id":event_id, "purchase_date":"2026-09-22",
+                "price_basis":"gross_including_vat", "effective_unit_price_gross":"1234.56",
+                "currency_basis":"company_default", "unit_family":"piece",
+            }
+            offer = Offer(
+                offer_id=f"one_c_history:{item_id}", provider="one_c_history", source_item_id=item_id,
+                title=f"Наименование исторической позиции {row_index + 1:03d} вариант {rank}",
+                article=f"ART-{row_index + 1:03d}-{rank}", manufacturer="Производитель оборудования",
+                price=Decimal("1234.56"), currency="RUB", price_unit="шт",
+                attributes={"characteristic":"Характеристика оборудования, исполнение и типоразмер"},
+                data_provenance=provenance,
+                history_retrieval_classification=HistoryRetrievalClassification.FUZZY,
+            )
+            offers.append(offer)
+            matches.append(MatchResult(
+                offer=offer, decision=MatchDecision.REVIEW, rank=rank,
+                matched_attributes=["unit"], missing_attributes=["name", "article"],
+            ))
+        result_rows.append(SourcingResult(
+            intent=ProductIntent(
+                source_row_id=row_id, source_text=source["name"], normalized_name=source["name"],
+                quantity=source["quantity"], unit=source["raw_unit"],
+            ),
+            offers=offers, match_results=matches,
+            route={
+                "source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW",
+                "history_reason_code":"fuzzy_candidates_require_review", "history_candidate_count":20,
+            },
+        ).model_dump(mode="json"))
+
+    sizes = {}
+    for count in (1, 2, 3):
+        limited_results = []
+        for result in result_rows:
+            limited_results.append({
+                **result,
+                "offers":result["offers"][:count],
+                "match_results":result["match_results"][:count],
+            })
+        projected = canonical_tender_projection({"results":limited_results}, sources, source_ids)
+        run = {
+            "schema_version":1, "run_id":"a" * 32, "tender_id":"b" * 32,
+            "source_sha256":"c" * 64, "workspace_revision":1, "status":"completed",
+            "source_mode":"one_c_only", "history_catalog_version":"2026-10-shared-history-snapshot-v1",
+            "selected_source_row_ids":source_ids, "rows":projected,
+        }
+        encoded = json.dumps(run, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        sizes[count] = len(encoded)
+        assert all(len(row["history_review_candidates"]) == count for row in projected)
+        if count == 3:
+            assert set(projected[0]["route"]) == {
+                "source_mode", "final_source_kind", "history_outcome",
+                "history_safe_basis", "history_catalog_version", "fallback_called",
+            }
+    assert sizes[1] < sizes[2] < sizes[3]
+    assert sizes[3] < MAX_TENDER_RUN_BYTES
+    assert MAX_TENDER_RUN_BYTES == 1024 * 1024
+    print(f"D4B 370-row fuzzy run bytes: one={sizes[1]}, two={sizes[2]}, three={sizes[3]}")
 
 
 def test_tender_price_resolver_uses_only_proven_etm_pricewnds(tender_api, tmp_path):

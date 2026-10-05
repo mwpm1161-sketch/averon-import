@@ -171,7 +171,7 @@ def test_history_results_are_distinct_from_live_provider_offers_and_totals():
     assert "В истории 1С нет безопасно подтверждённого совпадения, а поиск у поставщика завершился ошибкой." in route_copy
     assert "В истории 1С были варианты, требующие проверки; показан результат поставщика." in route_copy
     assert "historyReviewPresentation(candidateList, route)" in result_renderer
-    assert "Похожие названия в истории 1С — совпадение не подтверждено" in app
+    assert "Похожие позиции в истории 1С — требуется ручное сравнение" in app
     assert "Найдено точное название и единица измерения в истории 1С" in app
     assert "Несколько точных вариантов — требуется выбор" in app
     assert "Автоматического подтверждения недостаточно: нужна дополнительная проверка идентичности товара." in app

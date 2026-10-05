@@ -14,6 +14,7 @@ function createSourcingState(overrides = {}) {
     modalPhase: "closed",
     modalContext: "none",
     reviewDetailNavigation: {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false},
+    fuzzyConfirmation: null,
     ...overrides,
   };
 }
@@ -1148,7 +1149,10 @@ function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || 
   if (!state.sourcing) return;
   state.sourcing.modalPhase = phase;
   state.sourcing.modalContext = phase === "closed" ? "none" : context;
-  if (phase === "closed") state.sourcing.reviewDetailNavigation = {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false};
+  if (phase === "closed") {
+    state.sourcing.reviewDetailNavigation = {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false};
+    state.sourcing.fuzzyConfirmation = null;
+  }
   const submit = $("#tender-sourcing-submit");
   if (!submit) return;
   const canLaunch = context === "excel_tender" && ["before_run", "failed"].includes(phase);
@@ -2136,15 +2140,16 @@ async function openExcelTenderRunDetail(runId = null) {
       positions_fallback_called: summary.positions_fallback_called || 0,
       positions_history_review: summary.positions_history_review || 0,
       results: (run.rows || []).map((row) => {
-        const candidates = (row.history_review_candidates || []).map((candidate) => ({
+        const decisionState = decisionRows.get(row.source_row_id);
+        const durableCandidates = decisionState?.candidates || [];
+        const candidates = durableCandidates.map((candidate) => ({
           ...candidate.offer,
           history_retrieval_classification: candidate.offer?.retrieval_classification,
           data_provenance: candidate.price_provenance || {},
         }));
-        const matches = (row.history_review_candidates || []).map((candidate, index) => ({
+        const matches = durableCandidates.map((candidate, index) => ({
           ...(candidate.match || {}), offer: candidates[index],
         }));
-        const decisionState = decisionRows.get(row.source_row_id);
         return {
           intent: {source_row_id:row.source_row_id, ...(row.identity || {}), source_text:row.identity?.normalized_name || ""},
           route: row.route || {}, recommended_offer: row.recommended_offer || null,
@@ -4416,10 +4421,8 @@ function historyReviewPresentation(candidates, route = null) {
   }
   return {
     kind: "fuzzy",
-    title: "Похожие названия в истории 1С — совпадение не подтверждено",
-    explanation: route?.history_reason_code === "source_article_not_found"
-      ? "Точный исходный артикул не найден; похожие записи не подтверждают совпадение."
-      : "Похожие записи служат только для ориентира и не подтверждают идентичность товара.",
+    title: "Похожие позиции в истории 1С — требуется ручное сравнение",
+    explanation: "Автоматически подтвердить совпадение нельзя. Сравните исходную позицию с записью истории.",
   };
 }
 
@@ -4497,6 +4500,7 @@ function renderProjectItemDetails(projectResult, item) {
       detail.sourceRowId = sourceRowId;
       detail.showCompletion = false;
       detail.showEarlierActionableHint = false;
+      if (state.sourcing.fuzzyConfirmation?.sourceRowId !== sourceRowId) state.sourcing.fuzzyConfirmation = null;
     }
   }
   const candidates = projectReviewCandidates(item);
@@ -4582,13 +4586,13 @@ function nextActionableHistoryReviewItem(result, sourceRowId) {
   const ordered = currentPosition < 0 ? sequence : sequence.slice(currentPosition + 1);
   return ordered.find(({item}) => !item.historyEffectiveDecision
     && item.route?.final_source_kind === "history_review"
-    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable))?.item || null;
+    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable || candidate.confirmable_for_explicit_fuzzy))?.item || null;
 }
 
 function hasActionableHistoryReviewItem(result) {
   return projectReviewSequence(result).some(({item}) => !item.historyEffectiveDecision
     && item.route?.final_source_kind === "history_review"
-    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable));
+    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable || candidate.confirmable_for_explicit_fuzzy));
 }
 
 function renderProjectReviewNavigation(result, sourceRowId) {
@@ -4625,6 +4629,42 @@ function renderHumanHistoryDecisionAction(item, candidate) {
   const stateForCandidate = (item.historyDecisionCandidates || []).find((entry) => entry.candidate_offer_id === offer.offer_id);
   if (!stateForCandidate) return "";
   const effective = item.historyEffectiveDecision;
+  const sourceRowId = item.intent?.source_row_id || "";
+  const fuzzy = offer.history_retrieval_classification === "FUZZY";
+  if (effective?.candidate_offer_id === offer.offer_id) {
+    return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
+  }
+  if (fuzzy) {
+    if (!stateForCandidate.confirmable_for_explicit_fuzzy) {
+      return `<p class="history-confirmation-blocked" role="status">${escapeHtml(stateForCandidate.reason_code === "HISTORY_CANDIDATE_SOURCE_CONFLICT" ? "Кандидат противоречит исходным данным и не может быть подтверждён." : "Кандидат не прошёл проверку и не может быть подтверждён.")}</p>`;
+    }
+    const pending = state.sourcing.fuzzyConfirmation;
+    const selected = pending?.sourceRowId === sourceRowId && pending?.offerId === offer.offer_id;
+    if (!selected) return `<button type="button" class="button secondary history-fuzzy-compare" data-row-id="${escapeHtml(sourceRowId)}" data-offer-id="${escapeHtml(offer.offer_id || "")}">Сравнить и подтвердить</button>`;
+    const intent = item.intent || {};
+    const provenance = offer.data_provenance || candidate.price_provenance || {};
+    const value = (raw) => escapeHtml(raw === null || raw === undefined || String(raw).trim() === "" ? "Не указано" : String(raw));
+    const sourceRows = [
+      ["Наименование", intent.normalized_name || intent.source_text], ["Единица", intent.unit],
+      ["Артикул", intent.article], ["Производитель", intent.manufacturer], ["Модель", intent.model],
+    ];
+    const historyRows = [
+      ["Наименование", offer.title], ["Единица", offer.price_unit], ["Артикул", offer.article],
+      ["Производитель", offer.manufacturer], ["Характеристика / модель", offer.history_characteristic],
+      ["Историческая цена", offer.price === null || offer.price === undefined ? "Не указана" : `${offer.price} ${offer.currency || ""} / ${offer.price_unit || "ед."}`],
+      ["Дата закупки", provenance.purchase_date],
+      ...(provenance.counterparty ? [["Контрагент", provenance.counterparty]] : []),
+    ];
+    const compareRows = (rows) => rows.map(([label, fieldValue]) => `<div class="history-fuzzy-compare-row"><span>${escapeHtml(label)}</span><b>${value(fieldValue)}</b></div>`).join("");
+    const identity = `data-row-id="${escapeHtml(sourceRowId)}" data-offer-id="${escapeHtml(offer.offer_id || "")}"`;
+    return `<section class="history-fuzzy-confirmation" aria-label="Сравнение позиции с историей 1С">
+      <div class="history-fuzzy-comparison"><section><h4>Исходная позиция</h4>${compareRows(sourceRows)}</section><section><h4>История 1С</h4>${compareRows(historyRows)}</section></div>
+      <p class="history-fuzzy-warning">Название отличается и совпадение не подтверждено автоматически.</p>
+      <p class="history-fuzzy-warning">Подтвердите только если это действительно одна и та же позиция.</p>
+      <label class="history-fuzzy-assertion-label"><input type="checkbox" class="history-fuzzy-assertion" data-offer-id="${escapeHtml(offer.offer_id || "")}"> Я подтверждаю, что это одна и та же позиция</label>
+      <div class="history-confirmation-actions"><button type="button" class="button secondary history-fuzzy-cancel" ${identity}>Отмена</button><button type="button" class="button secondary history-fuzzy-confirm" ${identity} disabled>Подтвердить совпадение</button><button type="button" class="button primary history-fuzzy-confirm-and-next" ${identity} disabled>Подтвердить и далее</button></div>
+    </section>`;
+  }
   if (!stateForCandidate.confirmable) {
     const explanations = {
       HISTORY_CANDIDATE_SOURCE_CONFLICT: "Кандидат нельзя подтвердить из-за противоречия с исходными данными.",
@@ -4635,17 +4675,38 @@ function renderHumanHistoryDecisionAction(item, candidate) {
     };
     return `<p class="history-confirmation-blocked" role="status">${escapeHtml(explanations[stateForCandidate.reason_code] || "Кандидат не прошёл проверку и не может быть подтверждён.")}</p>`;
   }
-  if (effective?.candidate_offer_id === offer.offer_id) {
-    return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
-  }
-  const identity = `data-row-id="${escapeHtml(item.intent?.source_row_id || "")}" data-offer-id="${escapeHtml(offer.offer_id || "")}"`;
+  const identity = `data-row-id="${escapeHtml(sourceRowId)}" data-offer-id="${escapeHtml(offer.offer_id || "")}"`;
   return `<div class="history-human-confirmation"><p>Это историческая закупка из 1С. Подтверждение удостоверяет только идентичность позиции; дата и цена остаются историческими.</p><div class="history-confirmation-actions"><button type="button" class="button secondary history-confirm-candidate" ${identity}>Подтвердить эту запись</button><button type="button" class="button primary history-confirm-and-next" ${identity}>Подтвердить и далее</button></div></div>`;
 }
 
 function bindHumanHistoryDecisionActions(projectResult, item) {
+  const sourceRowId = item.intent?.source_row_id || "";
+  for (const button of $$("#sourcing-content .history-fuzzy-compare")) {
+    button.addEventListener("click", () => {
+      if (button.disabled) return;
+      state.sourcing.fuzzyConfirmation = {sourceRowId:button.dataset.rowId, offerId:button.dataset.offerId};
+      renderProjectItemDetails(projectResult, item);
+    });
+  }
+  for (const button of $$("#sourcing-content .history-fuzzy-cancel")) {
+    button.addEventListener("click", () => {
+      if (button.disabled || button.dataset.rowId !== sourceRowId) return;
+      state.sourcing.fuzzyConfirmation = null;
+      renderProjectItemDetails(projectResult, item);
+    });
+  }
+  for (const checkbox of $$("#sourcing-content .history-fuzzy-assertion")) {
+    checkbox.addEventListener("change", () => {
+      for (const button of $$("#sourcing-content .history-fuzzy-confirm, #sourcing-content .history-fuzzy-confirm-and-next")) {
+        if (button.dataset.offerId === checkbox.dataset.offerId) button.disabled = !checkbox.checked;
+      }
+    });
+  }
   const buttons = [
     ...$$("#sourcing-content .history-confirm-candidate"),
     ...$$("#sourcing-content .history-confirm-and-next"),
+    ...$$("#sourcing-content .history-fuzzy-confirm"),
+    ...$$("#sourcing-content .history-fuzzy-confirm-and-next"),
     ...$$("#sourcing-content .history-revoke-confirmation"),
   ];
   for (const button of buttons) {
@@ -4656,13 +4717,21 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
       if (!workspace || !runId) return;
       if (button.disabled) return;
       const isRevoke = button.classList.contains("history-revoke-confirmation");
-      const advanceAfterConfirm = button.classList.contains("history-confirm-and-next");
+      const fuzzyConfirmation = button.classList.contains("history-fuzzy-confirm")
+        || button.classList.contains("history-fuzzy-confirm-and-next");
+      const advanceAfterConfirm = button.classList.contains("history-confirm-and-next")
+        || button.classList.contains("history-fuzzy-confirm-and-next");
+      if (fuzzyConfirmation) {
+        const assertion = $$("#sourcing-content .history-fuzzy-assertion")
+          .find((checkbox) => checkbox.dataset.offerId === button.dataset.offerId);
+        if (!assertion?.checked) return;
+      }
       const excelTenderProject = isExcelTenderProjectResult(projectResult);
       const detail = state.sourcing?.reviewDetailNavigation;
       if (excelTenderProject && (!detail || detail.sourceRowId !== sourceRowId || detail.requestPending)) return;
       if (excelTenderProject) {
         detail.requestPending = true;
-        for (const pendingButton of $$("#sourcing-content .history-confirm-candidate, #sourcing-content .history-confirm-and-next, #sourcing-content .history-revoke-confirmation, #sourcing-content .project-review-previous, #sourcing-content .project-review-next, #sourcing-content .project-results-back")) {
+        for (const pendingButton of $$("#sourcing-content .history-confirm-candidate, #sourcing-content .history-confirm-and-next, #sourcing-content .history-fuzzy-compare, #sourcing-content .history-fuzzy-cancel, #sourcing-content .history-fuzzy-confirm, #sourcing-content .history-fuzzy-confirm-and-next, #sourcing-content .history-revoke-confirmation, #sourcing-content .project-review-previous, #sourcing-content .project-review-next, #sourcing-content .project-results-back")) {
           pendingButton.disabled = true;
         }
       }
@@ -4676,7 +4745,11 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
           method:"POST", headers:{"Content-Type":"application/json"},
           body:JSON.stringify(isRevoke
             ? {decision:"REVOKE_HISTORY_CONFIRMATION", expected_revision:projectResult.historyDecisionRevision}
-            : {decision:"CONFIRM_HISTORY_CANDIDATE", source_row_id:button.dataset.rowId, candidate_offer_id:button.dataset.offerId, expected_revision:projectResult.historyDecisionRevision}),
+            : {
+              decision:"CONFIRM_HISTORY_CANDIDATE", source_row_id:button.dataset.rowId,
+              candidate_offer_id:button.dataset.offerId, expected_revision:projectResult.historyDecisionRevision,
+              ...(fuzzyConfirmation ? {confirmation_mode:"EXPLICIT_FUZZY_IDENTITY", explicit_identity_assertion:true} : {}),
+            }),
         });
         applyTenderHistoryDecisionSnapshot(projectResult, response);
         const detailStillCurrent = !excelTenderProject || (
@@ -4687,6 +4760,7 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
         );
         if (!detailStillCurrent) return;
         if (excelTenderProject) detail.requestPending = false;
+        if (fuzzyConfirmation) state.sourcing.fuzzyConfirmation = null;
         if (isRevoke && excelTenderProject) {
           detail.showCompletion = false;
           detail.showEarlierActionableHint = false;

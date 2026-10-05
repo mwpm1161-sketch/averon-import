@@ -24,7 +24,7 @@ from .repository import TenderWorkspaceError, TenderWorkspaceRepository
 MAX_HISTORY_DECISION_EVENTS_PER_RUN = 1000
 MAX_HISTORY_DECISION_LEDGER_BYTES = 2 * 1024 * 1024
 _ID_RE = re.compile(r"^[a-f0-9]{32}$")
-_HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}
+_HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT", "FUZZY"}
 _OFFER_FIELDS = {
     "offer_id", "provider", "source_item_id", "title", "article", "manufacturer",
     "brand", "price", "currency", "price_unit", "retrieved_at", "retrieval_classification",
@@ -39,6 +39,63 @@ _MATCH_FIELDS = {
     "decision", "offer_id", "matched_attributes", "supporting_attributes",
     "conflicting_attributes", "missing_attributes",
 }
+
+
+def _expand_review_candidate(candidate: Any) -> dict[str, Any]:
+    """Expand the compact immutable FUZZY_V1 run projection to the review contract."""
+    if not isinstance(candidate, dict) or set(candidate) != {"fuzzy_v1"}:
+        return candidate if isinstance(candidate, dict) else {}
+    compact = candidate.get("fuzzy_v1")
+    if (
+        not isinstance(compact, dict)
+        or set(compact) != {"classification", "provider", "identity", "provenance", "match", "rank"}
+        or compact.get("classification") != "FUZZY"
+        or compact.get("provider") != "1c"
+    ):
+        return {}
+    identity = compact.get("identity")
+    provenance_values = compact.get("provenance")
+    match_values = compact.get("match")
+    rank = compact.get("rank")
+    if (
+        not isinstance(identity, list) or len(identity) != 10
+        or not isinstance(provenance_values, list) or len(provenance_values) != 10
+        or not isinstance(match_values, list) or len(match_values) != 4
+        or isinstance(rank, bool) or not isinstance(rank, int)
+    ):
+        return {}
+    (
+        offer_id, source_item_id, title, article, manufacturer, characteristic,
+        price, currency, price_unit, retrieved_at,
+    ) = identity
+    source_token, source_kind_token, snapshot, history_item_id, event_id, purchase_date, price_basis_token, effective_price, currency_basis, unit_family = provenance_values
+    decision, match_offer_id_matches, conflicts, missing = match_values
+    if not isinstance(match_offer_id_matches, bool):
+        return {}
+    return {
+        "offer": {
+            "offer_id":offer_id, "provider":"one_c_history", "source_item_id":source_item_id,
+            "title":title, "article":article, "manufacturer":manufacturer, "brand":"",
+            "history_characteristic":characteristic, "price":price, "currency":currency,
+            "price_unit":price_unit, "retrieved_at":retrieved_at,
+            "retrieval_classification":"FUZZY",
+        },
+        "price_provenance": {
+            "source":"one_c_history" if source_token == "1c" else source_token,
+            "source_kind":"historical_purchase" if source_kind_token == "purchase" else source_kind_token,
+            "snapshot_version":snapshot, "history_item_id":history_item_id,
+            "selected_event_id":event_id, "purchase_date":purchase_date,
+            "price_basis":"gross_including_vat" if price_basis_token == "gross" else price_basis_token,
+            "effective_unit_price_gross":effective_price,
+            "currency_basis":currency_basis, "unit_family":unit_family,
+        },
+        "match": {
+            "decision":decision, "offer_id":offer_id if match_offer_id_matches else "",
+            "matched_attributes":[], "supporting_attributes":[],
+            "conflicting_attributes":conflicts, "missing_attributes":missing,
+        },
+        "retrieval_rank":rank,
+    }
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -87,6 +144,7 @@ def _safe_match_projection(value: Any) -> dict[str, Any] | None:
 
 
 def _public_review_candidate(candidate: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    candidate = _expand_review_candidate(candidate)
     if not isinstance(candidate, dict):
         return {}, {}, {}
     raw_offer = candidate.get("offer") if isinstance(candidate.get("offer"), dict) else {}
@@ -118,6 +176,7 @@ def _public_review_candidate(candidate: Any) -> tuple[dict[str, Any], dict[str, 
 def _candidate_fingerprint(
     *, tender_id: str, workspace: dict[str, Any], run: dict[str, Any], source: dict[str, Any],
     canonical: dict[str, Any], candidate: dict[str, Any],
+    confirmation_basis: str | None = None, identity_assertion: str | None = None,
 ) -> str:
     offer = candidate["offer"]
     provenance = candidate["price_provenance"]
@@ -161,12 +220,35 @@ def _candidate_fingerprint(
         history_characteristic = offer.get("history_characteristic")
         if isinstance(history_characteristic, str) and history_characteristic.strip():
             evidence["history_characteristic"] = history_characteristic
+    elif offer.get("retrieval_classification") == "FUZZY":
+        # Fuzzy decisions use a distinct, explicit authority contract. Preserve
+        # legacy exact/normalized fingerprints while binding all weak-identity
+        # evidence and the persisted retrieval position here.
+        evidence.update({
+            "confirmation_basis": confirmation_basis,
+            "identity_assertion": identity_assertion,
+            "retrieval_rank": candidate.get("retrieval_rank"),
+            "history_characteristic": offer.get("history_characteristic", ""),
+            "source_identity_full": {
+                key: source.get(key)
+                for key in ("name", "resource_code", "article", "manufacturer", "model", "raw_unit", "quantity", "quantity_trusted", "unit_basis")
+            },
+            "candidate_identity_full": {
+                key: offer.get(key)
+                for key in ("title", "article", "manufacturer", "brand", "source_item_id", "history_characteristic")
+            },
+            "commercial_provenance": provenance,
+            "match_evidence_full": match,
+        })
     return _sha256(evidence)
 
 
 def _confirmation_basis(candidate: dict[str, Any]) -> str:
     offer = candidate.get("offer") if isinstance(candidate.get("offer"), dict) else {}
-    return "NORMALIZED_CONFIRMATION" if offer.get("retrieval_classification") == "NORMALIZED_NAME_UNIT" else "EXACT_CONFIRMATION"
+    classification = offer.get("retrieval_classification")
+    if classification == "FUZZY":
+        return "FUZZY_MANUAL_CONFIRMATION"
+    return "NORMALIZED_CONFIRMATION" if classification == "NORMALIZED_NAME_UNIT" else "EXACT_CONFIRMATION"
 
 
 def _candidate_gate(
@@ -176,20 +258,35 @@ def _candidate_gate(
     source: dict[str, Any],
     canonical: dict[str, Any],
     candidate: dict[str, Any],
+    *, confirmation_mode: str | None = None, explicit_identity_assertion: bool = False,
 ) -> tuple[str | None, str | None]:
     """Return (reason code, fingerprint); None reason means confirmable."""
-    if not isinstance(candidate, dict) or set(candidate) != {"offer", "price_provenance", "match"}:
+    candidate = _expand_review_candidate(candidate)
+    if not isinstance(candidate, dict):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     offer = candidate.get("offer")
+    if not isinstance(offer, dict):
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+    classification = offer.get("retrieval_classification")
+    expected_candidate_keys = {"offer", "price_provenance", "match"}
+    if classification == "FUZZY":
+        expected_candidate_keys.add("retrieval_rank")
+        rank = candidate.get("retrieval_rank")
+        if isinstance(rank, bool) or not isinstance(rank, int) or not 1 <= rank <= 3:
+            return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+    if set(candidate) != expected_candidate_keys:
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     provenance = candidate.get("price_provenance")
     match = _safe_match_projection(candidate.get("match"))
-    if not isinstance(offer, dict) or set(offer) - _OFFER_FIELDS:
+    if set(offer) - _OFFER_FIELDS:
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     required_offer_strings = {
         "offer_id":180, "provider":40, "source_item_id":180, "title":500,
         "article":180, "manufacturer":180, "brand":180, "currency":12,
         "price_unit":80, "retrieved_at":40, "retrieval_classification":40,
     }
+    if classification == "FUZZY":
+        required_offer_strings.pop("brand")
     if any(not isinstance(offer.get(key), str) or len(offer[key]) > limit for key, limit in required_offer_strings.items()):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if "history_characteristic" in offer and (
@@ -222,8 +319,14 @@ def _candidate_gate(
         or route.get("history_catalog_version") != run.get("history_catalog_version")
     ):
         return "HISTORY_CANDIDATE_SNAPSHOT_INVALID", None
-    classification = offer.get("retrieval_classification")
     if classification not in _HISTORY_CLASSES:
+        return "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
+    if classification == "FUZZY":
+        if confirmation_mode != "EXPLICIT_FUZZY_IDENTITY" or explicit_identity_assertion is not True:
+            return "HISTORY_CANDIDATE_EXPLICIT_ASSERTION_REQUIRED", None
+        if match.get("decision") != "REVIEW":
+            return "HISTORY_CANDIDATE_MATCH_NOT_REVIEW", None
+    elif confirmation_mode is not None or explicit_identity_assertion:
         return "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
     if offer.get("provider") != "one_c_history" or provenance.get("source") != "one_c_history" or provenance.get("source_kind") != "historical_purchase":
         return "HISTORY_CANDIDATE_PROVENANCE_INVALID", None
@@ -307,6 +410,8 @@ def _candidate_gate(
         fingerprint = _candidate_fingerprint(
             tender_id=tender_id, workspace=workspace, run=run, source=source,
             canonical=canonical, candidate=candidate,
+            confirmation_basis="FUZZY_MANUAL_CONFIRMATION" if classification == "FUZZY" else None,
+            identity_assertion="SAME_PRODUCT_V1" if classification == "FUZZY" else None,
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
@@ -385,13 +490,22 @@ class TenderHistoryDecisionStore:
                         "history_item_id", "selected_event_id",
                     }
                     allowed_with_basis = allowed | {"confirmation_basis"}
+                    allowed_fuzzy = allowed | {"confirmation_basis", "identity_assertion"}
                     required = ("source_row_id", "candidate_offer_id", "evidence_fingerprint", "history_snapshot_version", "history_item_id", "selected_event_id")
                     if (
-                        set(event) not in (allowed, allowed_with_basis)
+                        set(event) not in (allowed, allowed_with_basis, allowed_fuzzy)
                         or any(not isinstance(event.get(key), str) or not event[key] or len(event[key]) > 200 for key in required)
                         or not _ID_RE.fullmatch(event["source_row_id"])
                         or not re.fullmatch(r"[a-f0-9]{64}", event["evidence_fingerprint"])
-                        or event.get("confirmation_basis") not in (None, "NORMALIZED_CONFIRMATION")
+                        or event.get("confirmation_basis") not in (None, "NORMALIZED_CONFIRMATION", "FUZZY_MANUAL_CONFIRMATION")
+                        or (
+                            event.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION"
+                            and (set(event) != allowed_fuzzy or event.get("identity_assertion") != "SAME_PRODUCT_V1")
+                        )
+                        or (
+                            event.get("confirmation_basis") != "FUZZY_MANUAL_CONFIRMATION"
+                            and ("identity_assertion" in event or set(event) == allowed_fuzzy)
+                        )
                     ):
                         raise ValueError("confirmation shape")
                     confirm_ids.add(decision_id)
@@ -449,32 +563,48 @@ class TenderHistoryDecisionStore:
             candidates = projected if isinstance(projected, list) else []
             candidate_details = []
             for candidate in candidates:
-                reason, fingerprint = _candidate_gate(tender_id, workspace, run, source, canonical, candidate)
+                candidate = _expand_review_candidate(candidate)
                 offer, public_provenance, public_match = _public_review_candidate(candidate)
                 candidate_id = str((offer or {}).get("offer_id") or "")
+                classification = offer.get("retrieval_classification") if isinstance(offer, dict) else None
+                if classification == "FUZZY":
+                    fuzzy_reason, fuzzy_fingerprint = _candidate_gate(
+                        tender_id, workspace, run, source, canonical, candidate,
+                        confirmation_mode="EXPLICIT_FUZZY_IDENTITY", explicit_identity_assertion=True,
+                    )
+                    reason, fingerprint = fuzzy_reason, None
+                else:
+                    reason, fingerprint = _candidate_gate(tender_id, workspace, run, source, canonical, candidate)
+                    fuzzy_reason, fuzzy_fingerprint = "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
                 detail = {
                     "candidate_offer_id": candidate_id,
                     "offer": offer,
                     "price_provenance": public_provenance,
                     "match": public_match,
-                    "confirmable": reason is None,
-                    "reason_code": reason,
+                    "confirmable": classification != "FUZZY" and reason is None,
+                    "reason_code": fuzzy_reason if classification == "FUZZY" else reason,
                     "evidence_fingerprint": fingerprint,
                     "decision": None,
                     "confirmation_basis": _confirmation_basis(candidate),
+                    "retrieval_rank": candidate.get("retrieval_rank") if classification == "FUZZY" else None,
+                    "confirmable_for_explicit_fuzzy": classification == "FUZZY" and fuzzy_reason is None,
+                    "fuzzy_evidence_fingerprint": fuzzy_fingerprint,
                 }
                 candidate_details.append(detail)
-                if reason is None and fingerprint:
+                effective_fingerprint = fuzzy_fingerprint if classification == "FUZZY" else fingerprint
+                expected_basis = _confirmation_basis(candidate)
+                if effective_fingerprint:
                     for index, event in enumerate(events):
                         if (
                             event["decision_type"] == "CONFIRM_HISTORY_CANDIDATE"
-                            and event.get("confirmation_basis", "EXACT_CONFIRMATION") == _confirmation_basis(candidate)
+                            and event.get("confirmation_basis", "EXACT_CONFIRMATION") == expected_basis
+                            and (classification != "FUZZY" or event.get("identity_assertion") == "SAME_PRODUCT_V1")
                             and event.get("source_row_id") == row_id
                             and event.get("candidate_offer_id") == candidate_id
-                            and event.get("evidence_fingerprint") == fingerprint
+                            and event.get("evidence_fingerprint") == effective_fingerprint
                             and event["decision_id"] not in revoked
                         ):
-                            valid_confirms.setdefault(row_id, []).append((index, event, candidate, fingerprint))
+                            valid_confirms.setdefault(row_id, []).append((index, event, candidate, effective_fingerprint))
             candidates_by_row[row_id] = candidate_details
         effective: dict[str, dict[str, Any]] = {}
         for row_id, confirmations in valid_confirms.items():
@@ -490,9 +620,16 @@ class TenderHistoryDecisionStore:
                 "candidate": candidate,
                 "confirmation_basis": event.get("confirmation_basis", "EXACT_CONFIRMATION"),
             }
+            if event.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION":
+                item["identity_assertion"] = event["identity_assertion"]
             effective[row_id] = item
             for detail in candidates_by_row.get(row_id, []):
-                if detail["candidate_offer_id"] == item["candidate_offer_id"] and detail["evidence_fingerprint"] == fingerprint:
+                detail_fingerprint = (
+                    detail.get("fuzzy_evidence_fingerprint")
+                    if detail.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION"
+                    else detail.get("evidence_fingerprint")
+                )
+                if detail["candidate_offer_id"] == item["candidate_offer_id"] and detail_fingerprint == fingerprint:
                     detail["decision"] = {key: item[key] for key in ("decision_id", "created_at")}
         digest_items = [
             {"source_row_id": row_id, "decision_id": item["decision_id"], "candidate_offer_id": item["candidate_offer_id"], "evidence_fingerprint": item["evidence_fingerprint"]}
@@ -527,7 +664,8 @@ class TenderHistoryDecisionStore:
     def confirm(
         self, workspace_path: Path, workspace: dict[str, Any], run: dict[str, Any], *, tender_id: str,
         run_id: str, source_row_id: str, candidate_offer_id: str, expected_revision: int,
-        actor_username: str, actor_role: str,
+        actor_username: str, actor_role: str, confirmation_mode: str | None = None,
+        explicit_identity_assertion: bool | None = None,
     ) -> dict[str, Any]:
         ledger_path = self._path(workspace_path, tender_id, run_id)
         with self.repository._lock, self._lock:
@@ -540,7 +678,21 @@ class TenderHistoryDecisionStore:
             detail = next((item for item in row_state["candidates"] if item["candidate_offer_id"] == candidate_offer_id), None)
             if detail is None:
                 raise TenderWorkspaceError("Вариант истории не найден.", 404, "TENDER_HISTORY_CANDIDATE_NOT_FOUND")
-            if not detail["confirmable"]:
+            fuzzy_candidate = detail.get("offer", {}).get("retrieval_classification") == "FUZZY"
+            if fuzzy_candidate:
+                if (
+                    confirmation_mode != "EXPLICIT_FUZZY_IDENTITY"
+                    or explicit_identity_assertion is not True
+                    or detail.get("confirmable_for_explicit_fuzzy") is not True
+                    or not detail.get("fuzzy_evidence_fingerprint")
+                ):
+                    raise TenderWorkspaceError("Для похожей записи требуется отдельное явное подтверждение идентичности.", 409, "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE")
+                evidence_fingerprint = detail["fuzzy_evidence_fingerprint"]
+            else:
+                if confirmation_mode is not None or explicit_identity_assertion is not None or not detail["confirmable"]:
+                    raise TenderWorkspaceError("Этот вариант нельзя подтвердить из-за недостаточных или противоречивых данных.", 409, "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE")
+                evidence_fingerprint = detail["evidence_fingerprint"]
+            if evidence_fingerprint is None:
                 raise TenderWorkspaceError("Этот вариант нельзя подтвердить из-за недостаточных или противоречивых данных.", 409, "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE")
             candidate = detail
             offer = candidate["offer"]
@@ -554,13 +706,16 @@ class TenderHistoryDecisionStore:
                 "run_id": run_id,
                 "source_row_id": source_row_id,
                 "candidate_offer_id": candidate_offer_id,
-                "evidence_fingerprint": candidate["evidence_fingerprint"],
+                "evidence_fingerprint": evidence_fingerprint,
                 "history_snapshot_version": provenance["snapshot_version"],
                 "history_item_id": provenance["history_item_id"],
                 "selected_event_id": provenance["selected_event_id"],
             }
             if _confirmation_basis(candidate) == "NORMALIZED_CONFIRMATION":
                 event["confirmation_basis"] = "NORMALIZED_CONFIRMATION"
+            elif _confirmation_basis(candidate) == "FUZZY_MANUAL_CONFIRMATION":
+                event["confirmation_basis"] = "FUZZY_MANUAL_CONFIRMATION"
+                event["identity_assertion"] = "SAME_PRODUCT_V1"
             ledger = self._read(ledger_path, tender_id, run_id)
             self._append(ledger_path, ledger, event)
             return self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)

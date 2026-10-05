@@ -431,6 +431,18 @@ button { cursor: pointer; }
 .history-human-confirmation p { margin:0; line-height:1.45; }
 .history-human-confirmation span { color:#475569; }
 .history-confirmation-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.history-fuzzy-confirmation { display:grid; gap:10px; padding:14px; border:1px solid #cbd5e1; border-radius:12px; background:#f8fafc; }
+.history-fuzzy-comparison { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+.history-fuzzy-comparison > section { min-width:0; padding:12px; border:1px solid #e2e8f0; border-radius:10px; background:#fff; }
+.history-fuzzy-comparison h4 { margin:0 0 8px; font-size:14px; }
+.history-fuzzy-compare-row { display:grid; grid-template-columns:minmax(100px,.7fr) minmax(0,1.3fr); gap:8px; padding:5px 0; border-top:1px solid #f1f5f9; font-size:12px; }
+.history-fuzzy-compare-row span { color:#64748b; }
+.history-fuzzy-compare-row b { overflow-wrap:anywhere; font-weight:600; }
+.history-fuzzy-warning { margin:0; color:#7c2d12; font-size:13px; }
+.history-fuzzy-assertion-label { display:flex; align-items:center; gap:8px; font-weight:600; }
+.history-fuzzy-assertion-label input { width:16px; height:16px; }
+.history-fuzzy-confirm:disabled, .history-fuzzy-confirm-and-next:disabled { opacity:.45; cursor:not-allowed; }
+@media (max-width:640px) { .history-fuzzy-comparison { grid-template-columns:1fr; } }
 .project-review-navigation { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:14px 0; padding:9px 12px; border:1px solid #e2e8f0; border-radius:11px; background:#f8fafc; color:#475569; font-size:13px; }
 .project-review-navigation > span { text-align:center; font-weight:600; }
 .project-review-navigation button:disabled { opacity:.45; cursor:default; }

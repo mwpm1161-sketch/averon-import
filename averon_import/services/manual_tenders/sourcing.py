@@ -435,21 +435,46 @@ def canonical_tender_projection(
                 for item in matches
                 if isinstance(item, dict) and isinstance(item.get("offer"), dict)
             }
+            strong_candidates = []
+            fuzzy_candidates = []
             for candidate in offers:
                 if not isinstance(candidate, dict):
                     continue
                 classification = candidate.get("history_retrieval_classification")
-                if classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}:
-                    continue
                 candidate_match = match_by_offer_id.get(str(candidate.get("offer_id") or ""))
                 if not isinstance(candidate_match, dict) or candidate_match.get("decision") == "REJECT":
                     continue
+                entry = (candidate, candidate_match)
+                if classification in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}:
+                    strong_candidates.append(entry)
+                elif classification == "FUZZY":
+                    fuzzy_candidates.append(entry)
+
+            # Strong evidence remains the only durable confirmation set whenever
+            # it exists. Weak candidates are retained only for fuzzy-only review.
+            selected_candidates = [
+                (candidate, candidate_match, None)
+                for candidate, candidate_match in strong_candidates[:_MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW]
+            ]
+            if not selected_candidates:
+                selected_candidates = [
+                    (candidate, candidate_match, rank)
+                    for rank, (candidate, candidate_match) in enumerate(
+                        fuzzy_candidates[:_MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW], start=1,
+                    )
+                ]
+
+            for candidate, candidate_match, retrieval_rank in selected_candidates:
+                classification = candidate.get("history_retrieval_classification")
                 safe_candidate: dict[str, Any] = {}
-                for key, limit in (
+                identity_fields = (
                     ("offer_id", 180), ("provider", 40), ("source_item_id", 180), ("title", 500),
-                    ("article", 180), ("manufacturer", 180), ("brand", 180), ("currency", 12),
+                    ("article", 180), ("manufacturer", 180), ("currency", 12),
                     ("price_unit", 80), ("retrieved_at", 40),
-                ):
+                )
+                if classification != "FUZZY":
+                    identity_fields = identity_fields[:6] + (("brand", 180),) + identity_fields[6:]
+                for key, limit in identity_fields:
                     value = candidate.get(key)
                     if isinstance(value, str):
                         safe_candidate[key] = value[:limit]
@@ -463,13 +488,50 @@ def canonical_tender_projection(
                 if price_value is None or isinstance(price_value, (str, int, float)) and len(str(price_value)) <= 100:
                     safe_candidate["price"] = price_value
                 safe_candidate["retrieval_classification"] = classification
-                history_review_candidates.append({
+                safe_provenance = _safe_price_provenance(candidate)
+                safe_match = _safe_history_review_match(candidate_match)
+                if classification == "FUZZY":
+                    safe_provenance = {
+                        key: value for key, value in safe_provenance.items()
+                        if key not in {"normalizer_revision", "normalized_name_signature"}
+                    }
+                    safe_match = {
+                        key: safe_match.get(key, [])
+                        for key in ("decision", "offer_id", "conflicting_attributes", "missing_attributes")
+                    }
+                durable_candidate = {
                     "offer": safe_candidate,
-                    "price_provenance": _safe_price_provenance(candidate),
-                    "match": _safe_history_review_match(candidate_match),
-                })
-                if len(history_review_candidates) >= _MAX_HISTORY_REVIEW_CANDIDATES_PER_ROW:
-                    break
+                    "price_provenance": safe_provenance,
+                    "match": safe_match,
+                }
+                if retrieval_rank is not None:
+                    # A versioned positional schema keeps realistic 370-row
+                    # fuzzy runs below the unchanged byte cap while retaining
+                    # every identity, commercial, provenance, and conflict fact.
+                    durable_candidate = {"fuzzy_v1": {
+                        "classification": "FUZZY",
+                        "provider": "1c",
+                        "identity": [
+                            safe_candidate.get("offer_id"), safe_candidate.get("source_item_id"),
+                            safe_candidate.get("title"), safe_candidate.get("article", ""),
+                            safe_candidate.get("manufacturer", ""), safe_candidate.get("history_characteristic", ""),
+                            safe_candidate.get("price"), safe_candidate.get("currency"),
+                            safe_candidate.get("price_unit"), safe_candidate.get("retrieved_at"),
+                        ],
+                        "provenance": [
+                            "1c", "purchase", safe_provenance.get("snapshot_version"),
+                            safe_provenance.get("history_item_id"), safe_provenance.get("selected_event_id"),
+                            safe_provenance.get("purchase_date"), "gross",
+                            safe_provenance.get("effective_unit_price_gross"), safe_provenance.get("currency_basis"),
+                            safe_provenance.get("unit_family"),
+                        ],
+                        "match": [
+                            safe_match.get("decision"), safe_match.get("offer_id") == safe_candidate.get("offer_id"),
+                            safe_match.get("conflicting_attributes", []), safe_match.get("missing_attributes", []),
+                        ],
+                        "rank": retrieval_rank,
+                    }}
+                history_review_candidates.append(durable_candidate)
         notices = result.get("notices") if isinstance(result.get("notices"), list) else []
         notice_codes = sorted({
             str(item.get("code")) for item in notices
@@ -484,6 +546,26 @@ def canonical_tender_projection(
                     "price", "currency", "price_unit", "retrieved_at", "availability", "availability_text",
                 )
                 if key in offer
+            }
+        route_projection = {
+            key: route.get(key)
+            for key in (
+                "source_mode", "final_source_kind", "fallback_status", "history_outcome",
+                "history_safe_basis", "history_reason_code", "history_catalog_version",
+                "history_selected_event_id", "history_purchase_date", "history_age_days",
+                "fallback_called", "fallback_provider_key", "fallback_catalog_version",
+                "routing_policy_revision",
+            )
+            if key in route
+        }
+        if history_review_candidates and "fuzzy_v1" in history_review_candidates[0]:
+            route_projection = {
+                key: route_projection[key]
+                for key in (
+                    "source_mode", "final_source_kind", "history_outcome",
+                    "history_safe_basis", "history_catalog_version", "fallback_called",
+                )
+                if key in route_projection
             }
         projection.append({
             "source_row_id": source_row_id,
@@ -504,17 +586,7 @@ def canonical_tender_projection(
                 "provider": (safe_offer or {}).get("provider") or route.get("fallback_provider_key") or "",
                 "source_item_id": (safe_offer or {}).get("source_item_id") or route.get("history_selected_event_id") or "",
             },
-            "route": {
-                key: route.get(key)
-                for key in (
-                    "source_mode", "final_source_kind", "fallback_status", "history_outcome",
-                    "history_safe_basis", "history_reason_code", "history_catalog_version",
-                    "history_selected_event_id",
-                    "history_purchase_date", "history_age_days", "fallback_called",
-                    "fallback_provider_key", "fallback_catalog_version", "routing_policy_revision",
-                )
-                if key in route
-            },
+            "route": route_projection,
             "warning_codes": notice_codes,
         })
     return projection

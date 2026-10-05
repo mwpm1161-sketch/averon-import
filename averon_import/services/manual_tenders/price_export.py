@@ -9,6 +9,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
+import unicodedata
 from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -48,6 +49,10 @@ _LIVE_DECISIONS = {"MATCH", "LIKELY_MATCH"}
 _SAFE_HISTORY_BASES = {"EXACT_ARTICLE", "EXACT_SOURCE_NAME_UNIT"}
 _NON_CONVERTIBLE_UNIT_DIMENSIONS = {"package", "set"}
 _HISTORICAL_FILL = PatternFill(fill_type="solid", fgColor="FFF2CC")
+
+
+def _history_identity_text(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е").replace("\u00a0", " ").split())
 
 
 def _sha256_file(path: Path) -> str:
@@ -389,11 +394,21 @@ class TenderPriceResolver:
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
         retrieval_classification = offer.get("retrieval_classification")
         confirmation_basis = confirmation.get("confirmation_basis")
+        fuzzy_confirmation = confirmation_basis == "FUZZY_MANUAL_CONFIRMATION"
         if (
             offer.get("provider") != "one_c_history"
-            or retrieval_classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT"}
+            or retrieval_classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT", "FUZZY"}
             or (retrieval_classification == "NORMALIZED_NAME_UNIT" and confirmation_basis != "NORMALIZED_CONFIRMATION")
-            or (retrieval_classification != "NORMALIZED_NAME_UNIT" and confirmation_basis != "EXACT_CONFIRMATION")
+            or (retrieval_classification in {"EXACT_ARTICLE", "EXACT_NAME_UNIT"} and confirmation_basis != "EXACT_CONFIRMATION")
+            or (retrieval_classification == "FUZZY" and (
+                not fuzzy_confirmation
+                or confirmation.get("identity_assertion") != "SAME_PRODUCT_V1"
+                or isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), bool)
+                or not isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), int)
+                or not 1 <= confirmation["candidate"]["retrieval_rank"] <= 3
+                or match.get("decision") != "REVIEW"
+            ))
+            or (retrieval_classification != "FUZZY" and confirmation_basis == "FUZZY_MANUAL_CONFIRMATION")
             or match.get("offer_id") != offer.get("offer_id")
             or offer.get("offer_id") != confirmation.get("candidate_offer_id")
         ):
@@ -402,6 +417,14 @@ class TenderPriceResolver:
         if not isinstance(history_characteristic, str) or len(history_characteristic) > 300:
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
         if history_model_characteristic_conflicts(source.get("model"), history_characteristic):
+            return _reason("HISTORY_CANDIDATE_SOURCE_CONFLICT", source, historical=True, human_confirmed=True, audit=audit)
+        source_article = _history_identity_text(source.get("article"))
+        candidate_article = _history_identity_text(offer.get("article"))
+        if source_article and (not candidate_article or source_article != candidate_article):
+            return _reason("HISTORY_CANDIDATE_SOURCE_CONFLICT", source, historical=True, human_confirmed=True, audit=audit)
+        source_manufacturer = _history_identity_text(source.get("manufacturer"))
+        candidate_manufacturer = _history_identity_text(offer.get("manufacturer"))
+        if source_manufacturer and candidate_manufacturer and source_manufacturer != candidate_manufacturer:
             return _reason("HISTORY_CANDIDATE_SOURCE_CONFLICT", source, historical=True, human_confirmed=True, audit=audit)
         if retrieval_classification == "NORMALIZED_NAME_UNIT":
             from averon_import.services.sourcing.history_identity import (
@@ -1814,7 +1837,10 @@ class TenderXlsxPriceExporter:
                     price_cell.fill = _HISTORICAL_FILL
                     total_cell.fill = _HISTORICAL_FILL
                     purchase_date = str((decision.audit_summary or {}).get("purchase_date") or "")
-                    human_note = " Совпадение позиции подтверждено пользователем." if decision.human_confirmed else ""
+                    if decision.human_confirmed and (decision.audit_summary or {}).get("human_confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION":
+                        human_note = " Совпадение позиции явно подтверждено пользователем."
+                    else:
+                        human_note = " Совпадение позиции подтверждено пользователем." if decision.human_confirmed else ""
                     price_cell.comment = Comment(
                         f"Историческая цена по предыдущей покупке 1С от {purchase_date}. "
                         f"Не подтверждает текущую доступность и не является текущим предложением.{human_note}",

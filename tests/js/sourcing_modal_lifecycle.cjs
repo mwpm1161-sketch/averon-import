@@ -132,7 +132,7 @@ assert.equal(context.historyReviewPresentation(
 const fuzzyOnly = historyItem([fuzzy]);
 const fuzzyCandidates = context.projectReviewCandidates(fuzzyOnly);
 assert.equal(context.historyReviewPresentation(fuzzyCandidates, fuzzyOnly.route).title,
-  "Похожие названия в истории 1С — совпадение не подтверждено");
+  "Похожие позиции в истории 1С — требуется ручное сравнение");
 const fuzzyCard = context.renderHistoricalOfferCard(fuzzyCandidates[0], {route: fuzzyOnly.route});
 assert(fuzzyCard.includes("Похожее название · не подтверждено"));
 assert(!fuzzyCard.includes("must-not-overstate"));
