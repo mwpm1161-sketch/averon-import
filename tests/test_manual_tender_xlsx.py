@@ -5305,13 +5305,206 @@ def test_default_row_and_column_dimension_styles_are_semantically_equivalent(tmp
     )
 
 
+def _table_export_workspace(source_path, *, tender_id="table-preservation-test"):
+    parsed = TenderWorkbookParser().parse(source_path, tender_id=tender_id)
+    workspace = {
+        "tender_id": tender_id,
+        "source_sha256": parsed["source_sha256"],
+        "sheet_name": parsed["sheet_name"],
+        "header_row": parsed["header_row"],
+        "table_name": parsed["table_name"],
+        "table_ref": parsed["table_ref"],
+        "mapping": parsed["mapping"],
+        "source_manifest": parsed["manifest"],
+        "rows": parsed["rows"],
+        "logical_right_edge": parsed["logical_right_edge"],
+        "future_output_columns": parsed["future_output_columns"],
+        "counts": parsed["counts"],
+    }
+    return parsed, workspace
+
+
+def _deterministic_export_decisions(parsed):
+    from averon_import.services.manual_tenders.price_export import TenderPriceDecision
+
+    decisions = []
+    unit_price = Decimal("12.34")
+    for row in parsed["rows"]:
+        if row["row_type"] != "item":
+            continue
+        quantity = Decimal(row["quantity"] or "1")
+        decisions.append(TenderPriceDecision(
+            source_row_id=row["source_row_id"],
+            excel_row=row["excel_row"],
+            eligible=True,
+            reason_code=None,
+            source_unit_price=unit_price,
+            total_price=unit_price * quantity,
+            source_kind="deterministic_test_fixture",
+            historical=False,
+            audit_summary={},
+        ))
+    return decisions
+
+
+def _assert_source_owned_tables_preserved(source_path, output_path, parsed, decisions):
+    from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+    from averon_import.services.manual_tenders.price_export import (
+        _package_snapshot, _worksheet_relationship_part_map, _workbook_snapshot,
+    )
+
+    def table_parts(path):
+        with zipfile.ZipFile(path) as archive:
+            return {
+                item.filename.casefold(): (item.filename, archive.read(item.filename))
+                for item in archive.infolist()
+                if re.fullmatch(r"xl/tables/table\d+\.xml", item.filename, re.IGNORECASE)
+            }
+
+    source_tables = table_parts(source_path)
+    output_tables = table_parts(output_path)
+    assert source_tables.keys() == output_tables.keys()
+    assert {key: value[1] for key, value in source_tables.items()} == {
+        key: value[1] for key, value in output_tables.items()
+    }
+
+    source_package = _package_snapshot(source_path)
+    output_package = _package_snapshot(output_path)
+    source_rel = _worksheet_relationship_part_map(source_path)[parsed["sheet_name"]]
+    output_rel = _worksheet_relationship_part_map(output_path)[parsed["sheet_name"]]
+    assert source_rel == output_rel
+    source_table_edges = [
+        edge for edge in source_package["relationships"].get(source_rel, [])
+        if edge[1].casefold().endswith("/table")
+    ]
+    output_table_edges = [
+        edge for edge in output_package["relationships"].get(output_rel, [])
+        if edge[1].casefold().endswith("/table")
+    ]
+    assert output_table_edges == source_table_edges
+    assert len(output_table_edges) == len(output_tables)
+    for part in source_tables:
+        assert output_package["effective_types"][part] == source_package["effective_types"][part]
+
+    source_snapshot = _workbook_snapshot(source_path)
+    output_snapshot = _workbook_snapshot(output_path)
+    source_sheet = next(sheet for sheet in source_snapshot["sheets"] if sheet["name"] == parsed["sheet_name"])
+    output_sheet = next(sheet for sheet in output_snapshot["sheets"] if sheet["name"] == parsed["sheet_name"])
+    source_ag = {
+        cell: value for cell, value in source_sheet["cells"].items()
+        if column_index_from_string(coordinate_from_string(cell)[0]) <= 7
+    }
+    output_ag = {
+        cell: value for cell, value in output_sheet["cells"].items()
+        if column_index_from_string(coordinate_from_string(cell)[0]) <= 7
+    }
+    assert output_ag == source_ag
+
+    workbook = load_workbook(output_path, data_only=False, read_only=False, keep_links=False)
+    try:
+        sheet = workbook[parsed["sheet_name"]]
+        table = sheet.tables["AveronTenderInput"]
+        assert table.name == table.displayName == "AveronTenderInput"
+        assert table.ref == "A1:G501"
+        assert len(table.tableColumns or []) == 7
+        assert sheet["H1"].value == "Цена за единицу"
+        assert sheet["I1"].value == "Общая стоимость"
+        for decision in decisions:
+            assert Decimal(str(sheet[f"H{decision.excel_row}"].value)) == decision.source_unit_price
+            assert Decimal(str(sheet[f"I{decision.excel_row}"].value)) == decision.total_price
+    finally:
+        workbook.close()
+
+
+def test_official_empty_template_exports_without_extending_its_table(tmp_path):
+    import hashlib
+    from averon_import.services.manual_tenders.price_export import TenderXlsxPriceExporter
+
+    source = tmp_path / "official-empty.xlsx"
+    output = tmp_path / "official-empty-export.xlsx"
+    _official(source, include_required=False)
+    parsed, workspace = _table_export_workspace(source)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    result = TenderXlsxPriceExporter().write(source, output, workspace, [])
+
+    assert result["target_columns"] == {"unit_price": "H", "total": "I"}
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha
+    _assert_source_owned_tables_preserved(source, output, parsed, [])
+
+
+def test_third_party_table_default_omission_is_restored_byte_for_byte(tmp_path):
+    import hashlib
+    from xml.etree import ElementTree as ET
+    from averon_import.services.manual_tenders.price_export import TenderXlsxPriceExporter
+
+    source = tmp_path / "third-party-default-omitted.xlsx"
+    output = tmp_path / "third-party-default-omitted-export.xlsx"
+    _official(source)
+
+    def omit_default_header_count(parts):
+        part = next(name for name in parts if re.fullmatch(r"xl/tables/table\d+\.xml", name, re.IGNORECASE))
+        root = ET.fromstring(parts[part])
+        root.attrib.pop("headerRowCount", None)
+        parts[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    _rewrite_xlsx_parts(source, omit_default_header_count)
+    with zipfile.ZipFile(source) as archive:
+        source_table_bytes = archive.read("xl/tables/table1.xml")
+    assert b"headerRowCount" not in source_table_bytes
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    parsed, workspace = _table_export_workspace(source)
+    decisions = _deterministic_export_decisions(parsed)
+
+    result = TenderXlsxPriceExporter().write(source, output, workspace, decisions)
+
+    assert len(decisions) == 1
+    assert result["target_columns"] == {"unit_price": "H", "total": "I"}
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha
+    with zipfile.ZipFile(output) as archive:
+        assert archive.read("xl/tables/table1.xml") == source_table_bytes
+    _assert_source_owned_tables_preserved(source, output, parsed, decisions)
+
+
+def test_real_table_default_omission_exports_without_source_mutation(tmp_path):
+    import hashlib
+    from averon_import.services.manual_tenders.price_export import TenderXlsxPriceExporter
+
+    configured_path = os.environ.get("AVERON_REAL_TABLE_PRESERVATION_XLSX")
+    if not configured_path or not Path(configured_path).is_file():
+        pytest.skip("Set AVERON_REAL_TABLE_PRESERVATION_XLSX to run the real XLSX preservation regression.")
+    source = Path(configured_path)
+    output = tmp_path / "real-table-preservation-export.xlsx"
+    parsed, workspace = _table_export_workspace(source, tender_id="real-table-preservation-test")
+    decisions = _deterministic_export_decisions(parsed)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert parsed["mapping_required"] is False
+    assert parsed["table_name"] == "AveronTenderInput"
+    assert parsed["table_ref"] == "A1:G501"
+    assert parsed["logical_right_edge"] == 7
+    assert parsed["item_count"] == len(decisions) == 2
+
+    result = TenderXlsxPriceExporter().write(source, output, workspace, decisions)
+
+    assert result["target_columns"] == {"unit_price": "H", "total": "I"}
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha
+    _assert_source_owned_tables_preserved(source, output, parsed, decisions)
+
+
 @pytest.mark.parametrize(
     "mutation",
-    ["table_ref", "table_column_name_order", "relationship_target", "relationship_type", "effective_content_type", "opaque_loss"],
+    [
+        "table_ref", "table_name", "table_display_name", "table_column_name", "table_column_name_order",
+        "table_column_count", "table_auto_filter", "table_nondefault_header_count", "table_totals_count",
+        "table_totals_shown", "table_style", "table_deleted", "unexpected_table_added",
+        "relationship_target", "relationship_type", "effective_content_type", "opaque_loss",
+    ],
 )
 def test_export_package_verifier_rejects_ooxml_mutations(tmp_path, mutation):
     from xml.etree import ElementTree as ET
-    from averon_import.services.manual_tenders.price_export import _verify_package_roundtrip
+    from averon_import.services.manual_tenders.price_export import (
+        _restore_source_owned_package_metadata, _verify_package_roundtrip,
+    )
 
     source = tmp_path / "package-source.xlsx"
     output = tmp_path / "package-output.xlsx"
@@ -5319,29 +5512,113 @@ def test_export_package_verifier_rejects_ooxml_mutations(tmp_path, mutation):
     sheet = workbook.active
     sheet.append(["Description", "Quantity"])
     sheet.append(["A source row", 4])
-    from openpyxl.worksheet.table import Table
-    sheet.add_table(Table(displayName="PackageTable", ref="A1:B2"))
+    sheet.append([None, None, "Other description", "Other quantity"])
+    sheet.append([None, None, "other", "value"])
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    table = Table(displayName="PackageTable", ref="A1:B2")
+    table.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=True)
+    sheet.add_table(table)
     workbook.save(source)
     workbook.close()
+
+    def omit_default_header_count(parts):
+        name = next(part for part in parts if re.fullmatch(r"xl/tables/table\d+\.xml", part, re.IGNORECASE))
+        root = ET.fromstring(parts[name])
+        root.attrib.pop("headerRowCount", None)
+        parts[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    _rewrite_xlsx_parts(source, omit_default_header_count)
     opened = load_workbook(source)
     opened.save(output)
     opened.close()
+    _restore_source_owned_package_metadata(source, output)
 
     def entries(path):
         with zipfile.ZipFile(path) as archive:
             return {item.filename: archive.read(item.filename) for item in archive.infolist()}
 
     parts = entries(output)
-    if mutation in {"table_ref", "table_column_name_order"}:
+    if mutation.startswith("table_") and mutation != "table_deleted":
         name = next(part for part in parts if re.fullmatch(r"xl/tables/table\d+\.xml", part, re.IGNORECASE))
         root = ET.fromstring(parts[name])
         if mutation == "table_ref":
-            root.attrib["ref"] = "A1:B1"
-        else:
+            root.attrib["ref"] = "A1:C2"
+        elif mutation == "table_name":
+            root.attrib["name"] = "ChangedPackageTable"
+        elif mutation == "table_display_name":
+            root.attrib["displayName"] = "ChangedPackageTableDisplay"
+        elif mutation in {"table_column_name", "table_column_name_order", "table_column_count"}:
             columns = next(node for node in root.iter() if node.tag.endswith("tableColumns"))
-            first, second = list(columns)
-            first.attrib["name"], second.attrib["name"] = second.attrib["name"], first.attrib["name"]
+            if mutation == "table_column_name":
+                list(columns)[0].attrib["name"] = "Changed column"
+            elif mutation == "table_column_name_order":
+                first, second = list(columns)
+                first.attrib["name"], second.attrib["name"] = second.attrib["name"], first.attrib["name"]
+            else:
+                columns.remove(list(columns)[-1])
+                columns.attrib["count"] = str(len(columns))
+        elif mutation == "table_auto_filter":
+            next(node for node in root.iter() if node.tag.endswith("autoFilter")).attrib["ref"] = "A1:B1"
+        elif mutation == "table_nondefault_header_count":
+            root.attrib["headerRowCount"] = "0"
+        elif mutation == "table_totals_count":
+            root.attrib["totalsRowCount"] = "1"
+        elif mutation == "table_totals_shown":
+            root.attrib["totalsRowShown"] = "1"
+        elif mutation == "table_style":
+            next(node for node in root.iter() if node.tag.endswith("tableStyleInfo")).attrib["name"] = "TableStyleMedium2"
         parts[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    elif mutation == "table_deleted":
+        table_name = next(part for part in parts if re.fullmatch(r"xl/tables/table\d+\.xml", part, re.IGNORECASE))
+        parts.pop(table_name)
+        sheet_parts = parts["xl/worksheets/sheet1.xml"]
+        sheet_root = ET.fromstring(sheet_parts)
+        table_parts_node = next(node for node in sheet_root.iter() if node.tag.endswith("tableParts"))
+        sheet_root.remove(table_parts_node)
+        parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet_root, encoding="utf-8", xml_declaration=True)
+        rel_name = "xl/worksheets/_rels/sheet1.xml.rels"
+        rel_root = ET.fromstring(parts[rel_name])
+        for relation in list(rel_root):
+            if relation.attrib.get("Type", "").endswith("/table"):
+                rel_root.remove(relation)
+        parts[rel_name] = ET.tostring(rel_root, encoding="utf-8", xml_declaration=True)
+        content_root = ET.fromstring(parts["[Content_Types].xml"])
+        for override in list(content_root):
+            if override.attrib.get("PartName", "").casefold() == "/" + table_name.casefold():
+                content_root.remove(override)
+        parts["[Content_Types].xml"] = ET.tostring(content_root, encoding="utf-8", xml_declaration=True)
+    elif mutation == "unexpected_table_added":
+        table_name = next(part for part in parts if re.fullmatch(r"xl/tables/table\d+\.xml", part, re.IGNORECASE))
+        unexpected_root = ET.fromstring(parts[table_name])
+        unexpected_root.attrib.update({"id":"2", "name":"UnexpectedTable", "displayName":"UnexpectedTable", "ref":"C1:D2"})
+        columns = next(node for node in unexpected_root.iter() if node.tag.endswith("tableColumns"))
+        list(columns)[0].attrib["name"] = "Other description"
+        list(columns)[1].attrib["name"] = "Other quantity"
+        auto_filter = next(node for node in unexpected_root.iter() if node.tag.endswith("autoFilter"))
+        auto_filter.attrib["ref"] = "C1:D2"
+        parts["xl/tables/table2.xml"] = ET.tostring(unexpected_root, encoding="utf-8", xml_declaration=True)
+        sheet_name = "xl/worksheets/sheet1.xml"
+        sheet_root = ET.fromstring(parts[sheet_name])
+        table_parts_node = next(node for node in sheet_root.iter() if node.tag.endswith("tableParts"))
+        table_parts_node.attrib["count"] = "2"
+        ET.SubElement(table_parts_node, "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}tablePart", {
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id":"rId99",
+        })
+        parts[sheet_name] = ET.tostring(sheet_root, encoding="utf-8", xml_declaration=True)
+        rel_name = "xl/worksheets/_rels/sheet1.xml.rels"
+        rel_root = ET.fromstring(parts[rel_name])
+        ET.SubElement(rel_root, "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship", {
+            "Id":"rId99",
+            "Type":"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
+            "Target":"../tables/table2.xml",
+        })
+        parts[rel_name] = ET.tostring(rel_root, encoding="utf-8", xml_declaration=True)
+        content_root = ET.fromstring(parts["[Content_Types].xml"])
+        ET.SubElement(content_root, "{http://schemas.openxmlformats.org/package/2006/content-types}Override", {
+            "PartName":"/xl/tables/table2.xml",
+            "ContentType":"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        })
+        parts["[Content_Types].xml"] = ET.tostring(content_root, encoding="utf-8", xml_declaration=True)
     elif mutation in {"relationship_target", "relationship_type"}:
         name = "xl/_rels/workbook.xml.rels"
         root = ET.fromstring(parts[name])
@@ -5377,7 +5654,10 @@ def test_export_package_verifier_rejects_ooxml_mutations(tmp_path, mutation):
 
     with pytest.raises(TenderWorkspaceError) as error:
         _verify_package_roundtrip(source, output)
-    assert error.value.code in {"TENDER_EXPORT_PRESERVATION_FAILED", "TENDER_EXPORT_PRESERVATION_UNSUPPORTED"}
+    if mutation.startswith("table_") or mutation == "unexpected_table_added":
+        assert error.value.code == "TENDER_EXPORT_PRESERVATION_FAILED"
+    else:
+        assert error.value.code in {"TENDER_EXPORT_PRESERVATION_FAILED", "TENDER_EXPORT_PRESERVATION_UNSUPPORTED"}
 
 
 def _rewrite_xlsx_parts(path, transform):

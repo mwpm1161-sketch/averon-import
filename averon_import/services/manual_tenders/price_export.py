@@ -894,7 +894,7 @@ def _package_snapshot(path: Path) -> dict[str, Any]:
 
 
 def _restore_source_owned_package_metadata(source: Path, output: Path) -> None:
-    """Restore only validated source extension subtrees and original docProps parts."""
+    """Restore source-owned tables, extension subtrees, and original docProps parts."""
     source_extensions, unsupported = _package_preservation_inventory(source)
     if unsupported:
         raise TenderWorkspaceError(
@@ -906,6 +906,18 @@ def _restore_source_owned_package_metadata(source: Path, output: Path) -> None:
     with zipfile.ZipFile(source) as source_zip, zipfile.ZipFile(output) as output_zip:
         source_names = {item.filename.casefold(): item.filename for item in source_zip.infolist()}
         output_names = {item.filename.casefold(): item.filename for item in output_zip.infolist()}
+        for part, source_part in source_names.items():
+            if not re.fullmatch(r"xl/tables/table\d+\.xml", part):
+                continue
+            output_part = output_names.get(part)
+            if output_part is None:
+                raise TenderWorkspaceError(
+                    "Исходное определение таблицы не сохранено.", 409, "TENDER_EXPORT_PRESERVATION_FAILED",
+                )
+            # Table definitions are source-owned. Restore only the matching
+            # table parts; the verifier below still checks package structure,
+            # relationships, content types, and every table's exact semantics.
+            replacements[part] = source_zip.read(source_part)
         for part in ("docprops/app.xml", "docprops/core.xml"):
             source_part = source_names.get(part)
             if source_part is not None:
