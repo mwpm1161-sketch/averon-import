@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 
 const app = fs.readFileSync(process.argv[2], "utf8");
+const css = fs.readFileSync(process.argv[3], "utf8");
 function sourceBetween(start, end) {
   const first = app.indexOf(start);
   const last = app.indexOf(end, first + start.length);
@@ -145,6 +146,21 @@ vm.runInNewContext([
   markup = context.renderManualHistorySearch(row);
   assert(markup.includes("История 1С"));
   assert(markup.includes("Я подтверждаю, что это одна и та же позиция"));
+  assert(markup.includes('class="manual-history-search-controls"'), "query controls have a dedicated layout wrapper");
+  assert(markup.includes('class="manual-history-results"'), "manual candidates render in their own responsive result grid");
+  assert(markup.includes('type="checkbox" class="manual-history-assertion"'), "confirmation uses a native visible checkbox");
+  assert.doesNotMatch(css, /\.manual-history-search-form\s*>\s*div\s*\{/,
+    "search form styling must not turn the result grid into a flex row");
+  assert.match(css, /\.manual-history-search-form\s*>\s*\.manual-history-search-controls\s*\{[^}]*display:flex/s,
+    "only the query controls use the horizontal flex layout");
+  assert.match(css, /\.manual-history-results\s*\{[^}]*display:grid[^}]*minmax\(min\(100%,360px\),1fr\)/s,
+    "candidate cards use responsive columns with a readable minimum width");
+  assert.match(css, /\.manual-history-assertion-label input\[type="checkbox"\]\s*\{[^}]*appearance:auto[^}]*flex:none[^}]*width:18px[^}]*height:18px[^}]*accent-color:/s,
+    "the native checkbox remains full-sized, non-flexing, and visibly accented");
+  assert.match(css, /\.manual-history-assertion-label:has\(input:checked\)/,
+    "the checked state has a visible label treatment");
+  assert.match(css, /\.manual-history-assertion-label input\[type="checkbox"\]:focus-visible/,
+    "keyboard focus remains visible on the checkbox");
   assert.match(markup, /manual-history-confirm[^>]*disabled/);
   assert.match(markup, /manual-history-confirm-and-next[^>]*disabled/);
   assert.equal(await confirm.click(), false, "confirmation is unavailable before the assertion checkbox");

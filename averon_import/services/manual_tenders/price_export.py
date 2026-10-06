@@ -612,9 +612,20 @@ def _canonical_xml(element: Any) -> Any:
     return tag, attributes, text, children
 
 
-def _dimension_style_fingerprint(sheet: Any, dimension: Any, row: int, column: int) -> str | None:
+def _dimension_style_fingerprint(
+    sheet: Any,
+    dimension: Any,
+    row: int,
+    column: int,
+    *,
+    default_style_is_unset: bool = False,
+) -> str | None:
     style = getattr(dimension, "_style", None)
-    if style is None:
+    # openpyxl can serialize a row or column with an explicit style index that
+    # points to an all-zero/default XF when the source omitted that dimension
+    # style. This is semantically identical to no dimension style; non-default
+    # formatting remains part of the preservation comparison.
+    if style is None or (default_style_is_unset and not any(style)):
         return None
     cell = sheet.cell(row, column)
     cell._style = copy(style)
@@ -649,7 +660,9 @@ def _workbook_snapshot(path: Path) -> dict[str, Any]:
                     "hidden": bool(dimension.hidden),
                     "outlineLevel": int(dimension.outlineLevel or 0),
                     "collapsed": bool(dimension.collapsed),
-                    "style": _dimension_style_fingerprint(sheet, dimension, index, 1),
+                    "style": _dimension_style_fingerprint(
+                        sheet, dimension, index, 1, default_style_is_unset=True,
+                    ),
                     "thickTop": bool(dimension.thickTop),
                     "thickBottom": bool(dimension.thickBot),
                 }
@@ -667,7 +680,9 @@ def _workbook_snapshot(path: Path) -> dict[str, Any]:
                     "bestFit": bool(dimension.bestFit),
                     "outlineLevel": int(dimension.outlineLevel or 0),
                     "collapsed": bool(dimension.collapsed),
-                    "style": _dimension_style_fingerprint(sheet, dimension, 1, minimum),
+                    "style": _dimension_style_fingerprint(
+                        sheet, dimension, 1, minimum, default_style_is_unset=True,
+                    ),
                     "customWidth": bool(dimension.customWidth),
                 }
                 for column in range(minimum, maximum + 1):

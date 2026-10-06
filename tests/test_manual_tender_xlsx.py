@@ -2824,7 +2824,7 @@ def test_d3_human_history_ui_lifecycle_regression():
         ("manual_tender_history_search.cjs", "PASS: manual history search is explicit"),
     ):
         result = subprocess.run(
-            [node, str(root / "tests" / "js" / script), str(root / "averon_import" / "static" / "app.js")],
+            [node, str(root / "tests" / "js" / script), str(root / "averon_import" / "static" / "app.js"), str(root / "averon_import" / "static" / "styles.css")],
             capture_output=True, text=True, timeout=30, check=False,
         )
         assert result.returncode == 0, result.stdout + result.stderr
@@ -3417,6 +3417,8 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
     assert completed_export["status"] == "completed", completed_export
     assert completed_export["result"]["human_confirmed_historical_count"] == 1
     export_path = next((workspace_path / "exports").glob("*.xlsx"))
+    source_path = workspace_path / "source.xlsx"
+    assert hashlib.sha256(source_path.read_bytes()).hexdigest() == workspace["source_sha256"]
     output = load_workbook(export_path)
     try:
         note = output[TEMPLATE_SHEET]["H2"].comment.text
@@ -3424,6 +3426,26 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
         assert "tender-user" not in note
     finally:
         output.close()
+    listed_exports = _api_request(
+        main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/exports", headers=_auth_headers(),
+    )
+    assert listed_exports.status_code == 200
+    export_id = listed_exports.json()["exports"][0]["export_id"]
+    downloaded = _api_request(
+        main.app, "GET",
+        f"/api/manual-tenders/{workspace['tender_id']}/exports/{export_id}/download",
+        headers=_auth_headers(),
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    assert downloaded.content == export_path.read_bytes()
+    downloaded_path = tmp_path / "manual-search-export-download.xlsx"
+    downloaded_path.write_bytes(downloaded.content)
+    downloaded_workbook = load_workbook(downloaded_path, data_only=False, read_only=True)
+    try:
+        assert TEMPLATE_SHEET in downloaded_workbook.sheetnames
+    finally:
+        downloaded_workbook.close()
 
     decision_id = effective["decision_id"]
     revoked = _api_request(
@@ -5077,6 +5099,39 @@ def test_export_semantic_verifier_rejects_source_changes(tmp_path, mutation):
             before, _workbook_snapshot(output), target_sheet="Sheet", allowed_cells=set(), target_columns=set(),
         )
     assert error.value.code == "TENDER_EXPORT_PRESERVATION_FAILED"
+
+
+def test_default_row_and_column_dimension_styles_are_semantically_equivalent(tmp_path):
+    from copy import copy
+    from averon_import.services.manual_tenders.price_export import _verify_semantic_roundtrip, _workbook_snapshot
+
+    source = tmp_path / "default-dimension-style-source.xlsx"
+    output = tmp_path / "default-dimension-style-output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Header"
+    sheet.row_dimensions[1].height = 26
+    sheet.column_dimensions["A"].width = 14
+    workbook.save(source)
+    workbook.close()
+    before = _workbook_snapshot(source)
+
+    workbook = load_workbook(source)
+    # Some real OOXML workbooks contain duplicate default XFs. When openpyxl
+    # saves those files it can emit that default style on dimensions explicitly.
+    workbook.active.row_dimensions[1]._style = copy(workbook._cell_styles[0])
+    workbook.active.column_dimensions["A"]._style = copy(workbook._cell_styles[0])
+    workbook.save(output)
+    workbook.close()
+    after = _workbook_snapshot(output)
+
+    assert before["sheets"][0]["row_dimensions"]["1"]["style"] is None
+    assert after["sheets"][0]["row_dimensions"]["1"]["style"] is None
+    assert before["sheets"][0]["column_dimensions"][1]["style"] is None
+    assert after["sheets"][0]["column_dimensions"][1]["style"] is None
+    _verify_semantic_roundtrip(
+        before, after, target_sheet="Sheet", allowed_cells=set(), target_columns=set(),
+    )
 
 
 @pytest.mark.parametrize(
