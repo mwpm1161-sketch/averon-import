@@ -26,7 +26,9 @@ _UNIT_FAMILIES: dict[str, tuple[str, bool]] = {
     "литр": ("litre", True), "литра": ("litre", True), "литров": ("litre", True),
     "мл": ("millilitre", False), "ml": ("millilitre", False),
     "компл": ("set", True), "комплект": ("set", True),
+    "комплекта": ("set", True), "комплектов": ("set", True),
     "комп": ("set", False), "уп": ("pack", True), "упак": ("pack", True), "упаковка": ("pack", True),
+    "упаковки": ("pack", True), "упаковок": ("pack", True),
     "боб": ("bobbin", False),
 }
 

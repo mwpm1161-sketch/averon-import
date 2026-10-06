@@ -681,9 +681,8 @@ def test_canonical_history_units_share_safe_alias_families_and_keep_unknowns_blo
     assert normalize_sourcing_unit_family("штуки") == "piece"
     assert normalize_sourcing_unit_family("метров") == "meter"
     assert normalize_sourcing_unit_family("килограммов") == "kilogram"
-    assert normalize_sourcing_unit_family("г") is None
-    assert normalize_sourcing_unit_family("мл") is None
-    assert normalize_sourcing_unit_family("Пар") is None
+    for unit in ("пар", "г", "гр", "g", "мл", "ml", "пог. м", "пог м", "пог.м", "комп", "боб"):
+        assert normalize_sourcing_unit_family(unit) is None
 
 
 def test_fuzzy_retrieval_does_not_promote_similarity_to_safe_match(tmp_path):

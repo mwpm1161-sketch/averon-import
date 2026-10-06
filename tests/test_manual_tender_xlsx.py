@@ -525,7 +525,7 @@ def test_formula_quantity_never_becomes_authoritative(tmp_path):
 
 @pytest.mark.parametrize(("unit", "base", "scale", "dimension"), [
     ("шт", "шт", "1", "count"), ("шт.", "шт", "1", "count"),
-    ("штука", "шт", "1", "count"), ("штуки", "шт", "1", "count"),
+    ("штук", "шт", "1", "count"), ("штука", "шт", "1", "count"), ("штуки", "шт", "1", "count"),
     ("10 шт", "шт", "10", "count"),
     ("100 шт", "шт", "100", "count"), ("1000 шт", "шт", "1000", "count"),
     ("м", "м", "1", "length"), ("метр", "м", "1", "length"),
@@ -534,10 +534,17 @@ def test_formula_quantity_never_becomes_authoritative(tmp_path):
     ("1000 м", "м", "1000", "length"), ("кг", "кг", "1", "mass"),
     ("kg", "кг", "1", "mass"), ("килограмм", "кг", "1", "mass"),
     ("килограмма", "кг", "1", "mass"), ("килограммов", "кг", "1", "mass"),
-    ("т", "кг", "1000", "mass"), ("м2", "м2", "1", "area"),
-    ("м3", "м3", "1", "volume"), ("л", "л", "1", "volume"),
-    ("компл", "компл", "1", "set"), ("уп", "уп", "1", "package"),
-    ("упак", "уп", "1", "package"),
+    ("т", "кг", "1000", "mass"), ("тонна", "кг", "1000", "mass"),
+    ("тонны", "кг", "1000", "mass"), ("тонн", "кг", "1000", "mass"),
+    ("м2", "м2", "1", "area"), ("м²", "м2", "1", "area"),
+    ("м3", "м3", "1", "volume"), ("м³", "м3", "1", "volume"),
+    ("л", "л", "1", "volume"), ("литр", "л", "1", "volume"),
+    ("литра", "л", "1", "volume"), ("литров", "л", "1", "volume"),
+    ("компл", "компл", "1", "set"), ("комплект", "компл", "1", "set"),
+    ("комплекта", "компл", "1", "set"), ("комплектов", "компл", "1", "set"),
+    ("уп", "уп", "1", "package"), ("упак", "уп", "1", "package"),
+    ("упаковка", "уп", "1", "package"), ("упаковки", "уп", "1", "package"),
+    ("упаковок", "уп", "1", "package"),
 ])
 def test_tender_unit_basis_supported_units(unit, base, scale, dimension):
     result = parse_unit_basis(unit)
@@ -560,6 +567,8 @@ def test_unknown_and_unapproved_pack_scales_remain_unknown():
     assert parse_unit_basis("12 уп")["trusted"] is False
     assert parse_unit_basis("10 кг")["trusted"] is False
     assert parse_unit_basis("10 компл")["trusted"] is False
+    for unit in ("пар", "г", "гр", "g", "мл", "ml", "пог. м", "пог м", "пог.м", "комп", "боб"):
+        assert parse_unit_basis(unit)["trusted"] is False
 
 
 def test_xlsx_preflight_rejects_non_xlsx_and_unsafe_archive_members(tmp_path):
