@@ -42,7 +42,7 @@ _PRICE_PROVENANCE_FIELDS = {
         "selected_event_id", "purchase_date", "price_basis",
         "effective_unit_price_gross", "currency_basis", "unit_family",
         "normalizer_revision", "normalized_name_signature", "warehouse",
-        "warehouse_truncated",
+        "warehouse_truncated", "counterparty", "counterparty_truncated",
     ),
     "lemana_b2b": ("source", "product_item", "mirror_revision"),
 }

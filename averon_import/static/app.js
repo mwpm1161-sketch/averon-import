@@ -1025,6 +1025,7 @@ const ONE_C_HISTORY_FIELDS = [
   ["reported_unit_price_gross", "Цена с НДС", false], ["amount_gross", "Сумма с НДС", false],
   ["document_date", "Дата документа", false], ["document_type", "Тип документа", false],
   ["document_reference", "Документ прихода", false], ["counterparty", "Контрагент / поставщик", false],
+  ["warehouse", "Склад", false],
   ["contract", "Договор", false], ["article", "Артикул", false], ["manufacturer", "Производитель / бренд", false],
   ["characteristic", "Характеристика", false], ["supplier_code", "Код поставщика", false],
   ["supplier_inn", "ИНН поставщика", false], ["vat_rate", "Ставка НДС", false], ["currency", "Валюта", false],
@@ -2156,7 +2157,9 @@ async function openExcelTenderRunDetail(runId = null) {
         }));
         return {
           intent: {source_row_id:row.source_row_id, ...(row.identity || {}), source_text:row.identity?.normalized_name || ""},
-          route: row.route || {}, recommended_offer: row.recommended_offer || null,
+          route: row.route || {}, recommended_offer: row.recommended_offer
+            ? {...row.recommended_offer, data_provenance:row.price_provenance || {}}
+            : null,
           review_candidate: matches[0] || null, offers: candidates, match_results: matches,
           historyDecisionCandidates: decisionState?.candidates || [],
           historyEffectiveDecision: decisionState?.effective_decision || null,

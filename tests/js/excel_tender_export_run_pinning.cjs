@@ -16,10 +16,21 @@ const newRunId = runId("b");
 const savedRunId = oldRunId;
 const oldExportId = runId("d");
 const newExportId = runId("e");
-const oldRun = {run_id:oldRunId,status:"completed",source_mode:"provider_only",completed_at:"2026-10-01T10:00:00Z",summary:{}};
+const oldRun = {run_id:oldRunId,status:"completed",source_mode:"one_c_only",completed_at:"2026-10-01T10:00:00Z",summary:{}};
 const newRun = {run_id:newRunId,status:"completed",source_mode:"one_c_only",completed_at:"2026-10-02T10:00:00Z",summary:{}};
 const oldExport = {export_id:oldExportId,run_id:oldRunId,filename:"old.xlsx",created_at:"2026-10-01T10:00:00Z",priced_count:1};
 const newExport = {export_id:newExportId,run_id:newRunId,filename:"new.xlsx",created_at:"2026-10-02T10:00:00Z",priced_count:2};
+const durableAutoSafeRun = {
+  run_id:oldRunId, source_mode:"one_c_only", summary:{positions_total:1,positions_processed:1,positions_matched:1},
+  rows:[{
+    source_row_id:"a".repeat(32), identity:{normalized_name:"Синтетическая позиция"},
+    route:{source_mode:"one_c_only",final_source_kind:"historical_purchase",history_purchase_date:"2026-08-01"},
+    recommended_offer:{offer_id:"one_c_history:event-1",provider:"one_c_history",title:"Синтетическое предложение"},
+    price_provenance:{source:"one_c_history",purchase_date:"2026-08-01",counterparty:"Контрагент durable",warehouse:"Склад durable"},
+  }],
+};
+assert(!Object.hasOwn(durableAutoSafeRun.rows[0].recommended_offer,"data_provenance"),
+  "fixture must match the actual split durable run shape");
 
 const nodes = new Map();
 for (const selector of [
@@ -51,7 +62,7 @@ const context = {
     }
     if (url.endsWith("/exports")) return {exports:[oldExport,newExport]};
     if (url.endsWith("/history-decisions")) return {rows:[],effective:{},decision_revision:0,decision_digest:"0"};
-    if (url.endsWith(`/runs/${savedRunId}`)) return {run_id:savedRunId,source_mode:"provider_only",summary:{},rows:[]};
+    if (url.endsWith(`/runs/${savedRunId}`)) return durableAutoSafeRun;
     throw new Error(`Unexpected API request: ${url}`);
   },
   getJobForPolling:async () => ({status:"completed",result:{run_id:newRunId,source_mode:"provider_only",results:[]}}),
@@ -61,6 +72,7 @@ const context = {
   renderExcelTenderExportControls:null,
   refreshExcelTenderExports:null,
   applyTenderHistoryDecisionSnapshot(result) { return result; },
+  formatSourcingHistoryDate:value => value || "",
   setSourcingModalPhase() {},
   escapeHtml:value => String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"),
   $:selector => nodes.get(selector),
@@ -77,10 +89,11 @@ const code = [
   sliceBetween("function renderExcelTenderExportControls() {", "async function refreshExcelTenderExports"),
   sliceBetween("async function refreshExcelTenderExports", "function tenderExportConfirmationSummary"),
   sliceBetween("function tenderExportConfirmationSummary", "function clearTenderExportFailure"),
+  sliceBetween("function historicalOfferDate(", "function renderHistoricalOfferCard("),
   sliceBetween("async function startExcelTenderPriceExport() {", "async function pollExcelTenderPriceExport"),
   sliceBetween("async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {", "async function startExcelTenderSourcing()"),
 ].join("\n");
-vm.runInNewContext(`${code}; globalThis.runPoll=pollExcelTenderJob; globalThis.openRun=openExcelTenderRunDetail; globalThis.renderExportControls=renderExcelTenderExportControls; globalThis.startPriceExport=startExcelTenderPriceExport; globalThis.summary=tenderExportConfirmationSummary;`, context);
+vm.runInNewContext(`${code}; globalThis.runPoll=pollExcelTenderJob; globalThis.openRun=openExcelTenderRunDetail; globalThis.renderExportControls=renderExcelTenderExportControls; globalThis.startPriceExport=startExcelTenderPriceExport; globalThis.summary=tenderExportConfirmationSummary; globalThis.historyDate=historicalOfferDate; globalThis.historyCounterparty=historicalOfferCounterparty; globalThis.historyWarehouse=historicalOfferWarehouse;`, context);
 
 (async function main() {
   await context.runPoll("source-job","tender",4,1);
@@ -103,6 +116,14 @@ vm.runInNewContext(`${code}; globalThis.runPoll=pollExcelTenderJob; globalThis.o
   assert.equal(state.excelTender.selectedExportRunId,oldRunId,"opening saved run detail binds export context to that run");
   assert.equal(state.excelTender.selectedExportId,oldExportId,"saved-run open selects an artifact from that run");
   assert(!nodes.get("#tender-export-artifact").innerHTML.includes(newExportId));
+  const restoredAutoSafe = state.sourcing.result.results[0];
+  assert.equal(restoredAutoSafe.recommended_offer.data_provenance.warehouse,"Склад durable",
+    "actual run restoration hydrates safe offer from durable row.price_provenance");
+  assert.equal(context.historyDate(restoredAutoSafe.recommended_offer,restoredAutoSafe.route),"2026-08-01");
+  assert.equal(context.historyCounterparty(restoredAutoSafe.recommended_offer),"Контрагент durable");
+  assert.equal(context.historyWarehouse(restoredAutoSafe.recommended_offer),"Склад durable");
+  assert(!Object.hasOwn(durableAutoSafeRun.rows[0].recommended_offer,"data_provenance"),
+    "hydration must not depend on provenance pre-attached to the durable recommended offer");
 
   state.excelTender.selectedExportRunId = newRunId;
   state.excelTender.selectedExportId = oldExportId;

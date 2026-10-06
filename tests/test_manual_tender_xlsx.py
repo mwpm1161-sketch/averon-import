@@ -2239,6 +2239,7 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
             "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
             "normalized_name_signature":history_name_signature_digest(source["name"]),
             "warehouse":"Склад нормализованного события",
+            "counterparty":"Контрагент сохранённого события",
         },
     )
     base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
@@ -2248,6 +2249,8 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
     assert candidate["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
     assert candidate["confirmable"] is True
     assert candidate["price_provenance"]["warehouse"] == "Склад нормализованного события"
+    assert candidate["price_provenance"]["purchase_date"] == "2025-04-16"
+    assert candidate["price_provenance"]["counterparty"] == "Контрагент сохранённого события"
 
     run = main.tender_sourcing_runs.get_public(
         repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id,
@@ -2279,6 +2282,10 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
     assert restored["effective"][source["source_row_id"]]["warehouse_evidence"] == {
         "warehouse":"Склад нормализованного события", "truncated":False,
     }
+    restored_candidate = restored["rows"][0]["candidates"][0]
+    assert restored_candidate["price_provenance"]["purchase_date"] == "2025-04-16"
+    assert restored_candidate["price_provenance"]["counterparty"] == "Контрагент сохранённого события"
+    assert restored_candidate["price_provenance"]["warehouse"] == "Склад нормализованного события"
 
     def forbidden_active_history_read(*_args, **_kwargs):
         pytest.fail("price export must use the immutable run/ledger rather than query active 1C history")
@@ -2539,7 +2546,13 @@ def test_d4a_exact_fingerprint_remains_compatible_with_legacy_candidate_contract
 def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_path, monkeypatch):
     main, repository = tender_api
     workspace = _confirm_ivy_history_tender(main, repository, tmp_path)
-    run_id = _persist_history_review_run(main, repository, workspace)
+    run_id = _persist_history_review_run(
+        main, repository, workspace,
+        provenance_overrides={
+            "counterparty":"Контрагент сохранённого события",
+            "warehouse":"Склад сохранённого события",
+        },
+    )
     base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
     initial = _api_request(main.app, "GET", base, headers=_auth_headers())
     assert initial.status_code == 200, initial.text
@@ -2550,6 +2563,9 @@ def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_
     candidate = snapshot["rows"][0]["candidates"][0]
     assert candidate["confirmable"] is True
     assert candidate["offer"]["title"] == "Плющ искусственный"
+    assert candidate["price_provenance"]["purchase_date"] == "2025-04-16"
+    assert candidate["price_provenance"]["counterparty"] == "Контрагент сохранённого события"
+    assert candidate["price_provenance"]["warehouse"] == "Склад сохранённого события"
     before_jobs = len(main.job_service.jobs)
 
     confirm = _api_request(
@@ -2580,6 +2596,10 @@ def test_d3_durable_human_history_confirm_restart_export_revoke(tender_api, tmp_
     restored = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
     assert restored["decision_revision"] == 1
     assert restored["effective"][snapshot["rows"][0]["source_row_id"]]["decision_id"] == confirmed["effective"][snapshot["rows"][0]["source_row_id"]]["decision_id"]
+    restarted_candidate = restored["rows"][0]["candidates"][0]
+    assert restarted_candidate["price_provenance"]["purchase_date"] == "2025-04-16"
+    assert restarted_candidate["price_provenance"]["counterparty"] == "Контрагент сохранённого события"
+    assert restarted_candidate["price_provenance"]["warehouse"] == "Склад сохранённого события"
 
     export_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export"
     included = _api_request(
@@ -2673,6 +2693,8 @@ def test_d3_exact_and_normalized_candidate_projection_is_bounded_and_size_safe(t
             "currency_basis":"company_default", "unit_family":"piece",
             "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
             "normalized_name_signature":history_name_signature_digest(source["name"]),
+            "counterparty":"К" * 60,
+            "warehouse":"Я" * 64,
         }
         offer = Offer(
             offer_id=f"one_c_history:item-{index}", provider="one_c_history", source_item_id=f"item-{index}",
@@ -2698,6 +2720,8 @@ def test_d3_exact_and_normalized_candidate_projection_is_bounded_and_size_safe(t
     assert all(len(row["history_review_candidates"]) == 1 for row in projection)
     assert all(row["history_review_candidates"][0]["offer"]["history_characteristic"] == "техническая характеристика" for row in projection)
     assert all("attributes" not in row["history_review_candidates"][0]["offer"] for row in projection)
+    assert all(len(row["history_review_candidates"][0]["price_provenance"]["counterparty"].encode("utf-8")) == 120 for row in projection)
+    assert all(len(row["history_review_candidates"][0]["price_provenance"]["warehouse"].encode("utf-8")) == 128 for row in projection)
     assert len(encoded) < 1024 * 1024
     assert len(encoded) < MAX_TENDER_RUN_BYTES
 
@@ -4463,7 +4487,7 @@ def test_tender_price_resolver_uses_only_proven_etm_pricewnds(tender_api, tmp_pa
     assert rejected[0].reason_code == "PRICE_BASIS_UNPROVEN"
 
 
-def test_historical_price_export_requires_explicit_confirmation_without_ghost_job(tender_api, tmp_path):
+def test_historical_price_export_requires_explicit_confirmation_then_uses_reloaded_provenance(tender_api, tmp_path, monkeypatch):
     main, repository = tender_api
     from averon_import.services.manual_tenders.price_export import TenderPriceExportRepository
 
@@ -4475,15 +4499,28 @@ def test_historical_price_export_requires_explicit_confirmation_without_ghost_jo
         "selected_event_id":"history-event-1", "purchase_date":"2025-01-24",
         "price_basis":"gross_including_vat", "effective_unit_price_gross":"1234.5600",
         "currency_basis":"RUB", "unit_family":"count",
+        "counterparty":"Контрагент auto-safe", "warehouse":"Склад auto-safe",
     }
     run_id = _persist_price_export_run(main, repository, workspace, source_row, provider="one_c_history", provenance=provenance, history=True)
     path = repository.workspace_root / workspace["tender_id"]
-    run = main.tender_sourcing_runs.get_public(path, workspace["tender_id"], run_id)
+    from averon_import.services.manual_tenders.sourcing import TenderSourcingRunStore
+    restarted_runs = TenderSourcingRunStore(repository)
+    monkeypatch.setattr(main, "tender_sourcing_runs", restarted_runs)
+    run = restarted_runs.get_public(path, workspace["tender_id"], run_id)
+    assert run["rows"][0]["price_provenance"]["purchase_date"] == "2025-01-24"
+    assert run["rows"][0]["price_provenance"]["counterparty"] == "Контрагент auto-safe"
+    assert run["rows"][0]["price_provenance"]["warehouse"] == "Склад auto-safe"
+    detail = _api_request(main.app, "GET", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}", headers=_auth_headers())
+    assert detail.status_code == 200
+    assert detail.json()["rows"][0]["price_provenance"] == run["rows"][0]["price_provenance"]
     historical_decision = main.tender_price_resolver.resolve_run(
         workspace, run, tender_id=workspace["tender_id"], run_id=run_id,
         include_historical_prices=True,
     )[0]
     assert historical_decision.eligible, historical_decision.safe_summary()
+    assert historical_decision.audit_summary["purchase_date"] == "2025-01-24"
+    assert historical_decision.audit_summary["counterparty"] == "Контрагент auto-safe"
+    assert historical_decision.audit_summary["warehouse"] == "Склад auto-safe"
     response = _api_request(main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export", headers={**_auth_headers(), "Content-Type":"application/json"}, body=b'{"include_historical_prices":false,"allow_partial":false}')
     assert response.status_code == 409
     detail = response.json()["detail"]
@@ -4492,6 +4529,31 @@ def test_historical_price_export_requires_explicit_confirmation_without_ghost_jo
     assert not list((path / "exports").glob("*")) if (path / "exports").exists() else True
     assert not any(job.kind == "manual_tender_price_export" for job in main.job_service.jobs.values())
     assert isinstance(main.tender_price_exports, TenderPriceExportRepository)
+
+    def forbidden_active_history_read(*_args, **_kwargs):
+        pytest.fail("auto-safe export must use immutable run provenance rather than query active 1C history")
+
+    monkeypatch.setattr(main.one_c_history_repository, "catalog_version", forbidden_active_history_read)
+    monkeypatch.setattr(main.one_c_history_repository, "read_catalog_snapshot", forbidden_active_history_read)
+    accepted = _api_request(
+        main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert accepted.status_code == 202, accepted.text
+    exported = _wait_tender_job(main, accepted.json()["id"])
+    assert exported["status"] == "completed", exported
+    assert exported["result"]["automatic_historical_count"] == 1
+    assert exported["result"]["human_confirmed_historical_count"] == 0
+    export_path = next((path / "exports").glob("*.xlsx"))
+    workbook = load_workbook(export_path)
+    try:
+        comment = workbook[TEMPLATE_SHEET]["H2"].comment.text
+        assert "Дата закупки: 2025-01-24" in comment
+        assert "Контрагент: Контрагент auto-safe" in comment
+        assert "Склад: Склад auto-safe" in comment
+    finally:
+        workbook.close()
 
 
 def test_tender_price_export_job_persists_owner_bound_verified_artifact(tender_api, tmp_path):
@@ -4625,7 +4687,8 @@ def test_tender_price_provenance_is_allowlisted_durable_and_self_contained(tende
             "selected_event_id": "history-item-17:row-51", "purchase_date": "2026-09-21",
             "price_basis": "gross_per_unit", "effective_unit_price_gross": Decimal("987.654321"),
             "currency_basis": "company_default", "unit_family": "piece",
-            "counterparty": "must not persist", "document_type": "must not persist",
+            "counterparty": "К" * 100, "counterparty_truncated": False,
+            "warehouse": "Склад из durable provenance", "document_type": "must not persist",
             "source_item_code": "must not persist",
         },
     )
@@ -4677,6 +4740,8 @@ def test_tender_price_provenance_is_allowlisted_durable_and_self_contained(tende
         "selected_event_id": "history-item-17:row-51", "purchase_date": "2026-09-21",
         "price_basis": "gross_per_unit", "effective_unit_price_gross": "987.654321",
         "currency_basis": "company_default", "unit_family": "piece",
+        "warehouse": "Склад из durable provenance",
+        "counterparty": "К" * 60, "counterparty_truncated": True,
     }
     route = history_detail.json()["rows"][0]["route"]
     assert route["final_source_kind"] == "historical_purchase"
@@ -4708,8 +4773,10 @@ def test_tender_price_provenance_is_allowlisted_durable_and_self_contained(tende
     ):
         assert forbidden not in persisted_json
     public_json = json.dumps([etm_detail.json(), history_detail.json(), lemana_detail.json()], ensure_ascii=False)
-    for forbidden in ("token", "authorization", "raw_response", "counterparty", "document_type", "verified_gross"):
+    for forbidden in ("token", "authorization", "raw_response", "document_type", "verified_gross"):
         assert forbidden not in public_json.casefold()
+    assert len(history_provenance["counterparty"].encode("utf-8")) == 120
+    assert history_provenance["counterparty_truncated"] is True
     assert all(
         "data_provenance" not in row
         for detail in (etm_detail, history_detail, lemana_detail)
@@ -4793,6 +4860,66 @@ def test_realistic_370_row_tender_run_fits_existing_one_mib_bound(tender_api, tm
     assert len(rows) == 370
     assert run_path.stat().st_size < MAX_TENDER_RUN_BYTES
     assert MAX_TENDER_RUN_BYTES == 1024 * 1024
+
+
+def test_370_auto_safe_history_rows_with_max_bounded_context_fit_durable_run(tender_api, tmp_path):
+    main, repository = tender_api
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=370)
+    source_rows = [row for row in workspace["rows"] if row["row_type"] == "item"]
+    selected_ids = [row["source_row_id"] for row in source_rows]
+    results = []
+    for index, row in enumerate(source_rows, start=1):
+        offer_id = f"one_c_history:event-{index:04d}"
+        provenance = {
+            "source":"one_c_history", "source_kind":"historical_purchase",
+            "snapshot_version":"synthetic-history-size-v1", "history_item_id":f"history-item-{index:04d}",
+            "selected_event_id":f"history-event-{index:04d}", "purchase_date":"2026-09-21",
+            "price_basis":"gross_including_vat", "effective_unit_price_gross":"123.4500",
+            "currency_basis":"company_default", "unit_family":"piece",
+            "normalizer_revision":"history-identity-v1", "normalized_name_signature":"a" * 64,
+            "counterparty":"К" * 60, "warehouse":"Я" * 64,
+        }
+        offer = {
+            "offer_id":offer_id, "provider":"one_c_history", "source_item_id":f"item-{index:04d}",
+            "title":f"Synthetic historical offer {index:04d}", "price":"123.45", "currency":"RUB",
+            "price_unit":"шт", "data_provenance":provenance,
+        }
+        results.append({
+            "intent":{
+                "source_row_id":row["source_row_id"], "normalized_name":row["name"],
+                "quantity":str(row["quantity"]), "unit":row["raw_unit"],
+            },
+            "recommended_offer":offer,
+            "match_results":[{"offer":offer, "decision":"MATCH", "rank":1, "matched_attributes":["name", "unit"]}],
+            "route":{
+                "source_mode":"one_c_only", "final_source_kind":"historical_purchase",
+                "history_outcome":"SAFE_MATCH", "history_catalog_version":"synthetic-history-size-v1",
+                "history_selected_event_id":provenance["selected_event_id"],
+                "history_purchase_date":provenance["purchase_date"],
+            },
+        })
+
+    rows = canonical_tender_projection({"results":results}, source_rows, selected_ids)
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    store = main.tender_sourcing_runs
+    running = store.create_running(
+        workspace_path, workspace, source_mode="one_c_only", provider=None,
+        selected_ids=selected_ids, history_catalog_version="synthetic-history-size-v1",
+    )
+    store.complete(
+        workspace_path, running["run_id"],
+        summary={
+            "positions_total":370, "positions_processed":370, "positions_matched":370,
+            "positions_review":0, "positions_without_offers":0,
+        },
+        catalog_version=None, history_catalog_version="synthetic-history-size-v1", rows=rows,
+    )
+    run_path = workspace_path / "runs" / f"{running['run_id']}.json"
+    persisted = json.loads(run_path.read_text(encoding="utf-8"))
+    assert len(persisted["rows"]) == 370
+    assert len(persisted["rows"][0]["price_provenance"]["warehouse"].encode("utf-8")) == 128
+    assert len(persisted["rows"][0]["price_provenance"]["counterparty"].encode("utf-8")) == 120
+    assert run_path.stat().st_size < MAX_TENDER_RUN_BYTES
 
 
 def test_tender_ui_uses_id_only_request_default_selection_runs_and_shared_result_renderer():
