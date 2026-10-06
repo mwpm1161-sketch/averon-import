@@ -41,6 +41,7 @@ from .repository import MAX_TENDER_STORAGE_BYTES, TenderWorkspaceError, TenderWo
 from .history_fuzzy_eligibility import (
     MAX_FUZZY_RETRIEVAL_RANK,
     fuzzy_confirmation_eligibility_reason,
+    manual_search_confirmation_eligibility_reason,
 )
 
 TENDER_EXPORT_POLICY_REVISION = "xlsx-price-export-v1"
@@ -386,22 +387,27 @@ class TenderPriceResolver:
             "human_confirmation_fingerprint": confirmation.get("evidence_fingerprint"),
             "human_confirmation_basis": confirmation.get("confirmation_basis"),
         }
+        confirmation_basis = confirmation.get("confirmation_basis")
+        manual_confirmation = confirmation_basis == "MANUAL_SEARCH_CONFIRMATION"
         if (
             run.get("source_mode") != "one_c_only"
             or route.get("source_mode") != "one_c_only"
-            or route.get("final_source_kind") != "history_review"
-            or route.get("history_outcome") != "REVIEW"
+            or (
+                route.get("final_source_kind") not in {"history_review", "none"}
+                or route.get("history_outcome") not in {"REVIEW", "NO_MATCH"}
+                if manual_confirmation
+                else route.get("final_source_kind") != "history_review" or route.get("history_outcome") != "REVIEW"
+            )
             or route.get("history_safe_basis") not in (None, "")
             or not confirmation.get("decision_id")
             or not confirmation.get("evidence_fingerprint")
         ):
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
         retrieval_classification = offer.get("retrieval_classification")
-        confirmation_basis = confirmation.get("confirmation_basis")
         fuzzy_confirmation = confirmation_basis == "FUZZY_MANUAL_CONFIRMATION"
         if (
             offer.get("provider") != "one_c_history"
-            or retrieval_classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT", "FUZZY"}
+            or retrieval_classification not in {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT", "FUZZY", "MANUAL_HISTORY_SEARCH"}
             or (retrieval_classification == "NORMALIZED_NAME_UNIT" and confirmation_basis != "NORMALIZED_CONFIRMATION")
             or (retrieval_classification in {"EXACT_ARTICLE", "EXACT_NAME_UNIT"} and confirmation_basis != "EXACT_CONFIRMATION")
             or (retrieval_classification == "FUZZY" and (
@@ -411,7 +417,15 @@ class TenderPriceResolver:
                 or not isinstance(confirmation.get("candidate", {}).get("retrieval_rank"), int)
                 or not 1 <= confirmation["candidate"]["retrieval_rank"] <= MAX_FUZZY_RETRIEVAL_RANK
             ))
+            or (retrieval_classification == "MANUAL_HISTORY_SEARCH" and (
+                not manual_confirmation
+                or confirmation.get("identity_assertion") != "SAME_PRODUCT_V1"
+                or not isinstance(confirmation.get("candidate", {}).get("manual_variant_id"), str)
+                or not confirmation["candidate"]["manual_variant_id"]
+                or confirmation["candidate"].get("price_provenance", {}).get("manual_integrity_valid") is not True
+            ))
             or (retrieval_classification != "FUZZY" and confirmation_basis == "FUZZY_MANUAL_CONFIRMATION")
+            or (retrieval_classification != "MANUAL_HISTORY_SEARCH" and manual_confirmation)
             or match.get("offer_id") != offer.get("offer_id")
             or offer.get("offer_id") != confirmation.get("candidate_offer_id")
         ):
@@ -425,6 +439,14 @@ class TenderPriceResolver:
             )
             if fuzzy_reason is not None:
                 return _reason(fuzzy_reason, source, historical=True, human_confirmed=True, audit=audit)
+        elif retrieval_classification == "MANUAL_HISTORY_SEARCH":
+            manual_reason = manual_search_confirmation_eligibility_reason(
+                source, offer, provenance, match, route,
+                expected_snapshot_version=run.get("history_catalog_version"),
+                physical_excel_row=canonical.get("physical_excel_row"),
+            )
+            if manual_reason is not None:
+                return _reason(manual_reason, source, historical=True, human_confirmed=True, audit=audit)
         history_characteristic = offer.get("history_characteristic", "")
         if not isinstance(history_characteristic, str) or len(history_characteristic) > 300:
             return _reason("HISTORY_CONFIRMATION_INVALID", source, historical=True, human_confirmed=True, audit=audit)
@@ -1849,7 +1871,9 @@ class TenderXlsxPriceExporter:
                     price_cell.fill = _HISTORICAL_FILL
                     total_cell.fill = _HISTORICAL_FILL
                     purchase_date = str((decision.audit_summary or {}).get("purchase_date") or "")
-                    if decision.human_confirmed and (decision.audit_summary or {}).get("human_confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION":
+                    if decision.human_confirmed and (decision.audit_summary or {}).get("human_confirmation_basis") == "MANUAL_SEARCH_CONFIRMATION":
+                        human_note = " Совпадение позиции вручную найдено и подтверждено пользователем."
+                    elif decision.human_confirmed and (decision.audit_summary or {}).get("human_confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION":
                         human_note = " Совпадение позиции явно подтверждено пользователем."
                     else:
                         human_note = " Совпадение позиции подтверждено пользователем." if decision.human_confirmed else ""

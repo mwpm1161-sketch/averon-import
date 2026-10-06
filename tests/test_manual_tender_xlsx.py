@@ -2821,6 +2821,7 @@ def test_d3_human_history_ui_lifecycle_regression():
     for script, expected in (
         ("manual_tender_history_decisions.cjs", "PASS: strong confirmation unchanged; fuzzy compare/assertion/two-step"),
         ("excel_tender_review_navigation.cjs", "PASS: Excel Tender review sequence"),
+        ("manual_tender_history_search.cjs", "PASS: manual history search is explicit"),
     ):
         result = subprocess.run(
             [node, str(root / "tests" / "js" / script), str(root / "averon_import" / "static" / "app.js")],
@@ -3022,6 +3023,102 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     assert revoked.json()["effective"] == {}
 
 
+@pytest.mark.parametrize("decision", ["MATCH", "LIKELY_MATCH", "REVIEW"])
+def test_d4c_manual_search_match_decisions_remain_explicitly_confirmable(decision):
+    from averon_import.services.manual_tenders.history_fuzzy_eligibility import manual_search_confirmation_eligibility_reason
+
+    source = {
+        "source_row_id":"1" * 32, "excel_row":18,
+        "name":"Клей для плитки СМ17 25 кг", "article":"", "manufacturer":"",
+        "model":"СМ17", "raw_unit":"кг",
+    }
+    offer = {
+        "offer_id":"one_c_history:history-item", "provider":"one_c_history",
+        "source_item_id":"history-item", "title":"Клей д/плитки СМ 17",
+        "article":"", "manufacturer":"", "history_characteristic":"СМ17",
+        "price":"123.45", "currency":"RUB", "price_unit":"кг",
+        "retrieval_classification":"MANUAL_HISTORY_SEARCH",
+    }
+    provenance = {
+        "source":"one_c_history", "source_kind":"historical_purchase",
+        "snapshot_version":"snapshot", "history_item_id":"history-item",
+        "selected_event_id":"history-event", "purchase_date":"2025-04-16",
+        "price_basis":"gross_including_vat", "effective_unit_price_gross":"123.45",
+        "currency_basis":"company_default", "unit_family":"kilogram",
+        "manual_integrity_valid":True,
+    }
+    match = {"offer_id":offer["offer_id"], "decision":decision, "conflicting_attributes":[]}
+    route = {
+        "source_mode":"one_c_only", "final_source_kind":"none", "history_outcome":"NO_MATCH",
+        "history_safe_basis":None, "history_catalog_version":"snapshot",
+    }
+    assert manual_search_confirmation_eligibility_reason(
+        source, offer, provenance, match, route,
+        expected_snapshot_version="snapshot", physical_excel_row=18,
+    ) is None
+
+
+@pytest.mark.parametrize("case", [
+    "alternative", "reject", "article_mismatch", "article_missing", "manufacturer_conflict",
+    "model_conflict", "unit_conflict", "invalid_provenance", "non_rub", "net_price", "future_date",
+])
+def test_d4c_manual_discovery_cannot_bypass_hard_gates(case):
+    from datetime import date, timedelta
+    from averon_import.services.manual_tenders.history_fuzzy_eligibility import manual_search_confirmation_eligibility_reason
+
+    source = {
+        "source_row_id":"2" * 32, "excel_row":19, "name":"Клей для плитки СМ17 25 кг",
+        "article":"", "manufacturer":"", "model":"СМ17", "raw_unit":"кг",
+    }
+    offer = {
+        "offer_id":"one_c_history:history-item", "provider":"one_c_history",
+        "source_item_id":"history-item", "title":"Клей д/плитки СМ 17", "article":"",
+        "manufacturer":"", "history_characteristic":"СМ17", "price":"123.45",
+        "currency":"RUB", "price_unit":"кг", "retrieval_classification":"MANUAL_HISTORY_SEARCH",
+    }
+    provenance = {
+        "source":"one_c_history", "source_kind":"historical_purchase", "snapshot_version":"snapshot",
+        "history_item_id":"history-item", "selected_event_id":"history-event", "purchase_date":"2025-04-16",
+        "price_basis":"gross_including_vat", "effective_unit_price_gross":"123.45",
+        "currency_basis":"company_default", "unit_family":"kilogram", "manual_integrity_valid":True,
+    }
+    match = {"offer_id":offer["offer_id"], "decision":"LIKELY_MATCH", "conflicting_attributes":[]}
+    route = {
+        "source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW",
+        "history_safe_basis":None, "history_catalog_version":"snapshot",
+    }
+    if case == "alternative":
+        match["decision"] = "ALTERNATIVE"
+    elif case == "reject":
+        match["decision"] = "REJECT"
+    elif case in {"article_mismatch", "article_missing"}:
+        source["article"] = "SOURCE-ARTICLE"
+        offer["article"] = "OTHER-ARTICLE" if case == "article_mismatch" else ""
+    elif case == "manufacturer_conflict":
+        source["manufacturer"] = "Maker A"
+        offer["manufacturer"] = "Maker B"
+    elif case == "model_conflict":
+        source["model"] = "25-40"
+        offer["history_characteristic"] = "25-60"
+    elif case == "unit_conflict":
+        offer["price_unit"] = "шт"
+        provenance["unit_family"] = "piece"
+    elif case == "invalid_provenance":
+        provenance["manual_integrity_valid"] = False
+    elif case == "non_rub":
+        offer["currency"] = "USD"
+    elif case == "net_price":
+        provenance["price_basis"] = "net_excluding_vat"
+    elif case == "future_date":
+        provenance["purchase_date"] = (date.today() + timedelta(days=1)).isoformat()
+
+    reason = manual_search_confirmation_eligibility_reason(
+        source, offer, provenance, match, route,
+        expected_snapshot_version="snapshot", physical_excel_row=19,
+    )
+    assert reason is not None, case
+
+
 @pytest.mark.parametrize("case", [
     "reject", "alternative", "article_mismatch", "article_missing", "manufacturer_mismatch", "model_mismatch",
     "unit_mismatch", "corrupt_provenance", "snapshot_mismatch", "event_mismatch", "price_mismatch",
@@ -3143,6 +3240,240 @@ def test_d4b_preprojection_bad_fuzzy_provenance_is_not_confirmable_or_exportable
     assert not any(job.kind == "manual_tender_price_export" for job in main.job_service.jobs.values())
     export_dir = workspace_path / "exports"
     assert not export_dir.exists() or not list(export_dir.iterdir())
+
+
+def _activate_d4c_history(repository, *, item_name="Клей д/плитки СМ 17", unit="кг", article="", manufacturer="", characteristic=""):
+    import hashlib
+    from averon_import.core.unit_normalization import normalize_unit_family
+    from averon_import.services.one_c_history.xlsx_import import ParsedEvent, ParsedWorkbook
+
+    event = ParsedEvent(
+        item_key="d4c-history-item", item_code="D4C-CM17", item_name=item_name,
+        raw_unit=unit, unit_family=normalize_unit_family(unit),
+        identity_quality="stable_code_present", group_number=1, source_row=4,
+        document_date="2025-04-16", document_type="Поступление товаров и услуг",
+        document_reference="synthetic-d4c-event", counterparty="Синтетический контрагент",
+        contract="synthetic", quantity="10", reported_unit_price_gross="123.45",
+        effective_unit_price_gross="123.45", amount_gross="1234.50", price_usable=True,
+        optional_facts={"article":article, "manufacturer":manufacturer, "characteristic":characteristic, "currency":"RUB"},
+        source_facts={},
+    )
+    semantic = hashlib.sha256(b"d4c synthetic history").hexdigest()
+    parsed = ParsedWorkbook(
+        filename="synthetic-d4c.xlsx", file_sha256=hashlib.sha256(b"d4c synthetic xlsx").hexdigest(),
+        sheet_name="Synthetic", header_row=1, headers=[], header_signature="a" * 64,
+        layout_type="flat", field_mapping={}, group_header_row=None, event_header_row=1,
+        group_headers=[], group_field_mapping={}, event_field_mapping={}, group_header_signature=None,
+        event_header_signature="a" * 64, item_name_parse_strategy="none", events=[event],
+        item_count=1, group_count=1, physical_row_count=1, distinct_counterparty_count=1,
+        unit_vocabulary_count=1, period_start="2025-04-16", period_end="2025-04-16",
+        document_type_counts={"Поступление товаров и услуг":1}, document_type_other_event_count=0,
+        supplier_missing_count=0, unusable_price_count=0, missing_code_count=0,
+        repeated_display_label_count=0, normalized_display_collision_count=0,
+        code_conflict_count=0, skipped_row_count=0, warnings=[],
+    )
+    staging = repository.build_staging_snapshot(parsed, profile_id=None, semantic_import_fingerprint=semantic)
+    repository.activate(staging)
+    return repository.catalog_version()
+
+
+def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_export(tender_api, tmp_path, monkeypatch):
+    from averon_import.services.one_c_history.activity import OneCHistoryActivityRegistry
+    from averon_import.services.one_c_history.repository import OneCHistoryRepository
+    from averon_import.services.sourcing.providers.one_c_history import OneCHistoryProvider
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path,
+        source_name="Клей для плитки СМ17 25 кг", source_unit="кг",
+    )
+    history_repository = OneCHistoryRepository(tmp_path / "local-one-c")
+    pinned_version = _activate_d4c_history(history_repository)
+    provider = OneCHistoryProvider(history_repository)
+    main.one_c_history_repository = history_repository
+    main.one_c_history_activity = OneCHistoryActivityRegistry()
+    from dataclasses import replace
+    monkeypatch.setattr(main, "sourcing_runtime", replace(main.sourcing_runtime, one_c_history_provider=provider))
+
+    run_id = _persist_history_review_run(main, repository, workspace)
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run_path = main.tender_sourcing_runs._path(workspace_path, run_id)
+    run_data = json.loads(run_path.read_text(encoding="utf-8"))
+    run_data["catalog_version"] = pinned_version
+    run_data["history_catalog_version"] = pinned_version
+    row = run_data["rows"][0]
+    row["history_review_candidates"] = []
+    row["recommended_offer"] = None
+    row["recommended_match"] = None
+    row["price_provenance"] = {}
+    row["route"].update({
+        "source_mode":"one_c_only", "final_source_kind":"none", "history_outcome":"NO_MATCH",
+        "history_safe_basis":None, "history_catalog_version":pinned_version,
+        "history_selected_event_id":"", "history_purchase_date":"", "history_candidate_count":0,
+    })
+    run_path.write_text(json.dumps(run_data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    before_run_bytes = run_path.read_bytes()
+    source = next(item for item in workspace["rows"] if item["row_type"] == "item")
+    endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-search"
+    decision_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    headers = {**_auth_headers(), "Content-Type":"application/json"}
+
+    wrong_owner = _api_request(
+        main.app, "POST", endpoint,
+        headers={**_auth_headers("another-user"), "Content-Type":"application/json"},
+        body=json.dumps({"source_row_id":source["source_row_id"], "query":"СМ17"}).encode(),
+    )
+    assert wrong_owner.status_code == 404
+    for body in (
+        {"source_row_id":source["source_row_id"], "query":"x"},
+        {"source_row_id":source["source_row_id"], "query":"x" * 201},
+        {"source_row_id":source["source_row_id"], "query":"СМ17", "limit":21},
+        {"source_row_id":source["source_row_id"], "query":"СМ17", "price":"1"},
+    ):
+        assert _api_request(main.app, "POST", endpoint, headers=headers, body=json.dumps(body, ensure_ascii=False).encode()).status_code == 422
+
+    searched = _api_request(
+        main.app, "POST", endpoint, headers=headers,
+        body=json.dumps({"source_row_id":source["source_row_id"], "query":"СМ17", "limit":20}, ensure_ascii=False).encode(),
+    )
+    assert searched.status_code == 200, searched.text
+    payload = searched.json()
+    assert payload["snapshot_version"] == pinned_version
+    assert len(payload["results"]) == 1
+    result = payload["results"][0]
+    assert result["title"] == "Клей д/плитки СМ 17"
+    assert result["history_item_id"] == "d4c-history-item"
+    assert result["variant_id"] and result["match_decision"] in {"MATCH", "LIKELY_MATCH", "REVIEW"}
+    assert result["confirmable_for_manual_search"] is True, (result.get("reason_code"), result.get("reason"))
+    assert result["selected_event_id"] and result["purchase_date"] == "2025-04-16"
+    assert run_path.read_bytes() == before_run_bytes, "manual search must not rewrite the immutable run"
+    assert not (workspace_path / "history-decisions" / f"{run_id}.json").exists(), "search results must not persist before confirmation"
+
+    confirm_body = {
+        "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+        "expected_revision":0, "confirmation_mode":"EXPLICIT_MANUAL_HISTORY_SEARCH",
+        "explicit_identity_assertion":True,
+        "manual_history_ref":{"history_item_id":result["history_item_id"], "variant_id":result["variant_id"]},
+    }
+    original_catalog_version = history_repository.catalog_version
+    monkeypatch.setattr(history_repository, "catalog_version", lambda: "1c-changed-after-search")
+    changed = _api_request(main.app, "POST", decision_endpoint, headers=headers, body=json.dumps(confirm_body).encode())
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "TENDER_HISTORY_SNAPSHOT_CHANGED"
+    assert changed.json()["detail"]["message"] == "История 1С была обновлена после этого подбора. Запустите подбор заново, чтобы искать и подтверждать записи в актуальной версии истории."
+    assert _api_request(main.app, "GET", decision_endpoint, headers=_auth_headers()).json()["events"] == []
+    monkeypatch.setattr(history_repository, "catalog_version", original_catalog_version)
+
+    tampered = {**confirm_body, "price":"0.01"}
+    assert _api_request(main.app, "POST", decision_endpoint, headers=headers, body=json.dumps(tampered).encode()).status_code == 422
+    confirmed = _api_request(main.app, "POST", decision_endpoint, headers=headers, body=json.dumps(confirm_body).encode())
+    assert confirmed.status_code == 200, confirmed.text
+    saved = confirmed.json()
+    assert saved["events"][0]["confirmation_basis"] == "MANUAL_SEARCH_CONFIRMATION"
+    assert saved["events"][0]["identity_assertion"] == "SAME_PRODUCT_V1"
+    assert saved["events"][0]["manual_search_candidate"]["offer"]["retrieval_classification"] == "MANUAL_HISTORY_SEARCH"
+    assert "retrieval_rank" not in saved["events"][0]["manual_search_candidate"]
+    assert saved["effective"][source["source_row_id"]]["confirmation_basis"] == "MANUAL_SEARCH_CONFIRMATION"
+    assert run_path.read_bytes() == before_run_bytes
+
+    # Size a representative 370-row ledger from actual server-owned evidence.
+    # Only the selected result is durable; search result sets are not copied in.
+    from averon_import.services.manual_tenders.history_decisions import (
+        MAX_HISTORY_DECISION_LEDGER_BYTES, _canonical_json,
+    )
+    import copy
+    prototype = saved["events"][0]
+    events = []
+    for index in range(370):
+        event = copy.deepcopy(prototype)
+        event["decision_id"] = f"{index + 1:032x}"
+        event["source_row_id"] = f"{index + 1:032x}"
+        event["evidence_fingerprint"] = hashlib.sha256(str(index).encode()).hexdigest()
+        events.append(event)
+    realistic_ledger = {
+        "schema_version":1, "tender_id":workspace["tender_id"], "run_id":run_id,
+        "decision_revision":370, "events":events,
+    }
+    manual_ledger_size = len(_canonical_json(realistic_ledger))
+    assert manual_ledger_size < MAX_HISTORY_DECISION_LEDGER_BYTES
+
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+    main.tender_history_decisions = TenderHistoryDecisionStore(repository)
+    restored = _api_request(main.app, "GET", decision_endpoint, headers=_auth_headers()).json()
+    effective = restored["effective"][source["source_row_id"]]
+    assert effective["confirmation_basis"] == "MANUAL_SEARCH_CONFIRMATION"
+    resolved = main.tender_price_resolver.resolve_run(
+        workspace, main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id),
+        tender_id=workspace["tender_id"], run_id=run_id,
+        include_historical_prices=True, human_history_decisions=restored["effective"],
+    )
+    assert resolved[0].eligible and resolved[0].audit_summary["human_confirmation_basis"] == "MANUAL_SEARCH_CONFIRMATION"
+
+    export = _api_request(
+        main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
+        headers=headers, body=b'{"include_historical_prices":true,"allow_partial":false}',
+    )
+    assert export.status_code == 202, export.text
+    completed_export = _wait_tender_job(main, export.json()["id"])
+    assert completed_export["status"] == "completed", completed_export
+    assert completed_export["result"]["human_confirmed_historical_count"] == 1
+    export_path = next((workspace_path / "exports").glob("*.xlsx"))
+    output = load_workbook(export_path)
+    try:
+        note = output[TEMPLATE_SHEET]["H2"].comment.text
+        assert "Совпадение позиции вручную найдено и подтверждено пользователем." in note
+        assert "tender-user" not in note
+    finally:
+        output.close()
+
+    decision_id = effective["decision_id"]
+    revoked = _api_request(
+        main.app, "POST", f"{decision_endpoint}/{decision_id}/revoke", headers=headers,
+        body=b'{"decision":"REVOKE_HISTORY_CONFIRMATION","expected_revision":1}',
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["effective"] == {}
+
+
+def test_d4c_manual_search_is_available_for_unresolved_review_rows(tender_api, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from averon_import.services.one_c_history.activity import OneCHistoryActivityRegistry
+    from averon_import.services.one_c_history.repository import OneCHistoryRepository
+    from averon_import.services.sourcing.providers.one_c_history import OneCHistoryProvider
+
+    main, repository = tender_api
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path,
+        source_name="Клей для плитки СМ17 25 кг", source_unit="кг",
+    )
+    history_repository = OneCHistoryRepository(tmp_path / "review-row-one-c")
+    pinned_version = _activate_d4c_history(history_repository)
+    main.one_c_history_repository = history_repository
+    main.one_c_history_activity = OneCHistoryActivityRegistry()
+    monkeypatch.setattr(main, "sourcing_runtime", replace(
+        main.sourcing_runtime, one_c_history_provider=OneCHistoryProvider(history_repository),
+    ))
+
+    run_id = _persist_history_review_run(main, repository, workspace)
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run_path = main.tender_sourcing_runs._path(workspace_path, run_id)
+    run_data = json.loads(run_path.read_text(encoding="utf-8"))
+    run_data["catalog_version"] = pinned_version
+    run_data["history_catalog_version"] = pinned_version
+    run_data["source_mode"] = "one_c_only"
+    run_data["rows"][0]["route"].update({
+        "source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW",
+        "history_safe_basis":None, "history_catalog_version":pinned_version,
+    })
+    run_path.write_text(json.dumps(run_data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    source = next(item for item in workspace["rows"] if item["row_type"] == "item")
+    response = _api_request(
+        main.app, "POST",
+        f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-search",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({"source_row_id":source["source_row_id"], "query":"клей СМ 17"}, ensure_ascii=False).encode(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["results"][0]["history_item_id"] == "d4c-history-item"
 
 
 @pytest.mark.parametrize("case", [

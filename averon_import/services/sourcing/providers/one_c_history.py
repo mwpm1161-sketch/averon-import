@@ -134,6 +134,12 @@ def normalize_exact_source_name(value: object) -> str:
     return " ".join(text.replace("\u00a0", " ").split())
 
 
+def _manual_search_key(value: object) -> str:
+    """Retrieval-only key that tolerates spacing around compact technical tokens."""
+    normalized = normalize_product_search_text(value)
+    return re.sub(r"[^\w]+", "", normalized, flags=re.UNICODE)
+
+
 def _loose_name_collision_key(value: object) -> str:
     """Negative-only diagnostic key used to reject punctuation/spacing collisions."""
 
@@ -416,6 +422,164 @@ class OneCHistoryProvider:
             return []
         offers, _, _ = self._retrieve(projection, intent, bounded)
         return offers
+
+    def manual_search(self, intent: ProductIntent, query: str, *, limit: int = 20) -> list[dict[str, object]]:
+        """Search the cached local snapshot for one user-selected history item.
+
+        This is a discovery API only. It does not change automatic retrieval,
+        persist results, or grant confirmation authority.
+        """
+        bounded = max(0, min(int(limit), 20))
+        query = str(query or "").strip()[:200]
+        query_key = normalize_product_search_text(query)
+        if len(query_key) < 2 or bounded == 0:
+            return []
+        try:
+            projection = self._load_projection()
+        except OneCHistoryReadError:
+            return []
+        if projection is None:
+            return []
+        compact_query = _manual_search_key(query_key)
+        source_family = normalize_unit_family(intent.unit)
+        ranked: list[tuple[tuple[int, float, str, int, str], dict[str, object]]] = []
+        for indexed in projection.items:
+            event = indexed.selected_price_event
+            candidate_raw_unit = event.raw_unit if event is not None else indexed.item.raw_unit
+            candidate_family = normalize_unit_family(candidate_raw_unit)
+            unit_compatible = bool(source_family and candidate_family and source_family == candidate_family)
+            if source_family and candidate_family and source_family != candidate_family:
+                continue
+            best: tuple[float, OneCHistoryVariant] | None = None
+            for cached in indexed.indexed_variants:
+                variant = cached.variant
+                fields = (
+                    variant.item_name,
+                    variant.article or indexed.item.article,
+                    variant.manufacturer or indexed.item.manufacturer,
+                    variant.characteristic or indexed.item.characteristic,
+                    indexed.item.source_item_code,
+                )
+                score = 0.0
+                for field in fields:
+                    field_key = normalize_product_search_text(field)
+                    if not field_key:
+                        continue
+                    field_compact = _manual_search_key(field_key)
+                    if field_key == query_key:
+                        score = max(score, 1000.0)
+                    elif compact_query and field_compact == compact_query:
+                        score = max(score, 950.0)
+                    elif query_key in field_key or field_key in query_key:
+                        score = max(score, 760.0 + min(len(query_key), len(field_key)) / 100.0)
+                    elif compact_query and (compact_query in field_compact or field_compact in compact_query):
+                        score = max(score, 720.0 + min(len(compact_query), len(field_compact)) / 100.0)
+                    score = max(score, float(fuzz.WRatio(query_key, field_key)))
+                    if compact_query and field_compact:
+                        score = max(score, float(fuzz.WRatio(compact_query, field_compact)) * 0.92)
+                if best is None or score > best[0] or (
+                    score == best[0]
+                    and (variant.first_source_row, variant.variant_id)
+                    < (best[1].first_source_row, best[1].variant_id)
+                ):
+                    best = (score, variant)
+            if best is None or best[0] < 42.0:
+                continue
+            score, variant = best
+            retrieved = _RetrievedItem(
+                indexed, variant, score, HistoryRetrievalClassification.MANUAL_HISTORY_SEARCH,
+            )
+            offer = self._to_offer(projection, retrieved)
+            match = self.matcher.match(intent, [offer])[0]
+            integrity_valid = bool(
+                indexed.item.provenance_valid
+                and not indexed.item.integrity_conflicts
+                and variant.provenance_valid
+                and event is not None
+                and event.item_id == indexed.item.item_id
+                and event.provenance_valid
+                and event.numeric_values_valid
+                and event.price_usable
+                and event.effective_unit_price_gross is not None
+                and event.effective_unit_price_gross.is_finite()
+                and event.effective_unit_price_gross > 0
+            )
+            offer = offer.model_copy(update={
+                "data_provenance": {
+                    **offer.data_provenance,
+                    "manual_integrity_valid": integrity_valid,
+                },
+            })
+            result = {
+                "offer": offer,
+                "match": match,
+                "variant_id": variant.variant_id,
+                "unit_compatible": unit_compatible,
+                "integrity_valid": integrity_valid,
+                "display_score": score,
+            }
+            key = (
+                -int(unit_compatible), -score, indexed.item.item_id,
+                variant.first_source_row, variant.variant_id,
+            )
+            ranked.append((key, result))
+        ranked.sort(key=lambda item: item[0])
+        return [item[1] for item in ranked[:bounded]]
+
+    def materialize_manual_ref(
+        self, intent: ProductIntent, *, history_item_id: str, variant_id: str,
+    ) -> dict[str, object] | None:
+        """Rematerialize one exact item/variant from the current cached snapshot."""
+        if not isinstance(history_item_id, str) or not history_item_id or len(history_item_id) > 180:
+            return None
+        if not isinstance(variant_id, str) or not variant_id or len(variant_id) > 180:
+            return None
+        try:
+            projection = self._load_projection()
+        except OneCHistoryReadError:
+            return None
+        if projection is None:
+            return None
+        indexed = next((item for item in projection.items if item.item.item_id == history_item_id), None)
+        if indexed is None:
+            return None
+        variant = next((item.variant for item in indexed.indexed_variants if item.variant.variant_id == variant_id), None)
+        if variant is None:
+            return None
+        retrieved = _RetrievedItem(
+            indexed, variant, 0.0, HistoryRetrievalClassification.MANUAL_HISTORY_SEARCH,
+        )
+        offer = self._to_offer(projection, retrieved)
+        match = self.matcher.match(intent, [offer])[0]
+        event = indexed.selected_price_event
+        integrity_valid = bool(
+            indexed.item.provenance_valid
+            and not indexed.item.integrity_conflicts
+            and variant.provenance_valid
+            and event is not None
+            and event.item_id == indexed.item.item_id
+            and event.provenance_valid
+            and event.numeric_values_valid
+            and event.price_usable
+            and event.effective_unit_price_gross is not None
+            and event.effective_unit_price_gross.is_finite()
+            and event.effective_unit_price_gross > 0
+        )
+        offer = offer.model_copy(update={
+            "data_provenance": {
+                **offer.data_provenance,
+                "manual_integrity_valid": integrity_valid,
+            },
+        })
+        source_family = normalize_unit_family(intent.unit)
+        offer_family = normalize_unit_family(offer.price_unit)
+        return {
+            "offer": offer,
+            "match": match,
+            "variant_id": variant.variant_id,
+            "unit_compatible": bool(source_family and offer_family and source_family == offer_family),
+            "integrity_valid": integrity_valid,
+        }
 
     def lookup(
         self,

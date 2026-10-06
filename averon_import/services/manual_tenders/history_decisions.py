@@ -23,12 +23,13 @@ from .repository import TenderWorkspaceError, TenderWorkspaceRepository
 from .history_fuzzy_eligibility import (
     MAX_FUZZY_RETRIEVAL_RANK,
     fuzzy_confirmation_eligibility_reason,
+    manual_search_confirmation_eligibility_reason,
 )
 
 MAX_HISTORY_DECISION_EVENTS_PER_RUN = 1000
 MAX_HISTORY_DECISION_LEDGER_BYTES = 2 * 1024 * 1024
 _ID_RE = re.compile(r"^[a-f0-9]{32}$")
-_HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT", "FUZZY"}
+_HISTORY_CLASSES = {"EXACT_ARTICLE", "EXACT_NAME_UNIT", "NORMALIZED_NAME_UNIT", "FUZZY", "MANUAL_HISTORY_SEARCH"}
 _OFFER_FIELDS = {
     "offer_id", "provider", "source_item_id", "title", "article", "manufacturer",
     "brand", "price", "currency", "price_unit", "retrieved_at", "retrieval_classification",
@@ -36,8 +37,9 @@ _OFFER_FIELDS = {
 }
 _PROVENANCE_FIELDS = {
     "source", "source_kind", "snapshot_version", "history_item_id", "selected_event_id",
-    "purchase_date", "price_basis", "effective_unit_price_gross", "currency_basis", "unit_family",
+    "purchase_date", "counterparty", "price_basis", "effective_unit_price_gross", "currency_basis", "unit_family",
     "normalizer_revision", "normalized_name_signature",
+    "manual_integrity_valid",
 }
 _MATCH_FIELDS = {
     "decision", "offer_id", "matched_attributes", "supporting_attributes",
@@ -181,6 +183,56 @@ def _public_review_candidate(candidate: Any) -> tuple[dict[str, Any], dict[str, 
     return offer, provenance, match
 
 
+def manual_search_candidate(offer: Any, match: Any, variant_id: str) -> dict[str, Any]:
+    """Build bounded server-owned evidence from a rematerialized Offer/match."""
+    if not isinstance(variant_id, str) or not variant_id or len(variant_id) > 180:
+        raise ValueError("invalid manual variant id")
+    classification = getattr(offer, "history_retrieval_classification", None)
+    classification = getattr(classification, "value", classification)
+    attributes = getattr(offer, "attributes", {})
+    provenance = getattr(offer, "data_provenance", {})
+    decision = getattr(match, "decision", None)
+    decision = getattr(decision, "value", decision)
+    candidate_offer = {
+        "offer_id": str(getattr(offer, "offer_id", ""))[:180],
+        "provider": str(getattr(offer, "provider", ""))[:40],
+        "source_item_id": str(getattr(offer, "source_item_id", ""))[:180],
+        "title": str(getattr(offer, "title", ""))[:500],
+        "article": str(getattr(offer, "article", ""))[:180],
+        "manufacturer": str(getattr(offer, "manufacturer", ""))[:180],
+        "brand": str(getattr(offer, "brand", ""))[:180],
+        "price": str(getattr(offer, "price", "")) if getattr(offer, "price", None) is not None else None,
+        "currency": str(getattr(offer, "currency", ""))[:12],
+        "price_unit": str(getattr(offer, "price_unit", ""))[:80],
+        "retrieved_at": getattr(offer, "retrieved_at").isoformat()[:40],
+        "retrieval_classification": str(classification or "")[:40],
+        "history_characteristic": str(attributes.get("characteristic") or "")[:300] if isinstance(attributes, dict) else "",
+    }
+    safe_provenance: dict[str, Any] = {}
+    if isinstance(provenance, dict):
+        for key, value in provenance.items():
+            if key not in _PROVENANCE_FIELDS:
+                continue
+            if isinstance(value, Decimal):
+                value = str(value)
+            if (isinstance(value, (str, int, float, bool)) or value is None) and len(str(value)) <= 180:
+                safe_provenance[key] = value
+    safe_match = {
+        "decision": str(decision or "")[:40],
+        "offer_id": str(getattr(match, "offer").offer_id or "")[:180],
+        "matched_attributes": list(getattr(match, "matched_attributes", []))[:20],
+        "supporting_attributes": list(getattr(match, "supporting_attributes", []))[:20],
+        "conflicting_attributes": list(getattr(match, "conflicting_attributes", []))[:20],
+        "missing_attributes": list(getattr(match, "missing_attributes", []))[:20],
+    }
+    return {
+        "offer": candidate_offer,
+        "price_provenance": safe_provenance,
+        "match": safe_match,
+        "manual_variant_id": variant_id,
+    }
+
+
 def _candidate_fingerprint(
     *, tender_id: str, workspace: dict[str, Any], run: dict[str, Any], source: dict[str, Any],
     canonical: dict[str, Any], candidate: dict[str, Any],
@@ -248,6 +300,24 @@ def _candidate_fingerprint(
             "commercial_provenance": provenance,
             "match_evidence_full": match,
         })
+    elif offer.get("retrieval_classification") == "MANUAL_HISTORY_SEARCH":
+        evidence.update({
+            "confirmation_basis": confirmation_basis,
+            "identity_assertion": identity_assertion,
+            "discovery_mode": "MANUAL_HISTORY_SEARCH_V1",
+            "manual_variant_id": candidate.get("manual_variant_id"),
+            "history_characteristic": offer.get("history_characteristic", ""),
+            "source_identity_full": {
+                key: source.get(key)
+                for key in ("name", "resource_code", "article", "manufacturer", "model", "raw_unit", "quantity", "quantity_trusted", "unit_basis")
+            },
+            "candidate_identity_full": {
+                key: offer.get(key)
+                for key in ("title", "article", "manufacturer", "brand", "source_item_id", "history_characteristic")
+            },
+            "commercial_provenance": provenance,
+            "match_evidence_full": match,
+        })
     return _sha256(evidence)
 
 
@@ -256,6 +326,8 @@ def _confirmation_basis(candidate: dict[str, Any]) -> str:
     classification = offer.get("retrieval_classification")
     if classification == "FUZZY":
         return "FUZZY_MANUAL_CONFIRMATION"
+    if classification == "MANUAL_HISTORY_SEARCH":
+        return "MANUAL_SEARCH_CONFIRMATION"
     return "NORMALIZED_CONFIRMATION" if classification == "NORMALIZED_NAME_UNIT" else "EXACT_CONFIRMATION"
 
 
@@ -276,11 +348,16 @@ def _candidate_gate(
     if not isinstance(offer, dict):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     classification = offer.get("retrieval_classification")
+    manual_candidate = classification == "MANUAL_HISTORY_SEARCH"
     expected_candidate_keys = {"offer", "price_provenance", "match"}
     if classification == "FUZZY":
         expected_candidate_keys.add("retrieval_rank")
         rank = candidate.get("retrieval_rank")
         if isinstance(rank, bool) or not isinstance(rank, int) or not 1 <= rank <= MAX_FUZZY_RETRIEVAL_RANK:
+            return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+    if manual_candidate:
+        expected_candidate_keys.add("manual_variant_id")
+        if not isinstance(candidate.get("manual_variant_id"), str) or not candidate["manual_variant_id"] or len(candidate["manual_variant_id"]) > 180:
             return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if set(candidate) != expected_candidate_keys:
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
@@ -312,12 +389,17 @@ def _candidate_gate(
     ):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     route = canonical.get("route") if isinstance(canonical.get("route"), dict) else {}
+    manual_route = manual_candidate
     if (
         run.get("status") != "completed"
         or run.get("source_mode") != "one_c_only"
         or route.get("source_mode") != "one_c_only"
-        or route.get("final_source_kind") != "history_review"
-        or route.get("history_outcome") != "REVIEW"
+        or (
+            route.get("final_source_kind") not in {"history_review", "none"}
+            or route.get("history_outcome") not in {"REVIEW", "NO_MATCH"}
+            if manual_route
+            else route.get("final_source_kind") != "history_review" or route.get("history_outcome") != "REVIEW"
+        )
         or route.get("history_safe_basis") not in (None, "")
     ):
         return "HISTORY_CANDIDATE_ROUTE_INVALID", None
@@ -332,6 +414,9 @@ def _candidate_gate(
     if classification == "FUZZY":
         if confirmation_mode != "EXPLICIT_FUZZY_IDENTITY" or explicit_identity_assertion is not True:
             return "HISTORY_CANDIDATE_EXPLICIT_ASSERTION_REQUIRED", None
+    elif manual_candidate:
+        if confirmation_mode != "EXPLICIT_MANUAL_HISTORY_SEARCH" or explicit_identity_assertion is not True:
+            return "HISTORY_CANDIDATE_EXPLICIT_ASSERTION_REQUIRED", None
     elif confirmation_mode is not None or explicit_identity_assertion:
         return "HISTORY_CANDIDATE_CLASS_NOT_CONFIRMABLE", None
     if offer.get("provider") != "one_c_history" or provenance.get("source") != "one_c_history" or provenance.get("source_kind") != "historical_purchase":
@@ -345,6 +430,28 @@ def _candidate_gate(
         )
         if fuzzy_reason is not None:
             return fuzzy_reason, None
+    elif manual_candidate:
+        manual_reason = manual_search_confirmation_eligibility_reason(
+            source, offer, provenance, match, route,
+            expected_snapshot_version=run.get("history_catalog_version"),
+            physical_excel_row=canonical.get("physical_excel_row"),
+        )
+        if manual_reason is not None:
+            return manual_reason, None
+    if classification in {"FUZZY", "MANUAL_HISTORY_SEARCH"}:
+        try:
+            fingerprint = _candidate_fingerprint(
+                tender_id=tender_id, workspace=workspace, run=run, source=source,
+                canonical=canonical, candidate=candidate,
+                confirmation_basis=(
+                    "FUZZY_MANUAL_CONFIRMATION" if classification == "FUZZY"
+                    else "MANUAL_SEARCH_CONFIRMATION"
+                ),
+                identity_assertion="SAME_PRODUCT_V1",
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+        return None, fingerprint
     if history_model_characteristic_conflicts(source.get("model"), offer.get("history_characteristic", "")):
         return "HISTORY_CANDIDATE_SOURCE_CONFLICT", None
     if match.get("offer_id") != offer.get("offer_id") or match.get("decision") == "REJECT":
@@ -425,8 +532,11 @@ def _candidate_gate(
         fingerprint = _candidate_fingerprint(
             tender_id=tender_id, workspace=workspace, run=run, source=source,
             canonical=canonical, candidate=candidate,
-            confirmation_basis="FUZZY_MANUAL_CONFIRMATION" if classification == "FUZZY" else None,
-            identity_assertion="SAME_PRODUCT_V1" if classification == "FUZZY" else None,
+            confirmation_basis=(
+                "FUZZY_MANUAL_CONFIRMATION" if classification == "FUZZY"
+                else "MANUAL_SEARCH_CONFIRMATION" if manual_candidate else None
+            ),
+            identity_assertion="SAME_PRODUCT_V1" if classification in {"FUZZY", "MANUAL_HISTORY_SEARCH"} else None,
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
@@ -506,20 +616,32 @@ class TenderHistoryDecisionStore:
                     }
                     allowed_with_basis = allowed | {"confirmation_basis"}
                     allowed_fuzzy = allowed | {"confirmation_basis", "identity_assertion"}
+                    allowed_manual = allowed | {"confirmation_basis", "identity_assertion", "manual_search_candidate"}
                     required = ("source_row_id", "candidate_offer_id", "evidence_fingerprint", "history_snapshot_version", "history_item_id", "selected_event_id")
                     if (
-                        set(event) not in (allowed, allowed_with_basis, allowed_fuzzy)
+                        set(event) not in (allowed, allowed_with_basis, allowed_fuzzy, allowed_manual)
                         or any(not isinstance(event.get(key), str) or not event[key] or len(event[key]) > 200 for key in required)
                         or not _ID_RE.fullmatch(event["source_row_id"])
                         or not re.fullmatch(r"[a-f0-9]{64}", event["evidence_fingerprint"])
-                        or event.get("confirmation_basis") not in (None, "NORMALIZED_CONFIRMATION", "FUZZY_MANUAL_CONFIRMATION")
+                        or event.get("confirmation_basis") not in (None, "NORMALIZED_CONFIRMATION", "FUZZY_MANUAL_CONFIRMATION", "MANUAL_SEARCH_CONFIRMATION")
                         or (
                             event.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION"
                             and (set(event) != allowed_fuzzy or event.get("identity_assertion") != "SAME_PRODUCT_V1")
                         )
                         or (
                             event.get("confirmation_basis") != "FUZZY_MANUAL_CONFIRMATION"
-                            and ("identity_assertion" in event or set(event) == allowed_fuzzy)
+                            and event.get("confirmation_basis") != "MANUAL_SEARCH_CONFIRMATION"
+                            and ("identity_assertion" in event or set(event) == allowed_fuzzy or set(event) == allowed_manual)
+                        )
+                        or (
+                            event.get("confirmation_basis") == "MANUAL_SEARCH_CONFIRMATION"
+                            and (
+                                set(event) != allowed_manual
+                                or event.get("identity_assertion") != "SAME_PRODUCT_V1"
+                                or not isinstance(event.get("manual_search_candidate"), dict)
+                                or set(event["manual_search_candidate"]) != {"offer", "price_provenance", "match", "manual_variant_id"}
+                                or len(_canonical_json(event["manual_search_candidate"])) > 6000
+                            )
                         )
                     ):
                         raise ValueError("confirmation shape")
@@ -563,6 +685,59 @@ class TenderHistoryDecisionStore:
 
         sources, canonicals = TenderPriceResolver.validate_run(workspace, run, tender_id=tender_id, run_id=run_id)
         return sources, canonicals
+
+    def manual_search_context(
+        self, workspace_path: Path, workspace: dict[str, Any], run: dict[str, Any],
+        tender_id: str, run_id: str, source_row_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], int]:
+        """Validate an unresolved one_c_only row without changing its immutable run."""
+        with self.repository._lock, self._lock:
+            sources, canonicals = self._validated_context(workspace_path, workspace, run, tender_id, run_id)
+            if run.get("source_mode") != "one_c_only":
+                raise TenderWorkspaceError("Ручной поиск доступен только для запусков из истории 1С.", 409, "TENDER_MANUAL_HISTORY_SEARCH_MODE_INVALID")
+            source = sources.get(source_row_id)
+            canonical = canonicals.get(source_row_id)
+            if source is None or canonical is None or source.get("row_type") != "item":
+                raise TenderWorkspaceError("Строка позиции не найдена в запуске.", 404, "TENDER_SOURCE_ROW_UNKNOWN")
+            snapshot = self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)
+            if source_row_id in snapshot["effective"]:
+                raise TenderWorkspaceError("Строка уже подтверждена. Сначала отмените подтверждение.", 409, "TENDER_HISTORY_ALREADY_CONFIRMED")
+            route = canonical.get("route") if isinstance(canonical.get("route"), dict) else {}
+            if (
+                route.get("source_mode") != "one_c_only"
+                or route.get("final_source_kind") not in {"history_review", "none"}
+                or route.get("history_outcome") not in {"REVIEW", "NO_MATCH"}
+                or route.get("history_safe_basis") not in (None, "")
+                or route.get("history_catalog_version") != run.get("history_catalog_version")
+            ):
+                raise TenderWorkspaceError("Для этой строки ручной поиск недоступен.", 409, "TENDER_MANUAL_HISTORY_SEARCH_NOT_ALLOWED")
+            return source, canonical, snapshot["decision_revision"]
+
+    def manual_candidate_detail(
+        self, workspace_path: Path, workspace: dict[str, Any], run: dict[str, Any],
+        tender_id: str, run_id: str, source_row_id: str, candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.repository._lock, self._lock:
+            source, canonical, _revision = self.manual_search_context(
+                workspace_path, workspace, run, tender_id, run_id, source_row_id,
+            )
+            reason, fingerprint = _candidate_gate(
+                tender_id, workspace, run, source, canonical, candidate,
+                confirmation_mode="EXPLICIT_MANUAL_HISTORY_SEARCH",
+                explicit_identity_assertion=True,
+            )
+            offer, provenance, match = _public_review_candidate(candidate)
+            return {
+                "candidate_offer_id": offer.get("offer_id", ""),
+                "manual_variant_id": candidate.get("manual_variant_id"),
+                "offer": offer,
+                "price_provenance": provenance,
+                "match": match,
+                "confirmable_for_manual_search": reason is None,
+                "reason_code": reason,
+                "confirmation_basis": "MANUAL_SEARCH_CONFIRMATION",
+                "manual_evidence_fingerprint": fingerprint,
+            }
 
     def _snapshot_locked(self, workspace_path: Path, workspace: dict[str, Any], run: dict[str, Any], tender_id: str, run_id: str) -> dict[str, Any]:
         sources, canonicals = self._validated_context(workspace_path, workspace, run, tender_id, run_id)
@@ -620,6 +795,52 @@ class TenderHistoryDecisionStore:
                             and event["decision_id"] not in revoked
                         ):
                             valid_confirms.setdefault(row_id, []).append((index, event, candidate, effective_fingerprint))
+            for index, event in enumerate(events):
+                if (
+                    event.get("decision_type") != "CONFIRM_HISTORY_CANDIDATE"
+                    or event.get("confirmation_basis") != "MANUAL_SEARCH_CONFIRMATION"
+                    or event.get("source_row_id") != row_id
+                ):
+                    continue
+                manual_candidate = event.get("manual_search_candidate")
+                if not isinstance(manual_candidate, dict):
+                    continue
+                reason, fingerprint = _candidate_gate(
+                    tender_id, workspace, run, source, canonical, manual_candidate,
+                    confirmation_mode="EXPLICIT_MANUAL_HISTORY_SEARCH",
+                    explicit_identity_assertion=True,
+                )
+                offer, public_provenance, public_match = _public_review_candidate(manual_candidate)
+                candidate_id = str(offer.get("offer_id") or "")
+                if (
+                    reason is not None
+                    or not fingerprint
+                    or fingerprint != event.get("evidence_fingerprint")
+                    or candidate_id != event.get("candidate_offer_id")
+                    or public_provenance.get("history_item_id") != event.get("history_item_id")
+                    or public_provenance.get("selected_event_id") != event.get("selected_event_id")
+                    or event.get("history_snapshot_version") != run.get("history_catalog_version")
+                    or event.get("identity_assertion") != "SAME_PRODUCT_V1"
+                ):
+                    continue
+                detail = {
+                    "candidate_offer_id": candidate_id,
+                    "manual_variant_id": manual_candidate.get("manual_variant_id"),
+                    "offer": offer,
+                    "price_provenance": public_provenance,
+                    "match": public_match,
+                    "confirmable": False,
+                    "reason_code": None,
+                    "evidence_fingerprint": None,
+                    "decision": None,
+                    "confirmation_basis": "MANUAL_SEARCH_CONFIRMATION",
+                    "retrieval_rank": None,
+                    "confirmable_for_manual_search": True,
+                    "manual_evidence_fingerprint": fingerprint,
+                }
+                candidate_details.append(detail)
+                if event["decision_id"] not in revoked:
+                    valid_confirms.setdefault(row_id, []).append((index, event, manual_candidate, fingerprint))
             candidates_by_row[row_id] = candidate_details
         effective: dict[str, dict[str, Any]] = {}
         for row_id, confirmations in valid_confirms.items():
@@ -635,13 +856,15 @@ class TenderHistoryDecisionStore:
                 "candidate": candidate,
                 "confirmation_basis": event.get("confirmation_basis", "EXACT_CONFIRMATION"),
             }
-            if event.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION":
+            if event.get("confirmation_basis") in {"FUZZY_MANUAL_CONFIRMATION", "MANUAL_SEARCH_CONFIRMATION"}:
                 item["identity_assertion"] = event["identity_assertion"]
             effective[row_id] = item
             for detail in candidates_by_row.get(row_id, []):
                 detail_fingerprint = (
                     detail.get("fuzzy_evidence_fingerprint")
                     if detail.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION"
+                    else detail.get("manual_evidence_fingerprint")
+                    if detail.get("confirmation_basis") == "MANUAL_SEARCH_CONFIRMATION"
                     else detail.get("evidence_fingerprint")
                 )
                 if detail["candidate_offer_id"] == item["candidate_offer_id"] and detail_fingerprint == fingerprint:
@@ -731,6 +954,54 @@ class TenderHistoryDecisionStore:
             elif _confirmation_basis(candidate) == "FUZZY_MANUAL_CONFIRMATION":
                 event["confirmation_basis"] = "FUZZY_MANUAL_CONFIRMATION"
                 event["identity_assertion"] = "SAME_PRODUCT_V1"
+            ledger = self._read(ledger_path, tender_id, run_id)
+            self._append(ledger_path, ledger, event)
+            return self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)
+
+    def confirm_manual_search(
+        self, workspace_path: Path, workspace: dict[str, Any], run: dict[str, Any], *,
+        tender_id: str, run_id: str, source_row_id: str, expected_revision: int,
+        candidate: dict[str, Any], actor_username: str, actor_role: str,
+    ) -> dict[str, Any]:
+        ledger_path = self._path(workspace_path, tender_id, run_id)
+        with self.repository._lock, self._lock:
+            snapshot = self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)
+            if snapshot["decision_revision"] != expected_revision:
+                raise TenderWorkspaceError("Журнал подтверждений изменился. Обновите список вариантов.", 409, "TENDER_HISTORY_DECISIONS_STALE")
+            if source_row_id in snapshot["effective"]:
+                raise TenderWorkspaceError("Строка уже подтверждена. Сначала отмените подтверждение.", 409, "TENDER_HISTORY_ALREADY_CONFIRMED")
+            row_state = next((row for row in snapshot["rows"] if row["source_row_id"] == source_row_id), None)
+            if row_state is None:
+                raise TenderWorkspaceError("Вариант истории не найден.", 404, "TENDER_HISTORY_CANDIDATE_NOT_FOUND")
+            source, canonical, _revision = self.manual_search_context(
+                workspace_path, workspace, run, tender_id, run_id, source_row_id,
+            )
+            reason, fingerprint = _candidate_gate(
+                tender_id, workspace, run, source, canonical, candidate,
+                confirmation_mode="EXPLICIT_MANUAL_HISTORY_SEARCH",
+                explicit_identity_assertion=True,
+            )
+            if reason is not None or fingerprint is None:
+                raise TenderWorkspaceError("Эту запись нельзя подтвердить из-за недостаточных или противоречивых данных.", 409, "TENDER_HISTORY_CANDIDATE_NOT_CONFIRMABLE")
+            offer = candidate["offer"]
+            provenance = candidate["price_provenance"]
+            event = {
+                "decision_id": uuid.uuid4().hex,
+                "decision_type": "CONFIRM_HISTORY_CANDIDATE",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "actor": {"username": _text(actor_username, 128), "role": actor_role},
+                "tender_id": tender_id,
+                "run_id": run_id,
+                "source_row_id": source_row_id,
+                "candidate_offer_id": offer["offer_id"],
+                "evidence_fingerprint": fingerprint,
+                "history_snapshot_version": provenance["snapshot_version"],
+                "history_item_id": provenance["history_item_id"],
+                "selected_event_id": provenance["selected_event_id"],
+                "confirmation_basis": "MANUAL_SEARCH_CONFIRMATION",
+                "identity_assertion": "SAME_PRODUCT_V1",
+                "manual_search_candidate": candidate,
+            }
             ledger = self._read(ledger_path, tender_id, run_id)
             self._append(ledger_path, ledger, event)
             return self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)

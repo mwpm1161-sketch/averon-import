@@ -15,6 +15,8 @@ function createSourcingState(overrides = {}) {
     modalContext: "none",
     reviewDetailNavigation: {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false},
     fuzzyConfirmation: null,
+    manualHistorySearch: null,
+    manualHistoryConfirmation: null,
     ...overrides,
   };
 }
@@ -1152,6 +1154,8 @@ function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || 
   if (phase === "closed") {
     state.sourcing.reviewDetailNavigation = {sourceRowId:null, showCompletion:false, showEarlierActionableHint:false, requestPending:false};
     state.sourcing.fuzzyConfirmation = null;
+    state.sourcing.manualHistorySearch = null;
+    state.sourcing.manualHistoryConfirmation = null;
   }
   const submit = $("#tender-sourcing-submit");
   if (!submit) return;
@@ -4385,6 +4389,17 @@ function projectReviewCandidates(item) {
           });
         }
       }
+      for (const durable of item.historyDecisionCandidates || []) {
+        const offer = durable?.offer;
+        if (offer?.retrieval_classification !== "MANUAL_HISTORY_SEARCH" || !offer.offer_id) continue;
+        if (projected.some((candidate) => candidate.offer?.history_retrieval_classification === "MANUAL_HISTORY_SEARCH"
+          && candidate.manual_variant_id === durable.manual_variant_id)) continue;
+        projected.push({
+          ...durable,
+          offer:{...offer, history_retrieval_classification:"MANUAL_HISTORY_SEARCH", data_provenance:durable.price_provenance || {}},
+          decision:durable.match?.decision || "REVIEW",
+        });
+      }
       return projected;
     }
   }
@@ -4402,6 +4417,18 @@ function projectReviewCandidates(item) {
     .slice()
     .sort((left, right) => Number(left.rank ?? Number.MAX_SAFE_INTEGER) - Number(right.rank ?? Number.MAX_SAFE_INTEGER))
     .forEach(add);
+  for (const durable of item.historyDecisionCandidates || []) {
+    const offer = durable?.offer;
+    const offerId = String(offer?.offer_id || "");
+    if (offer?.retrieval_classification !== "MANUAL_HISTORY_SEARCH" || !offerId) continue;
+    if (candidates.some((candidate) => candidate.offer?.history_retrieval_classification === "MANUAL_HISTORY_SEARCH"
+      && candidate.manual_variant_id === durable.manual_variant_id)) continue;
+    candidates.push({
+      ...durable,
+      offer: {...offer, history_retrieval_classification:"MANUAL_HISTORY_SEARCH", data_provenance:durable.price_provenance || {}},
+      decision:durable.match?.decision || "REVIEW",
+    });
+  }
   return candidates.slice(0, 5);
 }
 
@@ -4525,11 +4552,13 @@ function renderProjectItemDetails(projectResult, item) {
       detail.showCompletion = false;
       detail.showEarlierActionableHint = false;
       if (state.sourcing.fuzzyConfirmation?.sourceRowId !== sourceRowId) state.sourcing.fuzzyConfirmation = null;
+      if (state.sourcing.manualHistorySearch?.sourceRowId !== sourceRowId) state.sourcing.manualHistorySearch = null;
+      if (state.sourcing.manualHistoryConfirmation?.sourceRowId !== sourceRowId) state.sourcing.manualHistoryConfirmation = null;
     }
   }
   const candidates = projectReviewCandidates(item);
   const route = item.route || null;
-  const historical = route?.final_source_kind === "history_review" || route?.final_source_kind === "historical_purchase";
+  const historical = route?.source_mode === "one_c_only" || route?.final_source_kind === "history_review" || route?.final_source_kind === "historical_purchase";
   const historyPresentation = historyReviewPresentation(candidates, route);
   const sourceLabel = intent.normalized_name || intent.source_text || "Позиция без исходного текста";
   $("#sourcing-subtitle").textContent = "Проверка позиции";
@@ -4546,7 +4575,8 @@ function renderProjectItemDetails(projectResult, item) {
     ${excelTenderProject ? renderProjectReviewNavigation(projectResult, sourceRowId) : ""}
     <div class="offer-grid">${candidates.map((candidate) => historical
       ? `<div class="history-candidate-wrapper">${renderHistoricalOfferCard(candidate, {compact:true, route})}${renderHumanHistoryDecisionAction(item, candidate)}</div>`
-      : renderOfferCard(candidate, true, intent)).join("")}</div>`;
+      : renderOfferCard(candidate, true, intent)).join("")}</div>
+    ${manualHistorySearchAllowed(item) ? renderManualHistorySearch(item) : ""}`;
   for (const button of $$("#sourcing-content .project-results-back")) {
     button.addEventListener("click", () => {
       if (excelTenderProject && state.sourcing.reviewDetailNavigation?.requestPending) return;
@@ -4556,6 +4586,54 @@ function renderProjectItemDetails(projectResult, item) {
   }
   if (excelTenderProject) bindProjectReviewNavigation(projectResult, sourceRowId);
   bindHumanHistoryDecisionActions(projectResult, item);
+}
+
+function renderManualHistorySearch(item) {
+  const sourceRowId = item.intent?.source_row_id || "";
+  let search = state.sourcing.manualHistorySearch;
+  if (!search || search.sourceRowId !== sourceRowId) {
+    search = {
+      sourceRowId, open:false,
+      query:String(item.intent?.normalized_name || item.intent?.source_text || "").slice(0, 200),
+      results:null, busy:false, error:"",
+    };
+    state.sourcing.manualHistorySearch = search;
+  }
+  const escape = escapeHtml;
+  const compare = state.sourcing.manualHistoryConfirmation;
+  const results = Array.isArray(search.results) ? search.results : [];
+  const resultCards = search.results === null ? "" : results.length === 0
+    ? `<p class="manual-history-empty" role="status">В истории 1С ничего не найдено по этому запросу. Попробуйте изменить формулировку.</p>`
+    : `<div class="manual-history-results">${results.map((result) => {
+      const selected = compare?.sourceRowId === sourceRowId
+        && compare.historyItemId === result.history_item_id
+        && compare.variantId === result.variant_id;
+      const value = (raw) => escape(raw === null || raw === undefined || String(raw).trim() === "" ? "Не указано" : String(raw));
+      const summary = [
+        ["Артикул", result.article], ["Производитель", result.manufacturer],
+        ["Характеристика / модель", result.characteristic], ["Единица", result.price_unit],
+        ["Историческая цена", result.price === null || result.price === undefined ? "Не указана" : `${result.price} ${result.currency || ""} / ${result.price_unit || "ед."}`],
+        ["Дата закупки", result.purchase_date], ...(result.counterparty ? [["Контрагент", result.counterparty]] : []),
+      ].map(([label, fieldValue]) => `<div class="manual-history-result-row"><span>${escape(label)}</span><b>${value(fieldValue)}</b></div>`).join("");
+      const blocked = result.confirmable_for_manual_search !== true
+        ? `<p class="history-confirmation-blocked" role="status">${escape(result.reason || "Запись показана для сравнения, но не может быть подтверждена.")}</p>`
+        : selected ? `<section class="manual-history-comparison" aria-label="Сравнение позиции с историей 1С">
+            <div class="manual-history-comparison-columns">
+              <section><h4>Исходная позиция</h4><p>${value(item.intent?.normalized_name || item.intent?.source_text)}</p><small>${value(item.intent?.article)} · ${value(item.intent?.unit)}</small></section>
+              <section><h4>История 1С</h4><p>${value(result.title)}</p><small>${value(result.article)} · ${value(result.price_unit)}</small></section>
+            </div>
+            <p class="history-fuzzy-warning">Сравните исходные сведения с выбранной записью. Подтверждение означает, что это одна и та же позиция.</p>
+            <label class="history-fuzzy-assertion-label"><input type="checkbox" class="manual-history-assertion" data-variant-id="${escape(result.variant_id)}"> Я подтверждаю, что это одна и та же позиция</label>
+            <div class="history-confirmation-actions"><button type="button" class="button secondary manual-history-cancel">Отмена</button><button type="button" class="button secondary manual-history-confirm" data-row-id="${escape(sourceRowId)}" data-history-item-id="${escape(result.history_item_id)}" data-variant-id="${escape(result.variant_id)}" data-offer-id="one_c_history:${escape(result.history_item_id)}" disabled>Подтвердить совпадение</button><button type="button" class="button primary manual-history-confirm-and-next" data-row-id="${escape(sourceRowId)}" data-history-item-id="${escape(result.history_item_id)}" data-variant-id="${escape(result.variant_id)}" data-offer-id="one_c_history:${escape(result.history_item_id)}" disabled>Подтвердить и далее</button></div>
+          </section>`
+        : `<button type="button" class="button secondary manual-history-compare" data-row-id="${escape(sourceRowId)}" data-history-item-id="${escape(result.history_item_id)}" data-variant-id="${escape(result.variant_id)}" data-offer-id="one_c_history:${escape(result.history_item_id)}">Сравнить и подтвердить</button>`;
+      return `<article class="manual-history-result-card"><span class="history-fuzzy-badge">Найдено вручную в истории 1С</span><h4>${value(result.title)}</h4><span class="manual-history-decision">Оценка: ${value(result.match_decision)}${result.unit_compatible ? " · единица совместима" : ""}</span><div class="manual-history-result-fields">${summary}</div>${blocked}</article>`;
+    }).join("")}</div>`;
+  return `<section class="manual-history-search" aria-label="Ручной поиск в истории 1С">
+    <p class="manual-history-search-prompt">Нужной записи нет?</p>
+    <button type="button" class="button secondary manual-history-open">${search.open ? "Скрыть ручной поиск" : "Найти другую запись в истории 1С"}</button>
+    ${search.open ? `<form class="manual-history-search-form"><label for="manual-history-query">Поиск по загруженной истории 1С</label><div><input id="manual-history-query" class="manual-history-query" type="search" minlength="2" maxlength="200" required value="${escape(search.query)}" ${search.busy ? "disabled" : ""}><button type="submit" class="button primary" ${search.busy ? "disabled" : ""}>${search.busy ? "Ищем…" : "Искать"}</button></div><small>Поиск выполняется только по загруженной истории 1С. Результаты не сохраняются до подтверждения.</small>${search.error ? `<p class="sourcing-warning" role="alert">${escape(search.error)}</p>` : ""}${resultCards}</form>` : ""}
+  </section>`;
 }
 
 function bindSourcingFilters(result) {
@@ -4585,7 +4663,11 @@ function projectReviewSequence(result) {
     const route = item?.route || {};
     const decision = projectDecision(item);
     if (route.final_source_kind === "historical_purchase" || route.history_outcome === "SAFE_MATCH" || decision === "HISTORY_SAFE_MATCH") continue;
-    if (route.final_source_kind !== "history_review" && decision !== "REVIEW") continue;
+    const manualHistorySearch = route.source_mode === "one_c_only"
+      && route.history_safe_basis == null
+      && ["REVIEW", "NO_MATCH"].includes(route.history_outcome)
+      && ["history_review", "none"].includes(route.final_source_kind);
+    if (route.final_source_kind !== "history_review" && decision !== "REVIEW" && !manualHistorySearch) continue;
     const sourceRowId = item?.intent?.source_row_id;
     if (!sourceRowId) continue;
     sequence.push({sourceRowId, item});
@@ -4604,19 +4686,32 @@ function nextProjectReviewItem(result, sourceRowId, direction) {
   return sequence[position + direction]?.item || null;
 }
 
-function nextActionableHistoryReviewItem(result, sourceRowId) {
+function nextActionableHistoryReviewItem(result, sourceRowId, {includeManualSearch = false} = {}) {
   const sequence = projectReviewSequence(result);
   const currentPosition = sequence.findIndex((entry) => entry.sourceRowId === sourceRowId);
   const ordered = currentPosition < 0 ? sequence : sequence.slice(currentPosition + 1);
-  return ordered.find(({item}) => !item.historyEffectiveDecision
-    && item.route?.final_source_kind === "history_review"
-    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable || candidate.confirmable_for_explicit_fuzzy))?.item || null;
+  return ordered.find(({item}) => !item.historyEffectiveDecision && (
+    includeManualSearch && manualHistorySearchAllowed(item)
+    || item.route?.final_source_kind === "history_review"
+      && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable || candidate.confirmable_for_explicit_fuzzy)
+  ))?.item || null;
 }
 
-function hasActionableHistoryReviewItem(result) {
-  return projectReviewSequence(result).some(({item}) => !item.historyEffectiveDecision
-    && item.route?.final_source_kind === "history_review"
-    && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable || candidate.confirmable_for_explicit_fuzzy));
+function hasActionableHistoryReviewItem(result, {includeManualSearch = false} = {}) {
+  return projectReviewSequence(result).some(({item}) => !item.historyEffectiveDecision && (
+    includeManualSearch && manualHistorySearchAllowed(item)
+    || item.route?.final_source_kind === "history_review"
+      && (item.historyDecisionCandidates || []).some((candidate) => candidate.confirmable || candidate.confirmable_for_explicit_fuzzy)
+  ));
+}
+
+function manualHistorySearchAllowed(item) {
+  const route = item?.route || {};
+  return !item?.historyEffectiveDecision
+    && route.source_mode === "one_c_only"
+    && route.history_safe_basis == null
+    && ["REVIEW", "NO_MATCH"].includes(route.history_outcome)
+    && ["history_review", "none"].includes(route.final_source_kind);
 }
 
 function renderProjectReviewNavigation(result, sourceRowId) {
@@ -4650,7 +4745,9 @@ function bindProjectReviewNavigation(result, sourceRowId) {
 
 function renderHumanHistoryDecisionAction(item, candidate) {
   const offer = candidate?.offer || {};
-  const stateForCandidate = (item.historyDecisionCandidates || []).find((entry) => entry.candidate_offer_id === offer.offer_id);
+  const manualOffer = offer.history_retrieval_classification === "MANUAL_HISTORY_SEARCH";
+  const stateForCandidate = (item.historyDecisionCandidates || []).find((entry) => entry.candidate_offer_id === offer.offer_id
+    && (!manualOffer || entry.manual_variant_id === candidate.manual_variant_id));
   const fuzzy = offer.history_retrieval_classification === "FUZZY";
   if (!stateForCandidate) {
     return fuzzy
@@ -4709,6 +4806,80 @@ function renderHumanHistoryDecisionAction(item, candidate) {
 
 function bindHumanHistoryDecisionActions(projectResult, item) {
   const sourceRowId = item.intent?.source_row_id || "";
+  for (const button of $$("#sourcing-content .manual-history-open")) {
+    button.addEventListener("click", () => {
+      let search = state.sourcing.manualHistorySearch;
+      if (!search || search.sourceRowId !== sourceRowId) {
+        search = {sourceRowId, open:false, query:String(item.intent?.normalized_name || item.intent?.source_text || "").slice(0, 200), results:null, busy:false, error:""};
+        state.sourcing.manualHistorySearch = search;
+      }
+      search.open = !search.open;
+      renderProjectItemDetails(projectResult, item);
+    });
+  }
+  const manualSearch = state.sourcing.manualHistorySearch;
+  const manualForm = $("#sourcing-content .manual-history-search-form");
+  const manualInput = $("#sourcing-content .manual-history-query");
+  if (manualForm && manualSearch?.sourceRowId === sourceRowId) {
+    manualInput?.addEventListener("input", () => {
+      if (state.sourcing.manualHistorySearch === manualSearch) manualSearch.query = manualInput.value.slice(0, 200);
+    });
+    manualForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const query = String(manualInput?.value || "").trim();
+      if (query.length < 2 || query.length > 200 || manualSearch.busy) return;
+      const workspace = state.excelTender.workspace;
+      const runId = projectResult.run_id;
+      if (!workspace || !runId) return;
+      manualSearch.query = query;
+      manualSearch.busy = true;
+      manualSearch.error = "";
+      manualSearch.results = null;
+      renderProjectItemDetails(projectResult, item);
+      try {
+        const response = await api(`/api/manual-tenders/${encodeURIComponent(workspace.tender_id)}/runs/${encodeURIComponent(runId)}/history-search`, {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({source_row_id:sourceRowId, query, limit:20}),
+        });
+        if (state.sourcing.manualHistorySearch !== manualSearch || state.sourcing.result !== projectResult) return;
+        manualSearch.results = Array.isArray(response.results) ? response.results.slice(0, 20) : [];
+        manualSearch.snapshotVersion = response.snapshot_version;
+      } catch (error) {
+        if (state.sourcing.manualHistorySearch !== manualSearch) return;
+        manualSearch.error = error.message || "Не удалось выполнить поиск по истории 1С.";
+        manualSearch.results = [];
+      } finally {
+        if (state.sourcing.manualHistorySearch === manualSearch) {
+          manualSearch.busy = false;
+          renderProjectItemDetails(projectResult, item);
+        }
+      }
+    });
+  }
+  for (const button of $$("#sourcing-content .manual-history-compare")) {
+    button.addEventListener("click", () => {
+      if (button.disabled) return;
+      state.sourcing.manualHistoryConfirmation = {
+        sourceRowId:button.dataset.rowId,
+        historyItemId:button.dataset.historyItemId,
+        variantId:button.dataset.variantId,
+      };
+      renderProjectItemDetails(projectResult, item);
+    });
+  }
+  for (const button of $$("#sourcing-content .manual-history-cancel")) {
+    button.addEventListener("click", () => {
+      state.sourcing.manualHistoryConfirmation = null;
+      renderProjectItemDetails(projectResult, item);
+    });
+  }
+  for (const checkbox of $$("#sourcing-content .manual-history-assertion")) {
+    checkbox.addEventListener("change", () => {
+      for (const button of $$("#sourcing-content .manual-history-confirm, #sourcing-content .manual-history-confirm-and-next")) {
+        if (button.dataset.variantId === checkbox.dataset.variantId) button.disabled = !checkbox.checked;
+      }
+    });
+  }
   for (const button of $$("#sourcing-content .history-fuzzy-compare")) {
     button.addEventListener("click", () => {
       if (button.disabled) return;
@@ -4735,6 +4906,8 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
     ...$$("#sourcing-content .history-confirm-and-next"),
     ...$$("#sourcing-content .history-fuzzy-confirm"),
     ...$$("#sourcing-content .history-fuzzy-confirm-and-next"),
+    ...$$("#sourcing-content .manual-history-confirm"),
+    ...$$("#sourcing-content .manual-history-confirm-and-next"),
     ...$$("#sourcing-content .history-revoke-confirmation"),
   ];
   for (const button of buttons) {
@@ -4747,11 +4920,19 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
       const isRevoke = button.classList.contains("history-revoke-confirmation");
       const fuzzyConfirmation = button.classList.contains("history-fuzzy-confirm")
         || button.classList.contains("history-fuzzy-confirm-and-next");
+      const manualConfirmation = button.classList.contains("manual-history-confirm")
+        || button.classList.contains("manual-history-confirm-and-next");
       const advanceAfterConfirm = button.classList.contains("history-confirm-and-next")
-        || button.classList.contains("history-fuzzy-confirm-and-next");
+        || button.classList.contains("history-fuzzy-confirm-and-next")
+        || button.classList.contains("manual-history-confirm-and-next");
       if (fuzzyConfirmation) {
         const assertion = $$("#sourcing-content .history-fuzzy-assertion")
           .find((checkbox) => checkbox.dataset.offerId === button.dataset.offerId);
+        if (!assertion?.checked) return;
+      }
+      if (manualConfirmation) {
+        const assertion = $$("#sourcing-content .manual-history-assertion")
+          .find((checkbox) => checkbox.dataset.variantId === button.dataset.variantId);
         if (!assertion?.checked) return;
       }
       const excelTenderProject = isExcelTenderProjectResult(projectResult);
@@ -4759,7 +4940,7 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
       if (excelTenderProject && (!detail || detail.sourceRowId !== sourceRowId || detail.requestPending)) return;
       if (excelTenderProject) {
         detail.requestPending = true;
-        for (const pendingButton of $$("#sourcing-content .history-confirm-candidate, #sourcing-content .history-confirm-and-next, #sourcing-content .history-fuzzy-compare, #sourcing-content .history-fuzzy-cancel, #sourcing-content .history-fuzzy-confirm, #sourcing-content .history-fuzzy-confirm-and-next, #sourcing-content .history-revoke-confirmation, #sourcing-content .project-review-previous, #sourcing-content .project-review-next, #sourcing-content .project-results-back")) {
+        for (const pendingButton of $$("#sourcing-content .history-confirm-candidate, #sourcing-content .history-confirm-and-next, #sourcing-content .history-fuzzy-compare, #sourcing-content .history-fuzzy-cancel, #sourcing-content .history-fuzzy-confirm, #sourcing-content .history-fuzzy-confirm-and-next, #sourcing-content .manual-history-compare, #sourcing-content .manual-history-cancel, #sourcing-content .manual-history-confirm, #sourcing-content .manual-history-confirm-and-next, #sourcing-content .history-revoke-confirmation, #sourcing-content .project-review-previous, #sourcing-content .project-review-next, #sourcing-content .project-results-back")) {
           pendingButton.disabled = true;
         }
       }
@@ -4775,7 +4956,14 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
             ? {decision:"REVOKE_HISTORY_CONFIRMATION", expected_revision:projectResult.historyDecisionRevision}
             : {
               decision:"CONFIRM_HISTORY_CANDIDATE", source_row_id:button.dataset.rowId,
-              candidate_offer_id:button.dataset.offerId, expected_revision:projectResult.historyDecisionRevision,
+              ...(manualConfirmation ? {
+                expected_revision:projectResult.historyDecisionRevision,
+                confirmation_mode:"EXPLICIT_MANUAL_HISTORY_SEARCH",
+                explicit_identity_assertion:true,
+                manual_history_ref:{history_item_id:button.dataset.historyItemId, variant_id:button.dataset.variantId},
+              } : {
+                candidate_offer_id:button.dataset.offerId, expected_revision:projectResult.historyDecisionRevision,
+              }),
               ...(fuzzyConfirmation ? {confirmation_mode:"EXPLICIT_FUZZY_IDENTITY", explicit_identity_assertion:true} : {}),
             }),
         });
@@ -4789,19 +4977,20 @@ function bindHumanHistoryDecisionActions(projectResult, item) {
         if (!detailStillCurrent) return;
         if (excelTenderProject) detail.requestPending = false;
         if (fuzzyConfirmation) state.sourcing.fuzzyConfirmation = null;
+        if (manualConfirmation) state.sourcing.manualHistoryConfirmation = null;
         if (isRevoke && excelTenderProject) {
           detail.showCompletion = false;
           detail.showEarlierActionableHint = false;
         }
         if (advanceAfterConfirm && !isRevoke && excelTenderProject
           && item.historyEffectiveDecision?.candidate_offer_id === button.dataset.offerId) {
-          const next = nextActionableHistoryReviewItem(projectResult, sourceRowId);
+          const next = nextActionableHistoryReviewItem(projectResult, sourceRowId, {includeManualSearch:manualConfirmation});
           if (next) {
             detail.showCompletion = false;
             detail.showEarlierActionableHint = false;
             renderProjectItemDetails(projectResult, next);
           } else {
-            const earlierActionableRemains = hasActionableHistoryReviewItem(projectResult);
+            const earlierActionableRemains = hasActionableHistoryReviewItem(projectResult, {includeManualSearch:manualConfirmation});
             detail.showCompletion = !earlierActionableRemains;
             detail.showEarlierActionableHint = earlierActionableRemains;
             renderProjectItemDetails(projectResult, item);

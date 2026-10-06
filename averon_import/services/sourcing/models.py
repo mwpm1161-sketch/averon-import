@@ -46,6 +46,7 @@ class HistoryRetrievalClassification(str, Enum):
     NORMALIZED_NAME_UNIT = "NORMALIZED_NAME_UNIT"
     STRUCTURED = "STRUCTURED"
     FUZZY = "FUZZY"
+    MANUAL_HISTORY_SEARCH = "MANUAL_HISTORY_SEARCH"
 
 
 class SourcingRouteMetadata(SourcingModel):

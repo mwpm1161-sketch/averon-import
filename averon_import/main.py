@@ -102,7 +102,10 @@ from averon_import.services.manual_tenders.price_export import (
     TenderXlsxPriceExporter,
     summarize_decisions,
 )
-from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+from averon_import.services.manual_tenders.history_decisions import (
+    TenderHistoryDecisionStore,
+    manual_search_candidate,
+)
 from averon_import.services.manual_tenders.parser import MAX_UPLOAD_BYTES as MAX_MANUAL_TENDER_UPLOAD_BYTES
 from averon_import.services.document_mutation import DocumentMutationLocks
 from averon_import.services.document_lifecycle import (
@@ -156,6 +159,7 @@ from averon_import.services.sourcing.demo_catalog import (
 )
 from averon_import.services.sourcing.models import ProductIntent, SourcingSourceMode
 from averon_import.services.sourcing.runtime import create_sourcing_runtime
+from averon_import.services.sourcing.product_understanding import build_fallback_intent
 from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.workspace import WorkspaceService, validate_document_id
 
@@ -2239,15 +2243,40 @@ class ManualTenderPriceExportRequest(BaseModel):
     allow_partial: StrictBool = False
 
 
+class ManualTenderHistoryRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    history_item_id: StrictStr = Field(min_length=1, max_length=180)
+    variant_id: StrictStr = Field(min_length=1, max_length=180)
+
+
+class ManualTenderHistorySearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_row_id: StrictStr = Field(pattern=r"^[a-f0-9]{32}$")
+    query: StrictStr = Field(min_length=2, max_length=200)
+    limit: StrictInt = Field(default=20, ge=1, le=20)
+
+
 class ManualTenderHistoryConfirmationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal["CONFIRM_HISTORY_CANDIDATE"]
     source_row_id: StrictStr = Field(pattern=r"^[a-f0-9]{32}$")
-    candidate_offer_id: StrictStr = Field(min_length=1, max_length=180)
+    candidate_offer_id: StrictStr | None = Field(default=None, min_length=1, max_length=180)
     expected_revision: StrictInt = Field(ge=0)
-    confirmation_mode: Literal["EXPLICIT_FUZZY_IDENTITY"] | None = None
+    confirmation_mode: Literal["EXPLICIT_FUZZY_IDENTITY", "EXPLICIT_MANUAL_HISTORY_SEARCH"] | None = None
     explicit_identity_assertion: StrictBool | None = None
+    manual_history_ref: ManualTenderHistoryRef | None = None
+
+    @model_validator(mode="after")
+    def _validate_confirmation_mode(self):
+        if self.confirmation_mode == "EXPLICIT_MANUAL_HISTORY_SEARCH":
+            if self.candidate_offer_id is not None or self.manual_history_ref is None or self.explicit_identity_assertion is not True:
+                raise ValueError("manual history confirmation requires only a stable item/variant reference and assertion")
+        elif self.manual_history_ref is not None or self.candidate_offer_id is None:
+            raise ValueError("existing history confirmation requires a candidate offer id")
+        return self
 
 
 class ManualTenderHistoryRevocationRequest(BaseModel):
@@ -2495,6 +2524,112 @@ def get_manual_tender_history_decisions(
             lease.release()
 
 
+_MANUAL_HISTORY_REASON_MESSAGES = {
+    "HISTORY_CANDIDATE_SOURCE_CONFLICT": "Артикул, модель или другие исходные характеристики противоречат записи истории.",
+    "HISTORY_CANDIDATE_UNIT_CONFLICT": "Единица измерения несовместима или не подтверждена.",
+    "HISTORY_CANDIDATE_PRICE_INVALID": "Для записи нет подтверждённой положительной цены с НДС.",
+    "HISTORY_CANDIDATE_PRICE_BASIS_INVALID": "Для записи не подтверждена цена с НДС.",
+    "HISTORY_CANDIDATE_CURRENCY_INVALID": "Цена записи не подтверждена в рублях.",
+    "HISTORY_CANDIDATE_DATE_INVALID": "Дата или история выбранной закупки не прошла проверку.",
+    "HISTORY_CANDIDATE_PROVENANCE_INVALID": "Для записи не подтверждена целостность истории закупки.",
+    "HISTORY_CANDIDATE_MATCH_NOT_CONFIRMABLE": "Автоматическая оценка не допускает подтверждение этой записи.",
+    "HISTORY_CANDIDATE_EVIDENCE_INVALID": "Данных этой записи недостаточно для подтверждения.",
+}
+
+
+@app.post(
+    "/api/manual-tenders/{tender_id}/runs/{run_id}/history-search",
+    dependencies=[Depends(require_authenticated)],
+)
+def search_manual_tender_history(
+    tender_id: str,
+    run_id: str,
+    request: ManualTenderHistorySearchRequest,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    workspace_lease = history_lease = None
+    try:
+        workspace_path, workspace, workspace_lease = tender_repository.acquire_sourcing_workspace(
+            tender_id, _tender_owner_key(user),
+        )
+        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        try:
+            history_lease = one_c_history_activity.acquire_sourcing()
+        except OneCHistoryActivityConflict as exc:
+            raise _one_c_history_http_error(exc) from exc
+        active_version = one_c_history_repository.catalog_version()
+        if not active_version or active_version != run.get("history_catalog_version"):
+            raise TenderWorkspaceError(
+                "История 1С была обновлена после этого подбора. Запустите подбор заново, чтобы искать и подтверждать записи в актуальной версии истории.",
+                409,
+                "TENDER_HISTORY_SNAPSHOT_CHANGED",
+            )
+        source, canonical, decision_revision = tender_history_decisions.manual_search_context(
+            workspace_path, workspace, run, tender_id, run_id, request.source_row_id,
+        )
+        route = canonical.get("route") if isinstance(canonical.get("route"), dict) else {}
+        if route.get("history_catalog_version") != active_version:
+            raise TenderWorkspaceError(
+                "История 1С была обновлена после этого подбора. Запустите подбор заново, чтобы искать и подтверждать записи в актуальной версии истории.",
+                409,
+                "TENDER_HISTORY_SNAPSHOT_CHANGED",
+            )
+        provider = sourcing_runtime.one_c_history_provider
+        if provider is None:
+            raise TenderWorkspaceError("История 1С недоступна.", 503, "ONE_C_HISTORY_UNAVAILABLE")
+        intent = build_fallback_intent(TenderSourcingRowAdapter.convert(source))
+        found = provider.manual_search(intent, request.query, limit=request.limit)
+        results = []
+        for result in found:
+            candidate = manual_search_candidate(result["offer"], result["match"], str(result["variant_id"]))
+            detail = tender_history_decisions.manual_candidate_detail(
+                workspace_path, workspace, run, tender_id, run_id,
+                request.source_row_id, candidate,
+            )
+            offer = detail["offer"]
+            provenance = detail["price_provenance"]
+            reason = detail.get("reason_code")
+            results.append({
+                "history_item_id": offer.get("source_item_id", ""),
+                "variant_id": detail.get("manual_variant_id", ""),
+                "title": offer.get("title", ""),
+                "article": offer.get("article", ""),
+                "manufacturer": offer.get("manufacturer", ""),
+                "characteristic": offer.get("history_characteristic", ""),
+                "price": offer.get("price"),
+                "currency": offer.get("currency", ""),
+                "price_unit": offer.get("price_unit", ""),
+                "purchase_date": provenance.get("purchase_date"),
+                "counterparty": " ".join(str(provenance.get("counterparty") or "").split())[:120],
+                "selected_event_id": provenance.get("selected_event_id"),
+                "snapshot_version": provenance.get("snapshot_version"),
+                "match_decision": detail["match"].get("decision"),
+                "confirmable_for_manual_search": detail["confirmable_for_manual_search"],
+                "reason_code": reason,
+                "reason": _MANUAL_HISTORY_REASON_MESSAGES.get(reason, "Запись требует дополнительной проверки.") if reason else "",
+                "unit_compatible": bool(result.get("unit_compatible")),
+            })
+        return {
+            "tender_id": tender_id,
+            "run_id": run_id,
+            "source_row_id": request.source_row_id,
+            "decision_revision": decision_revision,
+            "snapshot_version": active_version,
+            "results": results[:20],
+        }
+    except Exception as exc:
+        if isinstance(exc, TenderWorkspaceError):
+            raise _tender_http_error(exc) from exc
+        if isinstance(exc, TenderActivityConflict):
+            raise _tender_http_error(exc) from exc
+        raise
+    finally:
+        if history_lease is not None:
+            history_lease.release()
+        if workspace_lease is not None:
+            workspace_lease.release()
+
+
 @app.post(
     "/api/manual-tenders/{tender_id}/runs/{run_id}/history-decisions",
     dependencies=[Depends(require_authenticated)],
@@ -2505,17 +2640,53 @@ def confirm_manual_tender_history_candidate(
     request: ManualTenderHistoryConfirmationRequest,
     user: CurrentUser = Depends(require_authenticated),
 ):
-    lease = None
+    lease = history_lease = None
     try:
         workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(
             tender_id, _tender_owner_key(user),
         )
         run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        if request.confirmation_mode == "EXPLICIT_MANUAL_HISTORY_SEARCH":
+            try:
+                history_lease = one_c_history_activity.acquire_sourcing()
+            except OneCHistoryActivityConflict as exc:
+                raise _one_c_history_http_error(exc) from exc
+            active_version = one_c_history_repository.catalog_version()
+            if not active_version or active_version != run.get("history_catalog_version"):
+                raise TenderWorkspaceError(
+                    "История 1С была обновлена после этого подбора. Запустите подбор заново, чтобы искать и подтверждать записи в актуальной версии истории.",
+                    409,
+                    "TENDER_HISTORY_SNAPSHOT_CHANGED",
+                )
+            source, _canonical, _revision = tender_history_decisions.manual_search_context(
+                workspace_path, workspace, run, tender_id, run_id, request.source_row_id,
+            )
+            provider = sourcing_runtime.one_c_history_provider
+            reference = request.manual_history_ref
+            materialized = provider.materialize_manual_ref(
+                build_fallback_intent(TenderSourcingRowAdapter.convert(source)),
+                history_item_id=reference.history_item_id,
+                variant_id=reference.variant_id,
+            ) if provider is not None and reference is not None else None
+            if materialized is None:
+                raise TenderWorkspaceError("Выбранная запись больше не найдена в закреплённой истории 1С.", 409, "TENDER_HISTORY_CANDIDATE_NOT_FOUND")
+            candidate = manual_search_candidate(
+                materialized["offer"], materialized["match"], str(materialized["variant_id"]),
+            )
+            return tender_history_decisions.confirm_manual_search(
+                workspace_path, workspace, run,
+                tender_id=tender_id, run_id=run_id,
+                source_row_id=request.source_row_id,
+                expected_revision=request.expected_revision,
+                candidate=candidate,
+                actor_username=user.username,
+                actor_role=user.role.value,
+            )
         return tender_history_decisions.confirm(
             workspace_path, workspace, run,
             tender_id=tender_id, run_id=run_id,
             source_row_id=request.source_row_id,
-            candidate_offer_id=request.candidate_offer_id,
+            candidate_offer_id=request.candidate_offer_id or "",
             expected_revision=request.expected_revision,
             confirmation_mode=request.confirmation_mode,
             explicit_identity_assertion=request.explicit_identity_assertion,
@@ -2526,6 +2697,8 @@ def confirm_manual_tender_history_candidate(
             raise _tender_http_error(exc) from exc
         raise
     finally:
+        if history_lease is not None:
+            history_lease.release()
         if lease is not None:
             lease.release()
 

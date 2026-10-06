@@ -443,6 +443,29 @@ button { cursor: pointer; }
 .history-fuzzy-assertion-label input { width:16px; height:16px; }
 .history-fuzzy-confirm:disabled, .history-fuzzy-confirm-and-next:disabled { opacity:.45; cursor:not-allowed; }
 @media (max-width:640px) { .history-fuzzy-comparison { grid-template-columns:1fr; } }
+.manual-history-search { display:grid; gap:10px; margin-top:20px; padding:16px; border:1px solid #dbe3ee; border-radius:14px; background:#f8fafc; }
+.manual-history-search-prompt { margin:0; font-weight:700; color:#334155; }
+.manual-history-search-form { display:grid; gap:8px; }
+.manual-history-search-form label { font-weight:600; }
+.manual-history-search-form > div { display:flex; gap:8px; }
+.manual-history-search-form input { min-width:0; flex:1; }
+.manual-history-search-form small { color:#64748b; }
+.manual-history-empty { margin:0; padding:10px; color:#475569; background:#fff; border-radius:8px; }
+.manual-history-results { display:grid; gap:10px; }
+.manual-history-result-card { display:grid; gap:8px; padding:12px; border:1px solid #dbe3ee; border-radius:10px; background:#fff; }
+.manual-history-result-card h4 { margin:0; font-size:14px; }
+.manual-history-decision { color:#475569; font-size:12px; }
+.manual-history-result-fields { display:grid; gap:2px; }
+.manual-history-result-row { display:grid; grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr); gap:8px; padding:4px 0; border-top:1px solid #f1f5f9; font-size:12px; }
+.manual-history-result-row span { color:#64748b; }
+.manual-history-result-row b { overflow-wrap:anywhere; font-weight:600; }
+.manual-history-comparison { display:grid; gap:10px; padding:12px; border:1px solid #cbd5e1; border-radius:10px; background:#f8fafc; }
+.manual-history-comparison-columns { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.manual-history-comparison-columns section { min-width:0; padding:10px; border:1px solid #e2e8f0; border-radius:8px; background:#fff; }
+.manual-history-comparison-columns h4,.manual-history-comparison-columns p { margin:0 0 6px; }
+.manual-history-comparison-columns small { color:#64748b; overflow-wrap:anywhere; }
+.manual-history-confirm:disabled,.manual-history-confirm-and-next:disabled { opacity:.45; cursor:not-allowed; }
+@media (max-width:640px) { .manual-history-search-form > div { align-items:stretch; flex-direction:column; } .manual-history-comparison-columns { grid-template-columns:1fr; } }
 .project-review-navigation { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:14px 0; padding:9px 12px; border:1px solid #e2e8f0; border-radius:11px; background:#f8fafc; color:#475569; font-size:13px; }
 .project-review-navigation > span { text-align:center; font-weight:600; }
 .project-review-navigation button:disabled { opacity:.45; cursor:default; }

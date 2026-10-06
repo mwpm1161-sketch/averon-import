@@ -261,6 +261,20 @@ await pendingRequest;
 assert.equal(currentRowId(),"row-4","final confirmation stays visible and completes only after the POST succeeds");
 assert(content.innerHTML.includes("Все доступные для подтверждения позиции просмотрены."));
 
+const manualOnly = item("manual-only","none",[],{decision:"NO_MATCH"});
+manualOnly.route.history_outcome = "NO_MATCH";
+const beforeManual = item("before-manual","history_review",[candidate("before-manual-offer")]);
+const afterManual = item("after-manual","history_review",[candidate("after-manual-offer")]);
+const manualFlow = {results:[beforeManual,manualOnly,afterManual]};
+assert.deepEqual(Array.from(context.sequence(manualFlow),entry => entry.sourceRowId),["before-manual","manual-only","after-manual"]);
+assert.equal(context.actionable(manualFlow,"before-manual")?.intent.source_row_id,"after-manual",
+  "automatic confirm-and-next keeps skipping manual-search-only rows");
+assert.equal(context.actionable(manualFlow,"before-manual",{includeManualSearch:true})?.intent.source_row_id,"manual-only",
+  "manual confirm-and-next includes an unresolved NO_MATCH row");
+manualOnly.historyEffectiveDecision = {decision_id:"manual-confirmed"};
+assert.equal(context.actionable(manualFlow,"before-manual",{includeManualSearch:true})?.intent.source_row_id,"after-manual",
+  "manual confirm-and-next advances after the current manual row is confirmed");
+
 const back = getButton("project-results-back");
 await back.click();
 assert.equal(context.backResult,result);

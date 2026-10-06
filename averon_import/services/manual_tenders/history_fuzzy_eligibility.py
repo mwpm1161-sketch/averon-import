@@ -1,4 +1,4 @@
-"""Shared conservative checks for durable fuzzy history confirmation candidates.
+"""Shared conservative checks for explicit human history confirmations.
 
 These checks decide whether a retrieval result can occupy one of the small
 human-confirmation slots. The decision store still revalidates all evidence
@@ -22,6 +22,7 @@ from .parser import parse_unit_basis
 # These matcher outcomes can be considered only for FUZZY retrieval through
 # the explicit identity-confirmation flow. They never change retrieval trust.
 FUZZY_CONFIRMABLE_MATCH_DECISIONS = frozenset({"MATCH", "LIKELY_MATCH", "REVIEW"})
+MANUAL_CONFIRMABLE_MATCH_DECISIONS = frozenset({"MATCH", "LIKELY_MATCH", "REVIEW"})
 
 
 def _identity(value: Any) -> str:
@@ -42,7 +43,7 @@ def _decimal(value: Any) -> Decimal | None:
     return parsed if parsed.is_finite() else None
 
 
-def fuzzy_confirmation_eligibility_reason(
+def human_history_candidate_hard_gate(
     source: dict[str, Any],
     offer: dict[str, Any],
     provenance: dict[str, Any],
@@ -51,40 +52,11 @@ def fuzzy_confirmation_eligibility_reason(
     *,
     expected_snapshot_version: Any,
     physical_excel_row: Any,
-    retrieval_rank: Any,
+    require_manual_integrity: bool = True,
 ) -> str | None:
-    """Return a fail-closed reason when fuzzy evidence cannot be confirmed.
-
-    Inputs are the bounded projections consumed by the decision store, so the
-    same identity and commercial checks govern both slot allocation and the
-    authoritative server gate.
-    """
+    """Shared immutable identity and commercial checks for human decisions."""
     if (
-        isinstance(retrieval_rank, bool)
-        or not isinstance(retrieval_rank, int)
-        or not 1 <= retrieval_rank <= MAX_FUZZY_RETRIEVAL_RANK
-    ):
-        return "HISTORY_CANDIDATE_EVIDENCE_INVALID"
-    if match.get("decision") not in FUZZY_CONFIRMABLE_MATCH_DECISIONS:
-        return "HISTORY_CANDIDATE_MATCH_NOT_CONFIRMABLE"
-    conflicts = match.get("conflicting_attributes")
-    if not isinstance(conflicts, list) or conflicts:
-        return "HISTORY_CANDIDATE_SOURCE_CONFLICT"
-    if match.get("offer_id") != offer.get("offer_id"):
-        return "HISTORY_CANDIDATE_EVIDENCE_INVALID"
-    if (
-        route.get("source_mode") != "one_c_only"
-        or route.get("final_source_kind") != "history_review"
-        or route.get("history_outcome") != "REVIEW"
-        or route.get("history_safe_basis") not in (None, "")
-        or not isinstance(expected_snapshot_version, str)
-        or not expected_snapshot_version
-        or route.get("history_catalog_version") != expected_snapshot_version
-    ):
-        return "HISTORY_CANDIDATE_ROUTE_INVALID"
-    if (
-        offer.get("retrieval_classification") != "FUZZY"
-        or offer.get("provider") != "one_c_history"
+        offer.get("provider") != "one_c_history"
         or provenance.get("source") != "one_c_history"
         or provenance.get("source_kind") != "historical_purchase"
     ):
@@ -158,4 +130,88 @@ def fuzzy_confirmation_eligibility_reason(
         or provenance.get("unit_family") != family
     ):
         return "HISTORY_CANDIDATE_UNIT_CONFLICT"
+    if require_manual_integrity and offer.get("retrieval_classification") == "MANUAL_HISTORY_SEARCH":
+        # This flag is produced only by exact server-side rematerialization and
+        # is bound into the durable evidence fingerprint.
+        if provenance.get("manual_integrity_valid") is not True:
+            return "HISTORY_CANDIDATE_PROVENANCE_INVALID"
     return None
+
+
+def fuzzy_confirmation_eligibility_reason(
+    source: dict[str, Any],
+    offer: dict[str, Any],
+    provenance: dict[str, Any],
+    match: dict[str, Any],
+    route: dict[str, Any],
+    *,
+    expected_snapshot_version: Any,
+    physical_excel_row: Any,
+    retrieval_rank: Any,
+) -> str | None:
+    """Apply fuzzy-only authority checks, then the shared hard gate."""
+    if (
+        isinstance(retrieval_rank, bool)
+        or not isinstance(retrieval_rank, int)
+        or not 1 <= retrieval_rank <= MAX_FUZZY_RETRIEVAL_RANK
+    ):
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID"
+    if match.get("decision") not in FUZZY_CONFIRMABLE_MATCH_DECISIONS:
+        return "HISTORY_CANDIDATE_MATCH_NOT_CONFIRMABLE"
+    conflicts = match.get("conflicting_attributes")
+    if not isinstance(conflicts, list) or conflicts:
+        return "HISTORY_CANDIDATE_SOURCE_CONFLICT"
+    if match.get("offer_id") != offer.get("offer_id"):
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID"
+    if (
+        offer.get("retrieval_classification") != "FUZZY"
+        or route.get("source_mode") != "one_c_only"
+        or route.get("final_source_kind") != "history_review"
+        or route.get("history_outcome") != "REVIEW"
+        or route.get("history_safe_basis") not in (None, "")
+        or not isinstance(expected_snapshot_version, str)
+        or not expected_snapshot_version
+        or route.get("history_catalog_version") != expected_snapshot_version
+    ):
+        return "HISTORY_CANDIDATE_ROUTE_INVALID"
+    return human_history_candidate_hard_gate(
+        source, offer, provenance, match, route,
+        expected_snapshot_version=expected_snapshot_version,
+        physical_excel_row=physical_excel_row,
+    )
+
+
+def manual_search_confirmation_eligibility_reason(
+    source: dict[str, Any],
+    offer: dict[str, Any],
+    provenance: dict[str, Any],
+    match: dict[str, Any],
+    route: dict[str, Any],
+    *,
+    expected_snapshot_version: Any,
+    physical_excel_row: Any,
+) -> str | None:
+    """Apply explicit manual-discovery policy, then the shared hard gate."""
+    if match.get("decision") not in MANUAL_CONFIRMABLE_MATCH_DECISIONS:
+        return "HISTORY_CANDIDATE_MATCH_NOT_CONFIRMABLE"
+    conflicts = match.get("conflicting_attributes")
+    if not isinstance(conflicts, list) or conflicts:
+        return "HISTORY_CANDIDATE_SOURCE_CONFLICT"
+    if match.get("offer_id") != offer.get("offer_id"):
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID"
+    if (
+        offer.get("retrieval_classification") != "MANUAL_HISTORY_SEARCH"
+        or route.get("source_mode") != "one_c_only"
+        or route.get("final_source_kind") not in {"history_review", "none"}
+        or route.get("history_outcome") not in {"REVIEW", "NO_MATCH"}
+        or route.get("history_safe_basis") not in (None, "")
+        or not isinstance(expected_snapshot_version, str)
+        or not expected_snapshot_version
+        or route.get("history_catalog_version") != expected_snapshot_version
+    ):
+        return "HISTORY_CANDIDATE_ROUTE_INVALID"
+    return human_history_candidate_hard_gate(
+        source, offer, provenance, match, route,
+        expected_snapshot_version=expected_snapshot_version,
+        physical_excel_row=physical_excel_row,
+    )
