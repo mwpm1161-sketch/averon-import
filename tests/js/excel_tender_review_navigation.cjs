@@ -73,6 +73,7 @@ const context = {
   historyReviewPresentation: () => ({title:"Проверка истории 1С",explanation:"Требуется проверка."}),
   renderHistoricalOfferCard: candidate => `<article>${candidate.offer.title}</article>`,
   historicalOfferDate: () => "2026-09-20",
+  historicalOfferWarehouse: () => "не указан",
   renderOfferCard: () => "<article>Предложение</article>",
   renderProductUnderstanding: () => "",
   renderSourcingRouteExplanation: () => "",

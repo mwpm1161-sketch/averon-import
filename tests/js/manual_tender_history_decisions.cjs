@@ -10,8 +10,11 @@ const projectCandidatesStart = source.indexOf("function projectReviewCandidates(
 const historyPresentationStart = source.indexOf("function historyReviewPresentation(candidates, route = null) {");
 const historyPresentationEnd = source.indexOf("function projectHasReviewCandidates(item) {", historyPresentationStart);
 const projectSequenceStart = source.indexOf("function projectReviewSequence(result) {");
-if ([applyStart, applyEnd, actionRenderStart, actionBindStart, actionEnd, projectCandidatesStart, historyPresentationStart, historyPresentationEnd, projectSequenceStart].some(index => index < 0)) throw new Error("Human history decision UI functions were not found");
-const snippet = [source.slice(applyStart, applyEnd), source.slice(actionRenderStart, actionBindStart), source.slice(projectSequenceStart, actionEnd), source.slice(projectCandidatesStart, historyPresentationStart), source.slice(historyPresentationStart, historyPresentationEnd)].join("\n");
+const provenanceStart = source.indexOf("function historicalOfferProvenance(value) {");
+const provenanceEnd = source.indexOf("function renderHistoricalOfferCard", provenanceStart);
+const cardEnd = source.indexOf("function sourcingRouteExplanation", provenanceEnd);
+if ([applyStart, applyEnd, actionRenderStart, actionBindStart, actionEnd, projectCandidatesStart, historyPresentationStart, historyPresentationEnd, projectSequenceStart, provenanceStart, provenanceEnd, cardEnd].some(index => index < 0)) throw new Error("Human history decision UI functions were not found");
+const snippet = [source.slice(applyStart, applyEnd), source.slice(provenanceStart, cardEnd), source.slice(actionRenderStart, actionBindStart), source.slice(projectSequenceStart, actionEnd), source.slice(projectCandidatesStart, historyPresentationStart), source.slice(historyPresentationStart, historyPresentationEnd)].join("\n");
 const actionStart = source.indexOf("function bindHumanHistoryDecisionActions(projectResult, item) {");
 const actionBindEnd = source.indexOf("function renderSourcingResult(result, row = null) {", actionStart);
 const actionSource = source.slice(actionStart, actionBindEnd);
@@ -23,8 +26,8 @@ const candidate = {offer:{offer_id:"one_c_history:item-1",title:"Плющ иск
 const eligible = {candidate_offer_id:candidate.offer.offer_id,offer:candidate.offer,confirmable:true,evidence_fingerprint:"f".repeat(64)};
 const sourceRowId = "a".repeat(32);
 const item = {intent:{source_row_id:sourceRowId,normalized_name:"Исходное изделие",source_text:"Исходное изделие",unit:"шт",article:"A-1",manufacturer:"Maker",model:"M-1"},historyDecisionCandidates:[eligible],historyEffectiveDecision:null};
-const fuzzyOffer = {offer_id:"one_c_history:fuzzy-1",provider:"one_c_history",source_item_id:"fuzzy-1",title:"Похожее историческое изделие",price:"234.50",currency:"RUB",price_unit:"шт",article:"A-1",manufacturer:"Maker",history_characteristic:"M-1",retrieved_at:"2026-10-01T00:00:00Z",history_retrieval_classification:"FUZZY",data_provenance:{purchase_date:"2025-04-16",counterparty:"Поставщик"}};
-const fuzzyEligible = {candidate_offer_id:fuzzyOffer.offer_id,offer:{...fuzzyOffer,retrieval_classification:"FUZZY"},price_provenance:{purchase_date:"2025-04-16"},match:{decision:"REVIEW",offer_id:fuzzyOffer.offer_id,conflicting_attributes:[],missing_attributes:["name"]},confirmable:false,confirmable_for_explicit_fuzzy:true,confirmation_basis:"FUZZY_MANUAL_CONFIRMATION",retrieval_rank:1,fuzzy_evidence_fingerprint:"g".repeat(64)};
+const fuzzyOffer = {offer_id:"one_c_history:fuzzy-1",provider:"one_c_history",source_item_id:"fuzzy-1",title:"Похожее историческое изделие",price:"234.50",currency:"RUB",price_unit:"шт",article:"A-1",manufacturer:"Maker",history_characteristic:"M-1",retrieved_at:"2026-10-01T00:00:00Z",history_retrieval_classification:"FUZZY",data_provenance:{purchase_date:"2025-04-16",counterparty:"Поставщик",warehouse:"Склад fuzzy-кандидата",warehouse_truncated:true}};
+const fuzzyEligible = {candidate_offer_id:fuzzyOffer.offer_id,offer:{...fuzzyOffer,retrieval_classification:"FUZZY"},price_provenance:{purchase_date:"2025-04-16",warehouse:"Склад fuzzy-кандидата",warehouse_truncated:true},match:{decision:"REVIEW",offer_id:fuzzyOffer.offer_id,conflicting_attributes:[],missing_attributes:["name"]},confirmable:false,confirmable_for_explicit_fuzzy:true,confirmation_basis:"FUZZY_MANUAL_CONFIRMATION",retrieval_rank:1,fuzzy_evidence_fingerprint:"g".repeat(64)};
 const escaped = value => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 const makeNode = (classes, dataset={}) => {
   const node = {dataset, disabled:false, checked:false, handlers:{},
@@ -57,6 +60,10 @@ const context = {
   $$:selector=>selectNodes(selector),
   escapeHtml:escaped,
   historicalOfferDate:()=>"2025-04-16",
+  historicalOfferPrice:()=>"123.45 RUB / шт",
+  offerTitleHtml:offer=>String(offer?.title || ""),
+  historyReviewPresentation:()=>({explanation:"Проверить историю."}),
+  renderSourcingDecision:()=>"",
   isExcelTenderProjectResult:()=>true,
   projectDecision:()=>"REVIEW",
   encodeURIComponent,
@@ -74,7 +81,7 @@ const context = {
           error.code = "TENDER_HISTORY_DECISIONS_STALE";
           throw error;
         }
-        const effective = {decision_id:"e".repeat(32),candidate_offer_id:fuzzyOffer.offer_id,confirmation_basis:"FUZZY_MANUAL_CONFIRMATION",identity_assertion:"SAME_PRODUCT_V1"};
+        const effective = {decision_id:"e".repeat(32),candidate_offer_id:fuzzyOffer.offer_id,confirmation_basis:"FUZZY_MANUAL_CONFIRMATION",identity_assertion:"SAME_PRODUCT_V1",warehouse_evidence:{warehouse:"Склад из подтвержденного журнала",truncated:true}};
         return {
           decision_revision:2,decision_digest:"e".repeat(64),effective:{[sourceRowId]:effective},
           rows:[{source_row_id:sourceRowId,candidates:[{...fuzzyEligible,decision:{decision_id:effective.decision_id}}],effective_decision:effective}],
@@ -94,6 +101,11 @@ const context = {
   },
 };
 vm.runInNewContext(`${snippet}; globalThis.renderAction=renderHumanHistoryDecisionAction; globalThis.apply=applyTenderHistoryDecisionSnapshot; globalThis.bind=bindHumanHistoryDecisionActions; globalThis.reviewCandidates=projectReviewCandidates; globalThis.historyPresentation=historyReviewPresentation; globalThis.nextActionable=nextActionableHistoryReviewItem;`, context);
+vm.runInNewContext("globalThis.renderHistoricalCard=renderHistoricalOfferCard; globalThis.offerWarehouse=historicalOfferWarehouse;", context);
+
+const automaticCard = context.renderHistoricalCard({offer:{title:"Automatic history row",data_provenance:{warehouse:"Склад automatic"}}});
+if (!automaticCard.includes("Склад: Склад automatic")) throw new Error("Automatic historical offer card must display warehouse provenance");
+if (context.offerWarehouse({price_provenance:{}}) !== "не указан") throw new Error("Missing warehouse must have an explicit neutral display value");
 
 const normalized = context.renderAction(item, {offer:candidate.offer,decision:"REVIEW"});
 if (!normalized.includes("Подтвердить эту запись") || !normalized.includes("Подтвердить и далее")) throw new Error("Server-approved normalized candidate should expose both ordinary confirmation actions");
@@ -160,7 +172,7 @@ async function runUiLifecycle() {
   await compare.handlers.click();
   if (postCount !== 1) throw new Error("Opening fuzzy comparison must not POST a confirmation");
   markup = context.renderAction(item, {offer:fuzzyOffer,decision:"REVIEW"});
-  for (const label of ["Исходная позиция", "История 1С", "M-1", "M-1", "234.50", "2025-04-16", "Название отличается и совпадение не подтверждено автоматически.", "Подтвердите только если это действительно одна и та же позиция.", "Я подтверждаю, что это одна и та же позиция"]) {
+  for (const label of ["Исходная позиция", "История 1С", "M-1", "M-1", "234.50", "2025-04-16", "Склад fuzzy-кандидата… (значение сокращено)", "Название отличается и совпадение не подтверждено автоматически.", "Подтвердите только если это действительно одна и та же позиция.", "Я подтверждаю, что это одна и та же позиция"]) {
     if (!markup.includes(label)) throw new Error(`Fuzzy compare view is missing ${label}`);
   }
   const cancel = makeNode(["history-fuzzy-cancel"], {rowId:sourceRowId,offerId:fuzzyOffer.offer_id});
@@ -189,6 +201,7 @@ async function runUiLifecycle() {
   if (context.state.sourcing.reviewDetailNavigation.sourceRowId !== sourceRowId || !context.state.sourcing.reviewDetailNavigation.showCompletion) throw new Error("Confirm-and-next must advance only after successful POST");
   markup = context.renderAction(item, {offer:fuzzyOffer,decision:"REVIEW"});
   if (!markup.includes("Подтверждено пользователем") || !markup.includes("Отменить подтверждение")) throw new Error("Successful fuzzy confirmation badge/revoke action is missing");
+  if (!markup.includes("Склад: Склад из подтвержденного журнала… (значение сокращено)")) throw new Error("Confirmed state must display persisted warehouse evidence");
 
   const revoke = makeNode(["history-revoke-confirmation"], {decisionId:"e".repeat(32)});
   nodePool = [revoke];

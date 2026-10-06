@@ -21,6 +21,14 @@ from .repository import (
 from .history_fuzzy_eligibility import (
     fuzzy_confirmation_eligibility_reason,
 )
+from .history_projection import (
+    HISTORY_TEXT_POOL_KEY,
+    MAX_COUNTERPARTY_DISPLAY_BYTES,
+    MAX_WAREHOUSE_DISPLAY_BYTES,
+    bounded_utf8_text,
+    encode_history_candidate_rows,
+    pending_history_candidate_v2,
+)
 
 _RUN_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Z0-9_-]{1,80}$")
@@ -33,7 +41,8 @@ _PRICE_PROVENANCE_FIELDS = {
         "source", "source_kind", "snapshot_version", "history_item_id",
         "selected_event_id", "purchase_date", "price_basis",
         "effective_unit_price_gross", "currency_basis", "unit_family",
-        "normalizer_revision", "normalized_name_signature",
+        "normalizer_revision", "normalized_name_signature", "warehouse",
+        "warehouse_truncated",
     ),
     "lemana_b2b": ("source", "product_item", "mirror_revision"),
 }
@@ -54,6 +63,8 @@ _PRICE_PROVENANCE_STRING_LIMITS = {
     "unit_family": 80,
     "normalizer_revision": 80,
     "normalized_name_signature": 64,
+    "warehouse": MAX_WAREHOUSE_DISPLAY_BYTES,
+    "counterparty": MAX_COUNTERPARTY_DISPLAY_BYTES,
     "product_item": 180,
     "mirror_revision": 120,
 }
@@ -239,8 +250,18 @@ class TenderSourcingRunStore:
                 "status": "completed", "completed_at": _now(),
                 "catalog_version": catalog_version,
                 "history_catalog_version": history_catalog_version,
-                "summary": summary, "rows": rows, "failure": None,
+                "summary": summary, "failure": None,
             })
+            try:
+                encoded_rows, text_pool = encode_history_candidate_rows(rows)
+            except (TypeError, ValueError, UnicodeEncodeError) as exc:
+                raise TenderWorkspaceError(
+                    "Результат подбора содержит повреждённые данные истории.",
+                    409, "TENDER_RESULT_INVALID",
+                ) from exc
+            run["rows"] = encoded_rows
+            if text_pool:
+                run[HISTORY_TEXT_POOL_KEY] = text_pool
             self._atomic_write(path, run)
             self._prune_terminal(workspace_path)
 
@@ -325,6 +346,31 @@ class TenderSourcingRunStore:
 
     def get_public(self, workspace_path: Path, tender_id: str, run_id: str) -> dict[str, Any]:
         run = self._read_path(self._path(workspace_path, run_id), tender_id=tender_id)
+        from .history_decisions import _expand_review_candidate
+        from .history_projection import decode_history_candidate_v2
+
+        pool = run.get(HISTORY_TEXT_POOL_KEY, [])
+        if (
+            not isinstance(pool, list) or any(not isinstance(item, str) for item in pool)
+            or pool != sorted(set(pool))
+        ):
+            raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT")
+        for row in run.get("rows", []):
+            if not isinstance(row, dict) or not isinstance(row.get("history_review_candidates", []), list):
+                raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT")
+            expanded_candidates = []
+            for candidate in row.get("history_review_candidates", []):
+                try:
+                    compact = decode_history_candidate_v2(candidate, pool)
+                except (TypeError, ValueError) as exc:
+                    raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT") from exc
+                if compact is not None:
+                    candidate = _expand_review_candidate(compact)
+                    if not candidate:
+                        raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT")
+                expanded_candidates.append(candidate)
+            row["history_review_candidates"] = expanded_candidates
+        run.pop(HISTORY_TEXT_POOL_KEY, None)
         return run
 
 
@@ -369,6 +415,8 @@ def _safe_provenance_value(key: str, value: Any) -> Any:
         rendered = str(value)
         return rendered if len(rendered) <= _PRICE_PROVENANCE_STRING_LIMITS[key] else _OMIT_PROVENANCE
     if isinstance(value, str):
+        if key in {"warehouse", "counterparty"}:
+            value, _truncated = bounded_utf8_text(value, _PRICE_PROVENANCE_STRING_LIMITS[key])
         return value[:_PRICE_PROVENANCE_STRING_LIMITS[key]]
     if isinstance(value, int):
         return value if len(str(value)) <= 32 else _OMIT_PROVENANCE
@@ -392,6 +440,17 @@ def _safe_price_provenance(offer: dict[str, Any] | None) -> dict[str, Any]:
     safe: dict[str, Any] = {}
     for key in fields:
         if key not in provenance:
+            continue
+        if key in {"warehouse", "counterparty"}:
+            text, truncated = bounded_utf8_text(provenance[key], _PRICE_PROVENANCE_STRING_LIMITS[key])
+            if text:
+                safe[key] = text
+            if truncated or provenance.get(f"{key}_truncated") is True:
+                safe[f"{key}_truncated"] = True
+            continue
+        if key in {"warehouse_truncated", "counterparty_truncated"}:
+            if provenance.get(key) is True:
+                safe[key] = True
             continue
         value = _safe_provenance_value(key, provenance[key])
         if value is not _OMIT_PROVENANCE:
@@ -460,11 +519,17 @@ def _compact_fuzzy_projection_candidate(
         key: value for key, value in safe_provenance.items()
         if key not in {"normalizer_revision", "normalized_name_signature"}
     }
+    raw_provenance = candidate.get("data_provenance")
+    raw_provenance = raw_provenance if isinstance(raw_provenance, dict) else {}
+    counterparty, counterparty_cut = bounded_utf8_text(
+        raw_provenance.get("counterparty"), MAX_COUNTERPARTY_DISPLAY_BYTES,
+    )
+    counterparty_truncated = counterparty_cut or raw_provenance.get("counterparty_truncated") is True
     safe_match = {
         key: safe_match.get(key, [])
         for key in ("decision", "offer_id", "conflicting_attributes", "missing_attributes")
     }
-    return {"fuzzy_v1": {
+    compact_v1 = {
         "classification": "FUZZY",
         "provider": "1c",
         "identity": [
@@ -487,7 +552,16 @@ def _compact_fuzzy_projection_candidate(
             safe_match.get("conflicting_attributes", []), safe_match.get("missing_attributes", []),
         ],
         "rank": retrieval_rank,
-    }}
+    }
+    if "warehouse" in safe_provenance or counterparty or counterparty_truncated:
+        return pending_history_candidate_v2(
+            compact_v1,
+            warehouse=safe_provenance.get("warehouse"),
+            counterparty=counterparty,
+            warehouse_truncated=safe_provenance.get("warehouse_truncated") is True,
+            counterparty_truncated=counterparty_truncated,
+        )
+    return {"fuzzy_v1": compact_v1}
 
 
 def canonical_tender_projection(
@@ -622,7 +696,10 @@ def canonical_tender_projection(
             )
             if key in route
         }
-        if history_review_candidates and "fuzzy_v1" in history_review_candidates[0]:
+        if history_review_candidates and (
+            "fuzzy_v1" in history_review_candidates[0]
+            or "_history_candidate_v2_pending" in history_review_candidates[0]
+        ):
             route_projection = {
                 key: route_projection[key]
                 for key in (

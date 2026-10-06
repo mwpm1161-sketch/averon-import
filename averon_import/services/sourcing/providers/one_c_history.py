@@ -47,6 +47,8 @@ from averon_import.services.sourcing.providers.base import SourcingProviderCache
 _MAX_PROVIDER_LIMIT = MAX_FUZZY_RETRIEVAL_RANK
 _MIN_FUZZY_SCORE = 58
 _COMPANY_DEFAULT_HISTORY_CURRENCY = "RUB"
+_WAREHOUSE_DISPLAY_MAX_BYTES = 128
+_COUNTERPARTY_DISPLAY_MAX_BYTES = 120
 _MATCHER_ARTICLE_TRANSLATION = str.maketrans({
     "а": "a", "в": "v", "е": "e", "з": "z", "и": "i", "к": "k",
     "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
@@ -59,6 +61,18 @@ def _effective_history_currency(source_currency: str | None) -> tuple[str, str]:
     if source_currency is not None and source_currency.strip():
         return source_currency, "source"
     return _COMPANY_DEFAULT_HISTORY_CURRENCY, "company_default"
+
+
+def _bounded_display_text(value: object, max_bytes: int) -> tuple[str, bool]:
+    if not isinstance(value, str):
+        return "", False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "", True
+    if len(encoded) <= max_bytes:
+        return value, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 
 
 class HistoryMatchOutcome(str, Enum):
@@ -905,6 +919,12 @@ class OneCHistoryProvider:
         selected_price = event.effective_unit_price_gross if event is not None else None
         source_currency = event.currency if event is not None else None
         currency, currency_basis = _effective_history_currency(source_currency)
+        counterparty, counterparty_truncated = _bounded_display_text(
+            event.counterparty if event is not None else "", _COUNTERPARTY_DISPLAY_MAX_BYTES,
+        )
+        warehouse, warehouse_truncated = _bounded_display_text(
+            event.warehouse if event is not None else "", _WAREHOUSE_DISPLAY_MAX_BYTES,
+        )
         provenance = {
             "source": "one_c_history",
             "source_kind": "historical_purchase",
@@ -916,7 +936,8 @@ class OneCHistoryProvider:
             "selected_event_id": event.event_id if event is not None else None,
             "purchase_date": event.document_date if event is not None else None,
             "document_type": event.document_type if event is not None else "",
-            "counterparty": event.counterparty if event is not None else "",
+            "counterparty": counterparty,
+            "warehouse": warehouse,
             "purchased_quantity": event.quantity if event is not None else None,
             "price_basis": event.price_basis if event is not None else "",
             "reported_unit_price_gross": event.reported_unit_price_gross if event is not None else None,
@@ -924,6 +945,10 @@ class OneCHistoryProvider:
             "currency_basis": currency_basis,
             "unit_family": unit_family,
         }
+        if counterparty_truncated:
+            provenance["counterparty_truncated"] = True
+        if warehouse_truncated:
+            provenance["warehouse_truncated"] = True
         if candidate.classification == HistoryRetrievalClassification.NORMALIZED_NAME_UNIT:
             provenance["normalizer_revision"] = HISTORY_IDENTITY_NORMALIZER_REVISION
             provenance["normalized_name_signature"] = history_name_signature_digest(variant.item_name)

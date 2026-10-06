@@ -83,11 +83,14 @@ class OneCHistoryRepository:
         return next((item for item in self.profiles() if item.profile_id == profile_id), None)
 
     def compatible_profiles(self, *, sheet_name: str, signature: str) -> list[ImportProfile]:
+        supported_versions = {PARSER_VERSION}
+        if PARSER_VERSION == 2:
+            supported_versions.add(1)
         return [
             item for item in self.profiles()
             if item.sheet_name == sheet_name
             and item.header_signature == signature
-            and item.parser_version == PARSER_VERSION
+            and item.parser_version in supported_versions
         ]
 
     def compatible_profile(self, *, sheet_name: str, signature: str) -> ImportProfile | None:
@@ -489,6 +492,15 @@ class OneCHistoryRepository:
                         "effective_unit_price_gross_decimal", "amount_gross_decimal",
                     )]
                     optional_facts, optional_valid = self._json_object(row["optional_facts_json"])
+                    warehouse_value = optional_facts.get("warehouse")
+                    warehouse = ""
+                    if isinstance(warehouse_value, str) and len(warehouse_value) <= 32_767:
+                        try:
+                            warehouse_value.encode("utf-8")
+                        except UnicodeEncodeError:
+                            pass
+                        else:
+                            warehouse = warehouse_value
                     if not optional_valid:
                         payload["integrity_conflicts"].add("malformed_descriptive_provenance")
                     currency, currency_valid = self._source_text(optional_facts.get("currency"))
@@ -545,6 +557,7 @@ class OneCHistoryRepository:
                         source_row=source_row,
                         provenance_valid=event_valid,
                         numeric_values_valid=all(pair[1] for pair in numeric_pairs),
+                        warehouse=warehouse,
                     ))
 
                 expected_items = metadata.get("item_count")
@@ -731,6 +744,10 @@ class OneCHistoryRepository:
                     )
                     items: dict[str, dict] = {}
                     for event in parsed.events:
+                        item_facts = {
+                            key: value for key, value in event.optional_facts.items()
+                            if key != "warehouse"
+                        }
                         items.setdefault(event.item_key, {
                             "item_id": event.item_key,
                             "source_item_code": event.item_code,
@@ -740,7 +757,7 @@ class OneCHistoryRepository:
                             "unit_family": event.unit_family,
                             "identity_quality": event.identity_quality,
                             "group_number": event.group_number,
-                            "descriptive_facts_json": json.dumps(event.optional_facts, ensure_ascii=False, separators=(",", ":")),
+                            "descriptive_facts_json": json.dumps(item_facts, ensure_ascii=False, separators=(",", ":")),
                         })
                     connection.executemany(
                         """INSERT INTO nomenclature_items(

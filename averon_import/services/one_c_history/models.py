@@ -14,6 +14,7 @@ FIELD_NAMES = (
     "counterparty", "contract", "article", "manufacturer", "characteristic",
     "supplier_code", "supplier_inn", "vat_rate", "currency", "organization",
     "document_stable_reference", "document_line_number",
+    "warehouse",
 )
 
 

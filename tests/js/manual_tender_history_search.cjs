@@ -62,6 +62,8 @@ const successfulResult = {
   history_item_id:"item-1", variant_id:"variant-1", title:"Клей д/плитки СМ 17",
   article:"", manufacturer:"", characteristic:"", price:"123.45", currency:"RUB",
   price_unit:"кг", purchase_date:"2025-04-16", match_decision:"LIKELY_MATCH",
+  counterparty:"Поставщик выбранного события", counterparty_truncated:true,
+  warehouse:"Склад выбранного события", warehouse_truncated:true,
   confirmable_for_manual_search:true, reason_code:null, reason:"", unit_compatible:true,
 };
 const context = {
@@ -137,6 +139,8 @@ vm.runInNewContext([
   let markup = context.renderManualHistorySearch(row);
   assert(markup.includes("Найдено вручную в истории 1С"));
   assert(markup.includes("Сравнить и подтвердить"));
+  assert(markup.includes("Склад выбранного события… (значение сокращено)"), "manual result displays bounded warehouse provenance");
+  assert(markup.includes("Поставщик выбранного события… (значение сокращено)"), "manual result displays bounded counterparty provenance");
   assert(markup.includes("Единица измерения несовместима."), "blocked candidates explain why they cannot be confirmed");
   state.sourcing.manualHistorySearch.results = [];
   assert(context.renderManualHistorySearch(row).includes("В истории 1С ничего не найдено по этому запросу"));

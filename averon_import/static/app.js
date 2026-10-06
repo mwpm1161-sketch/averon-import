@@ -4190,12 +4190,31 @@ function historicalOfferPrice(offer) {
 }
 
 function historicalOfferDate(offer, route = null) {
-  const value = route?.history_purchase_date || offer?.data_provenance?.purchase_date || "";
+  const provenance = historicalOfferProvenance(offer);
+  const value = route?.history_purchase_date || provenance.purchase_date || "";
   return formatSourcingHistoryDate(value) || String(value || "Дата закупки не указана");
 }
 
+function historicalOfferProvenance(value) {
+  if (!value || typeof value !== "object") return {};
+  const offer = value.offer && typeof value.offer === "object" ? value.offer : value;
+  const provenance = offer.data_provenance || value.price_provenance || offer.price_provenance;
+  return provenance && typeof provenance === "object" ? provenance : {};
+}
+
 function historicalOfferCounterparty(offer) {
-  return String(offer?.data_provenance?.counterparty || "не указан");
+  const provenance = historicalOfferProvenance(offer);
+  const value = typeof provenance.counterparty === "string" ? provenance.counterparty.trim() : "";
+  return value ? `${value}${provenance.counterparty_truncated === true ? "… (значение сокращено)" : ""}` : "не указан";
+}
+
+function historicalOfferWarehouse(offer) {
+  const provenance = historicalOfferProvenance(offer);
+  const evidence = offer?.warehouse_evidence;
+  const raw = evidence && typeof evidence.warehouse === "string" ? evidence.warehouse : provenance.warehouse;
+  const value = typeof raw === "string" ? raw.trim() : "";
+  const truncated = evidence ? evidence.truncated === true : provenance.warehouse_truncated === true;
+  return value ? `${value}${truncated ? "… (значение сокращено)" : ""}` : "не указан";
 }
 
 function renderHistoricalOfferCard(result, {compact = false, route = null} = {}) {
@@ -4219,7 +4238,7 @@ function renderHistoricalOfferCard(result, {compact = false, route = null} = {})
   return `<article class="offer-card historical-offer-card ${compact ? "compact" : "recommended"} ${retrievalClass}">
     <div class="offer-card-heading"><span class="technical-badge">История 1С</span>${retrievalBadge}${decisionBadge}<b>${offerTitleHtml(offer)}</b></div>
     <div class="offer-price">${historicalOfferPrice(offer)}</div>
-    <div class="offer-meta"><span>Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))}</span><span>Контрагент: ${escapeHtml(historicalOfferCounterparty(offer))}</span><span>Текущая доступность не подтверждена.</span></div>
+    <div class="offer-meta"><span>Дата закупки: ${escapeHtml(historicalOfferDate(result, route))}</span><span>Контрагент: ${escapeHtml(historicalOfferCounterparty(result))}</span><span>Склад: ${escapeHtml(historicalOfferWarehouse(result))}</span><span>Текущая доступность не подтверждена.</span></div>
     ${explanation ? `<p class="offer-explanation">${escapeHtml(explanation)}</p>` : ""}
   </article>`;
 }
@@ -4506,7 +4525,7 @@ function renderProjectResultRow(view, itemIndex) {
     : historicalReview ? `Вариант истории 1С для проверки: ${offerTitleHtml(offer)}`
     : offerTitleHtml(offer);
   const sourceCell = route?.final_source_kind === "historical_purchase" || historicalReview
-    ? `<span>История 1С${historicalReview ? " · требуется проверка" : ""}</span><small class="project-result-secondary">Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))}</small><small class="project-result-secondary">Поставщик в истории: ${escapeHtml(historicalOfferCounterparty(offer))}</small>`
+    ? `<span>История 1С${historicalReview ? " · требуется проверка" : ""}</span><small class="project-result-secondary">Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))}</small><small class="project-result-secondary">Поставщик в истории: ${escapeHtml(historicalOfferCounterparty(offer))}</small><small class="project-result-secondary">Склад: ${escapeHtml(historicalOfferWarehouse(offer))}</small>`
     : offer ? `<span>${escapeHtml(sourcingProviderLabel(offer))}</span>${route?.fallback_called ? `<small class="project-result-secondary">После проверки истории 1С</small>` : ""}`
     : "—";
   const priceCell = offer ? renderProjectPriceCell(offer, historical) : "—";
@@ -4613,7 +4632,8 @@ function renderManualHistorySearch(item) {
         ["Артикул", result.article], ["Производитель", result.manufacturer],
         ["Характеристика / модель", result.characteristic], ["Единица", result.price_unit],
         ["Историческая цена", result.price === null || result.price === undefined ? "Не указана" : `${result.price} ${result.currency || ""} / ${result.price_unit || "ед."}`],
-        ["Дата закупки", result.purchase_date], ...(result.counterparty ? [["Контрагент", result.counterparty]] : []),
+        ["Дата закупки", result.purchase_date], ["Контрагент", `${result.counterparty || "не указан"}${result.counterparty_truncated === true && result.counterparty ? "… (значение сокращено)" : ""}`],
+        ["Склад", `${result.warehouse || "не указан"}${result.warehouse_truncated === true ? "… (значение сокращено)" : ""}`],
       ].map(([label, fieldValue]) => `<div class="manual-history-result-row"><span>${escape(label)}</span><b>${value(fieldValue)}</b></div>`).join("");
       const blocked = result.confirmable_for_manual_search !== true
         ? `<p class="history-confirmation-blocked" role="status">${escape(result.reason || "Запись показана для сравнения, но не может быть подтверждена.")}</p>`
@@ -4757,7 +4777,7 @@ function renderHumanHistoryDecisionAction(item, candidate) {
   const effective = item.historyEffectiveDecision;
   const sourceRowId = item.intent?.source_row_id || "";
   if (effective?.candidate_offer_id === offer.offer_id) {
-    return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
+    return `<div class="history-human-confirmation" role="status"><b>Подтверждено пользователем ✓</b><span>Историческая закупка из 1С · ${escapeHtml(historicalOfferDate(candidate))} · Склад: ${escapeHtml(historicalOfferWarehouse({...candidate, warehouse_evidence: effective.warehouse_evidence}))}</span><button type="button" class="button text history-revoke-confirmation" data-decision-id="${escapeHtml(effective.decision_id)}">Отменить подтверждение</button></div>`;
   }
   if (fuzzy) {
     if (!stateForCandidate.confirmable_for_explicit_fuzzy) {
@@ -4779,6 +4799,7 @@ function renderHumanHistoryDecisionAction(item, candidate) {
       ["Историческая цена", offer.price === null || offer.price === undefined ? "Не указана" : `${offer.price} ${offer.currency || ""} / ${offer.price_unit || "ед."}`],
       ["Дата закупки", provenance.purchase_date],
       ...(provenance.counterparty ? [["Контрагент", provenance.counterparty]] : []),
+      ["Склад", `${provenance.warehouse || "не указан"}${provenance.warehouse_truncated === true ? "… (значение сокращено)" : ""}`],
     ];
     const compareRows = (rows) => rows.map(([label, fieldValue]) => `<div class="history-fuzzy-compare-row"><span>${escapeHtml(label)}</span><b>${value(fieldValue)}</b></div>`).join("");
     const identity = `data-row-id="${escapeHtml(sourceRowId)}" data-offer-id="${escapeHtml(offer.offer_id || "")}"`;

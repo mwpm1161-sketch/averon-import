@@ -106,6 +106,7 @@ from averon_import.services.manual_tenders.history_decisions import (
     TenderHistoryDecisionStore,
     manual_search_candidate,
 )
+from averon_import.services.manual_tenders.history_projection import bounded_utf8_text
 from averon_import.services.manual_tenders.parser import MAX_UPLOAD_BYTES as MAX_MANUAL_TENDER_UPLOAD_BYTES
 from averon_import.services.document_mutation import DocumentMutationLocks
 from averon_import.services.document_lifecycle import (
@@ -2589,6 +2590,8 @@ def search_manual_tender_history(
             offer = detail["offer"]
             provenance = detail["price_provenance"]
             reason = detail.get("reason_code")
+            warehouse, warehouse_truncated = bounded_utf8_text(provenance.get("warehouse"), 128)
+            counterparty, counterparty_truncated = bounded_utf8_text(provenance.get("counterparty"), 120)
             results.append({
                 "history_item_id": offer.get("source_item_id", ""),
                 "variant_id": detail.get("manual_variant_id", ""),
@@ -2600,7 +2603,10 @@ def search_manual_tender_history(
                 "currency": offer.get("currency", ""),
                 "price_unit": offer.get("price_unit", ""),
                 "purchase_date": provenance.get("purchase_date"),
-                "counterparty": " ".join(str(provenance.get("counterparty") or "").split())[:120],
+                "counterparty": " ".join(counterparty.split()),
+                "counterparty_truncated": counterparty_truncated or provenance.get("counterparty_truncated") is True,
+                "warehouse": " ".join(warehouse.split()),
+                "warehouse_truncated": warehouse_truncated or provenance.get("warehouse_truncated") is True,
                 "selected_event_id": provenance.get("selected_event_id"),
                 "snapshot_version": provenance.get("snapshot_version"),
                 "match_decision": detail["match"].get("decision"),

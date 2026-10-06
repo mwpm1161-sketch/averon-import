@@ -49,6 +49,7 @@ def _event(
     quantity="2",
     price_usable=True,
     counterparty="Контрагент синтетический",
+    warehouse="",
     currency=None,
     group_number=1,
 ):
@@ -76,6 +77,7 @@ def _event(
             "manufacturer": manufacturer,
             "characteristic": characteristic,
             "currency": currency,
+            **({"warehouse": warehouse} if warehouse != "__omit__" else {}),
         },
         source_facts={},
     )
@@ -287,6 +289,73 @@ def test_exact_article_match_with_compatible_unit_and_price_is_safe(tmp_path):
     assert result.selected_offer is not None
     assert result.match_results[0].decision == MatchDecision.MATCH
     assert result.selected_offer.data_provenance["source"] == "one_c_history"
+
+
+def test_provider_warehouse_is_from_same_selected_event_as_historical_price(tmp_path):
+    events = [
+        _event(row=2, when="2026-06-01", price="10", reported="10", amount="20", quantity="2",
+               counterparty="Контрагент старого события", warehouse="Склад старого события"),
+        _event(row=3, when="2026-08-01", price="18", reported="18", amount="36", quantity="2",
+               counterparty="Контрагент выбранного события", warehouse="Склад выбранного события"),
+    ]
+    repository, provider = _provider(tmp_path, events)
+    offer = provider.search(_intent())[0]
+    selected_event = max(repository.read_catalog_snapshot().items[0].events, key=lambda event: (event.document_date, event.source_row, event.event_id))
+
+    assert offer.data_provenance["selected_event_id"] == selected_event.event_id
+    assert offer.data_provenance["purchase_date"] == selected_event.document_date
+    assert offer.data_provenance["counterparty"] == selected_event.counterparty
+    assert offer.data_provenance["warehouse"] == selected_event.warehouse == "Склад выбранного события"
+
+
+def test_warehouse_only_changes_do_not_change_history_match_or_routing_evidence(tmp_path):
+    events_a = [_event(warehouse="Склад A")]
+    events_b = [_event(warehouse="Склад B")]
+    _repo_a, provider_a = _provider(tmp_path / "a", events_a)
+    _repo_b, provider_b = _provider(tmp_path / "b", events_b)
+
+    result_a = provider_a.lookup(_intent())
+    result_b = provider_b.lookup(_intent())
+    assert result_a.outcome == result_b.outcome
+    assert result_a.reason_code == result_b.reason_code
+    assert result_a.safe_basis == result_b.safe_basis
+    assert [offer.source_item_id for offer in result_a.candidates] == [offer.source_item_id for offer in result_b.candidates]
+    assert getattr(result_a.selected_offer, "offer_id", None) == getattr(result_b.selected_offer, "offer_id", None)
+    assert [(match.decision, match.rank, match.matched_attributes, match.conflicting_attributes, match.missing_attributes)
+            for match in result_a.match_results] == [
+        (match.decision, match.rank, match.matched_attributes, match.conflicting_attributes, match.missing_attributes)
+        for match in result_b.match_results
+    ]
+    assert result_a.candidates[0].data_provenance["warehouse"] == "Склад A"
+    assert result_b.candidates[0].data_provenance["warehouse"] == "Склад B"
+
+
+@pytest.mark.parametrize("warehouse", ["", 17, ["not", "text"]])
+def test_blank_or_malformed_warehouse_does_not_invalidate_historical_price(tmp_path, warehouse):
+    warehouse_value = "__omit__" if warehouse == "" else warehouse
+    repository, provider = _provider(tmp_path, [_event(warehouse=warehouse_value)])
+    event = repository.read_catalog_snapshot().items[0].events[0]
+    offer = provider.search(_intent())[0]
+
+    assert event.provenance_valid is True
+    assert event.price_usable is True
+    assert event.warehouse == ""
+    assert offer.data_provenance["effective_unit_price_gross"] == Decimal("12.50")
+
+
+def test_provider_warehouse_display_is_utf8_bounded_without_mutating_source_fact(tmp_path):
+    from averon_import.services.manual_tenders.history_projection import MAX_WAREHOUSE_DISPLAY_BYTES
+
+    source_warehouse = "Склад-" + "Я" * 100
+    repository, provider = _provider(tmp_path, [_event(warehouse=source_warehouse)])
+    stored_event = repository.read_catalog_snapshot().items[0].events[0]
+    offer = provider.search(_intent())[0]
+    display = offer.data_provenance["warehouse"]
+
+    assert stored_event.warehouse == source_warehouse
+    assert len(display.encode("utf-8")) <= MAX_WAREHOUSE_DISPLAY_BYTES
+    assert display.encode("utf-8").decode("utf-8") == display
+    assert offer.data_provenance["warehouse_truncated"] is True
 
 
 def test_conflicting_variant_and_price_event_units_cannot_be_safe(tmp_path):

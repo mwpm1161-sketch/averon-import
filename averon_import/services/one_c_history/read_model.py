@@ -42,6 +42,7 @@ class OneCHistoryEvent:
     source_row: int
     provenance_valid: bool = True
     numeric_values_valid: bool = True
+    warehouse: str = ""
 
 
 @dataclass(frozen=True, slots=True)

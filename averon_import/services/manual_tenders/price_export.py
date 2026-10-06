@@ -26,6 +26,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from averon_import.core.unit_normalization import normalize_unit_family
 from averon_import.services.sourcing.history_identity import history_model_characteristic_conflicts
 from averon_import.services.one_c_history.xlsx_import import OneCImportError, preflight_xlsx
+from .history_projection import bounded_utf8_text
 
 from .parser import (
     MAX_UPLOAD_BYTES,
@@ -82,6 +83,19 @@ def _bounded_decimal(value: Any) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return result if result.is_finite() else None
+
+
+def _durable_history_display(provenance: Any) -> dict[str, Any]:
+    if not isinstance(provenance, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, limit in (("warehouse", 128), ("counterparty", 120)):
+        text, truncated = bounded_utf8_text(provenance.get(key), limit)
+        if text:
+            result[key] = text
+        if truncated or provenance.get(f"{key}_truncated") is True:
+            result[f"{key}_truncated"] = True
+    return result
 
 
 @dataclass(frozen=True)
@@ -230,6 +244,8 @@ class TenderPriceResolver:
             "price_basis": provenance.get("price_basis"),
             "purchase_date": provenance.get("purchase_date"),
         }
+        if historical:
+            audit.update(_durable_history_display(provenance))
 
         if price is None or price <= 0:
             return _reason("PRICE_INVALID", source, historical=historical, audit=audit)
@@ -387,6 +403,7 @@ class TenderPriceResolver:
             "human_confirmation_fingerprint": confirmation.get("evidence_fingerprint"),
             "human_confirmation_basis": confirmation.get("confirmation_basis"),
         }
+        audit.update(_durable_history_display(provenance))
         confirmation_basis = confirmation.get("confirmation_basis")
         manual_confirmation = confirmation_basis == "MANUAL_SEARCH_CONFIRMATION"
         if (
@@ -1898,6 +1915,15 @@ class TenderXlsxPriceExporter:
                     price_cell.fill = _HISTORICAL_FILL
                     total_cell.fill = _HISTORICAL_FILL
                     purchase_date = str((decision.audit_summary or {}).get("purchase_date") or "")
+                    audit = decision.audit_summary or {}
+                    counterparty = audit.get("counterparty") if isinstance(audit.get("counterparty"), str) else ""
+                    warehouse = audit.get("warehouse") if isinstance(audit.get("warehouse"), str) else ""
+                    counterparty_display = counterparty or "не указан"
+                    warehouse_display = warehouse or "не указан"
+                    if audit.get("counterparty_truncated") is True and counterparty:
+                        counterparty_display += "… (значение сокращено)"
+                    if audit.get("warehouse_truncated") is True and warehouse:
+                        warehouse_display += "… (значение сокращено)"
                     if decision.human_confirmed and (decision.audit_summary or {}).get("human_confirmation_basis") == "MANUAL_SEARCH_CONFIRMATION":
                         human_note = " Совпадение позиции вручную найдено и подтверждено пользователем."
                     elif decision.human_confirmed and (decision.audit_summary or {}).get("human_confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION":
@@ -1905,12 +1931,14 @@ class TenderXlsxPriceExporter:
                     else:
                         human_note = " Совпадение позиции подтверждено пользователем." if decision.human_confirmed else ""
                     price_cell.comment = Comment(
-                        f"Историческая цена по предыдущей покупке 1С от {purchase_date}. "
+                        f"Историческая цена по предыдущей покупке 1С. Дата закупки: {purchase_date}. "
+                        f"Контрагент: {counterparty_display}. Склад: {warehouse_display}. "
                         f"Не подтверждает текущую доступность и не является текущим предложением.{human_note}",
                         "Averon Import",
                     )
                     total_cell.comment = Comment(
-                        f"Историческая стоимость по предыдущей покупке 1С от {purchase_date}. "
+                        f"Историческая стоимость по предыдущей покупке 1С. Дата закупки: {purchase_date}. "
+                        f"Контрагент: {counterparty_display}. Склад: {warehouse_display}. "
                         f"Не подтверждает текущую доступность и не является текущим предложением.{human_note}",
                         "Averon Import",
                     )

@@ -17,7 +17,7 @@ from fastapi import UploadFile
 from openpyxl import Workbook
 
 from averon_import.core.unit_normalization import normalize_unit_family
-from averon_import.services.one_c_history.models import ImportMappingRequest, PreviewMappingRequest
+from averon_import.services.one_c_history.models import ImportMappingRequest, ImportProfile, PreviewMappingRequest
 from averon_import.services.one_c_history.activity import OneCHistoryActivityConflict, OneCHistoryActivityRegistry
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.one_c_history.service import OneCHistoryImportService
@@ -60,6 +60,44 @@ def _flat_xlsx_bytes(path: Path, *, shift=0, sheet_name="TDSheet", name="Шай�
     return path.read_bytes()
 
 
+def _flat_warehouse_xlsx_bytes(path: Path, *, warehouse_a="Склад A", warehouse_b="Склад B", duplicate=False) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "TDSheet"
+    headers = ["Код номенклатуры", "Наименование", "Ед. изм.", "Количество", "Цена с НДС", "Сумма с НДС", "Дата документа", "Контрагент", "Склад"]
+    if duplicate:
+        headers.append("Склад")
+    sheet.append(headers)
+    first = ["ITEM-1", "Шайба", "шт", 2, 3, 6, datetime(2026, 9, 1), "Поставщик A", warehouse_a]
+    second = ["ITEM-1", "Шайба", "шт", 1, 5, 5, datetime(2026, 9, 2), "Поставщик B", warehouse_b]
+    if duplicate:
+        first.append("Другой склад A")
+        second.append("Другой склад B")
+    sheet.append(first)
+    sheet.append(second)
+    workbook.save(path)
+    return path.read_bytes()
+
+
+def _two_level_warehouse_xlsx_bytes(path: Path, *, warehouse_a="Склад события A", warehouse_b="") -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "TDSheet"
+    sheet.cell(row=6, column=3, value="Склад: C6 report filter only")
+    for row_number, values in (
+        (9, ["Номенклатура, ед. изм.", "Код номенклатуры", "Ед. изм.", None, None, None, None, None]),
+        (10, ["Цена с НДС", "Количество", "Сумма с НДС", "Дата документа", "Документ прихода", "Контрагент", "Договор", "Склад"]),
+        (11, ["Шайба, шт", "ITEM-1", "шт", None, None, None, None, "Склад группы не наследовать"]),
+        (12, [3, 2, 6, datetime(2026, 9, 1), "Поступление №1", "Поставщик A", "Договор A", warehouse_a]),
+        (13, [5, 1, 5, datetime(2026, 9, 2), "Поступление №2", "Поставщик B", "Договор B", warehouse_b]),
+    ):
+        for column, value in enumerate(values, start=1):
+            if value is not None:
+                sheet.cell(row=row_number, column=column, value=value)
+    workbook.save(path)
+    return path.read_bytes()
+
+
 def _two_level_xlsx_bytes(path: Path, *, shift=0) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
@@ -79,6 +117,197 @@ def _two_level_xlsx_bytes(path: Path, *, shift=0) -> bytes:
                 sheet.cell(row=row_number, column=column, value=value)
     workbook.save(path)
     return path.read_bytes()
+
+
+def _parse_detected_workbook(path: Path):
+    detected = detect_workbook(path)
+    parsed = parse_workbook(
+        path,
+        filename=path.name,
+        file_sha256="a" * 64,
+        sheet_name=detected["sheet_name"],
+        header_row=detected["header_row"],
+        headers=detected["headers"],
+        layout_type=detected["layout_type"],
+        field_mapping=detected["field_mapping"],
+        item_name_parse_strategy=detected["item_name_parse_strategy"],
+        group_header_row=detected.get("group_header_row"),
+        event_header_row=detected.get("event_header_row"),
+        group_headers=detected.get("group_headers"),
+        group_field_mapping=detected.get("group_field_mapping"),
+        event_field_mapping=detected.get("event_field_mapping"),
+        group_header_signature=detected.get("group_header_signature"),
+        event_header_signature=detected.get("event_header_signature"),
+    )
+    return detected, parsed
+
+
+def test_flat_and_two_level_warehouse_is_event_provenance_only(tmp_path):
+    flat_path = tmp_path / "flat-warehouse.xlsx"
+    _flat_warehouse_xlsx_bytes(flat_path, warehouse_a="Склад A", warehouse_b="")
+    flat_detected, flat = _parse_detected_workbook(flat_path)
+    assert flat_detected["event_field_mapping"]["warehouse"] == 8
+    assert [event.optional_facts["warehouse"] for event in flat.events] == ["Склад A", None]
+    assert [event.source_facts["warehouse"] for event in flat.events] == ["Склад A", None]
+
+    grouped_path = tmp_path / "two-level-warehouse.xlsx"
+    _two_level_warehouse_xlsx_bytes(grouped_path)
+    grouped_detected, grouped = _parse_detected_workbook(grouped_path)
+    assert grouped_detected["layout_type"] == "hierarchical_grouped"
+    assert grouped_detected["event_field_mapping"]["warehouse"] == 7
+    assert grouped_detected["group_field_mapping"]["warehouse"] is None
+    assert [event.optional_facts["warehouse"] for event in grouped.events] == ["Склад события A", None]
+    assert [event.source_facts["warehouse"] for event in grouped.events] == ["Склад события A", None]
+    assert all("group_warehouse" not in event.source_facts for event in grouped.events)
+
+
+def test_warehouse_import_persists_event_facts_and_changes_semantic_fingerprint(tmp_path):
+    service = _make_service(tmp_path / "service")
+    payload_a = _flat_warehouse_xlsx_bytes(tmp_path / "warehouse-a.xlsx", warehouse_a="Склад A", warehouse_b="Склад B")
+    _preview_a, result_a = asyncio.run(_import_preview(service, payload_a))
+    assert result_a["status"] == "succeeded"
+    metadata_a = service.repository.active_metadata()
+    version_a = service.repository.catalog_version()
+    with sqlite3.connect(service.repository.database_path) as connection:
+        stored = connection.execute(
+            "SELECT source_row, optional_facts_json, source_facts_json FROM purchase_events ORDER BY source_row"
+        ).fetchall()
+        descriptive = connection.execute(
+            "SELECT descriptive_facts_json FROM nomenclature_items WHERE source_item_code='ITEM-1'"
+        ).fetchone()[0]
+    connection.close()
+    assert [json.loads(row[1])["warehouse"] for row in stored] == ["Склад A", "Склад B"]
+    assert [json.loads(row[2])["warehouse"] for row in stored] == ["Склад A", "Склад B"]
+    assert "warehouse" not in json.loads(descriptive)
+
+    payload_b = _flat_warehouse_xlsx_bytes(tmp_path / "warehouse-b.xlsx", warehouse_a="Склад A", warehouse_b="Склад B2")
+    _preview_b, result_b = asyncio.run(_import_preview(service, payload_b))
+    metadata_b = service.repository.active_metadata()
+    version_b = service.repository.catalog_version()
+    assert result_b["status"] == "succeeded"
+    assert metadata_a["semantic_import_fingerprint"] != metadata_b["semantic_import_fingerprint"]
+    assert version_a != version_b
+
+    _preview_repeat, repeated = asyncio.run(_import_preview(service, payload_b))
+    assert repeated["idempotent"] is True
+    assert service.repository.catalog_version() == version_b
+
+
+def test_full_warehouse_source_text_is_preserved_within_source_cell_limit(tmp_path):
+    service = _make_service(tmp_path / "service")
+    warehouse = "W" * 32_767
+    payload = _flat_warehouse_xlsx_bytes(
+        tmp_path / "long-warehouse.xlsx", warehouse_a=warehouse, warehouse_b="Склад B",
+    )
+    _preview, result = asyncio.run(_import_preview(service, payload))
+    assert result["status"] == "succeeded"
+    with sqlite3.connect(service.repository.database_path) as connection:
+        stored = connection.execute(
+            "SELECT optional_facts_json, source_facts_json FROM purchase_events ORDER BY source_row LIMIT 1"
+        ).fetchone()
+    assert json.loads(stored[0])["warehouse"] == warehouse
+    assert json.loads(stored[1])["warehouse"] == warehouse
+    event = min(service.repository.read_catalog_snapshot().items[0].events, key=lambda item: item.source_row)
+    assert event.warehouse == warehouse
+
+
+def test_duplicate_warehouse_headers_require_manual_event_mapping(tmp_path):
+    service = _make_service(tmp_path / "service")
+    payload = _flat_warehouse_xlsx_bytes(tmp_path / "duplicate-warehouse.xlsx", duplicate=True)
+
+    async def exercise():
+        preview = await service.create_preview(_upload(payload))
+        assert preview["warehouse_header_ambiguous"] is True
+        assert preview["mapping_required"] is True
+        mapping = dict(preview["event_field_mapping"])
+        assert mapping["warehouse"] is None
+        mapping["warehouse"] = 8
+        analyzed = await service.analyze_preview(
+            preview["preview_id"],
+            PreviewMappingRequest(
+                sheet_name=preview["sheet_name"], header_row=preview["header_row"],
+                layout_type=preview["layout_type"], field_mapping=mapping,
+                event_field_mapping=mapping,
+                item_name_parse_strategy=preview["item_name_parse_strategy"],
+            ),
+        )
+        assert analyzed["mapping_required"] is False
+        request = ImportMappingRequest(
+            preview_id=preview["preview_id"], sheet_name=analyzed["sheet_name"],
+            header_row=analyzed["header_row"], layout_type=analyzed["layout_type"],
+            field_mapping=analyzed["field_mapping"],
+            event_field_mapping=analyzed["event_field_mapping"],
+            item_name_parse_strategy=analyzed["item_name_parse_strategy"],
+        )
+        return await service.import_confirmed(request)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "succeeded"
+    with sqlite3.connect(service.repository.database_path) as connection:
+        warehouses = [json.loads(row[0])["warehouse"] for row in connection.execute(
+            "SELECT optional_facts_json FROM purchase_events ORDER BY source_row"
+        )]
+    assert warehouses == ["Склад A", "Склад B"]
+
+
+def test_parser_v1_profile_bridge_maps_unique_warehouse_without_rewriting_profile(tmp_path):
+    service = _make_service(tmp_path / "service")
+    path = tmp_path / "legacy-profile.xlsx"
+    payload = _flat_warehouse_xlsx_bytes(path)
+    detected = detect_workbook(path)
+    old_mapping = {key: value for key, value in detected["event_field_mapping"].items() if value is not None and key != "warehouse"}
+    legacy = ImportProfile(
+        name="Legacy parser profile", layout_type=detected["layout_type"],
+        sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+        field_mapping=old_mapping, event_field_mapping=old_mapping,
+        header_signature=detected["header_signature"], parser_version=1,
+    )
+    service.repository.save_profile(legacy)
+
+    async def exercise():
+        preview = await service.create_preview(_upload(payload), profile_id=legacy.profile_id)
+        assert preview["mapping_required"] is False
+        assert preview["event_field_mapping"]["warehouse"] == 8
+        request = ImportMappingRequest(
+            preview_id=preview["preview_id"], sheet_name=preview["sheet_name"],
+            header_row=preview["header_row"], layout_type=preview["layout_type"],
+            field_mapping=preview["field_mapping"],
+            event_field_mapping=preview["event_field_mapping"],
+            item_name_parse_strategy=preview["item_name_parse_strategy"],
+        )
+        return await service.import_confirmed(request)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "succeeded"
+    saved = service.repository.profile(legacy.profile_id)
+    assert saved is not None and saved.parser_version == 1
+    assert "warehouse" not in saved.event_field_mapping
+    with sqlite3.connect(service.repository.database_path) as connection:
+        assert json.loads(connection.execute("SELECT optional_facts_json FROM purchase_events LIMIT 1").fetchone()[0])["warehouse"] == "Склад A"
+
+
+@pytest.mark.parametrize("stored_warehouse", [None, 17])
+def test_legacy_or_malformed_event_warehouse_is_display_only_and_does_not_block_price(tmp_path, stored_warehouse):
+    service = _make_service(tmp_path / "service")
+    payload = _flat_warehouse_xlsx_bytes(tmp_path / "legacy-warehouse.xlsx")
+    asyncio.run(_import_preview(service, payload))
+    with sqlite3.connect(service.repository.database_path) as connection:
+        row = connection.execute("SELECT event_id, optional_facts_json FROM purchase_events ORDER BY source_row LIMIT 1").fetchone()
+        optional = json.loads(row[1])
+        if stored_warehouse is None:
+            optional.pop("warehouse", None)
+        else:
+            optional["warehouse"] = stored_warehouse
+        connection.execute(
+            "UPDATE purchase_events SET optional_facts_json=? WHERE event_id=?",
+            (json.dumps(optional, ensure_ascii=False, separators=(",", ":")), row[0]),
+        )
+        connection.commit()
+    snapshot = service.repository.read_catalog_snapshot()
+    event = min(snapshot.items[0].events, key=lambda item: item.source_row)
+    assert event.warehouse == ""
+    assert event.provenance_valid is True
+    assert event.price_usable is True
 
 
 def _hierarchical_rows(*, second_quantity=1):

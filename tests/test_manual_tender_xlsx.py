@@ -2238,6 +2238,7 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
         provenance_overrides={
             "normalizer_revision":HISTORY_IDENTITY_NORMALIZER_REVISION,
             "normalized_name_signature":history_name_signature_digest(source["name"]),
+            "warehouse":"Склад нормализованного события",
         },
     )
     base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
@@ -2246,6 +2247,7 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
     assert candidate["offer"]["retrieval_classification"] == "NORMALIZED_NAME_UNIT"
     assert candidate["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
     assert candidate["confirmable"] is True
+    assert candidate["price_provenance"]["warehouse"] == "Склад нормализованного события"
 
     run = main.tender_sourcing_runs.get_public(
         repository.workspace_root / workspace["tender_id"], workspace["tender_id"], run_id,
@@ -2266,11 +2268,23 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
     assert confirmed_response.status_code == 200, confirmed_response.text
     confirmed = confirmed_response.json()
     assert confirmed["events"][0]["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
+    assert confirmed["events"][0]["warehouse_evidence"] == {
+        "warehouse":"Склад нормализованного события", "truncated":False,
+    }
     assert confirmed["effective"][source["source_row_id"]]["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
 
     monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
     restored = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
     assert restored["effective"][source["source_row_id"]]["confirmation_basis"] == "NORMALIZED_CONFIRMATION"
+    assert restored["effective"][source["source_row_id"]]["warehouse_evidence"] == {
+        "warehouse":"Склад нормализованного события", "truncated":False,
+    }
+
+    def forbidden_active_history_read(*_args, **_kwargs):
+        pytest.fail("price export must use the immutable run/ledger rather than query active 1C history")
+
+    monkeypatch.setattr(main.one_c_history_repository, "catalog_version", forbidden_active_history_read)
+    monkeypatch.setattr(main.one_c_history_repository, "read_catalog_snapshot", forbidden_active_history_read)
 
     export_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export"
     included = _api_request(
@@ -2283,6 +2297,12 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
     assert exported["status"] == "completed", exported
     assert exported["result"]["automatic_historical_count"] == 0
     assert exported["result"]["human_confirmed_historical_count"] == 1
+    export_path = next((repository.workspace_root / workspace["tender_id"] / "exports").glob("*.xlsx"))
+    exported_workbook = load_workbook(export_path)
+    try:
+        assert "Склад: Склад нормализованного события." in exported_workbook[TEMPLATE_SHEET]["H2"].comment.text
+    finally:
+        exported_workbook.close()
 
     decision_id = restored["effective"][source["source_row_id"]]["decision_id"]
     revoked = _api_request(
@@ -2292,6 +2312,7 @@ def test_d4a_normalized_history_confirmation_survives_restart_export_and_revoke(
     )
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["effective"] == {}
+    assert revoked.json()["rows"][0]["candidates"][0]["price_provenance"]["warehouse"] == "Склад нормализованного события"
 
 
 @pytest.mark.parametrize("provenance_override", [
@@ -2719,16 +2740,48 @@ def test_d3_ambiguous_exact_choices_append_and_latest_confirmation_is_effective(
     assert state["effective"][source_row_id]["candidate_offer_id"] == choices[1]["candidate_offer_id"]
 
 
-def test_d3_confirmable_exact_article_and_hard_conflicts_fail_closed(tender_api, tmp_path):
+def test_d3_confirmable_exact_article_and_hard_conflicts_fail_closed(tender_api, tmp_path, monkeypatch):
     main, repository = tender_api
     article_workspace = _confirm_ivy_history_tender(main, repository, tmp_path, source_article="SKU-42")
     article_run = _persist_history_review_run(
         main, repository, article_workspace, classification="EXACT_ARTICLE",
         offer_overrides={"article":"SKU-42"},
+        provenance_overrides={"warehouse":"Склад точного события"},
     )
     article_base = f"/api/manual-tenders/{article_workspace['tender_id']}/runs/{article_run}/history-decisions"
     article_snapshot = _api_request(main.app, "GET", article_base, headers=_auth_headers()).json()
-    assert article_snapshot["rows"][0]["candidates"][0]["confirmable"] is True
+    article_candidate = article_snapshot["rows"][0]["candidates"][0]
+    assert article_candidate["confirmable"] is True
+    assert article_candidate["price_provenance"]["warehouse"] == "Склад точного события"
+    article_confirmed = _api_request(
+        main.app, "POST", article_base,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE",
+            "source_row_id":article_snapshot["rows"][0]["source_row_id"],
+            "candidate_offer_id":article_candidate["candidate_offer_id"],
+            "expected_revision":0,
+        }).encode(),
+    )
+    assert article_confirmed.status_code == 200, article_confirmed.text
+    assert article_confirmed.json()["events"][0]["warehouse_evidence"] == {
+        "warehouse":"Склад точного события", "truncated":False,
+    }
+    from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
+    monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
+    article_restored = _api_request(main.app, "GET", article_base, headers=_auth_headers()).json()
+    article_row_id = article_snapshot["rows"][0]["source_row_id"]
+    assert article_restored["effective"][article_row_id]["warehouse_evidence"] == {
+        "warehouse":"Склад точного события", "truncated":False,
+    }
+    article_decision_id = article_restored["effective"][article_row_id]["decision_id"]
+    article_revoked = _api_request(
+        main.app, "POST", f"{article_base}/{article_decision_id}/revoke",
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=b'{"decision":"REVOKE_HISTORY_CONFIRMATION","expected_revision":1}',
+    )
+    assert article_revoked.status_code == 200 and article_revoked.json()["effective"] == {}
+    assert article_revoked.json()["rows"][0]["candidates"][0]["price_provenance"]["warehouse"] == "Склад точного события"
     repository.delete(article_workspace["tender_id"], "username:tender-user")
 
     invalid_cases = [
@@ -2968,6 +3021,7 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     run_id = _persist_history_review_run(
         main, repository, workspace, classification="FUZZY",
         offer_overrides={"title":"Плющ декоративный"},
+        provenance_overrides={"warehouse":"Склад fuzzy-кандидата"},
     )
     workspace_path = repository.workspace_root / workspace["tender_id"]
     base = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
@@ -2979,6 +3033,10 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     assert candidate["confirmable_for_explicit_fuzzy"] is True
     assert candidate["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
     assert len(candidate["fuzzy_evidence_fingerprint"]) == 64
+    assert candidate["price_provenance"]["warehouse"] == "Склад fuzzy-кандидата"
+    run_json = json.loads(main.tender_sourcing_runs._path(workspace_path, run_id).read_text(encoding="utf-8"))
+    assert "history_text_pool_v2" in run_json
+    assert set(run_json["rows"][0]["history_review_candidates"][0]) == {"history_candidate_v2"}
 
     normal_body = {
         "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
@@ -3002,9 +3060,13 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     payload = confirmed.json()
     assert payload["events"][0]["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
     assert payload["events"][0]["identity_assertion"] == "SAME_PRODUCT_V1"
+    assert payload["events"][0]["warehouse_evidence"] == {
+        "warehouse":"Склад fuzzy-кандидата", "truncated":False,
+    }
     effective = payload["effective"][source["source_row_id"]]
     assert effective["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
     assert effective["identity_assertion"] == "SAME_PRODUCT_V1"
+    assert effective["warehouse_evidence"] == {"warehouse":"Склад fuzzy-кандидата", "truncated":False}
 
     # Reload both durable stores to prove there is no dependency on transient job memory.
     monkeypatch.setattr(main, "tender_history_decisions", TenderHistoryDecisionStore(repository))
@@ -3012,6 +3074,10 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     run = main.tender_sourcing_runs.get_public(workspace_path, workspace["tender_id"], run_id)
     restored = _api_request(main.app, "GET", base, headers=_auth_headers()).json()
     assert restored["effective"][source["source_row_id"]]["confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+    assert restored["rows"][0]["candidates"][0]["price_provenance"]["warehouse"] == "Склад fuzzy-кандидата"
+    assert restored["effective"][source["source_row_id"]]["warehouse_evidence"] == {
+        "warehouse":"Склад fuzzy-кандидата", "truncated":False,
+    }
     resolved = main.tender_price_resolver.resolve_run(
         workspace, run, tender_id=workspace["tender_id"], run_id=run_id,
         include_historical_prices=True, human_history_decisions=restored["effective"],
@@ -3019,6 +3085,7 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     assert len(resolved) == 1 and resolved[0].eligible
     assert resolved[0].safe_summary()["authority"] == "HUMAN_CONFIRMED_HISTORY"
     assert resolved[0].audit_summary["human_confirmation_basis"] == "FUZZY_MANUAL_CONFIRMATION"
+    assert resolved[0].audit_summary["warehouse"] == "Склад fuzzy-кандидата"
 
     export_response = _api_request(
         main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
@@ -3035,6 +3102,7 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     try:
         fuzzy_comment = exported_workbook[TEMPLATE_SHEET]["H2"].comment.text
         assert "Совпадение позиции явно подтверждено пользователем." in fuzzy_comment
+        assert "Склад: Склад fuzzy-кандидата." in fuzzy_comment
         assert "tender-user" not in fuzzy_comment
     finally:
         exported_workbook.close()
@@ -3047,6 +3115,7 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     )
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["effective"] == {}
+    assert revoked.json()["rows"][0]["candidates"][0]["price_provenance"]["warehouse"] == "Склад fuzzy-кандидата"
 
 
 def test_d4b_real_tender_piece_unit_alias_is_confirmable(tender_api, tmp_path):
@@ -3347,7 +3416,10 @@ def test_d4b_preprojection_bad_fuzzy_provenance_is_not_confirmable_or_exportable
     assert not export_dir.exists() or not list(export_dir.iterdir())
 
 
-def _activate_d4c_history(repository, *, item_name="Клей д/плитки СМ 17", unit="кг", article="", manufacturer="", characteristic=""):
+def _activate_d4c_history(
+    repository, *, item_name="Клей д/плитки СМ 17", unit="кг", article="", manufacturer="",
+    characteristic="", warehouse="",
+):
     import hashlib
     from averon_import.core.unit_normalization import normalize_unit_family
     from averon_import.services.one_c_history.xlsx_import import ParsedEvent, ParsedWorkbook
@@ -3360,8 +3432,8 @@ def _activate_d4c_history(repository, *, item_name="Клей д/плитки С�
         document_reference="synthetic-d4c-event", counterparty="Синтетический контрагент",
         contract="synthetic", quantity="10", reported_unit_price_gross="123.45",
         effective_unit_price_gross="123.45", amount_gross="1234.50", price_usable=True,
-        optional_facts={"article":article, "manufacturer":manufacturer, "characteristic":characteristic, "currency":"RUB"},
-        source_facts={},
+        optional_facts={"article":article, "manufacturer":manufacturer, "characteristic":characteristic, "currency":"RUB", "warehouse":warehouse},
+        source_facts={"warehouse":warehouse} if warehouse else {},
     )
     semantic = hashlib.sha256(b"d4c synthetic history").hexdigest()
     parsed = ParsedWorkbook(
@@ -3458,7 +3530,8 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
         source_name="Клей для плитки СМ17 25 кг", source_unit="кг",
     )
     history_repository = OneCHistoryRepository(tmp_path / "local-one-c")
-    pinned_version = _activate_d4c_history(history_repository)
+    warehouse = "Склад-" + "W" * 117  # Exactly the 128-byte transport bound.
+    pinned_version = _activate_d4c_history(history_repository, warehouse=warehouse)
     provider = OneCHistoryProvider(history_repository)
     main.one_c_history_repository = history_repository
     main.one_c_history_activity = OneCHistoryActivityRegistry()
@@ -3516,6 +3589,18 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
     assert result["variant_id"] and result["match_decision"] in {"MATCH", "LIKELY_MATCH", "REVIEW"}
     assert result["confirmable_for_manual_search"] is True, (result.get("reason_code"), result.get("reason"))
     assert result["selected_event_id"] and result["purchase_date"] == "2025-04-16"
+    assert result["warehouse"] == warehouse
+    assert len(result["warehouse"].encode("utf-8")) == 128
+    assert result["warehouse_truncated"] is False
+    selected_event = next(
+        event
+        for history_item in history_repository.read_catalog_snapshot().items
+        for event in history_item.events
+        if event.event_id == result["selected_event_id"]
+    )
+    assert result["warehouse"] == selected_event.warehouse
+    assert result["purchase_date"] == selected_event.document_date
+    assert result["counterparty"] == selected_event.counterparty
     assert run_path.read_bytes() == before_run_bytes, "manual search must not rewrite the immutable run"
     assert not (workspace_path / "history-decisions" / f"{run_id}.json").exists(), "search results must not persist before confirmation"
 
@@ -3525,6 +3610,7 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
         "explicit_identity_assertion":True,
         "manual_history_ref":{"history_item_id":result["history_item_id"], "variant_id":result["variant_id"]},
     }
+    assert "warehouse" not in confirm_body and "counterparty" not in confirm_body
     original_catalog_version = history_repository.catalog_version
     monkeypatch.setattr(history_repository, "catalog_version", lambda: "1c-changed-after-search")
     changed = _api_request(main.app, "POST", decision_endpoint, headers=headers, body=json.dumps(confirm_body).encode())
@@ -3543,7 +3629,11 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
     assert saved["events"][0]["identity_assertion"] == "SAME_PRODUCT_V1"
     assert saved["events"][0]["manual_search_candidate"]["offer"]["retrieval_classification"] == "MANUAL_HISTORY_SEARCH"
     assert "retrieval_rank" not in saved["events"][0]["manual_search_candidate"]
+    assert saved["events"][0]["selected_event_id"] == result["selected_event_id"]
+    assert saved["events"][0]["manual_search_candidate"]["price_provenance"]["warehouse"] == warehouse
+    assert saved["events"][0]["warehouse_evidence"] == {"warehouse":warehouse, "truncated":False}
     assert saved["effective"][source["source_row_id"]]["confirmation_basis"] == "MANUAL_SEARCH_CONFIRMATION"
+    assert saved["effective"][source["source_row_id"]]["warehouse_evidence"] == {"warehouse":warehouse, "truncated":False}
     assert run_path.read_bytes() == before_run_bytes
 
     # Size a representative 370-row ledger from actual server-owned evidence.
@@ -3566,6 +3656,8 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
     }
     manual_ledger_size = len(_canonical_json(realistic_ledger))
     assert manual_ledger_size < MAX_HISTORY_DECISION_LEDGER_BYTES
+    assert MAX_HISTORY_DECISION_LEDGER_BYTES == 2 * 1024 * 1024
+    print(f"D4C 370-row manual history ledger bytes: {manual_ledger_size}")
 
     from averon_import.services.manual_tenders.history_decisions import TenderHistoryDecisionStore
     main.tender_history_decisions = TenderHistoryDecisionStore(repository)
@@ -3578,6 +3670,12 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
         include_historical_prices=True, human_history_decisions=restored["effective"],
     )
     assert resolved[0].eligible and resolved[0].audit_summary["human_confirmation_basis"] == "MANUAL_SEARCH_CONFIRMATION"
+
+    def forbidden_active_history_read(*_args, **_kwargs):
+        pytest.fail("price export must use the immutable run/ledger rather than query active 1C history")
+
+    monkeypatch.setattr(history_repository, "catalog_version", forbidden_active_history_read)
+    monkeypatch.setattr(history_repository, "read_catalog_snapshot", forbidden_active_history_read)
 
     export = _api_request(
         main.app, "POST", f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/export",
@@ -3594,6 +3692,7 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
     try:
         note = output[TEMPLATE_SHEET]["H2"].comment.text
         assert "Совпадение позиции вручную найдено и подтверждено пользователем." in note
+        assert f"Склад: {warehouse}." in note
         assert "tender-user" not in note
     finally:
         output.close()
@@ -3625,6 +3724,7 @@ def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_ex
     )
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["effective"] == {}
+    assert revoked.json()["rows"][0]["candidates"][0]["price_provenance"]["warehouse"] == warehouse
 
 
 def test_d4c_manual_search_is_available_for_unresolved_review_rows(tender_api, tmp_path, monkeypatch):
@@ -4169,6 +4269,12 @@ def test_d4b_fuzzy_projection_keeps_only_three_ranked_candidates_when_no_strong_
 
 def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candidates():
     from averon_import.services.sourcing.models import HistoryRetrievalClassification, MatchDecision, MatchResult, Offer, ProductIntent, SourcingResult
+    from averon_import.services.manual_tenders.history_projection import (
+        HISTORY_TEXT_POOL_KEY,
+        decode_history_candidate_v2,
+        encode_history_candidate_rows,
+        pending_history_candidate_v2,
+    )
 
     sources = []
     source_ids = []
@@ -4223,6 +4329,7 @@ def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candida
         ).model_dump(mode="json"))
 
     sizes = {}
+    v2_sizes = {}
     for count in (1, 2, 3):
         limited_results = []
         for result in result_rows:
@@ -4236,7 +4343,12 @@ def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candida
             "schema_version":1, "run_id":"a" * 32, "tender_id":"b" * 32,
             "source_sha256":"c" * 64, "workspace_revision":1, "status":"completed",
             "source_mode":"one_c_only", "history_catalog_version":"2026-10-shared-history-snapshot-v1",
-            "selected_source_row_ids":source_ids, "rows":projected,
+            "selected_source_row_ids":source_ids, "created_at":"2026-10-06T12:30:00+00:00",
+            "started_at":"2026-10-06T12:30:01+00:00", "completed_at":"2026-10-06T12:30:02+00:00",
+            "catalog_version":None, "provider_request":None,
+            "summary":{"positions_total":370,"positions_processed":370,"positions_matched":0,
+                "positions_review":370,"positions_without_offers":0},
+            "failure":None, "rows":projected,
         }
         encoded = json.dumps(run, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         sizes[count] = len(encoded)
@@ -4251,6 +4363,80 @@ def test_d4b_realistic_all_fuzzy_370_row_run_sizes_for_one_two_and_three_candida
     assert sizes[3] < MAX_TENDER_RUN_BYTES
     assert MAX_TENDER_RUN_BYTES == 1024 * 1024
     print(f"D4B 370-row fuzzy run bytes: one={sizes[1]}, two={sizes[2]}, three={sizes[3]}")
+
+    def byte_exact(prefix, token, limit):
+        prefix_bytes = prefix.encode("utf-8")
+        token_bytes = token.encode("utf-8")
+        assert token_bytes and len(prefix_bytes) <= limit
+        repetitions, padding = divmod(limit - len(prefix_bytes), len(token_bytes))
+        return prefix + token * repetitions + ("x" * padding)
+
+    for count in (1, 2, 3):
+        limited_results = [
+            {**result, "offers":result["offers"][:count], "match_results":result["match_results"][:count]}
+            for result in result_rows
+        ]
+        projected = canonical_tender_projection({"results":limited_results}, sources, source_ids)
+        case_rows = {"repeat_105": [], "unique_ascii_128": [], "unique_cyrillic_128": [], "unique_four_byte_128": []}
+        repeat_warehouse = byte_exact("Склад-", "Ж", 105)
+        repeat_counterparty = byte_exact("Контрагент-", "Ф", 120)
+        for row_index, row in enumerate(projected):
+            row_cases = {name: [] for name in case_rows}
+            for rank, candidate in enumerate(row["history_review_candidates"], 1):
+                unique_index = row_index * count + rank
+                if len(repeat_warehouse.encode("utf-8")) != 105 or len(repeat_counterparty.encode("utf-8")) != 120:
+                    raise AssertionError("repeat fixture byte bounds changed")
+                warehouse_values = {
+                    "repeat_105":repeat_warehouse,
+                    "unique_ascii_128":byte_exact(f"Warehouse-{unique_index:04d}-", "W", 128),
+                    "unique_cyrillic_128":byte_exact(f"Склад-{unique_index:04d}-", "Я", 128),
+                    "unique_four_byte_128":byte_exact(f"Склад-{unique_index:04d}-", "🧱", 128),
+                }
+                counterparty_values = {
+                    "repeat_105":repeat_counterparty,
+                    "unique_ascii_128":byte_exact(f"Counterparty-{unique_index:04d}-", "C", 120),
+                    "unique_cyrillic_128":byte_exact(f"Контрагент-{unique_index:04d}-", "Ф", 120),
+                    "unique_four_byte_128":byte_exact(f"Контрагент-{unique_index:04d}-", "🧑", 120),
+                }
+                for case_name in case_rows:
+                    row_cases[case_name].append(pending_history_candidate_v2(
+                        candidate["fuzzy_v1"], warehouse=warehouse_values[case_name],
+                        counterparty=counterparty_values[case_name],
+                    ))
+            for case_name in case_rows:
+                row_copy = dict(row)
+                row_copy["history_review_candidates"] = row_cases[case_name]
+                case_rows[case_name].append(row_copy)
+
+        for case_name, rows_with_v2 in case_rows.items():
+            compact_rows, text_pool = encode_history_candidate_rows(rows_with_v2)
+            run_v2 = {**run, "rows":compact_rows, HISTORY_TEXT_POOL_KEY:text_pool}
+            encoded_size = len(json.dumps(run_v2, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            v2_sizes[(count, case_name)] = encoded_size
+            assert encoded_size < MAX_TENDER_RUN_BYTES, (count, case_name, encoded_size)
+            if count == 3 and case_name == "unique_four_byte_128":
+                stored = compact_rows[0]["history_review_candidates"][0]
+                decoded = decode_history_candidate_v2(stored, text_pool)
+                assert decoded is not None
+                assert decoded["warehouse"] == byte_exact("Склад-0001-", "🧱", 128)
+                assert decoded["counterparty"] == byte_exact("Контрагент-0001-", "🧑", 120)
+                pending = rows_with_v2[0]["history_review_candidates"][0]["_history_candidate_v2_pending"]
+                assert decoded["fuzzy_v1"] == {
+                    "classification":"FUZZY", "provider":"1c", "identity":pending[0],
+                    "provenance":pending[1], "match":pending[2], "rank":pending[3],
+                }
+                corrupt = {"history_candidate_v2":[*stored["history_candidate_v2"]]}
+                corrupt["history_candidate_v2"][4] = len(text_pool)
+                with pytest.raises(ValueError, match="pool reference"):
+                    decode_history_candidate_v2(corrupt, text_pool)
+    assert v2_sizes[(3, "unique_ascii_128")] < MAX_TENDER_RUN_BYTES
+    assert v2_sizes[(3, "unique_cyrillic_128")] < MAX_TENDER_RUN_BYTES
+    assert v2_sizes[(3, "unique_four_byte_128")] < MAX_TENDER_RUN_BYTES
+    print("D4B 370-row history-candidate-v2 bytes:", ", ".join(
+        f"{count}x{name}={v2_sizes[(count, name)]}"
+        for count in (1, 2, 3)
+        for name in ("repeat_105", "unique_ascii_128", "unique_cyrillic_128", "unique_four_byte_128")
+    ))
 
 
 def test_tender_price_resolver_uses_only_proven_etm_pricewnds(tender_api, tmp_path):

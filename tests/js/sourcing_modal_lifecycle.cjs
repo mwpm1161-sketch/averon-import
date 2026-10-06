@@ -28,6 +28,7 @@ const context = vm.createContext({
   historicalOfferPrice: () => "100 ₽ / шт",
   historicalOfferDate: () => "2026-08-01",
   historicalOfferCounterparty: () => "поставщик",
+  historicalOfferWarehouse: () => "склад не указан",
   renderSourcingDecision: () => "<decision>must-not-overstate</decision>",
   renderProductUnderstanding: () => "",
   renderSourcingRouteExplanation: () => "",
@@ -94,6 +95,7 @@ assert.equal(context.historyReviewPresentation(uniqueCandidates, unique.route).t
   "Найдено точное название и единица измерения в истории 1С");
 const exactCard = context.renderHistoricalOfferCard(uniqueCandidates[0], {route: unique.route});
 assert(exactCard.includes("Требуется подтверждение"));
+assert(exactCard.includes("Склад: склад не указан"), "automatic history card labels missing warehouse provenance");
 assert(!exactCard.includes("must-not-overstate"), "exact history review must not be labeled as an alternative");
 
 const normalizedPrimary = historyItem([fuzzy, normalizedOne]);

@@ -21,7 +21,7 @@ from averon_import.core.unit_normalization import normalize_unit_family
 from averon_import.services.one_c_history.models import FIELD_NAMES
 
 
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_ZIP_MEMBERS = 1500
 MAX_UNCOMPRESSED_BYTES = 120 * 1024 * 1024
@@ -45,6 +45,7 @@ FIELD_ALIASES = {
     "document_type": {"типдокумента", "виддокумента", "типоперации", "documenttype"},
     "document_reference": {"документприхода", "документ", "номердокумента", "основание", "documentreference", "document"},
     "counterparty": {"контрагент", "поставщик", "наименованиеконтрагента", "counterparty", "supplier"},
+    "warehouse": {"склад"},
     "contract": {"договор", "контракт", "contract"},
     "article": {"артикул", "кодтовара", "article", "sku"},
     "manufacturer": {"производитель", "бренд", "manufacturer", "brand"},
@@ -225,7 +226,16 @@ def _header_mapping(headers: list[str]) -> dict[str, int | None]:
         for field, aliases in FIELD_ALIASES.items():
             if result[field] is None and normalized in aliases:
                 result[field] = index
+    warehouse_columns = [
+        index for index, label in enumerate(headers)
+        if _header_key(label) in FIELD_ALIASES["warehouse"]
+    ]
+    result["warehouse"] = warehouse_columns[0] if len(warehouse_columns) == 1 else None
     return result
+
+
+def _warehouse_header_ambiguous(headers: list[str]) -> bool:
+    return sum(_header_key(label) in FIELD_ALIASES["warehouse"] for label in headers) > 1
 
 
 def _relationship_mentions_lowercase_shared_strings(archive: zipfile.ZipFile) -> bool:
@@ -326,7 +336,9 @@ def _detect_header(sheet) -> tuple[int, list[str], dict[str, int | None]]:
     for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=MAX_HEADER_SCAN_ROWS, values_only=True), start=1):
         headers = [str(value).strip() if value is not None else "" for value in row]
         if any(len(value) > MAX_HEADER_LENGTH for value in headers):
-            raise OneCImportError("Заголовок XLSX превышает допустимую длину.")
+            # Long data cells can occur inside the bounded header scan. Such a
+            # row cannot be a header candidate, but must not reject the sheet.
+            continue
         while headers and not headers[-1]:
             headers.pop()
         mapping = _header_mapping(headers)
@@ -371,9 +383,15 @@ def _detect_two_level_header(sheet) -> dict | None:
     candidates = []
     for group_row in range(1, last_row):
         event_row = group_row + 1
-        group_headers = _header_values(sheet, group_row)
-        event_headers = _header_values(sheet, event_row)
+        try:
+            group_headers = _header_values(sheet, group_row)
+            event_headers = _header_values(sheet, event_row)
+        except OneCImportError:
+            # An overlong row is not a candidate header pair. Explicitly
+            # selected rows are still rejected by inspect_sheet_mapping().
+            continue
         group_mapping = _header_mapping(group_headers)
+        group_mapping["warehouse"] = None
         event_mapping = _header_mapping(event_headers)
         core_count = sum(event_mapping.get(field) is not None for field in (
             "quantity", "reported_unit_price_gross", "amount_gross",
@@ -398,6 +416,7 @@ def _detect_two_level_header(sheet) -> dict | None:
             "field_mapping": event_mapping,
             "group_field_mapping": group_mapping,
             "event_field_mapping": event_mapping,
+            "warehouse_header_ambiguous": _warehouse_header_ambiguous(event_headers),
             "item_name_parse_strategy": "comma_suffix_unit" if group_mapping.get("unit") is None else "none",
         }))
     if not candidates:
@@ -416,6 +435,7 @@ def _detect_sheet_structure(sheet) -> dict:
             [two_level["group_header_signature"], two_level["event_header_signature"]], separators=(",", ":")
         )
         two_level["header_signature"] = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+        two_level["warehouse_header_ambiguous"] = _warehouse_header_ambiguous(event_headers)
         return two_level
 
     try:
@@ -427,6 +447,7 @@ def _detect_sheet_structure(sheet) -> dict:
         group_row = event_row = header_row
         group_headers = headers
         group_mapping = dict(mapping)
+        group_mapping["warehouse"] = None
         event_mapping = dict(mapping)
         group_sig = header_signature(group_headers)
     else:
@@ -449,6 +470,7 @@ def _detect_sheet_structure(sheet) -> dict:
         "event_header_signature": header_signature(headers),
         "header_signature": header_signature(headers),
         "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
+        "warehouse_header_ambiguous": _warehouse_header_ambiguous(headers),
     }
 
 
@@ -482,6 +504,7 @@ def inspect_sheet_mapping(
             group_headers = _header_values(sheet, group_header_row)
             event_headers = _header_values(sheet, selected_event_row)
             group_mapping = _header_mapping(group_headers)
+            group_mapping["warehouse"] = None
             event_mapping = _header_mapping(event_headers)
             group_signature = header_signature(group_headers)
             event_signature = header_signature(event_headers)
@@ -494,6 +517,7 @@ def inspect_sheet_mapping(
                 "event_field_mapping": event_mapping, "group_header_signature": group_signature,
                 "event_header_signature": event_signature, "header_signature": combined,
                 "item_name_parse_strategy": "comma_suffix_unit" if group_mapping.get("unit") is None else "none",
+                "warehouse_header_ambiguous": _warehouse_header_ambiguous(event_headers),
             }
         else:
             headers = _header_values(sheet, selected_event_row)
@@ -505,6 +529,7 @@ def inspect_sheet_mapping(
                 group_row = event_row = selected_event_row
                 group_headers = headers
                 group_mapping = dict(mapping)
+                group_mapping["warehouse"] = None
                 event_mapping = dict(mapping)
                 group_signature = header_signature(group_headers)
             else:
@@ -521,6 +546,7 @@ def inspect_sheet_mapping(
                 "event_field_mapping": event_mapping, "group_header_signature": group_signature,
                 "event_header_signature": header_signature(headers), "header_signature": header_signature(headers),
                 "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
+                "warehouse_header_ambiguous": _warehouse_header_ambiguous(headers),
             }
         return {**structure, "sheet_names": list(workbook.sheetnames), "sheet_name": sheet_name}
     finally:
@@ -731,6 +757,21 @@ def _mapped(row: tuple, mapping: dict[str, int | None], field: str) -> object | 
     return row[index] if index is not None and index < len(row) else None
 
 
+def _warehouse_value(row: tuple, mapping: dict[str, int | None]) -> str | None:
+    """Accept only a bounded text value from this physical event row."""
+    value = _mapped(row, mapping, "warehouse")
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 32_767:
+        return None
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return text
+
+
 def _split_name_unit(name: str, raw_unit: str, strategy: str) -> tuple[str, str]:
     if raw_unit:
         if raw_unit != name and normalize_unit_family(raw_unit):
@@ -780,6 +821,10 @@ def parse_workbook(
         key: (group_field_mapping or field_mapping).get(key)
         for key in FIELD_NAMES
     } if layout_type == "hierarchical_grouped" else {key: None for key in FIELD_NAMES}
+    if layout_type == "hierarchical_grouped":
+        # Warehouses belong to event rows only, even when a one-row header is
+        # used for a grouped report.
+        group_mapping["warehouse"] = None
     group_header_row = group_header_row or (header_row if layout_type == "hierarchical_grouped" else None)
     event_header_row = event_header_row or header_row
     group_headers = group_headers or (headers if layout_type == "hierarchical_grouped" else [])
@@ -858,7 +903,7 @@ def parse_workbook(
                         }
                         group_source = {
                             f"group_{field}": _cell_value(_mapped(row, group_mapping, field))
-                            for field in FIELD_NAMES if group_mapping.get(field) is not None
+                            for field in FIELD_NAMES if field != "warehouse" and group_mapping.get(field) is not None
                         }
                         current_item = _GroupContext(
                             item_code=raw_group_code,
@@ -894,6 +939,7 @@ def parse_workbook(
                     field: _cell_value(_mapped(row, event_mapping, field))
                     for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
                 }
+                row_optional["warehouse"] = _warehouse_value(row, event_mapping)
                 optional = {
                     field: row_optional.get(field) or current_item.optional_facts.get(field)
                     for field in row_optional
@@ -903,6 +949,8 @@ def parse_workbook(
                     field: _cell_value(_mapped(row, event_mapping, field))
                     for field in FIELD_NAMES if event_mapping.get(field) is not None
                 })
+                if event_mapping.get("warehouse") is not None:
+                    source_facts["warehouse"] = _warehouse_value(row, event_mapping)
             else:
                 event_present = _has_mapped_value(row, event_mapping, EVENT_FIELDS)
                 raw_name = _cell_value(_mapped(row, event_mapping, "item_name")) or ""
@@ -928,10 +976,13 @@ def parse_workbook(
                     field: _cell_value(_mapped(row, event_mapping, field))
                     for field in ("article", "manufacturer", "characteristic", "supplier_code", "supplier_inn", "vat_rate", "currency", "organization", "document_stable_reference", "document_line_number")
                 }
+                optional["warehouse"] = _warehouse_value(row, event_mapping)
                 source_facts = {
                     field: _cell_value(_mapped(row, event_mapping, field))
                     for field in FIELD_NAMES if event_mapping.get(field) is not None
                 }
+                if event_mapping.get("warehouse") is not None:
+                    source_facts["warehouse"] = _warehouse_value(row, event_mapping)
 
             if layout_type == "hierarchical_grouped":
                 raw_unit_cell = _cell_value(_mapped(row, event_mapping, "unit")) or ""

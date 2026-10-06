@@ -168,7 +168,7 @@ class OneCHistoryImportService:
                 incompatible_profile = not (
                     requested_profile.sheet_name == detected["sheet_name"]
                     and requested_profile.header_signature == detected["header_signature"]
-                    and requested_profile.parser_version == PARSER_VERSION
+                    and requested_profile.parser_version in ({PARSER_VERSION, 1} if PARSER_VERSION == 2 else {PARSER_VERSION})
                 )
                 if incompatible_profile:
                     requested_profile = None
@@ -194,18 +194,20 @@ class OneCHistoryImportService:
 
             if profile_to_apply:
                 detected["layout_type"] = profile_to_apply.layout_type
+                old_profile_bridge = profile_to_apply.parser_version == 1 and PARSER_VERSION == 2
+                detected_warehouse = detected.get("event_field_mapping", {}).get("warehouse")
+                old_group_mapping = profile_to_apply.group_field_mapping or profile_to_apply.field_mapping
+                old_event_mapping = profile_to_apply.event_field_mapping or profile_to_apply.field_mapping
                 detected["group_field_mapping"] = (
-                    {
-                        key: (profile_to_apply.group_field_mapping or profile_to_apply.field_mapping).get(key)
-                        for key in FIELD_NAMES
-                    }
+                    {key: old_group_mapping.get(key) for key in FIELD_NAMES}
                     if profile_to_apply.layout_type == "hierarchical_grouped"
                     else {key: None for key in FIELD_NAMES}
                 )
-                detected["event_field_mapping"] = {
-                    key: (profile_to_apply.event_field_mapping or profile_to_apply.field_mapping).get(key)
-                    for key in FIELD_NAMES
-                }
+                detected["event_field_mapping"] = {key: old_event_mapping.get(key) for key in FIELD_NAMES}
+                if old_profile_bridge:
+                    if "warehouse" not in old_event_mapping and not detected.get("warehouse_header_ambiguous"):
+                        detected["event_field_mapping"]["warehouse"] = detected_warehouse
+                    detected["group_field_mapping"]["warehouse"] = None
                 detected["field_mapping"] = dict(detected["event_field_mapping"])
                 detected["item_name_parse_strategy"] = profile_to_apply.item_name_parse_strategy
             if selected_profile:
@@ -218,7 +220,7 @@ class OneCHistoryImportService:
                 event_mapping.get(name) is not None
                 for name in ("quantity", "reported_unit_price_gross", "amount_gross")
                 )
-            )
+            ) or (detected.get("warehouse_header_ambiguous") and event_mapping.get("warehouse") is None)
             parsed = None
             if not mapping_required:
                 parsed = await asyncio.to_thread(
@@ -295,6 +297,7 @@ class OneCHistoryImportService:
             "group_header_signature": detected.get("group_header_signature"),
             "event_header_signature": detected.get("event_header_signature"),
             "item_name_parse_strategy": detected["item_name_parse_strategy"],
+            "warehouse_header_ambiguous": bool(detected.get("warehouse_header_ambiguous")),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -315,7 +318,7 @@ class OneCHistoryImportService:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def _semantic_import_fingerprint(cls, detected: dict) -> str:
+    def _semantic_import_fingerprint(cls, detected: dict, events: list | None = None) -> str:
         layout_type = detected["layout_type"]
         event_mapping = cls._normalized_mapping(
             detected.get("event_field_mapping", detected.get("field_mapping"))
@@ -337,6 +340,15 @@ class OneCHistoryImportService:
             "event_header_signature": detected.get("event_header_signature") or detected.get("header_signature"),
             "parser_version": PARSER_VERSION,
         }
+        if events is not None:
+            warehouse_rows = [
+                [int(event.source_row), event.source_facts.get("warehouse")]
+                for event in sorted(events, key=lambda item: int(item.source_row))
+                if isinstance(getattr(event, "source_facts", None), dict)
+            ]
+            payload["event_warehouse_evidence_sha256"] = hashlib.sha256(json.dumps(
+                warehouse_rows, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -374,6 +386,7 @@ class OneCHistoryImportService:
                 "field_mapping": detected["field_mapping"],
                 "group_field_mapping": detected.get("group_field_mapping", {}),
                 "event_field_mapping": detected.get("event_field_mapping", detected["field_mapping"]),
+                "warehouse_header_ambiguous": bool(detected.get("warehouse_header_ambiguous")),
                 "item_name_parse_strategy": detected["item_name_parse_strategy"],
                 "mapping_profile_id": record.profile_id,
                 "profile_mapping_required": record.mapping_required,
@@ -415,7 +428,7 @@ class OneCHistoryImportService:
                     "group_headers", "field_mapping", "group_field_mapping",
                     "event_field_mapping", "group_header_signature",
                     "event_header_signature", "header_signature", "layout_type",
-                    "item_name_parse_strategy",
+                    "item_name_parse_strategy", "warehouse_header_ambiguous",
                 )},
             }
         finally:
@@ -447,6 +460,7 @@ class OneCHistoryImportService:
                 group_mapping_source = request.group_field_mapping or request.field_mapping
                 event_mapping_source = request.event_field_mapping or request.field_mapping
                 group_mapping = {field: group_mapping_source.get(field) for field in FIELD_NAMES}
+                group_mapping["warehouse"] = None
                 event_mapping = {field: event_mapping_source.get(field) for field in FIELD_NAMES}
                 group_row = request.group_header_row or structure.get("group_header_row") or header_row
                 event_row = request.event_header_row or header_row
@@ -483,7 +497,10 @@ class OneCHistoryImportService:
                 "group_field_mapping": group_mapping,
                 "event_field_mapping": event_mapping,
                 "item_name_parse_strategy": request.item_name_parse_strategy,
+                "warehouse_header_ambiguous": structure.get("warehouse_header_ambiguous", False),
             })
+            if detected.get("warehouse_header_ambiguous") and event_mapping.get("warehouse") is None:
+                raise OneCImportError("Выберите столбец «Склад» вручную: заголовок встречается несколько раз.")
             parsed = await asyncio.to_thread(
                 parse_workbook,
                 record.path,
@@ -576,6 +593,8 @@ class OneCHistoryImportService:
             else:
                 group_mapping = dict(legacy_mapping)
                 event_mapping = dict(legacy_mapping)
+            if request.layout_type == "hierarchical_grouped":
+                group_mapping["warehouse"] = None
             group_row = request.group_header_row if request.group_header_row is not None else detected.get("group_header_row")
             event_row = request.event_header_row if request.event_header_row is not None else detected.get("event_header_row", detected["header_row"])
             mapping = event_mapping
@@ -597,6 +616,8 @@ class OneCHistoryImportService:
                 raise OneCImportError("Сначала обновите предпросмотр для выбранного сопоставления.")
             if any(index is not None and index >= len(detected["headers"]) for index in event_mapping.values()):
                 raise OneCImportError("Сопоставление содержит столбец вне заголовков.")
+            if detected.get("warehouse_header_ambiguous") and event_mapping.get("warehouse") is None:
+                raise OneCImportError("Выберите столбец «Склад» вручную: заголовок встречается несколько раз.")
             if any(index is not None and index >= len(detected.get("group_headers", detected["headers"])) for index in group_mapping.values()):
                 raise OneCImportError("Сопоставление полей группы содержит столбец вне заголовков.")
             profile_id = request.profile_id if request.save_profile else (
@@ -658,7 +679,7 @@ class OneCHistoryImportService:
                 group_header_signature=detected.get("group_header_signature"),
                 event_header_signature=detected.get("event_header_signature"),
             )
-            semantic_import_fingerprint = self._semantic_import_fingerprint(requested_config)
+            semantic_import_fingerprint = self._semantic_import_fingerprint(requested_config, parsed.events)
             active = self.repository.active_metadata()
             if (
                 active

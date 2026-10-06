@@ -25,6 +25,13 @@ from .history_fuzzy_eligibility import (
     fuzzy_confirmation_eligibility_reason,
     manual_search_confirmation_eligibility_reason,
 )
+from .history_projection import (
+    HISTORY_CANDIDATE_V2_KEY,
+    MAX_COUNTERPARTY_DISPLAY_BYTES,
+    MAX_WAREHOUSE_DISPLAY_BYTES,
+    bounded_utf8_text,
+    decode_history_candidate_v2,
+)
 
 MAX_HISTORY_DECISION_EVENTS_PER_RUN = 1000
 MAX_HISTORY_DECISION_LEDGER_BYTES = 2 * 1024 * 1024
@@ -38,6 +45,7 @@ _OFFER_FIELDS = {
 _PROVENANCE_FIELDS = {
     "source", "source_kind", "snapshot_version", "history_item_id", "selected_event_id",
     "purchase_date", "counterparty", "price_basis", "effective_unit_price_gross", "currency_basis", "unit_family",
+    "warehouse", "warehouse_truncated", "counterparty_truncated",
     "normalizer_revision", "normalized_name_signature",
     "manual_integrity_valid",
 }
@@ -47,10 +55,20 @@ _MATCH_FIELDS = {
 }
 
 
-def _expand_review_candidate(candidate: Any) -> dict[str, Any]:
-    """Expand the compact immutable FUZZY_V1 run projection to the review contract."""
-    if not isinstance(candidate, dict) or set(candidate) != {"fuzzy_v1"}:
+def _expand_review_candidate(candidate: Any, text_pool: Any = None) -> dict[str, Any]:
+    """Expand legacy FUZZY_V1 or pooled history-candidate-v2 evidence."""
+    if isinstance(candidate, dict) and set(candidate) == {HISTORY_CANDIDATE_V2_KEY}:
+        try:
+            candidate = decode_history_candidate_v2(candidate, text_pool)
+        except (TypeError, ValueError):
+            return {}
+        if candidate is None:
+            return {}
+    legacy_keys = {"fuzzy_v1"}
+    v2_keys = legacy_keys | {"warehouse", "counterparty", "warehouse_truncated", "counterparty_truncated"}
+    if not isinstance(candidate, dict) or set(candidate) not in (legacy_keys, v2_keys):
         return candidate if isinstance(candidate, dict) else {}
+    display = candidate if set(candidate) == v2_keys else {}
     compact = candidate.get("fuzzy_v1")
     if (
         not isinstance(compact, dict)
@@ -78,9 +96,42 @@ def _expand_review_candidate(candidate: Any) -> dict[str, Any]:
     decision, match_offer_id_matches, conflicts, missing = match_values
     if not isinstance(match_offer_id_matches, bool):
         return {}
+    warehouse = display.get("warehouse")
+    counterparty = display.get("counterparty")
+    if (
+        warehouse is not None and (
+            not isinstance(warehouse, str) or len(warehouse.encode("utf-8")) > MAX_WAREHOUSE_DISPLAY_BYTES
+        )
+        or counterparty is not None and (
+            not isinstance(counterparty, str) or len(counterparty.encode("utf-8")) > MAX_COUNTERPARTY_DISPLAY_BYTES
+        )
+        or display and any(
+            key in display and not isinstance(display[key], bool)
+            for key in ("warehouse_truncated", "counterparty_truncated")
+        )
+    ):
+        return {}
     currency_basis = "source" if currency_basis_token == "s" else (
         "company_default" if currency_basis_token == "d" else currency_basis_token
     )
+    expanded_provenance = {
+        "source":"one_c_history" if source_token == "1c" else source_token,
+        "source_kind":"historical_purchase" if source_kind_token == "purchase" else source_kind_token,
+        "snapshot_version":snapshot, "history_item_id":history_item_id,
+        "selected_event_id":event_id, "purchase_date":purchase_date,
+        "price_basis":"gross_including_vat" if price_basis_token == "gross" else price_basis_token,
+        "effective_unit_price_gross":effective_price,
+        "currency_basis":currency_basis,
+        "unit_family":unit_family,
+    }
+    if warehouse:
+        expanded_provenance["warehouse"] = warehouse
+    if display.get("warehouse_truncated") is True:
+        expanded_provenance["warehouse_truncated"] = True
+    if counterparty:
+        expanded_provenance["counterparty"] = counterparty
+    if display.get("counterparty_truncated") is True:
+        expanded_provenance["counterparty_truncated"] = True
     return {
         "offer": {
             "offer_id":offer_id, "provider":"one_c_history", "source_item_id":source_item_id,
@@ -89,16 +140,7 @@ def _expand_review_candidate(candidate: Any) -> dict[str, Any]:
             "price_unit":price_unit, "retrieved_at":retrieved_at,
             "retrieval_classification":"FUZZY",
         },
-        "price_provenance": {
-            "source":"one_c_history" if source_token == "1c" else source_token,
-            "source_kind":"historical_purchase" if source_kind_token == "purchase" else source_kind_token,
-            "snapshot_version":snapshot, "history_item_id":history_item_id,
-            "selected_event_id":event_id, "purchase_date":purchase_date,
-            "price_basis":"gross_including_vat" if price_basis_token == "gross" else price_basis_token,
-            "effective_unit_price_gross":effective_price,
-            "currency_basis":currency_basis,
-            "unit_family":unit_family,
-        },
+        "price_provenance": expanded_provenance,
         "match": {
             "decision":decision, "offer_id":offer_id if match_offer_id_matches else "",
             "matched_attributes":[], "supporting_attributes":[],
@@ -114,6 +156,31 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _warehouse_decision_evidence(provenance: Any) -> dict[str, Any] | None:
+    """Keep bounded, server-owned warehouse display provenance in new decisions."""
+    if not isinstance(provenance, dict):
+        return None
+    warehouse, truncated = bounded_utf8_text(provenance.get("warehouse"), MAX_WAREHOUSE_DISPLAY_BYTES)
+    truncated = truncated or provenance.get("warehouse_truncated") is True
+    if not warehouse and not truncated:
+        return None
+    return {"warehouse": warehouse, "truncated": truncated}
+
+
+def _valid_warehouse_decision_evidence(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"warehouse", "truncated"}:
+        return False
+    warehouse = value.get("warehouse")
+    if not isinstance(warehouse, str) or not isinstance(value.get("truncated"), bool):
+        return False
+    try:
+        if len(warehouse.encode("utf-8")) > MAX_WAREHOUSE_DISPLAY_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return bool(warehouse) or value["truncated"] is True
 
 
 def _as_decimal(value: Any) -> Decimal | None:
@@ -172,13 +239,22 @@ def _public_review_candidate(candidate: Any) -> tuple[dict[str, Any], dict[str, 
     amount = _as_decimal(raw_offer.get("price"))
     offer["price"] = str(amount) if amount is not None else None
     raw_provenance = candidate.get("price_provenance") if isinstance(candidate.get("price_provenance"), dict) else {}
-    provenance = {
-        key: value
-        for key, value in raw_provenance.items()
-        if key in _PROVENANCE_FIELDS and (
-            isinstance(value, (str, int, float, bool)) or value is None
-        ) and len(str(value)) <= 180
-    }
+    provenance: dict[str, Any] = {}
+    for key, value in raw_provenance.items():
+        if key not in _PROVENANCE_FIELDS:
+            continue
+        if key in {"warehouse", "counterparty"}:
+            limit = MAX_WAREHOUSE_DISPLAY_BYTES if key == "warehouse" else MAX_COUNTERPARTY_DISPLAY_BYTES
+            text, was_truncated = bounded_utf8_text(value, limit)
+            if text:
+                provenance[key] = text
+            if was_truncated or raw_provenance.get(f"{key}_truncated") is True:
+                provenance[f"{key}_truncated"] = True
+        elif key in {"warehouse_truncated", "counterparty_truncated"}:
+            if value is True:
+                provenance[key] = True
+        elif (isinstance(value, (str, int, float, bool)) or value is None) and len(str(value)) <= 180:
+            provenance[key] = value
     match = _safe_match_projection(candidate.get("match")) or {}
     return offer, provenance, match
 
@@ -212,6 +288,18 @@ def manual_search_candidate(offer: Any, match: Any, variant_id: str) -> dict[str
     if isinstance(provenance, dict):
         for key, value in provenance.items():
             if key not in _PROVENANCE_FIELDS:
+                continue
+            if key in {"warehouse", "counterparty"}:
+                limit = MAX_WAREHOUSE_DISPLAY_BYTES if key == "warehouse" else MAX_COUNTERPARTY_DISPLAY_BYTES
+                text, truncated = bounded_utf8_text(value, limit)
+                if text:
+                    safe_provenance[key] = text
+                if truncated or provenance.get(f"{key}_truncated") is True:
+                    safe_provenance[f"{key}_truncated"] = True
+                continue
+            if key in {"warehouse_truncated", "counterparty_truncated"}:
+                if value is True:
+                    safe_provenance[key] = True
                 continue
             if isinstance(value, Decimal):
                 value = str(value)
@@ -381,6 +469,18 @@ def _candidate_gate(
     if offer.get("price") is not None and (not isinstance(offer.get("price"), (str, int, float)) or isinstance(offer.get("price"), bool) or len(str(offer["price"])) > 100):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if not isinstance(provenance, dict) or set(provenance) - _PROVENANCE_FIELDS or not isinstance(match, dict):
+        return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+    for key, limit in (("warehouse", MAX_WAREHOUSE_DISPLAY_BYTES), ("counterparty", MAX_COUNTERPARTY_DISPLAY_BYTES)):
+        value = provenance.get(key)
+        if value is not None:
+            if not isinstance(value, str):
+                return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+            try:
+                if len(value.encode("utf-8")) > limit:
+                    return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+            except UnicodeEncodeError:
+                return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
+    if any(key in provenance and not isinstance(provenance[key], bool) for key in ("warehouse_truncated", "counterparty_truncated")):
         return "HISTORY_CANDIDATE_EVIDENCE_INVALID", None
     if any(
         value is not None and not isinstance(value, (str, int, float, bool))
@@ -617,16 +717,22 @@ class TenderHistoryDecisionStore:
                     allowed_with_basis = allowed | {"confirmation_basis"}
                     allowed_fuzzy = allowed | {"confirmation_basis", "identity_assertion"}
                     allowed_manual = allowed | {"confirmation_basis", "identity_assertion", "manual_search_candidate"}
+                    allowed_shapes = [allowed, allowed_with_basis, allowed_fuzzy, allowed_manual]
+                    allowed_shapes.extend(shape | {"warehouse_evidence"} for shape in tuple(allowed_shapes))
                     required = ("source_row_id", "candidate_offer_id", "evidence_fingerprint", "history_snapshot_version", "history_item_id", "selected_event_id")
                     if (
-                        set(event) not in (allowed, allowed_with_basis, allowed_fuzzy, allowed_manual)
+                        set(event) not in allowed_shapes
+                        or "warehouse_evidence" in event and not _valid_warehouse_decision_evidence(event["warehouse_evidence"])
                         or any(not isinstance(event.get(key), str) or not event[key] or len(event[key]) > 200 for key in required)
                         or not _ID_RE.fullmatch(event["source_row_id"])
                         or not re.fullmatch(r"[a-f0-9]{64}", event["evidence_fingerprint"])
                         or event.get("confirmation_basis") not in (None, "NORMALIZED_CONFIRMATION", "FUZZY_MANUAL_CONFIRMATION", "MANUAL_SEARCH_CONFIRMATION")
                         or (
                             event.get("confirmation_basis") == "FUZZY_MANUAL_CONFIRMATION"
-                            and (set(event) != allowed_fuzzy or event.get("identity_assertion") != "SAME_PRODUCT_V1")
+                            and (
+                                set(event) not in (allowed_fuzzy, allowed_fuzzy | {"warehouse_evidence"})
+                                or event.get("identity_assertion") != "SAME_PRODUCT_V1"
+                            )
                         )
                         or (
                             event.get("confirmation_basis") != "FUZZY_MANUAL_CONFIRMATION"
@@ -636,7 +742,7 @@ class TenderHistoryDecisionStore:
                         or (
                             event.get("confirmation_basis") == "MANUAL_SEARCH_CONFIRMATION"
                             and (
-                                set(event) != allowed_manual
+                                set(event) not in (allowed_manual, allowed_manual | {"warehouse_evidence"})
                                 or event.get("identity_assertion") != "SAME_PRODUCT_V1"
                                 or not isinstance(event.get("manual_search_candidate"), dict)
                                 or set(event["manual_search_candidate"]) != {"offer", "price_provenance", "match", "manual_variant_id"}
@@ -856,6 +962,8 @@ class TenderHistoryDecisionStore:
                 "candidate": candidate,
                 "confirmation_basis": event.get("confirmation_basis", "EXACT_CONFIRMATION"),
             }
+            if "warehouse_evidence" in event:
+                item["warehouse_evidence"] = dict(event["warehouse_evidence"])
             if event.get("confirmation_basis") in {"FUZZY_MANUAL_CONFIRMATION", "MANUAL_SEARCH_CONFIRMATION"}:
                 item["identity_assertion"] = event["identity_assertion"]
             effective[row_id] = item
@@ -949,6 +1057,9 @@ class TenderHistoryDecisionStore:
                 "history_item_id": provenance["history_item_id"],
                 "selected_event_id": provenance["selected_event_id"],
             }
+            warehouse_evidence = _warehouse_decision_evidence(provenance)
+            if warehouse_evidence is not None:
+                event["warehouse_evidence"] = warehouse_evidence
             if _confirmation_basis(candidate) == "NORMALIZED_CONFIRMATION":
                 event["confirmation_basis"] = "NORMALIZED_CONFIRMATION"
             elif _confirmation_basis(candidate) == "FUZZY_MANUAL_CONFIRMATION":
@@ -1002,6 +1113,9 @@ class TenderHistoryDecisionStore:
                 "identity_assertion": "SAME_PRODUCT_V1",
                 "manual_search_candidate": candidate,
             }
+            warehouse_evidence = _warehouse_decision_evidence(provenance)
+            if warehouse_evidence is not None:
+                event["warehouse_evidence"] = warehouse_evidence
             ledger = self._read(ledger_path, tender_id, run_id)
             self._append(ledger_path, ledger, event)
             return self._snapshot_locked(workspace_path, workspace, run, tender_id, run_id)
