@@ -669,14 +669,18 @@ def test_match_with_unknown_unit_requires_review(tmp_path):
     assert result.selected_offer is None
 
 
-def test_canonical_history_units_use_broader_unit_normalizer_without_changing_live_aliases(tmp_path):
+def test_canonical_history_units_share_safe_alias_families_and_keep_unknowns_blocked(tmp_path):
     expected = {
-        "шт": "piece", "кг": "kilogram", "г": "gram", "м": "meter",
+        "шт": "piece", "штука": "piece", "штуки": "piece", "кг": "kilogram",
+        "килограмм": "kilogram", "г": "gram", "м": "meter", "метр": "meter",
         "м2": "square_meter", "л": "litre", "м3": "cubic_meter",
-        "компл": "set", "пог. м": "meter", "упак": "pack", "Пар": "pair",
+        "компл": "set", "пог. м": "meter", "уп": "pack", "упак": "pack", "Пар": "pair",
         "боб": "bobbin", "т": "tonne", "мл": "millilitre",
     }
     assert {unit: normalize_unit_family(unit) for unit in expected} == expected
+    assert normalize_sourcing_unit_family("штуки") == "piece"
+    assert normalize_sourcing_unit_family("метров") == "meter"
+    assert normalize_sourcing_unit_family("килограммов") == "kilogram"
     assert normalize_sourcing_unit_family("г") is None
     assert normalize_sourcing_unit_family("мл") is None
     assert normalize_sourcing_unit_family("Пар") is None

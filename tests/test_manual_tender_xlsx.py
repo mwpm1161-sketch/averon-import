@@ -524,18 +524,35 @@ def test_formula_quantity_never_becomes_authoritative(tmp_path):
 
 
 @pytest.mark.parametrize(("unit", "base", "scale", "dimension"), [
-    ("шт", "шт", "1", "count"), ("10 шт", "шт", "10", "count"),
+    ("шт", "шт", "1", "count"), ("шт.", "шт", "1", "count"),
+    ("штука", "шт", "1", "count"), ("штуки", "шт", "1", "count"),
+    ("10 шт", "шт", "10", "count"),
     ("100 шт", "шт", "100", "count"), ("1000 шт", "шт", "1000", "count"),
-    ("м", "м", "1", "length"), ("10 м", "м", "10", "length"),
+    ("м", "м", "1", "length"), ("метр", "м", "1", "length"),
+    ("метра", "м", "1", "length"), ("метров", "м", "1", "length"),
+    ("10 м", "м", "10", "length"),
     ("1000 м", "м", "1000", "length"), ("кг", "кг", "1", "mass"),
+    ("kg", "кг", "1", "mass"), ("килограмм", "кг", "1", "mass"),
+    ("килограмма", "кг", "1", "mass"), ("килограммов", "кг", "1", "mass"),
     ("т", "кг", "1000", "mass"), ("м2", "м2", "1", "area"),
     ("м3", "м3", "1", "volume"), ("л", "л", "1", "volume"),
     ("компл", "компл", "1", "set"), ("уп", "уп", "1", "package"),
+    ("упак", "уп", "1", "package"),
 ])
 def test_tender_unit_basis_supported_units(unit, base, scale, dimension):
     result = parse_unit_basis(unit)
     assert result["trusted"] is True
     assert (result["base_unit"], result["scale"], result["dimension"]) == (base, scale, dimension)
+
+
+def test_tender_unit_basis_and_history_family_share_piece_aliases():
+    from averon_import.core.unit_normalization import normalize_unit_family
+
+    for unit in ("шт", "шт.", "штука", "штуки", "штук"):
+        basis = parse_unit_basis(unit)
+        assert normalize_unit_family(unit) == "piece"
+        assert basis["trusted"] is True
+        assert (basis["base_unit"], basis["dimension"]) == ("шт", "count")
 
 
 def test_unknown_and_unapproved_pack_scales_remain_unknown():
@@ -3023,6 +3040,85 @@ def test_d4b_fuzzy_confirmation_requires_explicit_two_step_and_survives_restart_
     assert revoked.json()["effective"] == {}
 
 
+def test_d4b_real_tender_piece_unit_alias_is_confirmable(tender_api, tmp_path):
+    from averon_import.services.sourcing.product_understanding import build_fallback_intent
+
+    main, repository = tender_api
+    source_name = "SMD-линейка 240 диодов,2000 мм"
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path, source_name=source_name, source_unit="шт.",
+    )
+    source = next(row for row in workspace["rows"] if row["row_type"] == "item")
+    adapted = TenderSourcingRowAdapter.convert(source)
+    intent = build_fallback_intent(adapted)
+    assert source["raw_unit"] == "шт."
+    assert parse_unit_basis(source["raw_unit"])["trusted"] is True
+    assert adapted["unit"] == intent.unit == "шт."
+
+    run_id = _persist_history_review_run(
+        main, repository, workspace, classification="FUZZY",
+        offer_overrides={"title":source_name, "price_unit":"штуки"},
+        provenance_overrides={"unit_family":"piece"},
+    )
+    endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    snapshot = _api_request(main.app, "GET", endpoint, headers=_auth_headers()).json()
+    candidate = snapshot["rows"][0]["candidates"][0]
+    assert candidate["offer"]["price_unit"] == "штуки"
+    assert candidate["price_provenance"]["unit_family"] == "piece"
+    assert candidate["confirmable_for_explicit_fuzzy"] is True
+
+    confirmed = _api_request(
+        main.app, "POST", endpoint,
+        headers={**_auth_headers(), "Content-Type":"application/json"},
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+            "candidate_offer_id":candidate["candidate_offer_id"], "expected_revision":0,
+            "confirmation_mode":"EXPLICIT_FUZZY_IDENTITY", "explicit_identity_assertion":True,
+        }).encode(),
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+
+def test_d4b_and_d4c_unit_gate_still_blocks_piece_vs_kilogram():
+    from averon_import.services.manual_tenders.history_fuzzy_eligibility import (
+        fuzzy_confirmation_eligibility_reason, manual_search_confirmation_eligibility_reason,
+    )
+
+    source = {
+        "source_row_id":"7" * 32, "excel_row":2, "name":"SMD-линейка 240 диодов,2000 мм",
+        "article":"", "manufacturer":"", "model":"", "raw_unit":"шт.",
+    }
+    provenance = {
+        "source":"one_c_history", "source_kind":"historical_purchase",
+        "snapshot_version":"snapshot", "history_item_id":"history-item",
+        "selected_event_id":"history-event", "purchase_date":"2025-04-16",
+        "price_basis":"gross_including_vat", "effective_unit_price_gross":"123.45",
+        "currency_basis":"company_default", "unit_family":"kilogram", "manual_integrity_valid":True,
+    }
+    match = {"offer_id":"one_c_history:history-item", "decision":"REVIEW", "conflicting_attributes":[]}
+    route = {
+        "source_mode":"one_c_only", "final_source_kind":"history_review", "history_outcome":"REVIEW",
+        "history_safe_basis":None, "history_catalog_version":"snapshot",
+    }
+    offer = {
+        "offer_id":"one_c_history:history-item", "provider":"one_c_history",
+        "source_item_id":"history-item", "title":source["name"], "article":"", "manufacturer":"",
+        "history_characteristic":"", "price":"123.45", "currency":"RUB", "price_unit":"кг",
+        "retrieval_classification":"FUZZY",
+    }
+    assert fuzzy_confirmation_eligibility_reason(
+        source, offer, provenance, match, route,
+        expected_snapshot_version="snapshot", physical_excel_row=2, retrieval_rank=1,
+    ) == "HISTORY_CANDIDATE_UNIT_CONFLICT"
+
+    offer["retrieval_classification"] = "MANUAL_HISTORY_SEARCH"
+    route.update({"final_source_kind":"none", "history_outcome":"NO_MATCH"})
+    assert manual_search_confirmation_eligibility_reason(
+        source, offer, provenance, match, route,
+        expected_snapshot_version="snapshot", physical_excel_row=2,
+    ) == "HISTORY_CANDIDATE_UNIT_CONFLICT"
+
+
 @pytest.mark.parametrize("decision", ["MATCH", "LIKELY_MATCH", "REVIEW"])
 def test_d4c_manual_search_match_decisions_remain_explicitly_confirmable(decision):
     from averon_import.services.manual_tenders.history_fuzzy_eligibility import manual_search_confirmation_eligibility_reason
@@ -3275,6 +3371,72 @@ def _activate_d4c_history(repository, *, item_name="Клей д/плитки С�
     staging = repository.build_staging_snapshot(parsed, profile_id=None, semantic_import_fingerprint=semantic)
     repository.activate(staging)
     return repository.catalog_version()
+
+
+def test_d4c_manual_history_search_confirms_equivalent_piece_alias(tender_api, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from averon_import.services.one_c_history.activity import OneCHistoryActivityRegistry
+    from averon_import.services.one_c_history.repository import OneCHistoryRepository
+    from averon_import.services.sourcing.providers.one_c_history import OneCHistoryProvider
+
+    main, repository = tender_api
+    source_name = "SMD-линейка 240 диодов,2000 мм"
+    workspace = _confirm_ivy_history_tender(
+        main, repository, tmp_path, source_name=source_name, source_unit="шт.",
+    )
+    source = next(item for item in workspace["rows"] if item["row_type"] == "item")
+    history_repository = OneCHistoryRepository(tmp_path / "piece-alias-one-c")
+    pinned_version = _activate_d4c_history(
+        history_repository, item_name=source_name, unit="штуки",
+    )
+    main.one_c_history_repository = history_repository
+    main.one_c_history_activity = OneCHistoryActivityRegistry()
+    monkeypatch.setattr(main, "sourcing_runtime", replace(
+        main.sourcing_runtime, one_c_history_provider=OneCHistoryProvider(history_repository),
+    ))
+
+    run_id = _persist_history_review_run(main, repository, workspace)
+    workspace_path = repository.workspace_root / workspace["tender_id"]
+    run_path = main.tender_sourcing_runs._path(workspace_path, run_id)
+    run_data = json.loads(run_path.read_text(encoding="utf-8"))
+    run_data["catalog_version"] = pinned_version
+    run_data["history_catalog_version"] = pinned_version
+    row = run_data["rows"][0]
+    row["history_review_candidates"] = []
+    row["recommended_offer"] = None
+    row["recommended_match"] = None
+    row["price_provenance"] = {}
+    row["route"].update({
+        "source_mode":"one_c_only", "final_source_kind":"none", "history_outcome":"NO_MATCH",
+        "history_safe_basis":None, "history_catalog_version":pinned_version,
+        "history_selected_event_id":"", "history_purchase_date":"", "history_candidate_count":0,
+    })
+    run_path.write_text(json.dumps(run_data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+    search_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-search"
+    decisions_endpoint = f"/api/manual-tenders/{workspace['tender_id']}/runs/{run_id}/history-decisions"
+    headers = {**_auth_headers(), "Content-Type":"application/json"}
+    searched = _api_request(
+        main.app, "POST", search_endpoint, headers=headers,
+        body=json.dumps({"source_row_id":source["source_row_id"], "query":source_name}, ensure_ascii=False).encode(),
+    )
+    assert searched.status_code == 200, searched.text
+    result = searched.json()["results"][0]
+    assert result["price_unit"] == "штуки"
+    assert result["unit_compatible"] is True
+    assert result["confirmable_for_manual_search"] is True, result["reason_code"]
+
+    confirmed = _api_request(
+        main.app, "POST", decisions_endpoint, headers=headers,
+        body=json.dumps({
+            "decision":"CONFIRM_HISTORY_CANDIDATE", "source_row_id":source["source_row_id"],
+            "expected_revision":0, "confirmation_mode":"EXPLICIT_MANUAL_HISTORY_SEARCH",
+            "explicit_identity_assertion":True,
+            "manual_history_ref":{"history_item_id":result["history_item_id"], "variant_id":result["variant_id"]},
+        }).encode(),
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["events"][0]["manual_search_candidate"]["offer"]["price_unit"] == "штуки"
 
 
 def test_d4c_manual_search_snapshot_fence_no_match_confirm_restart_revoke_and_export(tender_api, tmp_path, monkeypatch):

@@ -13,10 +13,12 @@ _UNIT_FAMILIES: dict[str, tuple[str, bool]] = {
     "шт": ("piece", True), "штука": ("piece", True), "штуки": ("piece", True), "штук": ("piece", True),
     "пар": ("pair", False),
     "кг": ("kilogram", True), "kg": ("kilogram", True),
+    "килограмм": ("kilogram", True), "килограмма": ("kilogram", True), "килограммов": ("kilogram", True),
     "г": ("gram", False), "гр": ("gram", False), "g": ("gram", False),
     "т": ("tonne", True), "ton": ("tonne", True), "tonne": ("tonne", True),
     "тонна": ("tonne", True), "тонны": ("tonne", True), "тонн": ("tonne", True),
     "м": ("meter", True), "m": ("meter", True),
+    "метр": ("meter", True), "метра": ("meter", True), "метров": ("meter", True),
     "пог. м": ("meter", False), "пог м": ("meter", False), "пог.м": ("meter", False),
     "м2": ("square_meter", True), "m2": ("square_meter", True),
     "м3": ("cubic_meter", True), "m3": ("cubic_meter", True),
@@ -24,7 +26,7 @@ _UNIT_FAMILIES: dict[str, tuple[str, bool]] = {
     "литр": ("litre", True), "литра": ("litre", True), "литров": ("litre", True),
     "мл": ("millilitre", False), "ml": ("millilitre", False),
     "компл": ("set", True), "комплект": ("set", True),
-    "комп": ("set", False), "упак": ("pack", True), "упаковка": ("pack", True),
+    "комп": ("set", False), "уп": ("pack", True), "упак": ("pack", True), "упаковка": ("pack", True),
     "боб": ("bobbin", False),
 }
 

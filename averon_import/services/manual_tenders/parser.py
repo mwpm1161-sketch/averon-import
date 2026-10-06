@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+from averon_import.core.unit_normalization import normalize_sourcing_unit_family
 from averon_import.services.one_c_history.xlsx_import import OneCImportError, preflight_xlsx as shared_preflight_xlsx
 from .template import (
     PREPARED_ROWS, TEMPLATE_HEADERS, TEMPLATE_SCHEMA_NAME,
@@ -263,31 +264,34 @@ def _decimal_quantity(value: Any, data_type: str) -> tuple[str, str | None, bool
 def parse_unit_basis(raw_value: Any) -> dict[str, Any]:
     raw = _cell_text(raw_value)
     normalized = " ".join(unicodedata.normalize("NFKC", raw).casefold().replace("ё", "е").split())
-    match = re.fullmatch(r"(?:(\d+)\s*)?(шт|штук|м|метр(?:а|ов)?|кг|килограмм(?:а|ов)?|т|тонн(?:а|ы)?|м2|м²|м3|м³|л|литр(?:а|ов)?|компл|комплект(?:а|ов)?|уп|упак(?:овка|овки|овок)?)\.?", normalized)
+    match = re.fullmatch(r"(?:(\d+)\s*)?(.+?)(\.)?", normalized)
     if not match:
         return asdict(TenderUnitBasis(raw, None, None, None, None, False))
     multiplier = int(match.group(1) or 1)
     unit = match.group(2)
+    family = normalize_sourcing_unit_family(unit)
+    if family is None or "." in unit:
+        return asdict(TenderUnitBasis(raw, None, None, None, None, False))
     if multiplier not in {1, 10, 100, 1000}:
         return asdict(TenderUnitBasis(raw, None, None, None, None, False))
-    if multiplier != 1 and unit not in {"шт", "штук", "м", "метр", "метра", "метров"}:
+    if multiplier != 1 and family not in {"piece", "meter"}:
         return asdict(TenderUnitBasis(raw, None, None, None, None, False))
-    if unit in {"шт", "штук"}:
+    if family == "piece":
         base, dim, basis = "шт", "count", "each"
-    elif unit in {"м", "метр", "метра", "метров"}:
+    elif family == "meter":
         base, dim, basis = "м", "length", "each"
-    elif unit in {"кг", "килограмм", "килограмма", "килограммов"}:
+    elif family == "kilogram":
         base, dim, basis = "кг", "mass", "each"
-    elif unit in {"т", "тонна", "тонны", "тонн"}:
+    elif family == "tonne":
         base, dim, basis = "кг", "mass", "tonne_to_kg"
         multiplier *= 1000
-    elif unit in {"м2", "м²"}:
+    elif family == "square_meter":
         base, dim, basis = "м2", "area", "each"
-    elif unit in {"м3", "м³"}:
+    elif family == "cubic_meter":
         base, dim, basis = "м3", "volume", "each"
-    elif unit in {"л", "литр", "литра", "литров"}:
+    elif family == "litre":
         base, dim, basis = "л", "volume", "each"
-    elif unit in {"компл", "комплект", "комплекта", "комплектов"}:
+    elif family == "set":
         base, dim, basis = "компл", "set", "unspecified_set"
     else:
         base, dim, basis = "уп", "package", "unspecified_package"
