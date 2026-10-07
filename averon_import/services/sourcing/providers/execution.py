@@ -215,8 +215,14 @@ class ProviderRunner:
 
         copied: dict[str, OutcomeNativeProviderAdapter] = {}
         for key, adapter in registry.items():
-            if not isinstance(key, str) or not key:
-                raise ProviderRunnerConfigurationError("provider registry keys must be non-empty strings")
+            if not isinstance(key, str):
+                raise ProviderRunnerConfigurationError("provider registry keys must be valid provider keys")
+            try:
+                ProviderSelection(provider_keys=(key,))
+            except Exception:
+                raise ProviderRunnerConfigurationError(
+                    "provider registry keys must be valid provider keys",
+                ) from None
             if not callable(getattr(adapter, "request_identity", None)) or not callable(
                 getattr(adapter, "execute_search", None)
             ):
@@ -291,15 +297,28 @@ class ProviderRunner:
                 limit=limit,
                 execution_scope_id=scope.execution_scope_id,
             )
-            if not isinstance(raw_identity, ProviderSearchRequestIdentity):
-                raise TypeError("adapter returned a non-contract request identity")
+        except Exception:
+            return self._failure(
+                provider_key,
+                ProviderFailureCategory.UNKNOWN,
+                request_count=0,
+            ), False
+
+        if not isinstance(raw_identity, ProviderSearchRequestIdentity):
+            return self._failure(
+                provider_key,
+                ProviderFailureCategory.INVALID_RESPONSE,
+                request_count=0,
+            ), False
+
+        try:
             identity = ProviderSearchRequestIdentity.model_validate(
                 raw_identity.model_dump(mode="python"),
             )
         except Exception:
             return self._failure(
                 provider_key,
-                ProviderFailureCategory.UNKNOWN,
+                ProviderFailureCategory.INVALID_RESPONSE,
                 request_count=0,
             ), False
 
@@ -319,6 +338,7 @@ class ProviderRunner:
         if cached is not None:
             payload = cached.model_dump(mode="python")
             payload["request_count"] = 0
+            payload["timings"] = ()
             return ProviderSearchOutcome.model_validate(payload), True
 
         request_counter = ProviderRequestCounter()

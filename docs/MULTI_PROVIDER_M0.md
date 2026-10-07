@@ -35,9 +35,10 @@ underlying HTTP attempts. Request counts must never be guessed.
 Equivalent work can be reused only from the in-memory cache held by the same
 `ProviderExecutionScope` instance and only when provider, request fingerprint,
 affinity/revisions, limit, and scope match. Cache hits report zero new outbound
-requests. There is no persisted or cross-run live commercial cache. The runner
-does not call `stats()`, local status, or connectivity probes and contains no
-matcher decisions.
+requests and carry no replayed provider timings; `reused_provider_keys`
+identifies reuse explicitly. There is no persisted or cross-run live commercial
+cache. The runner does not call `stats()`, local status, or connectivity probes
+and contains no matcher decisions.
 
 M1A does not change API/UI behavior, durable data or schema version 1, current
 `SourcingService` routing, matcher authority, export authority, or any existing

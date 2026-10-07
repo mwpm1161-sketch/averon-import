@@ -13,6 +13,7 @@ from averon_import.services.sourcing.providers.contracts import (
     ProviderSearchState,
     ProviderSearchRequestIdentity,
     ProviderSelection,
+    ProviderTiming,
 )
 from averon_import.services.sourcing.providers.execution import (
     ProviderExecutionLimitError,
@@ -21,6 +22,9 @@ from averon_import.services.sourcing.providers.execution import (
     ProviderRunner,
     ProviderRunnerConfigurationError,
 )
+
+
+_MISSING = object()
 
 
 def _offer(provider: str, offer_id: str, *, title: str | None = None) -> Offer:
@@ -50,6 +54,9 @@ class FakeOutcomeAdapter:
         affinity: ProviderAffinity | None = None,
         error: Exception | None = None,
         raw_outcome: object | None = None,
+        timings: tuple[ProviderTiming, ...] = (),
+        identity_result: object = _MISSING,
+        identity_error: Exception | None = None,
     ) -> None:
         self.key = key
         self.offers = offers
@@ -64,6 +71,9 @@ class FakeOutcomeAdapter:
         )
         self.error = error
         self.raw_outcome = raw_outcome
+        self.timings = timings
+        self.identity_result = identity_result
+        self.identity_error = identity_error
         self.execute_calls = 0
         self.health_calls = 0
 
@@ -74,6 +84,10 @@ class FakeOutcomeAdapter:
         limit: int,
         execution_scope_id: str,
     ) -> ProviderSearchRequestIdentity:
+        if self.identity_error is not None:
+            raise self.identity_error
+        if self.identity_result is not _MISSING:
+            return self.identity_result  # type: ignore[return-value]
         fingerprint = hashlib.sha256(
             f"{intent.fingerprint}:{limit}".encode("utf-8"),
         ).hexdigest()
@@ -106,6 +120,7 @@ class FakeOutcomeAdapter:
             offers=offers,
             request_count=request_counter.request_count,
             failure_category=self.failure_category,
+            timings=self.timings,
             affinity=self.affinity,
             catalog_version=f"{self.key}-catalog-7",
         )
@@ -261,8 +276,14 @@ def test_registry_insertion_order_cannot_change_provider_or_offer_order():
     ]
 
 
-def test_run_local_dedup_reuses_outcome_without_inventing_another_request():
-    adapter = FakeOutcomeAdapter("etm_ipro", (_offer("etm_ipro", "cached"),), attempts=2)
+def test_run_local_dedup_reuses_outcome_without_replaying_request_or_timing():
+    provider_timing = ProviderTiming(stage="search", milliseconds=237.5)
+    adapter = FakeOutcomeAdapter(
+        "etm_ipro",
+        (_offer("etm_ipro", "cached"),),
+        attempts=2,
+        timings=(provider_timing,),
+    )
     runner = ProviderRunner({"etm_ipro": adapter})
     scope = ProviderExecutionScope(execution_scope_id="same-run")
     selection = ProviderSelection(provider_keys=("etm_ipro",))
@@ -272,9 +293,14 @@ def test_run_local_dedup_reuses_outcome_without_inventing_another_request():
 
     assert adapter.execute_calls == 1
     assert first.total_request_count == 2
+    assert first.outcomes[0].timings == (provider_timing,)
+    assert first.execution_summary.providers[0].elapsed_milliseconds == 237.5
     assert second.total_request_count == 0
     assert second.reused_provider_keys == ("etm_ipro",)
     assert second.offers == first.offers
+    assert adapter.execute_calls == 1
+    assert second.outcomes[0].timings == ()
+    assert second.execution_summary.providers[0].elapsed_milliseconds is None
     assert "_outcome_cache" not in scope.model_dump()
 
 
@@ -433,6 +459,72 @@ def test_registry_is_snapshotted_at_runner_construction():
     )
 
     assert tuple(offer.offer_id for offer in result.offers) == ("original",)
+
+
+def test_registry_key_uses_provider_selection_domain():
+    valid_adapter = FakeOutcomeAdapter("etm_ipro")
+    assert ProviderRunner({"etm_ipro": valid_adapter})
+
+    for invalid_key in ("", "ETM_IPRO", "bad/key"):
+        with pytest.raises(ProviderRunnerConfigurationError, match="valid provider keys"):
+            ProviderRunner({invalid_key: FakeOutcomeAdapter(invalid_key)})
+
+
+def test_registry_still_rejects_adapter_key_mismatch():
+    with pytest.raises(ProviderRunnerConfigurationError, match="must match"):
+        ProviderRunner({"supplier": FakeOutcomeAdapter("etm_ipro")})
+
+
+def test_non_contract_or_malformed_request_identity_is_invalid_response():
+    malformed_identity = ProviderSearchRequestIdentity.model_construct(
+        execution_scope_id="run-1",
+        provider_key="UPPERCASE",
+        request_fingerprint="bad-fingerprint",
+        affinity=ProviderAffinity(),
+        limit=10,
+    )
+    for identity in (None, malformed_identity):
+        adapter = FakeOutcomeAdapter("etm_ipro", identity_result=identity)
+        result = _run({"etm_ipro": adapter}, ("etm_ipro",))
+
+        assert result.outcomes[0].state == ProviderSearchState.FAILURE
+        assert result.outcomes[0].failure_category == ProviderFailureCategory.INVALID_RESPONSE
+        assert adapter.execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    "identity_updates",
+    [
+        {"provider_key": "supplier"},
+        {"execution_scope_id": "another-run"},
+        {"limit": 9},
+    ],
+)
+def test_valid_request_identity_context_mismatch_is_misconfigured(identity_updates):
+    identity_adapter = FakeOutcomeAdapter("etm_ipro")
+    identity = identity_adapter.request_identity(
+        _intent(),
+        limit=10,
+        execution_scope_id="run-1",
+    ).model_copy(update=identity_updates)
+    adapter = FakeOutcomeAdapter("etm_ipro", identity_result=identity)
+
+    result = _run({"etm_ipro": adapter}, ("etm_ipro",))
+
+    assert result.outcomes[0].state == ProviderSearchState.FAILURE
+    assert result.outcomes[0].failure_category == ProviderFailureCategory.MISCONFIGURED
+    assert adapter.execute_calls == 0
+
+
+def test_request_identity_exception_remains_unknown_without_leaking_text():
+    secret_message = "identity upstream token body"
+    adapter = FakeOutcomeAdapter("etm_ipro", identity_error=RuntimeError(secret_message))
+
+    result = _run({"etm_ipro": adapter}, ("etm_ipro",))
+
+    assert result.outcomes[0].failure_category == ProviderFailureCategory.UNKNOWN
+    assert secret_message not in result.model_dump_json()
+    assert adapter.execute_calls == 0
 
 
 def test_provider_execution_result_rejects_result_over_the_requested_limit():
