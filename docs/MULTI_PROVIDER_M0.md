@@ -1,15 +1,16 @@
-# Multi-provider sourcing M0 contracts and M1A runner
+# Multi-provider sourcing contracts and inactive execution (M0–M1B)
 
 M0/M0.1 contracts at baseline `5e93518b36efd479e2614709e523e5d5cdf64fd2`
 are final approved. M1A adds only the inactive internal `ProviderRunner` in
 `averon_import/services/sourcing/providers/execution.py`; no current runtime
 caller, API, or UI imports or invokes it.
 
-This note records inactive internal contracts introduced by M0 and the
-request-local execution engine introduced by M1A. Current API
-models, endpoint payloads, provider resolution, matcher, settings UI, search
-execution, export resolver, and tender durable writer remain on their existing
-single-provider and schema-version-1 paths.
+This note records inactive internal contracts introduced by M0, the
+request-local execution engine introduced by M1A, and the outcome-native
+provider adapters introduced by M1B. Current API models, endpoint payloads,
+provider resolution, matcher, settings UI, search execution, export resolver,
+and tender durable writer remain on their existing single-provider and
+schema-version-1 paths.
 
 ## M1A execution boundary
 
@@ -43,8 +44,7 @@ and contains no matcher decisions.
 M1A does not change API/UI behavior, durable data or schema version 1, current
 `SourcingService` routing, matcher authority, export authority, or any existing
 provider adapter. No VseInstrumenti network integration or credential work is
-included. The next planned phase is legacy-provider adaptation and routing
-integration, subject to independent review.
+included. M1A was final approved at `087bcf99554d498a31741c584c811ee95895e03e`.
 
 ## Provider selection and identity
 
@@ -118,3 +118,56 @@ future VseInstrumenti live-enablement phase must provide an explicitly approved
 credential source and must not silently store the token in that plaintext
 fallback. M0 does not choose a production credential mechanism, change
 credentials, call a supplier API, or enable multi-provider execution.
+
+## M1B inactive adapters and transport accounting
+
+M1B adds explicit outcome-native adapters for `LocalCatalogProvider`,
+`LemanaB2BProvider`, and `EtmIproProvider` in
+`averon_import/services/sourcing/providers/execution_adapters.py`. They accept
+provider instances explicitly and satisfy the M1A adapter protocol, but no
+production runtime registry or caller is added. `ProviderRunner` remains
+inactive.
+
+Actual outbound attempts are observed request-locally at the configured
+transport boundary. Lemana records immediately before its transport call, so
+token acquisition, product/price requests, and a price attempt retried after a
+401 are counted only when each attempt is actually sent. ETM records
+immediately before `_transport` in its normal request path, after its existing
+rate-limit and quarantine checks; a login is included only when sent. Local
+mirror lookup, token/session cache hits, rate-limit waiting, local validation,
+and requests suppressed by ETM quarantine do not increment the counter. No
+global counter or persistent traffic state is introduced.
+
+The existing providers' ordinary `.search()` paths retain their prior call
+shape and output. The observer is optional and passed only by the new explicit
+adapter path. ETM's process-wide outbound gate, login interval, persistent
+12-hour auth quarantine, authenticated-403 handling, and no-blind-retry rule
+are unchanged. Instrumentation adds no provider requests or preflight checks.
+
+The adapter error mapping is bounded and excludes exception text:
+
+| Existing `SourcingProviderError.category` | Outcome category |
+| --- | --- |
+| `auth`, `authentication` | `AUTHENTICATION` |
+| `rate_limit`, `rate_limited` | `RATE_LIMITED` |
+| `network`, `transport` | `TRANSPORT` |
+| `timeout` | `TIMEOUT` |
+| `invalid_response` | `INVALID_RESPONSE` |
+| `not_configured`, `invalid_request`, `health_error` | `MISCONFIGURED` |
+| `upstream_error`, `storage_error` | `UNAVAILABLE` |
+| unrecognized category | `UNKNOWN` |
+
+Local results keep a zero request count. Successful searches produce
+`SUCCESS`, no-result searches produce `EMPTY`, and provider-local exceptions
+produce `FAILURE`; no partial result is invented. Search identities include
+the intent fingerprint, requested limit, provider key, and non-secret
+provider affinity. Lemana affinity includes environment, region, and mirror
+revision. ETM affinity includes environment, mirror/index revision, warehouse
+selection, live-candidate cap, and an opaque hash of its configured API base
+override. Local affinity includes only the deterministic catalog revision and
+adapter revision, with no fabricated environment or region.
+
+M1B does not add VseInstrumenti, settings, credentials, API traffic, an export
+evidence integration, or changes to API/UI, schema, export, matcher, or
+`SourcingService`. The next phase, after independent review, is controlled
+routing integration rather than further provider implementation.

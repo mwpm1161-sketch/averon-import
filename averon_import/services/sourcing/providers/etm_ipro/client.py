@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from averon_import.services.app_settings import EtmIproSettings
 from averon_import.services.sourcing.providers.base import SourcingProviderError
+from averon_import.services.sourcing.providers.outbound import OutboundAttemptObserver
 
 from .models import parse_manufacturers
 
@@ -136,8 +137,12 @@ class EtmIproClient:
     def configured(self) -> bool:
         return bool(self.settings.enabled and self._login_value and self._password)
 
-    def check_access(self) -> bool:
-        self._get_session()
+    def check_access(
+        self,
+        *,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> bool:
+        self._get_session(outbound_attempt_observer=outbound_attempt_observer)
         return True
 
     def get_goods(
@@ -146,29 +151,54 @@ class EtmIproClient:
         *,
         lookup_type: str = "etm",
         manufacturer_code: str | None = None,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> dict[str, Any]:
         item = self._id(source_item_id)
         params: dict[str, str] = {"type": lookup_type}
         if manufacturer_code:
             params["mnf"] = str(manufacturer_code).strip()
-        return self._request_json("GET", f"/goods/{quote(item, safe='')}", query=params, bucket="goods")
+        return self._request_json(
+            "GET",
+            f"/goods/{quote(item, safe='')}",
+            query=params,
+            bucket="goods",
+            outbound_attempt_observer=outbound_attempt_observer,
+        )
 
-    def get_prices(self, source_item_ids: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    def get_prices(
+        self,
+        source_item_ids: list[str] | tuple[str, ...],
+        *,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> dict[str, Any]:
         items = self._ids(source_item_ids, limit=50)
         if not items:
             return {"data": []}
         joined = quote(",".join(items), safe="")
         return self._request_json(
-            "GET", f"/goods/{joined}/price", query={"type": "etm"}, bucket="price"
+            "GET",
+            f"/goods/{joined}/price",
+            query={"type": "etm"},
+            bucket="price",
+            outbound_attempt_observer=outbound_attempt_observer,
         )
 
     def get_price(self, source_item_id: str) -> dict[str, Any]:
         return self.get_prices([source_item_id])
 
-    def get_remains(self, source_item_id: str) -> dict[str, Any]:
+    def get_remains(
+        self,
+        source_item_id: str,
+        *,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> dict[str, Any]:
         item = self._id(source_item_id)
         return self._request_json(
-            "GET", f"/goods/{quote(item, safe='')}/remains", query={"type": "etm"}, bucket="remains"
+            "GET",
+            f"/goods/{quote(item, safe='')}/remains",
+            query={"type": "etm"},
+            bucket="remains",
+            outbound_attempt_observer=outbound_attempt_observer,
         )
 
     def get_manufacturers(self) -> tuple:
@@ -353,14 +383,27 @@ class EtmIproClient:
             )
         return safe_url
 
-    def _get_session(self, *, force: bool = False) -> str:
+    def _get_session(
+        self,
+        *,
+        force: bool = False,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> str:
         # Keep lock ordering consistent with authenticated requests, which take
         # the process-wide outbound gate before touching this client's session
         # state. The gate is reentrant so login can use _request_raw safely.
         with _ETM_OUTBOUND_GATE:
-            return self._resolve_session(force=force)
+            return self._resolve_session(
+                force=force,
+                outbound_attempt_observer=outbound_attempt_observer,
+            )
 
-    def _resolve_session(self, *, force: bool = False) -> str:
+    def _resolve_session(
+        self,
+        *,
+        force: bool = False,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> str:
         if not self.configured:
             raise SourcingProviderError(
                 "ЭТМ iPRO не настроен: укажите логин и пароль",
@@ -392,7 +435,13 @@ class EtmIproClient:
                 raise self._auth_state_unavailable_error() from None
             try:
                 query = urlencode({"log": self._login_value, "pwd": self._password})
-                payload = self._request_json("POST", f"{ETM_LOGIN_PATH}?{query}", auth=False, bucket="auth")
+                payload = self._request_json(
+                    "POST",
+                    f"{ETM_LOGIN_PATH}?{query}",
+                    auth=False,
+                    bucket="auth",
+                    outbound_attempt_observer=outbound_attempt_observer,
+                )
                 session = self._data_value(payload, "session")
                 if not isinstance(session, str) or not session.strip():
                     raise SourcingProviderError(
@@ -434,13 +483,16 @@ class EtmIproClient:
         query: dict[str, Any] | None = None,
         auth: bool = True,
         bucket: str = "general",
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> Any:
         url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{self.api_base_url}{path_or_url}"
         headers = {"Accept": "application/json"}
         request_query = dict(query or {})
         session: str | None = None
         if auth:
-            session = self._get_session()
+            session = self._get_session(
+                outbound_attempt_observer=outbound_attempt_observer,
+            )
             request_query["session-id"] = session
         request_url = self._replace_query(url, request_query, authenticated=auth)
         try:
@@ -450,6 +502,7 @@ class EtmIproClient:
                 headers=headers,
                 bucket=bucket,
                 authenticated=auth,
+                outbound_attempt_observer=outbound_attempt_observer,
             )
             if not 200 <= status < 300:
                 raise self._status_error(status)
@@ -594,6 +647,7 @@ class EtmIproClient:
         headers: dict[str, str],
         bucket: str,
         authenticated: bool = False,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> tuple[int, bytes]:
         request = urllib.request.Request(url, headers=headers, method=method)
         if bucket not in {"auth", "general"}:
@@ -605,6 +659,8 @@ class EtmIproClient:
                 if quarantine is not None and quarantine > self._wall_clock():
                     raise self._auth_quarantined_error()
             try:
+                if outbound_attempt_observer is not None:
+                    outbound_attempt_observer.record_outbound_attempt()
                 response = self._transport(request, float(self.settings.request_timeout_s))
                 try:
                     status = getattr(response, "status", None) or getattr(response, "code", None)

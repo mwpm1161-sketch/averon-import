@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 from averon_import.services.app_settings import LemanaB2BSettings
 from averon_import.services.sourcing.providers.base import SourcingProviderError
+from averon_import.services.sourcing.providers.outbound import OutboundAttemptObserver
 
 from .models import LemanaPriceRecord, LemanaProductsPage, parse_price_payload, parse_products_payload
 
@@ -98,8 +99,12 @@ class LemanaB2BClient:
             and self.settings.region_id is not None
         )
 
-    def check_access(self) -> bool:
-        self._get_token()
+    def check_access(
+        self,
+        *,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> bool:
+        self._get_token(outbound_attempt_observer=outbound_attempt_observer)
         return True
 
     def get_products(
@@ -109,6 +114,7 @@ class LemanaB2BClient:
         page: int = 1,
         per_page: int = _DEFAULT_PAGE_SIZE,
         if_modified_since: str | None = None,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> LemanaProductsPage | None:
         region = self._region(region_id)
         bounded_page = max(1, min(int(page), 100_000))
@@ -121,7 +127,10 @@ class LemanaB2BClient:
             headers["If-Modified-Since"] = str(if_modified_since)
         try:
             payload = self._request_json(
-                "GET", f"{LEMANA_PRODUCTS_PATH}?{query}", headers=headers
+                "GET",
+                f"{LEMANA_PRODUCTS_PATH}?{query}",
+                headers=headers,
+                outbound_attempt_observer=outbound_attempt_observer,
             )
         except LemanaNotModified:
             return None
@@ -140,6 +149,7 @@ class LemanaB2BClient:
         product_items: list[str] | tuple[str, ...],
         *,
         region_id: int | None = None,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> tuple[LemanaPriceRecord, ...]:
         """Fetch bounded regional prices through the documented batch endpoint."""
 
@@ -166,6 +176,7 @@ class LemanaB2BClient:
                 "regionId": region,
                 "retailPrice": False,
             },
+            outbound_attempt_observer=outbound_attempt_observer,
         )
         try:
             return parse_price_payload(payload)
@@ -181,6 +192,7 @@ class LemanaB2BClient:
         region_id: int | None = None,
         page: int = 1,
         per_page: int = _DEFAULT_PAGE_SIZE,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> tuple[LemanaPriceRecord, ...]:
         """Read a bounded regional price page through the documented GET route."""
 
@@ -192,7 +204,11 @@ class LemanaB2BClient:
                 "perPage": max(1, min(int(per_page), _DEFAULT_PAGE_SIZE)),
             }
         )
-        payload = self._request_json("GET", f"{LEMANA_PRICE_PATH}?{query}")
+        payload = self._request_json(
+            "GET",
+            f"{LEMANA_PRICE_PATH}?{query}",
+            outbound_attempt_observer=outbound_attempt_observer,
+        )
         try:
             return parse_price_payload(payload)
         except ValueError as exc:
@@ -223,7 +239,12 @@ class LemanaB2BClient:
 
         return str(value)
 
-    def _get_token(self, *, force: bool = False) -> str:
+    def _get_token(
+        self,
+        *,
+        force: bool = False,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> str:
         if not self.settings.enabled or not self.settings.client_id.strip() or not self._client_secret:
             raise SourcingProviderError(
                 "Лемана ПРО B2B не настроен",
@@ -248,6 +269,7 @@ class LemanaB2BClient:
                     body_bytes=form,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     auth_request=True,
+                    outbound_attempt_observer=outbound_attempt_observer,
                 )
             except SourcingProviderError:
                 raise
@@ -290,6 +312,7 @@ class LemanaB2BClient:
         body_bytes: bytes | None = None,
         headers: dict[str, str] | None = None,
         auth_request: bool = False,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> Any:
         if body is not None and body_bytes is not None:
             raise ValueError("body and body_bytes are mutually exclusive")
@@ -301,7 +324,10 @@ class LemanaB2BClient:
         for attempt in range(2):
             token = None
             if not auth_request:
-                token = self._get_token(force=attempt == 1)
+                token = self._get_token(
+                    force=attempt == 1,
+                    outbound_attempt_observer=outbound_attempt_observer,
+                )
                 raw_headers["Authorization"] = f"Bearer {token}"
             try:
                 status, raw = self._request_raw(
@@ -309,6 +335,7 @@ class LemanaB2BClient:
                     url_or_path,
                     payload=payload,
                     headers=raw_headers,
+                    outbound_attempt_observer=outbound_attempt_observer,
                 )
                 if status == 304:
                     raise LemanaNotModified()
@@ -335,6 +362,7 @@ class LemanaB2BClient:
         *,
         payload: bytes | None,
         headers: dict[str, str],
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> tuple[int, bytes]:
         if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
             url = url_or_path
@@ -342,6 +370,8 @@ class LemanaB2BClient:
             url = f"{self.api_base_url}{url_or_path}"
         request = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
+            if outbound_attempt_observer is not None:
+                outbound_attempt_observer.record_outbound_attempt()
             response = self._transport(request, float(self.settings.request_timeout_s))
             try:
                 status = getattr(response, "status", None) or getattr(response, "code", None)

@@ -18,6 +18,7 @@ from averon_import.services.sourcing.models import (
     SourcingProviderRuntimeState,
 )
 from averon_import.services.sourcing.providers.base import SourcingProviderCachePolicy, SourcingProviderError
+from averon_import.services.sourcing.providers.outbound import OutboundAttemptObserver
 
 from .client import EtmIproClient
 from .mirror import (
@@ -202,6 +203,30 @@ class EtmIproProvider:
         return self.mirror.rebuild_search_index(progress=progress)
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
+        return self._search(intent, limit=limit, outbound_attempt_observer=None)
+
+    def search_with_observer(
+        self,
+        intent: ProductIntent,
+        *,
+        limit: int = 20,
+        outbound_attempt_observer: OutboundAttemptObserver,
+    ) -> list[Offer]:
+        """Run the existing search flow while observing its actual HTTP attempts."""
+
+        return self._search(
+            intent,
+            limit=limit,
+            outbound_attempt_observer=outbound_attempt_observer,
+        )
+
+    def _search(
+        self,
+        intent: ProductIntent,
+        *,
+        limit: int,
+        outbound_attempt_observer: OutboundAttemptObserver | None,
+    ) -> list[Offer]:
         self._ensure_configured()
         requested_limit = max(1, min(int(limit), 100))
         live_limit = min(requested_limit, int(self.settings.max_live_candidates))
@@ -211,11 +236,19 @@ class EtmIproProvider:
         if intent.article and intent.manufacturer:
             manufacturer_code = self.mirror.resolve_manufacturer(intent.manufacturer)
             if manufacturer_code:
-                payload = self.client.get_goods(
-                    intent.article,
-                    lookup_type="mnf",
-                    manufacturer_code=manufacturer_code,
-                )
+                if outbound_attempt_observer is None:
+                    payload = self.client.get_goods(
+                        intent.article,
+                        lookup_type="mnf",
+                        manufacturer_code=manufacturer_code,
+                    )
+                else:
+                    payload = self.client.get_goods(
+                        intent.article,
+                        lookup_type="mnf",
+                        manufacturer_code=manufacturer_code,
+                        outbound_attempt_observer=outbound_attempt_observer,
+                    )
                 direct_goods = _goods_rows(payload)[:live_limit]
         records = (
             self.mirror.search(
@@ -250,20 +283,36 @@ class EtmIproProvider:
         for source_item_id, raw in goods_by_id.items():
             details.append((source_item_id, raw, record_by_id.get(source_item_id)))
         source_ids = [item[0] for item in details]
-        prices = self.client.get_prices(source_ids)
+        if outbound_attempt_observer is None:
+            prices = self.client.get_prices(source_ids)
+        else:
+            prices = self.client.get_prices(
+                source_ids,
+                outbound_attempt_observer=outbound_attempt_observer,
+            )
         offers: list[Offer] = []
         for source_item_id, raw, catalog_record in details:
             if not raw:
-                raw = _goods_row_for_source_item(
-                    self.client.get_goods(source_item_id),
-                    source_item_id,
-                ) or {}
+                if outbound_attempt_observer is None:
+                    goods_payload = self.client.get_goods(source_item_id)
+                else:
+                    goods_payload = self.client.get_goods(
+                        source_item_id,
+                        outbound_attempt_observer=outbound_attempt_observer,
+                    )
+                raw = _goods_row_for_source_item(goods_payload, source_item_id) or {}
             goods = _goods_record(raw)
             if goods is None:
                 goods = catalog_record
             if goods is None:
                 continue
-            remains = self.client.get_remains(source_item_id)
+            if outbound_attempt_observer is None:
+                remains = self.client.get_remains(source_item_id)
+            else:
+                remains = self.client.get_remains(
+                    source_item_id,
+                    outbound_attempt_observer=outbound_attempt_observer,
+                )
             offers.append(self._offer(goods, _price_row(prices, source_item_id), remains, raw))
         return offers
 

@@ -21,6 +21,7 @@ from averon_import.services.sourcing.providers.base import (
     SourcingProviderCachePolicy,
     SourcingProviderError,
 )
+from averon_import.services.sourcing.providers.outbound import OutboundAttemptObserver
 
 from .client import LemanaB2BClient
 from .mirror import LemanaCatalogMirror, LemanaMirrorSyncResult
@@ -132,6 +133,30 @@ class LemanaB2BProvider:
         )
 
     def search(self, intent: ProductIntent, *, limit: int = 20) -> list[Offer]:
+        return self._search(intent, limit=limit, outbound_attempt_observer=None)
+
+    def search_with_observer(
+        self,
+        intent: ProductIntent,
+        *,
+        limit: int = 20,
+        outbound_attempt_observer: OutboundAttemptObserver,
+    ) -> list[Offer]:
+        """Run the unchanged search flow while observing its HTTP attempts."""
+
+        return self._search(
+            intent,
+            limit=limit,
+            outbound_attempt_observer=outbound_attempt_observer,
+        )
+
+    def _search(
+        self,
+        intent: ProductIntent,
+        *,
+        limit: int,
+        outbound_attempt_observer: OutboundAttemptObserver | None,
+    ) -> list[Offer]:
         self._ensure_configured()
         self._ensure_affinity()
         if not self.mirror.has_content():
@@ -144,10 +169,17 @@ class LemanaB2BProvider:
         products = self.mirror.search(intent, limit=max(1, min(int(limit), 100)))
         if not products:
             return []
-        prices = self.client.get_prices(
-            [product.product_item for product in products],
-            region_id=self.settings.region_id,
-        )
+        if outbound_attempt_observer is None:
+            prices = self.client.get_prices(
+                [product.product_item for product in products],
+                region_id=self.settings.region_id,
+            )
+        else:
+            prices = self.client.get_prices(
+                [product.product_item for product in products],
+                region_id=self.settings.region_id,
+                outbound_attempt_observer=outbound_attempt_observer,
+            )
         price_by_item = {price.product_item: price for price in prices}
         return [self._offer(product, price_by_item.get(product.product_item)) for product in products]
 
