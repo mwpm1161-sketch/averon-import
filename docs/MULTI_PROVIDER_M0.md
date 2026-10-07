@@ -167,7 +167,33 @@ selection, live-candidate cap, and an opaque hash of its configured API base
 override. Local affinity includes only the deterministic catalog revision and
 adapter revision, with no fabricated environment or region.
 
-M1B does not add VseInstrumenti, settings, credentials, API traffic, an export
-evidence integration, or changes to API/UI, schema, export, matcher, or
-`SourcingService`. The next phase, after independent review, is controlled
-routing integration rather than further provider implementation.
+M1B was final approved at `545fabaa4092149b93424283fd713e7e2b34316d`.
+
+## M1C controlled runtime composition and retrieval boundary
+
+M1C composes `ProviderRunner` and the approved adapters from the same
+`LocalCatalogProvider`, `LemanaB2BProvider`, and `EtmIproProvider` instances
+already held by `SourcingRuntime.providers`. The explicit
+`SourcingRuntime.execution_providers` registry contains only
+`etm_ipro`, `lemana_b2b`, and `local_catalog`, with a canonical
+`execution_provider_keys` view. It is deliberately separate from the legacy
+provider map: `demo_store_http` remains available to existing singleton
+search, but is not execution-capable. Runtime composition constructs no
+supplier request, stats, health, or connectivity probe.
+
+`SourcingService.execute_provider_selection(intent, *, selection, limit,
+execution_scope)` is the internal retrieval-only boundary. The caller must
+provide an explicit `ProviderSelection` and its own `ProviderExecutionScope`;
+there is no implicit all-provider selection or process-global scope. A service
+without a configured runner fails closed. The method delegates to
+`ProviderRunner` and returns `ProviderExecutionResult`; it does not call
+matcher/ranking, health/stats, legacy search caches, or durable writers.
+
+Existing `search_intent()` and `search_project()` continue through their
+legacy singleton implementation, including existing provider fields,
+defaults, stats checks, cache behavior, circuit behavior, history routing, and
+durable schema version 1. Multi-provider offers are not passed to the current
+matcher or tender projection. No API/UI selection or capability endpoint,
+durable format, export, matcher, D4, or VseInstrumenti integration is added.
+The next required phase is composite-aware multi-provider matching and
+projection design, subject to independent review.

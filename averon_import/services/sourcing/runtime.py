@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from averon_import.ai.config import AiSettings, ProviderSettings
@@ -14,6 +16,15 @@ from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.catalog_repository import CatalogRepository
 from averon_import.services.sourcing.providers.base import SourcingProvider
 from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
+from averon_import.services.sourcing.providers.execution import (
+    OutcomeNativeProviderAdapter,
+    ProviderRunner,
+)
+from averon_import.services.sourcing.providers.execution_adapters import (
+    EtmIproExecutionAdapter,
+    LemanaB2BExecutionAdapter,
+    LocalCatalogExecutionAdapter,
+)
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
 from averon_import.services.sourcing.providers.lemana_b2b import LemanaB2BProvider
 from averon_import.services.sourcing.providers.etm_ipro import EtmIproProvider
@@ -81,7 +92,15 @@ class SourcingRuntime:
     repository: CatalogRepository
     providers: dict[str, SourcingProvider]
     service: SourcingService
+    execution_providers: Mapping[str, OutcomeNativeProviderAdapter]
+    provider_runner: ProviderRunner
     one_c_history_provider: OneCHistoryProvider | None = None
+
+    @property
+    def execution_provider_keys(self) -> tuple[str, ...]:
+        """Canonical internal capability list; reading it never probes providers."""
+
+        return tuple(sorted(self.execution_providers))
 
 
 def create_sourcing_runtime(
@@ -115,6 +134,15 @@ def create_sourcing_runtime(
         lemana_provider.key: lemana_provider,
         etm_provider.key: etm_provider,
     }
+    # Keep the outcome-native domain explicit. Do not derive this registry
+    # from `providers`: legacy-only providers must never become selectable by
+    # merely being added to the legacy runtime map.
+    execution_providers: dict[str, OutcomeNativeProviderAdapter] = {
+        etm_provider.key: EtmIproExecutionAdapter(etm_provider),
+        lemana_provider.key: LemanaB2BExecutionAdapter(lemana_provider),
+        local_provider.key: LocalCatalogExecutionAdapter(local_provider),
+    }
+    provider_runner = ProviderRunner(execution_providers)
     configured_provider = str(settings_service.settings.sourcing.provider or "")
     default_provider = (
         configured_provider
@@ -126,6 +154,7 @@ def create_sourcing_runtime(
         default_provider=default_provider,
         ai=SourcingAIService(create_sourcing_ai_transport(settings_service, secret_store)),
         cache=SourcingCache(data_root / "sourcing" / "cache.json"),
+        provider_runner=provider_runner,
         one_c_history_provider=(
             OneCHistoryProvider(one_c_history_repository)
             if one_c_history_repository is not None
@@ -136,5 +165,7 @@ def create_sourcing_runtime(
         repository=repository,
         providers=providers,
         service=sourcing_service,
+        execution_providers=MappingProxyType(execution_providers),
+        provider_runner=provider_runner,
         one_c_history_provider=sourcing_service.one_c_history_provider,
     )

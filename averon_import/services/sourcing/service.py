@@ -45,6 +45,13 @@ from averon_import.services.sourcing.providers.base import (
     get_provider_cache_policy,
     normalize_provider_runtime_state,
 )
+from averon_import.services.sourcing.providers.contracts import ProviderSelection
+from averon_import.services.sourcing.providers.execution import (
+    ProviderExecutionResult,
+    ProviderExecutionScope,
+    ProviderRunner,
+    ProviderRunnerConfigurationError,
+)
 
 
 def _price_unit_family(value: Any) -> str | None:
@@ -71,6 +78,7 @@ class SourcingService:
         matcher: OfferMatcher | None = None,
         cache: SourcingCache | None = None,
         one_c_history_provider: OneCHistoryProvider | None = None,
+        provider_runner: ProviderRunner | None = None,
     ):
         self.providers = providers
         self.default_provider = default_provider
@@ -78,12 +86,39 @@ class SourcingService:
         self.matcher = matcher or OfferMatcher()
         self.cache = cache or SourcingCache()
         self.one_c_history_provider = one_c_history_provider
+        self.provider_runner = provider_runner
 
     def provider(self, key: str | None = None) -> SourcingProvider:
         selected = key or self.default_provider
         if selected not in self.providers:
             raise ValueError(f"Неизвестный sourcing provider: {selected}")
         return self.providers[selected]
+
+    def execute_provider_selection(
+        self,
+        intent: ProductIntent,
+        *,
+        selection: ProviderSelection,
+        limit: int,
+        execution_scope: ProviderExecutionScope,
+    ) -> ProviderExecutionResult:
+        """Retrieve offers through the explicitly selected outcome-native providers.
+
+        This internal boundary deliberately stops at retrieval: matching,
+        ranking, legacy caches, health checks, and durable writes remain in
+        their existing caller-owned flows.
+        """
+
+        if self.provider_runner is None:
+            raise ProviderRunnerConfigurationError(
+                "outcome-native provider runner is not configured",
+            )
+        return self.provider_runner.run(
+            selection=selection,
+            intent=intent,
+            limit=limit,
+            scope=execution_scope,
+        )
 
     def set_ai(self, ai: SourcingAIService) -> None:
         self.ai = ai

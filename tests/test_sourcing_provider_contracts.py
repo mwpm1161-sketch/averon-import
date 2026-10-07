@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -47,6 +48,8 @@ def _offer(
         offer_id=offer_id,
         title=title or f"Product from {provider}",
         source_item_id=source_item_id if source_item_id is not None else f"item-{provider}",
+        # Stable duplicate fixtures should differ only in the fields under test.
+        retrieved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
 
 
