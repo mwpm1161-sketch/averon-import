@@ -27,6 +27,14 @@ objects, safe bounded diagnostics and per-provider affinity. It has no match
 decision. `ProviderExecutionSummary` records each provider independently, so
 one provider's failure does not erase another provider's offers.
 
+In both outcome and summary contracts, `request_count` counts actual outbound
+provider requests or HTTP attempts represented by that result. An attempted
+local success or local failure may therefore have a count of zero; no logical
+execution is fabricated as a network request. `NOT_ATTEMPTED` and `SUPPRESSED`
+always have a zero request count. Summary offer counts also follow the state:
+`NOT_ATTEMPTED`, `SUPPRESSED`, `EMPTY`, and `FAILURE` contain zero offers;
+`SUCCESS` and `PARTIAL_SUCCESS` contain at least one.
+
 Search outcomes are request-local DTOs, not tender run records. Persistent
 tender writes stay schema version 1 in M0, retain the current 1 MiB run limit,
 and continue to use the existing history projection and decision authority.
@@ -39,11 +47,21 @@ M0 does not modify existing provider health behavior.
 
 ## Commercial evidence and traffic
 
-Commercial evidence must identify provider and source item, price field and
-basis, currency and its basis, unit and its basis, applicable tax basis, and
-relevant environment/region/configuration. Missing facts stay unknown. This
-contract does not authorize an export. No VseInstrumenti export allowlist or
-price semantics are added.
+Commercial evidence is bound to `ProviderOfferReference(provider_key,
+offer_id)` and independently records `provider_key` and `source_item_id`. The
+contract rejects a provider mismatch, and `is_for_offer()` checks the exact
+provider, offer ID, and source item before evidence is associated with an
+`Offer`. Reusing a source item ID cannot bind the evidence to a different offer,
+and equal offer IDs from different providers remain distinct. Evidence still
+records price field and basis, currency and its basis, unit and its basis,
+applicable tax basis, and relevant environment/region/configuration. Missing
+facts stay unknown. This contract does not authorize an export. No VseInstrumenti
+export allowlist or price semantics are added.
+
+Health snapshots reject contradictory configured/status combinations: an
+unconfigured provider cannot be reachable; `NOT_CONFIGURED` requires
+`configured=False`; a reachable provider cannot carry a failure category.
+Snapshot validation is local and makes no provider HTTP calls.
 
 `ProviderSearchRequestIdentity` is scoped to one execution and includes the
 provider request fingerprint, limit and provider affinity. A future runner can

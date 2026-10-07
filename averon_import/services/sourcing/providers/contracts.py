@@ -188,7 +188,7 @@ class ProviderTiming(ProviderContractModel):
 
 
 class ProviderSearchOutcome(ProviderContractModel):
-    """One request-local adapter result; never contains a match decision."""
+    """One request-local result; request_count counts outbound provider requests."""
 
     provider_key: ProviderKey
     state: ProviderSearchState
@@ -196,7 +196,14 @@ class ProviderSearchOutcome(ProviderContractModel):
         default_factory=tuple,
         max_length=MAX_PROVIDER_OUTCOME_OFFERS,
     )
-    request_count: Annotated[StrictInt, Field(ge=0, le=MAX_PROVIDER_REQUESTS)] = 0
+    request_count: Annotated[
+        StrictInt,
+        Field(
+            ge=0,
+            le=MAX_PROVIDER_REQUESTS,
+            description="Actual outbound provider requests or HTTP attempts represented by this outcome.",
+        ),
+    ] = 0
     failure_category: ProviderFailureCategory | None = None
     timings: tuple[ProviderTiming, ...] = Field(
         default_factory=tuple,
@@ -221,8 +228,6 @@ class ProviderSearchOutcome(ProviderContractModel):
         if self.state in {ProviderSearchState.NOT_ATTEMPTED, ProviderSearchState.SUPPRESSED}:
             if self.request_count != 0:
                 raise ValueError("unattempted or suppressed outcomes cannot count requests")
-        elif self.request_count < 1:
-            raise ValueError("attempted outcomes must count at least one request")
 
         if self.state in {ProviderSearchState.FAILURE, ProviderSearchState.PARTIAL_SUCCESS}:
             if self.failure_category is None:
@@ -250,11 +255,18 @@ class ProviderRunState(str, Enum):
 
 
 class ProviderRunSummaryItem(ProviderContractModel):
-    """Bounded provider aggregate for a future project/run summary."""
+    """Bounded summary; request_count counts actual outbound provider requests."""
 
     provider_key: ProviderKey
     state: ProviderRunState
-    request_count: Annotated[StrictInt, Field(ge=0, le=MAX_PROVIDER_REQUESTS)] = 0
+    request_count: Annotated[
+        StrictInt,
+        Field(
+            ge=0,
+            le=MAX_PROVIDER_REQUESTS,
+            description="Actual outbound provider requests or HTTP attempts represented by this summary.",
+        ),
+    ] = 0
     offers_returned: Annotated[StrictInt, Field(ge=0, le=MAX_PROVIDER_RUN_OFFERS)] = 0
     failure_category: ProviderFailureCategory | None = None
     catalog_version: Annotated[StrictStr, Field(min_length=1, max_length=MAX_PROVIDER_AFFINITY_TEXT)] | None = None
@@ -266,8 +278,6 @@ class ProviderRunSummaryItem(ProviderContractModel):
         if self.state in {ProviderRunState.NOT_ATTEMPTED, ProviderRunState.SUPPRESSED}:
             if self.request_count or self.offers_returned:
                 raise ValueError("unattempted or suppressed providers cannot return results")
-        elif self.request_count < 1:
-            raise ValueError("attempted provider summaries must count requests")
         if self.state in {ProviderRunState.FAILURE, ProviderRunState.PARTIAL_SUCCESS}:
             if self.failure_category is None:
                 raise ValueError("failed provider summaries require a failure category")
@@ -277,6 +287,8 @@ class ProviderRunSummaryItem(ProviderContractModel):
             raise ValueError("successful provider summaries require offers")
         if self.state == ProviderRunState.EMPTY and self.offers_returned != 0:
             raise ValueError("empty provider summaries cannot count offers")
+        if self.state == ProviderRunState.FAILURE and self.offers_returned != 0:
+            raise ValueError("failed provider summaries cannot count usable offers")
         if self.state == ProviderRunState.PARTIAL_SUCCESS and self.offers_returned < 1:
             raise ValueError("partial success must preserve usable offers")
         return self
@@ -349,8 +361,9 @@ class TaxBasis(str, Enum):
 
 
 class CommercialEvidenceContract(ProviderContractModel):
-    """Provider-owned evidence required before future commercial export review."""
+    """Provider facts bound to one exact offer; this contract never authorizes export."""
 
+    offer_reference: ProviderOfferReference
     provider_key: ProviderKey
     source_item_id: Annotated[StrictStr, Field(min_length=1, max_length=180)]
     price_field: Annotated[StrictStr, Field(min_length=1, max_length=80)] | None = None
@@ -365,6 +378,21 @@ class CommercialEvidenceContract(ProviderContractModel):
     environment: Annotated[StrictStr, Field(max_length=24)] = ""
     region_id: Annotated[StrictStr, Field(max_length=80)] = ""
     config_revision: Annotated[StrictStr, Field(max_length=MAX_PROVIDER_AFFINITY_TEXT)] = ""
+
+    @model_validator(mode="after")
+    def _validate_offer_provider(self) -> CommercialEvidenceContract:
+        if self.provider_key != self.offer_reference.provider_key:
+            raise ValueError("commercial evidence provider must match its offer reference")
+        return self
+
+    def is_for_offer(self, offer: Offer) -> bool:
+        """Prove both the composite offer identity and source item match."""
+
+        return (
+            self.provider_key == offer.provider == self.offer_reference.provider_key
+            and self.offer_reference.offer_id == offer.offer_id
+            and self.source_item_id == offer.source_item_id
+        )
 
     @property
     def has_complete_commercial_basis(self) -> bool:
@@ -392,7 +420,7 @@ class CommercialEvidenceProvider(Protocol):
     key: str
 
     def commercial_evidence(self, offer: Offer) -> CommercialEvidenceContract:
-        """Return source-backed facts; unresolved fields must remain unknown."""
+        """Return source-backed facts bound to this offer; unknown facts stay unknown."""
         ...
 
 
@@ -411,6 +439,16 @@ class ProviderHealthSnapshot(ProviderContractModel):
     checked_at: Annotated[StrictStr, Field(max_length=40)] = ""
     catalog_version: Annotated[StrictStr, Field(min_length=1, max_length=MAX_PROVIDER_AFFINITY_TEXT)] | None = None
     failure_category: ProviderFailureCategory | None = None
+
+    @model_validator(mode="after")
+    def _validate_status_consistency(self) -> ProviderHealthSnapshot:
+        if not self.configured and self.status == ProviderHealthStatus.REACHABLE:
+            raise ValueError("an unconfigured provider cannot be reachable")
+        if self.status == ProviderHealthStatus.NOT_CONFIGURED and self.configured:
+            raise ValueError("not_configured status requires configured=False")
+        if self.status == ProviderHealthStatus.REACHABLE and self.failure_category is not None:
+            raise ValueError("reachable providers cannot carry a failure category")
+        return self
 
 
 class ProviderLocalStatusReader(Protocol):

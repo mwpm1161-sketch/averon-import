@@ -35,12 +35,18 @@ from averon_import.services.sourcing.providers.contracts import (
 )
 
 
-def _offer(provider: str, offer_id: str, *, title: str | None = None) -> Offer:
+def _offer(
+    provider: str,
+    offer_id: str,
+    *,
+    title: str | None = None,
+    source_item_id: str | None = None,
+) -> Offer:
     return Offer(
         provider=provider,
         offer_id=offer_id,
         title=title or f"Product from {provider}",
-        source_item_id=f"item-{provider}",
+        source_item_id=source_item_id if source_item_id is not None else f"item-{provider}",
     )
 
 
@@ -242,11 +248,50 @@ def test_outcome_distinguishes_empty_failure_suppressed_and_not_attempted():
     assert not skipped.suppressed and not skipped.attempted
 
 
+def test_request_count_is_outbound_traffic_and_may_be_zero_for_local_execution():
+    local_offer = _offer("local_catalog", "local-1")
+    local_success = ProviderSearchOutcome(
+        provider_key="local_catalog",
+        state=ProviderSearchState.SUCCESS,
+        offers=(local_offer,),
+        request_count=0,
+    )
+    local_failure = ProviderSearchOutcome(
+        provider_key="vseinstrumenti_openapi",
+        state=ProviderSearchState.FAILURE,
+        failure_category="misconfigured",
+        request_count=0,
+    )
+    network_success = ProviderSearchOutcome(
+        provider_key="etm_ipro",
+        state=ProviderSearchState.SUCCESS,
+        offers=(_offer("etm_ipro", "network-1"),),
+        request_count=2,
+    )
+
+    assert local_success.attempted and local_success.request_count == 0
+    assert local_failure.attempted and local_failure.request_count == 0
+    assert network_success.request_count == 2
+
+    assert ProviderRunSummaryItem(
+        provider_key="local_catalog",
+        state="success",
+        request_count=0,
+        offers_returned=1,
+    ).request_count == 0
+    assert ProviderRunSummaryItem(
+        provider_key="vseinstrumenti_openapi",
+        state="failure",
+        failure_category="misconfigured",
+        request_count=0,
+    ).request_count == 0
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         {"provider_key": "etm_ipro", "state": "success", "request_count": 1},
-        {"provider_key": "etm_ipro", "state": "empty", "request_count": 0},
+        {"provider_key": "etm_ipro", "state": "empty", "request_count": 0, "failure_category": "timeout"},
         {"provider_key": "etm_ipro", "state": "failure", "request_count": 1},
         {"provider_key": "etm_ipro", "state": "suppressed", "offers": [_offer("etm_ipro", "one")]},
         {"provider_key": "etm_ipro", "state": "not_attempted", "request_count": 1},
@@ -365,8 +410,51 @@ def test_provider_execution_summary_rejects_duplicate_keys_and_invalid_counts():
         ProviderExecutionSummary(providers=too_many_offers)
 
 
+@pytest.mark.parametrize(
+    ("state", "offers_returned", "failure_category"),
+    [
+        (ProviderRunState.NOT_ATTEMPTED, 1, None),
+        (ProviderRunState.SUPPRESSED, 1, "timeout"),
+        (ProviderRunState.EMPTY, 1, None),
+        (ProviderRunState.FAILURE, 1, "timeout"),
+        (ProviderRunState.SUCCESS, 0, None),
+        (ProviderRunState.PARTIAL_SUCCESS, 0, "timeout"),
+    ],
+)
+def test_provider_run_summary_enforces_offer_count_for_each_state(
+    state,
+    offers_returned,
+    failure_category,
+):
+    with pytest.raises(ValidationError):
+        ProviderRunSummaryItem(
+            provider_key="etm_ipro",
+            state=state,
+            request_count=0,
+            offers_returned=offers_returned,
+            failure_category=failure_category,
+        )
+
+
+@pytest.mark.parametrize("state", [ProviderRunState.SUCCESS, ProviderRunState.EMPTY])
+def test_success_and_empty_summary_states_cannot_carry_failure_category(state):
+    kwargs = {"offers_returned": 1} if state == ProviderRunState.SUCCESS else {}
+    with pytest.raises(ValidationError):
+        ProviderRunSummaryItem(
+            provider_key="etm_ipro",
+            state=state,
+            request_count=0,
+            failure_category="timeout",
+            **kwargs,
+        )
+
+
 def test_commercial_evidence_stays_unverified_until_each_basis_is_supplied():
     unknown = CommercialEvidenceContract(
+        offer_reference=ProviderOfferReference(
+            provider_key="vseinstrumenti_openapi",
+            offer_id="vi-offer-unknown",
+        ),
         provider_key="vseinstrumenti_openapi",
         source_item_id="sku-001",
         price_field="prices.price",
@@ -380,6 +468,7 @@ def test_commercial_evidence_stays_unverified_until_each_basis_is_supplied():
         region_id="region-fixture",
     )
     complete = CommercialEvidenceContract(
+        offer_reference=ProviderOfferReference(provider_key="fixture_supplier", offer_id="offer-1"),
         provider_key="fixture_supplier",
         source_item_id="item-1",
         price_field="prices.total",
@@ -400,6 +489,7 @@ def test_commercial_evidence_stays_unverified_until_each_basis_is_supplied():
     assert complete.tax_basis_required
 
     missing_required_affinity = CommercialEvidenceContract(
+        offer_reference=ProviderOfferReference(provider_key="fixture_supplier", offer_id="offer-2"),
         provider_key="fixture_supplier",
         source_item_id="item-2",
         price_field="prices.total",
@@ -416,6 +506,10 @@ def test_commercial_evidence_stays_unverified_until_each_basis_is_supplied():
 
 def test_commercial_evidence_never_defaults_currency_unit_or_tax_basis():
     evidence = CommercialEvidenceContract(
+        offer_reference=ProviderOfferReference(
+            provider_key="vseinstrumenti_openapi",
+            offer_id="vi-offer-2",
+        ),
         provider_key="vseinstrumenti_openapi",
         source_item_id="sku-001",
         price_field="prices.price",
@@ -427,9 +521,46 @@ def test_commercial_evidence_never_defaults_currency_unit_or_tax_basis():
     assert not evidence.has_complete_commercial_basis
     with pytest.raises(ValidationError):
         CommercialEvidenceContract(
+            offer_reference=ProviderOfferReference(provider_key="fixture_supplier", offer_id="offer-3"),
             provider_key="fixture_supplier",
             source_item_id="item-1",
             currency="руб",
+        )
+
+
+def test_commercial_evidence_is_bound_to_the_exact_offer():
+    source_offer = _offer("fixture_supplier", "offer-1", source_item_id="source-1")
+    another_offer_same_item = _offer("fixture_supplier", "offer-2", source_item_id="source-1")
+    same_offer_id_other_provider = _offer("vseinstrumenti_openapi", "offer-1", source_item_id="source-1")
+
+    class FixtureEvidenceProvider:
+        def commercial_evidence(self, offer: Offer) -> CommercialEvidenceContract:
+            return CommercialEvidenceContract(
+                offer_reference=ProviderOfferReference.from_offer(offer),
+                provider_key=offer.provider,
+                source_item_id=offer.source_item_id,
+            )
+
+    evidence = FixtureEvidenceProvider().commercial_evidence(source_offer)
+    other_provider_evidence = CommercialEvidenceContract(
+        offer_reference=ProviderOfferReference.from_offer(same_offer_id_other_provider),
+        provider_key=same_offer_id_other_provider.provider,
+        source_item_id=same_offer_id_other_provider.source_item_id,
+    )
+
+    assert evidence.is_for_offer(source_offer)
+    assert not evidence.is_for_offer(another_offer_same_item)
+    assert not evidence.is_for_offer(same_offer_id_other_provider)
+    assert evidence.offer_reference != other_provider_evidence.offer_reference
+    assert other_provider_evidence.is_for_offer(same_offer_id_other_provider)
+
+
+def test_commercial_evidence_rejects_provider_mismatch_with_offer_reference():
+    with pytest.raises(ValidationError, match="provider must match its offer reference"):
+        CommercialEvidenceContract(
+            offer_reference=ProviderOfferReference(provider_key="etm_ipro", offer_id="shared-id"),
+            provider_key="vseinstrumenti_openapi",
+            source_item_id="shared-source-id",
         )
 
 
@@ -442,6 +573,36 @@ def test_health_snapshot_is_separate_from_explicit_connectivity_probe():
     assert snapshot.status == ProviderHealthStatus.UNKNOWN
     assert snapshot.catalog_version is None
     assert "probe" not in snapshot.model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    ("configured", "status", "failure_category"),
+    [
+        (False, ProviderHealthStatus.REACHABLE, None),
+        (True, ProviderHealthStatus.NOT_CONFIGURED, None),
+        (True, ProviderHealthStatus.REACHABLE, "timeout"),
+    ],
+)
+def test_health_snapshot_rejects_contradictory_configuration_and_status(
+    configured,
+    status,
+    failure_category,
+):
+    with pytest.raises(ValidationError):
+        ProviderHealthSnapshot(
+            configured=configured,
+            status=status,
+            failure_category=failure_category,
+        )
+
+
+def test_unconfigured_health_status_is_consistent():
+    snapshot = ProviderHealthSnapshot(
+        configured=False,
+        status=ProviderHealthStatus.NOT_CONFIGURED,
+    )
+
+    assert snapshot.status == ProviderHealthStatus.NOT_CONFIGURED
 
 
 def test_request_identity_deduplicates_only_inside_matching_execution_scope():
