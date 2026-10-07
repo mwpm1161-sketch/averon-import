@@ -1,9 +1,8 @@
-"""Internal, behaviour-neutral contracts for future multi-provider sourcing.
+"""Internal contracts for request-local multi-provider sourcing.
 
-These DTOs are deliberately not wired into the current search runtime, API,
-durable run format, matcher, or export resolver. Search outcomes are
-request-local values; durable tender data continues to use its version-1
-allowlisted projection.
+Composite offer references are used by deterministic matching and correlation.
+Execution DTOs remain outside the legacy runtime API and durable run format;
+durable tender data continues to use its version-1 allowlisted projection.
 """
 
 from __future__ import annotations

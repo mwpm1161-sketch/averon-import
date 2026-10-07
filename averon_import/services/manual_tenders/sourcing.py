@@ -12,6 +12,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from averon_import.services.sourcing.providers.contracts import ProviderOfferReference
+
 from .repository import (
     MAX_TENDER_RUN_BYTES,
     MAX_TENDER_RUNS_PER_WORKSPACE,
@@ -564,6 +566,35 @@ def _compact_fuzzy_projection_candidate(
     return {"fuzzy_v1": compact_v1}
 
 
+def _offers_share_identity(left: Any, right: Any) -> bool:
+    """Correlate provider offers by composite identity whenever either has a provider."""
+
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    left_id = left.get("offer_id")
+    right_id = right.get("offer_id")
+    left_provider = left.get("provider")
+    right_provider = right.get("provider")
+    provider_present = (
+        ("provider" in left and left_provider not in (None, ""))
+        or ("provider" in right and right_provider not in (None, ""))
+    )
+    if provider_present:
+        try:
+            left_reference = ProviderOfferReference(
+                provider_key=left_provider,
+                offer_id=left_id,
+            )
+            right_reference = ProviderOfferReference(
+                provider_key=right_provider,
+                offer_id=right_id,
+            )
+        except (TypeError, ValueError):
+            return False
+        return left_reference == right_reference
+    return left_id == right_id
+
+
 def canonical_tender_projection(
     result_payload: dict[str, Any],
     source_rows: list[dict[str, Any]],
@@ -590,11 +621,21 @@ def canonical_tender_projection(
         matches = result.get("match_results") if isinstance(result.get("match_results"), list) else []
         offers = result.get("offers") if isinstance(result.get("offers"), list) else []
         recommended_match = next(
-            (item for item in matches if isinstance(item, dict) and offer and (item.get("offer") or {}).get("offer_id") == offer.get("offer_id")),
+            (
+                item for item in matches
+                if isinstance(item, dict)
+                and offer is not None
+                and _offers_share_identity(item.get("offer"), offer)
+            ),
             None,
         )
-        if recommended_match is None and isinstance(result.get("review_candidate"), dict):
-            recommended_match = result["review_candidate"]
+        review_match = result.get("review_candidate")
+        if (
+            recommended_match is None
+            and isinstance(review_match, dict)
+            and (offer is None or _offers_share_identity(review_match.get("offer"), offer))
+        ):
+            recommended_match = review_match
         route = result.get("route") if isinstance(result.get("route"), dict) else {}
         history_review_candidates: list[dict[str, Any]] = []
         if route.get("source_mode") == "one_c_only" and route.get("final_source_kind") == "history_review":

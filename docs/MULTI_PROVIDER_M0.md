@@ -195,5 +195,44 @@ defaults, stats checks, cache behavior, circuit behavior, history routing, and
 durable schema version 1. Multi-provider offers are not passed to the current
 matcher or tender projection. No API/UI selection or capability endpoint,
 durable format, export, matcher, D4, or VseInstrumenti integration is added.
-The next required phase is composite-aware multi-provider matching and
-projection design, subject to independent review.
+
+M1C was final approved at `9b5262b914741c2abc6660a28fddc82098b95ad5`.
+
+## M1D inactive composite-aware deterministic matching
+
+M1D adds a request-local `ProviderMatchEvaluator`, exposed internally through
+`SourcingService.evaluate_provider_execution(intent, execution)`. It evaluates
+only the already returned `ProviderExecutionResult`; retrieval, provider
+health/stats, AI ranking, legacy caches, and persistence are not part of this
+call. `ProviderMatchEvaluation` retains the exact intent and execution,
+deterministic `MatchResult` values, composite recommendation/review references,
+and the original provider outcomes including partial failures. It is bounded
+by the existing 400-offer execution limit and is not a durable or HTTP model.
+
+Multi-provider identity and correlation use
+`ProviderOfferReference(provider_key, offer_id)`. Every execution offer must
+have exactly one match with the same composite identity and offer facts;
+duplicate, malformed, missing, or foreign matches fail closed. `OfferMatcher`
+uses `(provider, offer_id)` only as its final deterministic ordering key after
+the existing evidence dimensions. The same-provider legacy tie order therefore
+continues to use `offer_id`, while provider identity never changes a decision
+or evidence quality.
+
+Identity recommendation keeps the existing `MATCH`, `LIKELY_MATCH`, then
+`ALTERNATIVE` precedence. Equal best deterministic evidence remains ambiguous
+and yields no recommendation, regardless of provider order, price, currency,
+availability, or retrieval time. A unique stronger evidence result may be
+recommended. Strong `REVIEW` candidates use the existing identity eligibility
+principles without rank/provider ordering as authority; tied strongest review
+candidates yield no unique review reference. Provider failures remain visible
+in the retained execution and never become synthetic `REJECT` matches.
+
+Tender projection now correlates `recommended_offer` with its
+`MatchResult.offer` by `(provider, offer_id)` whenever provider identity is
+available, while retaining offer-id-only correlation for legacy payloads that
+have no provider identity. Public projection shape and durable schema version
+1 are unchanged. Legacy `search_intent()`, `search_project()`, recommendation
+and review callers retain their existing behavior. No API/UI activation,
+commercial winner selection, AI ranking, export or D4 changes, durable v2
+writer, or VseInstrumenti work is included. Any API or durable multi-provider
+activation requires independent review in a later phase.

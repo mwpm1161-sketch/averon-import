@@ -52,6 +52,10 @@ from averon_import.services.sourcing.providers.execution import (
     ProviderRunner,
     ProviderRunnerConfigurationError,
 )
+from averon_import.services.sourcing.provider_matching import (
+    ProviderMatchEvaluation,
+    ProviderMatchEvaluator,
+)
 
 
 def _price_unit_family(value: Any) -> str | None:
@@ -119,6 +123,15 @@ class SourcingService:
             limit=limit,
             scope=execution_scope,
         )
+
+    def evaluate_provider_execution(
+        self,
+        intent: ProductIntent,
+        execution: ProviderExecutionResult,
+    ) -> ProviderMatchEvaluation:
+        """Match one existing execution locally, without repeating retrieval."""
+
+        return ProviderMatchEvaluator(self.matcher).evaluate(intent, execution)
 
     def set_ai(self, ai: SourcingAIService) -> None:
         self.ai = ai

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from averon_import.services.sourcing.models import MatchDecision, MatchResult, Offer, ProductIntent
+from averon_import.services.sourcing.providers.contracts import ProviderOfferReference
 from averon_import.services.sourcing.validation import DeterministicValidator, explanation_for
 
 
@@ -18,7 +19,7 @@ class OfferMatcher:
         self.validator = validator or DeterministicValidator()
 
     def match(self, intent: ProductIntent, offers: list[Offer]) -> list[MatchResult]:
-        provisional: list[tuple[int, MatchResult]] = []
+        provisional: list[tuple[tuple[object, ...], MatchResult]] = []
         for offer in offers:
             evidence = self.validator.validate(intent, offer)
             if evidence.conflicts:
@@ -58,7 +59,7 @@ class OfferMatcher:
                     len(evidence.preferred_differences),
                     -len(evidence.matched),
                     -len(evidence.supporting_matches),
-                    result.offer.offer_id,
+                    ProviderOfferReference.from_offer(result.offer).ordering_key,
                 ),
                 result,
             ))
@@ -66,7 +67,9 @@ class OfferMatcher:
         return [item[1].model_copy(update={"rank": index}) for index, item in enumerate(provisional, 1)]
 
 
-def recommended_offer(results: list[MatchResult]) -> Offer | None:
+def recommended_match(results: list[MatchResult]) -> MatchResult | None:
+    """Return a unique deterministic identity candidate, without commercial ranking."""
+
     for decision in (
         MatchDecision.MATCH,
         MatchDecision.LIKELY_MATCH,
@@ -79,8 +82,13 @@ def recommended_offer(results: list[MatchResult]) -> Offer | None:
         signature = _deterministic_evidence_signature(first)
         if sum(_deterministic_evidence_signature(item) == signature for item in candidates) > 1:
             return None
-        return first.offer
+        return first
     return None
+
+
+def recommended_offer(results: list[MatchResult]) -> Offer | None:
+    candidate = recommended_match(results)
+    return candidate.offer if candidate is not None else None
 
 
 def _deterministic_evidence_signature(result: MatchResult) -> tuple[object, ...]:
