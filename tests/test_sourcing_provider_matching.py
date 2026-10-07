@@ -118,6 +118,43 @@ def _reference(provider: str, offer_id: str = "same") -> ProviderOfferReference:
     return ProviderOfferReference(provider_key=provider, offer_id=offer_id)
 
 
+def _mutable_match_result(
+    offer: Offer,
+    *,
+    decision: MatchDecision = MatchDecision.MATCH,
+) -> MatchResult:
+    return MatchResult(
+        offer=offer,
+        decision=decision,
+        rank=1,
+        matched_attributes=["article"],
+        supporting_attributes=["brand"],
+        conflicting_attributes=[],
+        missing_attributes=["power"],
+        explanation="canonical explanation",
+        ai_evidence={},
+        deterministic_evidence={
+            "preferred_differences": [],
+            "nested": {"values": ["canonical"]},
+        },
+    )
+
+
+def _evaluate_single_result(
+    offer: Offer,
+    result: MatchResult,
+    intent: ProductIntent,
+) -> ProviderMatchEvaluation:
+    class StaticMatcher:
+        def match(self, _intent, _offers):
+            return [result]
+
+    return SourcingService({}, matcher=StaticMatcher()).evaluate_provider_execution(
+        intent,
+        _execution({offer.provider: [offer]}),
+    )
+
+
 def test_shared_offer_id_is_two_composite_matches_and_provider_is_only_final_order_key():
     etm = _offer("etm_ipro")
     lemana = _offer("lemana_b2b")
@@ -307,6 +344,108 @@ def test_unique_strong_review_candidate_has_exact_composite_reference():
     assert all(item.decision == MatchDecision.REVIEW for item in evaluation.matches)
     assert evaluation.review_candidate_reference == _reference("lemana_b2b")
     assert evaluation.review_candidate.offer == stronger
+
+
+def test_evaluation_snapshots_original_matcher_output_before_validation():
+    offer = _offer("etm_ipro", article="SKU-42")
+    original = _mutable_match_result(offer)
+    evaluation = _evaluate_single_result(offer, original, _intent(article="SKU-42"))
+
+    original.decision = MatchDecision.REVIEW
+    original.rank = 99
+    original.matched_attributes.append("mutated")
+    original.deterministic_evidence["nested"]["values"].append("mutated")
+
+    canonical = evaluation.matches[0]
+    assert canonical.decision == MatchDecision.MATCH
+    assert canonical.rank == 1
+    assert canonical.matched_attributes == ["article"]
+    assert canonical.deterministic_evidence["nested"]["values"] == ["canonical"]
+    assert evaluation.recommended_offer_reference == _reference("etm_ipro")
+    assert evaluation.recommended_match.decision == MatchDecision.MATCH
+
+
+def test_matches_accessor_returns_deep_defensive_copies():
+    offer = _offer("etm_ipro", article="SKU-42")
+    evaluation = _evaluate_single_result(
+        offer,
+        _mutable_match_result(offer),
+        _intent(article="SKU-42"),
+    )
+
+    exposed = evaluation.matches[0]
+    exposed.decision = MatchDecision.REVIEW
+    exposed.rank = 42
+    exposed.matched_attributes.append("mutated")
+    exposed.supporting_attributes.append("mutated")
+    exposed.conflicting_attributes.append("mutated")
+    exposed.missing_attributes.append("mutated")
+    exposed.ai_evidence["mutated"] = {"values": ["mutated"]}
+    exposed.deterministic_evidence["nested"]["values"].append("mutated")
+    exposed.explanation = "mutated explanation"
+
+    canonical = evaluation.matches[0]
+    assert canonical.decision == MatchDecision.MATCH
+    assert canonical.rank == 1
+    assert canonical.matched_attributes == ["article"]
+    assert canonical.supporting_attributes == ["brand"]
+    assert canonical.conflicting_attributes == []
+    assert canonical.missing_attributes == ["power"]
+    assert canonical.ai_evidence == {}
+    assert canonical.deterministic_evidence["nested"]["values"] == ["canonical"]
+    assert canonical.explanation == "canonical explanation"
+    assert ProviderOfferReference.from_offer(canonical.offer) == _reference("etm_ipro")
+    assert evaluation.recommended_offer_reference == _reference("etm_ipro")
+
+
+def test_recommended_match_accessor_returns_a_defensive_copy():
+    offer = _offer("lemana_b2b", article="SKU-42")
+    evaluation = _evaluate_single_result(
+        offer,
+        _mutable_match_result(offer),
+        _intent(article="SKU-42"),
+    )
+
+    exposed = evaluation.recommended_match
+    assert exposed is not None
+    exposed.decision = MatchDecision.REJECT
+    exposed.matched_attributes.clear()
+    exposed.deterministic_evidence["nested"]["values"].clear()
+
+    canonical = evaluation.recommended_match
+    assert canonical is not None
+    assert canonical.decision == MatchDecision.MATCH
+    assert canonical.matched_attributes == ["article"]
+    assert canonical.deterministic_evidence["nested"]["values"] == ["canonical"]
+    assert ProviderOfferReference.from_offer(canonical.offer) == _reference("lemana_b2b")
+    assert evaluation.recommended_offer_reference == _reference("lemana_b2b")
+
+
+def test_review_candidate_accessor_returns_a_defensive_copy():
+    offer = _offer("lemana_b2b", article="SKU-42")
+    evaluation = _evaluate_single_result(
+        offer,
+        _mutable_match_result(offer, decision=MatchDecision.REVIEW),
+        _intent(article="SKU-42"),
+    )
+    expected_reference = _reference("lemana_b2b")
+    assert evaluation.review_candidate_reference == expected_reference
+
+    exposed = evaluation.review_candidate
+    assert exposed is not None
+    exposed.decision = MatchDecision.REJECT
+    exposed.rank = 100
+    exposed.matched_attributes.clear()
+    exposed.deterministic_evidence["nested"]["values"].append("mutated")
+
+    canonical = evaluation.review_candidate
+    assert canonical is not None
+    assert canonical.decision == MatchDecision.REVIEW
+    assert canonical.rank == 1
+    assert canonical.matched_attributes == ["article"]
+    assert canonical.deterministic_evidence["nested"]["values"] == ["canonical"]
+    assert ProviderOfferReference.from_offer(canonical.offer) == expected_reference
+    assert evaluation.review_candidate_reference == expected_reference
 
 
 def test_duplicate_composite_execution_identity_fails_closed():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
@@ -142,27 +142,62 @@ def _unique_identity_recommendation(matches: tuple[MatchResult, ...]) -> MatchRe
     return None
 
 
-@dataclass(frozen=True)
+def _copy_match_snapshot(value: MatchResult) -> MatchResult:
+    return value.model_copy(deep=True)
+
+
+@dataclass(frozen=True, init=False)
 class ProviderMatchEvaluation:
     """Request-local deterministic matches correlated to one exact execution."""
 
     intent: ProductIntent
     execution: ProviderExecutionResult
-    matches: tuple[MatchResult, ...]
+    _matches: tuple[MatchResult, ...] = field(repr=False)
     recommended_offer_reference: ProviderOfferReference | None
     review_candidate_reference: ProviderOfferReference | None
+
+    def __init__(
+        self,
+        intent: ProductIntent,
+        execution: ProviderExecutionResult,
+        matches: tuple[MatchResult, ...],
+        recommended_offer_reference: ProviderOfferReference | None,
+        review_candidate_reference: ProviderOfferReference | None,
+    ) -> None:
+        if not isinstance(matches, tuple):
+            raise ProviderMatchEvaluationError("matches must be an immutable tuple")
+        try:
+            # Own the mutable legacy MatchResult hierarchy before validation.
+            snapshots = tuple(
+                _copy_match_snapshot(item) if isinstance(item, MatchResult) else item
+                for item in matches
+            )
+        except Exception as exc:
+            raise ProviderMatchEvaluationError("matches could not be snapshotted") from exc
+        object.__setattr__(self, "intent", intent)
+        object.__setattr__(self, "execution", execution)
+        object.__setattr__(self, "_matches", snapshots)
+        object.__setattr__(self, "recommended_offer_reference", recommended_offer_reference)
+        object.__setattr__(self, "review_candidate_reference", review_candidate_reference)
+        self.__post_init__()
+
+    @property
+    def matches(self) -> tuple[MatchResult, ...]:
+        """Return detached copies so callers cannot mutate the validated snapshot."""
+
+        return tuple(_copy_match_snapshot(item) for item in self._matches)
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, ProductIntent):
             raise ProviderMatchEvaluationError("intent must be a ProductIntent")
-        if not isinstance(self.matches, tuple):
+        if not isinstance(self._matches, tuple):
             raise ProviderMatchEvaluationError("matches must be an immutable tuple")
         offer_index = _execution_offer_index(self.execution)
-        if len(self.matches) != len(offer_index):
+        if len(self._matches) != len(offer_index):
             raise ProviderMatchEvaluationError("every execution offer must have exactly one match")
 
         matched: dict[ProviderOfferReference, MatchResult] = {}
-        for result in self.matches:
+        for result in self._matches:
             if not isinstance(result, MatchResult):
                 raise ProviderMatchEvaluationError("matches must contain MatchResult values")
             if result.ai_evidence:
@@ -177,10 +212,10 @@ class ProviderMatchEvaluation:
         if set(matched) != set(offer_index):
             raise ProviderMatchEvaluationError("match/execution composite identities do not correlate exactly")
 
-        expected_recommendation = _unique_reference(_unique_identity_recommendation(self.matches))
+        expected_recommendation = _unique_reference(_unique_identity_recommendation(self._matches))
         if self.recommended_offer_reference != expected_recommendation:
             raise ProviderMatchEvaluationError("recommended reference does not match deterministic evidence")
-        review = _unique_review_candidate(self.matches)
+        review = _unique_review_candidate(self._matches)
         expected_review = _unique_reference(review)
         if self.review_candidate_reference != expected_review:
             raise ProviderMatchEvaluationError("review reference does not match unique review evidence")
@@ -213,18 +248,20 @@ class ProviderMatchEvaluation:
     @property
     def recommended_match(self) -> MatchResult | None:
         reference = self.recommended_offer_reference
-        return next(
-            (item for item in self.matches if reference is not None and _reference_for(item.offer) == reference),
+        match = next(
+            (item for item in self._matches if reference is not None and _reference_for(item.offer) == reference),
             None,
         )
+        return _copy_match_snapshot(match) if match is not None else None
 
     @property
     def review_candidate(self) -> MatchResult | None:
         reference = self.review_candidate_reference
-        return next(
-            (item for item in self.matches if reference is not None and _reference_for(item.offer) == reference),
+        match = next(
+            (item for item in self._matches if reference is not None and _reference_for(item.offer) == reference),
             None,
         )
+        return _copy_match_snapshot(match) if match is not None else None
 
 
 class ProviderMatchEvaluator:
@@ -247,7 +284,13 @@ class ProviderMatchEvaluator:
             raise ProviderMatchEvaluationError("deterministic offer matching failed") from exc
         if not isinstance(raw_matches, (list, tuple)):
             raise ProviderMatchEvaluationError("matcher must return a finite sequence of MatchResult values")
-        matches = tuple(raw_matches)
+        if any(not isinstance(item, MatchResult) for item in raw_matches):
+            raise ProviderMatchEvaluationError("matcher must return a finite sequence of MatchResult values")
+        try:
+            # Snapshot the matcher-owned objects before computing any references.
+            matches = tuple(_copy_match_snapshot(item) for item in raw_matches)
+        except Exception as exc:
+            raise ProviderMatchEvaluationError("matcher results could not be snapshotted") from exc
         if len(matches) != len(offer_index):
             raise ProviderMatchEvaluationError("matcher must return exactly one result per execution offer")
         recommendation = _unique_reference(_unique_identity_recommendation(matches))

@@ -236,3 +236,10 @@ and review callers retain their existing behavior. No API/UI activation,
 commercial winner selection, AI ranking, export or D4 changes, durable v2
 writer, or VseInstrumenti work is included. Any API or durable multi-provider
 activation requires independent review in a later phase.
+
+M1D.1 keeps the validated evaluation matches in a private, deep-owned snapshot.
+The `matches`, `recommended_match`, and `review_candidate` accessors return
+defensive deep copies, so mutable legacy `MatchResult` objects cannot change
+the evaluation's validated recommendation or review state. Legacy
+`MatchResult` semantics remain unchanged outside this request-local boundary;
+commercial selection has not been activated.
