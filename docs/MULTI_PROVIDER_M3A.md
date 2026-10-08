@@ -8,6 +8,11 @@ or conversion on read. Existing API/UI, D4/history, TenderPriceResolver and XLSX
 export do not consume v2. No supplier, AI, VseInstrumenti, deployment, main merge
 or release-tag work is introduced.
 
+M3B follow-up: the inactive v2 DTO now declares decision-closure-v1, explicit
+returned/retained outcomes and compact-records-v1 JSON. Its pure in-memory
+projector/encoder is documented in [MULTI_PROVIDER_M3B.md](MULTI_PROVIDER_M3B.md).
+Production remains v1; the original M3A phase did not add that encoder.
+
 ## Reader boundary and compatibility
 
 `averon_import.services.manual_tenders.durable_read.read_tender_sourcing_run`
@@ -54,6 +59,7 @@ canonical DTOs. Nullable values are explicit `null`; unknown fields reject.
 ```text
 run:
   schema_version: 2
+  projection_policy: decision-closure-v1
   run_id, tender_id, source_sha256, workspace_revision
   status: running | completed | failed | interrupted
   created_at, started_at, completed_at: offset ISO timestamps (completed_at nullable)
@@ -72,7 +78,7 @@ reference: {provider_key, offer_id}
 outcome:
   {provider_key, state, request_count, failure_category,
    affinity: {environment, region_id, config_revision, adapter_revision},
-   catalog_version, offer_references: [reference, ...]}
+   catalog_version, offers_returned_count, retained_offer_references: [reference, ...]}
 offer:
   {offer_reference: reference, source_item_id, title, article, manufacturer, brand,
    price, currency, price_unit, availability, availability_text, url, provenance}
@@ -110,18 +116,21 @@ Provider selection uses the existing bounded ProviderSelection, canonical lexica
 order, unique explicit keys, and no inference/registry expansion. Every evaluated
 row requires exactly one outcome for each selected key. Each outcome owns only
 that provider's references. Outcome state/failure/request invariants follow the
-approved execution contract; result_limit bounds per-provider returned references.
+approved execution contract; result_limit bounds per-provider returned counts.
 Reused keys are a unique selected subset. Reuse retains the stored outcome request
 count, as the execution cache does; reading never performs a cache lookup.
 
 Every identity is `(provider_key, offer_id)`. Same offer_id across providers is
-legal; duplicate identities within one row reject. Returned outcome references
+legal; duplicate identities within one row reject. Retained outcome references
 must exactly equal the row's offers. Each offer has exactly one match and one
 commercial evidence record. Missing, duplicate, foreign and wrong-provider
 references reject. Repeated references across different source rows remain legal.
 Offers/matches/evidence/outcome references/candidates are sorted by composite
 identity; outcomes, provider keys and source rows also have deterministic order.
 Stored decisions, ranks and selected references are never recomputed by sorting.
+M3B retained offers must equal the exact union of stored commercial candidates,
+selected reference, identity recommendation and review reference. Returned counts
+describe retrieval even when an outcome retains no offers.
 
 MatchDecision and closed deterministic model-evidence source values are reused
 as stored facts. Stored recommended_offer_reference/review_candidate_reference
@@ -182,11 +191,12 @@ stored ETM winner and failed Lemana remain visible without fabricated offers.
 
 ## Exact bounds
 
-The repository hard cap remains **1,048,576 bytes**. V2 raw UTF-8 input, compact
-dictionary input and compact canonical DTO projection must each fit **786,432
-bytes (768 KiB)**. This leaves **262,144 bytes (25%)** storage headroom. Private
-incremental JSON byte counting only validates size and returns no serialized
-run. All limits reject; no truncation, discarded records or repaired payloads.
+The repository hard cap remains **1,048,576 bytes**. V2 source UTF-8 JSON (or its
+compact dictionary input) and canonical compact wire projection must each fit
+**786,432 bytes (768 KiB)**. M3B measures the lossless compact-records-v1 wire,
+instead of expanded DTO field names. This leaves **262,144 bytes (25%)** storage
+headroom. All limits reject; no truncation or repaired payloads. Defined omission
+of non-decision runtime offers is explicit in returned counts and policy revision.
 V1 retains the repository's historical full 1 MiB budget.
 
 | Collection / scalar | Maximum |
@@ -194,8 +204,8 @@ V1 retains the repository's historical full 1 MiB budget.
 | Selected providers / row outcomes / reused keys | 8 |
 | Selected source rows / evaluated rows | 500 |
 | Offers / matches / evidence / candidates per row | 400 |
-| Aggregate offers across the whole durable run | 400 |
-| Returned references per provider outcome / result_limit | 100 |
+| Aggregate retained offers across the whole durable run (M3B) | 4,096 |
+| Returned count / retained references per provider outcome / result_limit | 100 |
 | Attribute names per list, including preferred differences | 16 |
 | Commercial issue codes / selection reasons | 10 / 5 |
 | Outbound request_count | 1,000,000 |
@@ -204,16 +214,18 @@ V1 retains the repository's historical full 1 MiB budget.
 | Compact offer / match / evidence record bytes | 2,048 / 1,024 / 1,024 |
 | Compact outcome / selection-result record bytes | 40 KiB / 128 KiB |
 
-The aggregate 400-offer run cap is intentionally more conservative than the
-runtime 400-offer-per-execution cap. Per-record maxima cannot all be saturated
+M3B reassessed and replaced the obsolete aggregate 400-offer run cap with an
+independent 4,096 retained-record allocation cap. Runtime execution remains
+400 offers per row. Per-record maxima cannot all be saturated
 simultaneously: the independent global byte guard still applies. No runtime cap
 or current storage quota is increased. Timing samples, arbitrary intents and
 provider internals are omitted from this compact read projection.
 
-M3A.1 capacity note: this whole-run 400-offer bound is currently inactive and
-conservative. It MUST be reassessed before M3B production writer activation.
-M3B must not silently truncate runtime offers to satisfy it. M3A.1 changes no
-storage cap, byte budget, runtime limit or production writer.
+Historical M3A.1 capacity note required reassessment of the inactive whole-run
+400-offer bound before M3B writer activation, with no silent truncation. M3B
+completed that reassessment with explicit decision closure and count semantics;
+the production writer is still not activated. Byte budgets and runtime bounds
+are unchanged. Exact measurements and limitations are in MULTI_PROVIDER_M3B.md.
 
 | String | Maximum characters / exact format |
 | --- | --- |

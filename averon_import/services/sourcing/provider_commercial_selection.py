@@ -204,6 +204,8 @@ class ProviderCommercialSelection:
     candidate_references: tuple[ProviderOfferReference, ...]
     reason_codes: tuple[CommercialSelectionReason, ...]
     selection_basis: CommercialSelectionBasis | None
+    _validated_commercial: ProviderCommercialEvaluation = field(repr=False, compare=False)
+    _validated_decision: tuple = field(repr=False, compare=False)
 
     def __init__(
         self,
@@ -234,6 +236,22 @@ class ProviderCommercialSelection:
         object.__setattr__(self, "_commercial", snapshot)
         for name, value in expected:
             object.__setattr__(self, name, value)
+        object.__setattr__(self, "_validated_commercial", deepcopy(snapshot))
+        object.__setattr__(self, "_validated_decision", deepcopy(self._decision_facts()))
+
+    def _decision_facts(self) -> tuple:
+        return (self.state, self.selected_reference, self.candidate_references,
+                self.reason_codes, self.selection_basis)
+
+    def _validated_snapshot(self) -> ProviderCommercialSelection:
+        """Check the owned construction witness without rerunning selection."""
+        try:
+            if (self._decision_facts() != self._validated_decision
+                    or self._commercial._validated_snapshot() != self._validated_commercial._validated_snapshot()):
+                raise ValueError("selection changed after validation")
+            return deepcopy(self)
+        except Exception:
+            raise CommercialSelectionError("selection validation witness is invalid") from None
 
     @property
     def commercial_evaluation(self) -> ProviderCommercialEvaluation:

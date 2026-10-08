@@ -79,7 +79,8 @@ def _outcome(provider, offers, *, state=None, failure=None):
             "affinity": {"environment": "", "region_id": "1" if provider == LEMANA else "",
                          "config_revision": "", "adapter_revision": ""},
             "catalog_version": "d" * 64 if provider == LEMANA else "catalog-v1",
-            "offer_references": [deepcopy(item["offer_reference"]) for item in offers]}
+            "offers_returned_count": len(offers),
+            "retained_offer_references": [deepcopy(item["offer_reference"]) for item in offers]}
 
 
 def _fixture(kind="multi"):
@@ -108,7 +109,7 @@ def _fixture(kind="multi"):
            "review_candidate_reference": None,
            "matches": [_match(item) for item in offers], "commercial_evidence": [_evidence(item) for item in offers],
            "commercial_selection": selection}
-    return {"schema_version": 2, "run_id": "a" * 32, "tender_id": "b" * 32,
+    return {"schema_version": 2, "projection_policy": "decision-closure-v1", "run_id": "a" * 32, "tender_id": "b" * 32,
             "source_sha256": "f" * 64, "workspace_revision": 1, "status": "completed",
             "created_at": NOW, "started_at": NOW, "completed_at": NOW,
             "selection": {"provider_keys": keys}, "selected_source_row_ids": [ROW_ID], "rows": [row]}
@@ -164,7 +165,7 @@ def test_partial_failure_is_distinct_from_empty_or_unselected():
     assert run.partial_failure and run.rows[0].partial_failure
     assert run.rows[0].outcomes[1].state.value == "failure"
     assert run.rows[0].outcomes[1].failure_category.value == "timeout"
-    assert run.rows[0].outcomes[1].offer_references == ()
+    assert run.rows[0].outcomes[1].retained_offer_references == ()
     assert len(run.rows[0].offers) == len(run.rows[0].commercial_evidence) == 1
     assert run.rows[0].commercial_selection.selected_reference.provider_key == ETM
     assert run.rows[0].recommended_match.offer_reference.provider_key == ETM
@@ -209,10 +210,10 @@ def _corrupt(payload, case):
     elif case == "foreign-outcome": row["outcomes"][1]["provider_key"] = "other"
     elif case == "duplicate-provider": payload["selection"]["provider_keys"].append(ETM)
     elif case == "duplicate-offer": row["offers"].append(deepcopy(row["offers"][0]))
-    elif case == "absent-outcome-ref": row["outcomes"][0]["offer_references"] = []
-    elif case == "duplicate-outcome-ref": row["outcomes"][0]["offer_references"] *= 2
-    elif case == "foreign-outcome-ref": row["outcomes"][0]["offer_references"][0] = _ref(LEMANA)
-    elif case == "unknown-outcome-ref": row["outcomes"][0]["offer_references"][0] = _ref(ETM, "absent")
+    elif case == "absent-outcome-ref": row["outcomes"][0]["retained_offer_references"] = []
+    elif case == "duplicate-outcome-ref": row["outcomes"][0]["retained_offer_references"] *= 2
+    elif case == "foreign-outcome-ref": row["outcomes"][0]["retained_offer_references"][0] = _ref(LEMANA)
+    elif case == "unknown-outcome-ref": row["outcomes"][0]["retained_offer_references"][0] = _ref(ETM, "absent")
     elif case in {"missing-matches", "missing-commercial_evidence"}: row[case.removeprefix("missing-")].pop()
     elif case in {"duplicate-matches", "duplicate-commercial_evidence"}: row[case.removeprefix("duplicate-")].append(deepcopy(row[case.removeprefix("duplicate-")][0]))
     elif case in {"foreign-matches", "foreign-commercial_evidence"}: row[case.removeprefix("foreign-")][0]["offer_reference"] = _ref("other")
@@ -264,8 +265,8 @@ def _corrupt(payload, case):
     elif case == "excess-count": row["outcomes"][0]["request_count"] = 1_000_001
     elif case == "success-failure-category": row["outcomes"][0]["failure_category"] = "timeout"
     elif case == "failed-with-offer": row["outcomes"][0].update(state="failure", failure_category="timeout")
-    elif case == "failure-no-category": row["outcomes"][1].update(state="failure", offer_references=[])
-    elif case == "suppressed-requests": row["outcomes"][1].update(state="suppressed", offer_references=[])
+    elif case == "failure-no-category": row["outcomes"][1].update(state="failure", offers_returned_count=0, retained_offer_references=[])
+    elif case == "suppressed-requests": row["outcomes"][1].update(state="suppressed", offers_returned_count=0, retained_offer_references=[])
     elif case == "reused-unknown": row["reused_provider_keys"] = ["other"]
     elif case == "reused-duplicate": row["reused_provider_keys"] = [ETM, ETM]
     elif case == "outcome-result-limit": row["result_limit"] = 0
@@ -442,7 +443,7 @@ def test_remaining_collection_limits(location):
     if location == "providers": payload["selection"]["provider_keys"] = [f"p{i}" for i in range(9)]
     elif location == "rows": payload["rows"] = [deepcopy(row) for _ in range(501)]
     elif location == "selected_rows": payload["selected_source_row_ids"] = [f"{i:032x}" for i in range(501)]
-    elif location == "outcome_refs": row["outcomes"][0]["offer_references"] = [_ref(ETM, str(i)) for i in range(101)]
+    elif location == "outcome_refs": row["outcomes"][0]["retained_offer_references"] = [_ref(ETM, str(i)) for i in range(101)]
     elif location == "candidates": row["commercial_selection"]["candidate_references"] = [_ref(ETM, str(i)) for i in range(401)]
     elif location == "issues": row["commercial_evidence"][0]["issue_codes"] = ["PRICE_MISSING"] * 11
     elif location == "attributes": row["matches"][0]["matched_attributes"] = [f"a{i}" for i in range(17)]
@@ -503,20 +504,21 @@ def test_400_offer_snapshot_and_multibyte_near_budget_have_storage_headroom():
         read_tender_sourcing_run(payload)
 
 
-def test_canonical_byte_budget_cannot_be_bypassed_by_omitting_default_affinity_fields():
+def test_default_affinity_fields_are_restored_under_the_compact_wire_budget():
     payload = _near_budget_fixture()
     for outcome in payload["rows"][0]["outcomes"]:
         outcome["affinity"] = {}
     raw_size = len(_encoded(payload))
     assert raw_size < MAX_DURABLE_V2_BYTES
-    # Canonical defaults restore more bytes than the available headroom.
+    # Expanded friendly field names are no longer the canonical wire format.
+    # Restored defaults fit in the lossless positional representation.
     next(offer for offer in payload["rows"][0]["offers"] if len(offer["title"]) < 320)["title"] += "x"
     assert len(_encoded(payload)) < MAX_DURABLE_V2_BYTES
-    with pytest.raises(DurableTenderReadError):
-        read_tender_sourcing_run(payload)
+    run = read_tender_sourcing_run(payload)
+    assert all(outcome.affinity.environment == "" for outcome in run.rows[0].outcomes)
 
 
-def test_per_record_compact_budget_and_aggregate_offer_bound():
+def test_per_record_compact_budget_and_obsolete_aggregate_400_bound_removed():
     payload = _fixture()
     offer = payload["rows"][0]["offers"][0]
     offer.update(title="😀" * 320, article="😀" * 100, manufacturer="😀" * 100, brand="😀" * 100)
@@ -528,7 +530,7 @@ def test_per_record_compact_budget_and_aggregate_offer_bound():
     row["outcomes"] = [_outcome(key, row["offers"] if key == ETM else []) for key in payload["selection"]["provider_keys"]]
     payload["rows"].append(row)
     payload["selected_source_row_ids"].append(row["source_row_id"])
-    with pytest.raises(DurableTenderReadError): read_tender_sourcing_run(payload)
+    assert sum(len(item.offers) for item in read_tender_sourcing_run(payload).rows) == 401
 
 
 def _current_v1_run(tmp_path, *, history=False):
@@ -639,6 +641,15 @@ def test_v1_original_byte_limit_is_preserved_even_when_float_reencoding_is_large
     with pytest.raises(DurableTenderReadError): read_tender_sourcing_run(encoded + b" ")
 
 
+def test_v1_dictionary_decimal_size_accounting_keeps_legacy_string_representation():
+    payload = {"schema_version": 1, "legacy_price": Decimal("1234.5600"), "padding": ""}
+    baseline = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode()
+    payload["padding"] = "x" * (MAX_TENDER_RUN_BYTES - len(baseline))
+    assert read_tender_sourcing_run(payload).payload == payload
+    payload["padding"] += "x"
+    with pytest.raises(DurableTenderReadError): read_tender_sourcing_run(payload)
+
+
 def test_reader_has_no_filesystem_network_provider_or_decision_engine_calls(monkeypatch):
     import averon_import.services.sourcing.provider_commercial as commercial
     import averon_import.services.sourcing.provider_commercial_selection as selection
@@ -693,6 +704,9 @@ def test_stored_review_candidate_is_read_without_reconstructing_identity_policy(
     row["matches"][1]["deterministic_evidence"]["hard_contradiction"] = True
     row["review_candidate_reference"] = _ref()
     row["commercial_selection"].update(candidate_references=[], reason_codes=["NO_IDENTITY_CANDIDATE"])
+    for name in ("offers", "matches", "commercial_evidence"):
+        row[name] = row[name][:1]
+    row["outcomes"][1]["retained_offer_references"] = []
     read = read_tender_sourcing_run(payload).rows[0]
     assert read.recommended_match is None
     assert read.review_candidate.decision == MatchDecision.REVIEW
@@ -822,6 +836,9 @@ def test_empty_candidates_preserve_stored_no_identity_reason_without_inferring_i
     row = payload["rows"][0]
     row["commercial_selection"]["candidate_references"] = []
     _stored_no_safe_winner(row, ["NO_IDENTITY_CANDIDATE"])
+    for name in ("offers", "matches", "commercial_evidence"):
+        row[name] = []
+    row["outcomes"][0]["retained_offer_references"] = []
     read = read_tender_sourcing_run(payload).rows[0]
     assert read.commercial_selection.candidate_references == ()
     assert tuple(code.value for code in read.commercial_selection.reason_codes) == ("NO_IDENTITY_CANDIDATE",)
@@ -852,7 +869,8 @@ def test_comparison_reason_accepts_multiple_complete_candidates_without_proving_
         row["offers"].append(offer)
         row["matches"].append(_match(offer))
         row["commercial_evidence"].append(_evidence(offer))
-        row["outcomes"][0]["offer_references"].append(_ref(ETM, "c"))
+        row["outcomes"][0]["retained_offer_references"].append(_ref(ETM, "c"))
+        row["outcomes"][0]["offers_returned_count"] = 3
         row["commercial_selection"]["candidate_references"].append(_ref(ETM, "c"))
     _stored_no_safe_winner(row, [reason])
     before = deepcopy(payload)
@@ -908,6 +926,7 @@ def test_correlation_does_not_replace_a_stored_weaker_identity_cohort():
     row = payload["rows"][0]
     row["matches"][1]["decision"] = "ALTERNATIVE"
     row["matches"][1]["deterministic_evidence"]["preferred_differences"] = ["brand"]
+    row["recommended_offer_reference"] = _ref(ETM, "a")
     row["commercial_selection"].update(selected_reference=_ref(ETM, "b"), candidate_references=[_ref(ETM, "b")],
                                         selection_basis="SOLE_STRONGEST_IDENTITY")
     read = read_tender_sourcing_run(payload).rows[0]

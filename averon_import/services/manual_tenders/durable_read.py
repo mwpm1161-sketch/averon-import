@@ -35,6 +35,7 @@ from averon_import.services.sourcing.providers.execution import MAX_PROVIDER_EXE
 
 from .parser import MAX_ACTUAL_ITEMS
 from .repository import MAX_TENDER_RUN_BYTES
+from .durable_wire import MAX_RETAINED_OFFERS, _read_wire_payload, _wire_payload
 
 
 # 25% headroom below the unchanged 1 MiB repository hard cap. Both input bytes
@@ -96,14 +97,34 @@ def _decimal(value: object) -> Decimal | None:
 
 def _size_default(value: object) -> str:
     if type(value) is Decimal:
+        return _canonical_decimal(value)
+    raise TypeError("not a JSON fact")
+
+
+def _legacy_size_default(value: object) -> str:
+    if type(value) is Decimal:
         return str(value)
     raise TypeError("not a JSON fact")
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    value = _decimal(value)
+    if not value:
+        return "0"
+    parts = value.as_tuple()
+    digits = list(parts.digits)
+    exponent = parts.exponent
+    while digits[-1] == 0 and exponent < 100:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    return coefficient if exponent == 0 else f"{coefficient}E{exponent}"
 
 
 def _check_size(value: object, limit: int, *, legacy: bool = False) -> None:
     """Count compact UTF-8 JSON incrementally; never return serialized data."""
     encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"),
-                               allow_nan=legacy, default=_size_default)
+                               allow_nan=legacy, default=_legacy_size_default if legacy else _size_default)
     size = 0
     for chunk in encoder.iterencode(value):
         size += len(chunk.encode("utf-8"))
@@ -167,20 +188,23 @@ class DurableProviderOutcome(DurableContract):
     failure_category: ProviderFailureCategory | None
     affinity: DurableProviderAffinity
     catalog_version: Revision | None
-    offer_references: tuple[DurableOfferReference, ...] = Field(max_length=MAX_PROVIDER_OUTCOME_OFFERS)
+    offers_returned_count: Annotated[StrictInt, Field(ge=0, le=MAX_PROVIDER_OUTCOME_OFFERS)]
+    retained_offer_references: tuple[DurableOfferReference, ...] = Field(max_length=MAX_PROVIDER_OUTCOME_OFFERS)
 
-    @field_validator("offer_references", mode="before")
+    @field_validator("retained_offer_references", mode="before")
     @classmethod
     def _refs(cls, value: object):
         return _references(value, MAX_PROVIDER_OUTCOME_OFFERS)
 
     @model_validator(mode="after")
     def _state_facts(self):
-        if any(ref.provider_key != self.provider_key for ref in self.offer_references):
+        if any(ref.provider_key != self.provider_key for ref in self.retained_offer_references):
             raise ValueError("outcome references a foreign provider")
         success = self.state in {ProviderSearchState.SUCCESS, ProviderSearchState.PARTIAL_SUCCESS}
-        if success != bool(self.offer_references):
-            raise ValueError("outcome state contradicts returned references")
+        if success != bool(self.offers_returned_count):
+            raise ValueError("outcome state contradicts returned count")
+        if len(self.retained_offer_references) > self.offers_returned_count:
+            raise ValueError("retained count exceeds returned count")
         if self.state in {ProviderSearchState.NOT_ATTEMPTED, ProviderSearchState.SUPPRESSED} and self.request_count:
             raise ValueError("unattempted outcome counts requests")
         failed = self.state in {ProviderSearchState.FAILURE, ProviderSearchState.PARTIAL_SUCCESS}
@@ -359,10 +383,10 @@ class DurableTenderSourcingRowV2(DurableContract):
         indexed = {item.offer_reference: item for item in self.offers}
         if len(indexed) != len(self.offers):
             raise ValueError("duplicate composite offer")
-        returned = [ref for outcome in self.outcomes for ref in outcome.offer_references]
-        if len(set(returned)) != len(returned) or set(returned) != set(indexed):
-            raise ValueError("outcome references do not match returned offers")
-        if any(len(item.offer_references) > self.result_limit for item in self.outcomes):
+        retained = [ref for outcome in self.outcomes for ref in outcome.retained_offer_references]
+        if len(set(retained)) != len(retained) or set(retained) != set(indexed):
+            raise ValueError("outcome retained references do not match retained offers")
+        if any(item.offers_returned_count > self.result_limit for item in self.outcomes):
             raise ValueError("outcome exceeds result limit")
         for records in (self.matches, self.commercial_evidence):
             refs = [item.offer_reference for item in records]
@@ -432,6 +456,11 @@ class DurableTenderSourcingRowV2(DurableContract):
         candidates = selection.candidate_references
         if not set(candidates).issubset(indexed):
             raise ValueError("commercial candidate references absent offers")
+        closure = set(candidates)
+        closure.update(reference for reference in (selection.selected_reference, self.recommended_offer_reference,
+                                                   self.review_candidate_reference) if reference is not None)
+        if closure != set(indexed):
+            raise ValueError("retained offers must equal the declared decision closure")
         eligible_decisions = {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH, MatchDecision.ALTERNATIVE}
         if any(matches_by_reference[reference].decision not in eligible_decisions for reference in candidates):
             raise ValueError("commercial candidates require identity-eligible stored matches")
@@ -490,6 +519,7 @@ class DurableTenderSourcingRowV2(DurableContract):
 
 class DurableTenderSourcingRunV2(DurableContract):
     schema_version: Annotated[StrictInt, Field(ge=2, le=2)]
+    projection_policy: Literal["decision-closure-v1"]
     run_id: Id
     tender_id: Id
     source_sha256: Fingerprint
@@ -522,13 +552,13 @@ class DurableTenderSourcingRunV2(DurableContract):
         for row in self.rows:
             if tuple(item.provider_key for item in row.outcomes) != self.selection.provider_keys:
                 raise ValueError("every selected provider requires exactly one outcome per evaluated row")
-        # The durable snapshot also caps aggregate offers across rows at 400.
-        # This is deliberately more conservative than 400 per execution.
-        if sum(len(row.offers) for row in self.rows) > MAX_PROVIDER_EXECUTION_OFFERS:
-            raise ValueError("durable run exceeds aggregate execution-offer bound")
+        # Separate run allocation guard; the canonical wire byte budget remains
+        # authoritative. The runtime per-row cap stays at 400.
+        if sum(len(row.offers) for row in self.rows) > MAX_RETAINED_OFFERS:
+            raise ValueError("durable run exceeds retained record bound")
         object.__setattr__(self, "selected_source_row_ids", tuple(sorted(ids)))
         object.__setattr__(self, "rows", tuple(sorted(self.rows, key=lambda row: row.source_row_id)))
-        _check_size(self.model_dump(mode="json"), MAX_DURABLE_V2_BYTES)
+        _check_size(_wire_payload(self.model_dump(mode="python")), MAX_DURABLE_V2_BYTES)
         return self
 
     @property
@@ -605,8 +635,10 @@ def read_tender_sourcing_run(payload: bytes | str | dict) -> DurableTenderSourci
             value = json.loads(raw, parse_float=Decimal, parse_constant=_invalid_constant,
                                object_pairs_hook=_unique_object)
         _check_size(value, MAX_DURABLE_V2_BYTES)
+        if "wire_format" in value:
+            value = _read_wire_payload(value)
         return DurableTenderSourcingRunV2.model_validate(value)
     except DurableTenderReadError:
         raise
-    except (ValueError, TypeError, OverflowError, RecursionError):
+    except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
         raise DurableTenderReadError() from None
