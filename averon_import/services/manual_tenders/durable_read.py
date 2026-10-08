@@ -368,15 +368,16 @@ class DurableTenderSourcingRowV2(DurableContract):
             refs = [item.offer_reference for item in records]
             if len(set(refs)) != len(refs) or set(refs) != set(indexed):
                 raise ValueError("exactly one correlated record per offer is required")
-        matches = {item.offer_reference: item for item in self.matches}
+        matches_by_reference = {item.offer_reference: item for item in self.matches}
+        evidence_by_reference = {item.offer_reference: item for item in self.commercial_evidence}
         for reference in (self.recommended_offer_reference, self.review_candidate_reference):
-            if reference is not None and reference not in matches:
+            if reference is not None and reference not in matches_by_reference:
                 raise ValueError("identity candidate references an absent match")
-        if self.recommended_offer_reference is not None and matches[self.recommended_offer_reference].decision not in {
+        if self.recommended_offer_reference is not None and matches_by_reference[self.recommended_offer_reference].decision not in {
             MatchDecision.MATCH, MatchDecision.LIKELY_MATCH, MatchDecision.ALTERNATIVE,
         }:
             raise ValueError("identity recommendation requires a recommendable stored decision")
-        if self.review_candidate_reference is not None and matches[self.review_candidate_reference].decision != MatchDecision.REVIEW:
+        if self.review_candidate_reference is not None and matches_by_reference[self.review_candidate_reference].decision != MatchDecision.REVIEW:
             raise ValueError("review candidate requires a stored REVIEW decision")
         outcomes = {item.provider_key: item for item in self.outcomes}
         for evidence in self.commercial_evidence:
@@ -427,8 +428,30 @@ class DurableTenderSourcingRowV2(DurableContract):
             elif not {CommercialIssueCode.PROVIDER_PRICE_BASIS_UNPROVEN,
                       CommercialIssueCode.PRICE_UNIT_UNTRUSTED}.issubset(evidence.issue_codes):
                 raise ValueError("unproved provider requires its stored issue facts")
-        if not set(self.commercial_selection.candidate_references).issubset(indexed):
+        selection = self.commercial_selection
+        candidates = selection.candidate_references
+        if not set(candidates).issubset(indexed):
             raise ValueError("commercial candidate references absent offers")
+        eligible_decisions = {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH, MatchDecision.ALTERNATIVE}
+        if any(matches_by_reference[reference].decision not in eligible_decisions for reference in candidates):
+            raise ValueError("commercial candidates require identity-eligible stored matches")
+        candidate_states = {evidence_by_reference[reference].evidence_state for reference in candidates}
+        if selection.state == CommercialSelectionState.SELECTED:
+            # The scalar selection contract already requires selected_reference
+            # to be one of these candidates. This also proves its exact evidence
+            # is COMPLETE, without deriving a cohort or comparing any prices.
+            if candidate_states != {CommercialEvidenceState.COMPLETE}:
+                raise ValueError("selected state requires complete evidence for every candidate")
+        else:
+            reasons = selection.reason_codes
+            if (CommercialSelectionReason.COMMERCIAL_EVIDENCE_INCOMPLETE in reasons
+                    and CommercialEvidenceState.INCOMPLETE not in candidate_states):
+                raise ValueError("incomplete reason requires an incomplete candidate")
+            if (CommercialSelectionReason.COMMERCIAL_EVIDENCE_INVALID in reasons
+                    and CommercialEvidenceState.INVALID not in candidate_states):
+                raise ValueError("invalid reason requires an invalid candidate")
+            if CommercialSelectionReason.NO_IDENTITY_CANDIDATE in reasons and candidates:
+                raise ValueError("no identity candidate reason requires an empty candidate set")
         # Canonical ordering changes presentation only, never decisions/ranks.
         object.__setattr__(self, "outcomes", tuple(sorted(self.outcomes, key=lambda item: item.provider_key)))
         object.__setattr__(self, "reused_provider_keys", tuple(sorted(reused)))

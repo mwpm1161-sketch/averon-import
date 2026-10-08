@@ -641,6 +641,7 @@ def test_v1_original_byte_limit_is_preserved_even_when_float_reencoding_is_large
 def test_reader_has_no_filesystem_network_provider_or_decision_engine_calls(monkeypatch):
     import averon_import.services.sourcing.provider_commercial as commercial
     import averon_import.services.sourcing.provider_commercial_selection as selection
+    import averon_import.services.sourcing.provider_matching as matching
     from averon_import.services.sourcing.matching import OfferMatcher
     from averon_import.services.sourcing.provider_matching import ProviderMatchEvaluator
     from averon_import.services.sourcing.providers.execution import ProviderRunner
@@ -648,7 +649,7 @@ def test_reader_has_no_filesystem_network_provider_or_decision_engine_calls(monk
     def forbidden(*args, **kwargs):
         raise AssertionError("reader crossed an I/O or decision-engine boundary")
 
-    encoded = _encoded(_fixture("partial"))
+    encoded = [_encoded(_fixture(kind)) for kind in ("partial", "multi", "winner")]
     with monkeypatch.context() as guard:
         guard.setattr(builtins, "open", forbidden)
         guard.setattr(Path, "open", forbidden)
@@ -656,14 +657,16 @@ def test_reader_has_no_filesystem_network_provider_or_decision_engine_calls(monk
         guard.setattr(socket, "getaddrinfo", forbidden)
         guard.setattr(OfferMatcher, "match", forbidden)
         guard.setattr(ProviderMatchEvaluator, "evaluate", forbidden)
+        guard.setattr(matching, "_recommendation_quality", forbidden)
+        guard.setattr(matching, "_unique_identity_recommendation", forbidden)
         guard.setattr(ProviderRunner, "run", forbidden)
         guard.setattr(commercial, "resolve_commercial_evidence", forbidden)
         for resolver in commercial.COMMERCIAL_EVIDENCE_RESOLVERS.values():
             guard.setattr(type(resolver), "resolve", forbidden)
         guard.setattr(commercial, "compare_commercial_evidence", forbidden)
         guard.setattr(selection, "select_provider_commercial_winner", forbidden)
-        run = read_tender_sourcing_run(encoded)
-        assert run.partial_failure
+        runs = [read_tender_sourcing_run(payload) for payload in encoded]
+        assert runs[0].partial_failure
         assert read_tender_sourcing_run({"schema_version": 1, "rows": []}).payload == {"schema_version": 1, "rows": []}
 
 
@@ -687,3 +690,145 @@ def test_stored_review_candidate_is_read_without_reconstructing_identity_policy(
     assert read.recommended_match is None
     assert read.review_candidate.decision == MatchDecision.REVIEW
     assert read.review_candidate.offer_reference.provider_key == ETM
+
+
+def _stored_no_safe_winner(row, reasons):
+    row["commercial_selection"].update(state="NO_SAFE_WINNER", selected_reference=None,
+                                        selection_basis=None, reason_codes=list(reasons))
+
+
+def _stored_unusable_evidence(row, index, state):
+    """Test-only coherent scalar facts, without invoking a provider resolver."""
+    offer = row["offers"][index]
+    evidence = row["commercial_evidence"][index]
+    evidence.update(evidence_state=state, vat_basis="UNKNOWN",
+                    issue_codes=["PROVIDER_PRICE_BASIS_UNPROVEN", "VAT_BASIS_UNKNOWN"])
+    if state == "INCOMPLETE":
+        offer["provenance"]["price_field"] = "price"
+    else:
+        offer["provenance"]["source_item_id"] = "unmatched-item"
+        evidence["currency"] = ""
+        evidence["issue_codes"] += ["PROVENANCE_MISMATCH", "CURRENCY_UNKNOWN"]
+
+
+@pytest.mark.parametrize("decision", ["MATCH", "LIKELY_MATCH", "ALTERNATIVE"])
+def test_selected_complete_candidates_accept_all_identity_eligible_decisions(decision):
+    payload = _fixture("winner")
+    for match in payload["rows"][0]["matches"]:
+        match["decision"] = decision
+    run = read_tender_sourcing_run(payload)
+    row = run.rows[0]
+    assert row.commercial_selection.state.value == "SELECTED"
+    assert all(match.decision.value == decision for match in row.matches)
+    assert all(item.evidence_state.value == "COMPLETE" for item in row.commercial_evidence)
+
+
+@pytest.mark.parametrize("state", ["INCOMPLETE", "INVALID"])
+@pytest.mark.parametrize("index", [0, 1], ids=["selected", "other-candidate"])
+@pytest.mark.parametrize("transport", ["dict", "bytes"])
+def test_selected_rejects_unusable_evidence_for_selected_or_other_candidate(state, index, transport):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    _stored_unusable_evidence(row, index, state)
+    selected = deepcopy(row["commercial_selection"])
+    reason = f"COMMERCIAL_EVIDENCE_{state}"
+    _stored_no_safe_winner(row, [reason])
+    # The same offer/evidence/match facts pass every existing scalar/provenance
+    # invariant. Only declaring SELECTED makes this snapshot contradictory.
+    valid = read_tender_sourcing_run(payload)
+    assert valid.rows[0].commercial_evidence[index].evidence_state.value == state
+    row["commercial_selection"] = selected
+    before = deepcopy(payload)
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload if transport == "dict" else _encoded(payload))
+    assert payload == before
+    assert len(row["commercial_selection"]["candidate_references"]) == 2
+
+
+@pytest.mark.parametrize("state", ["SELECTED", "NO_SAFE_WINNER"])
+@pytest.mark.parametrize("index", [0, 1], ids=["selected-or-first", "other-candidate"])
+@pytest.mark.parametrize("decision", ["REVIEW", "REJECT"])
+def test_commercial_candidates_and_selected_reference_reject_review_or_reject(state, index, decision):
+    payload = _fixture("winner" if state == "SELECTED" else "multi")
+    assert isinstance(read_tender_sourcing_run(payload), DurableTenderSourcingRunV2)
+    row = payload["rows"][0]
+    match = row["matches"][index]
+    match["decision"] = decision
+    if decision == "REVIEW":
+        match["missing_attributes"] = ["power"]
+    else:
+        match["conflicting_attributes"] = ["article"]
+        match["deterministic_evidence"]["hard_contradiction"] = True
+    before = deepcopy(payload)
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload)
+    assert payload == before
+
+
+@pytest.mark.parametrize("reason", ["COMMERCIAL_EVIDENCE_INCOMPLETE", "COMMERCIAL_EVIDENCE_INVALID",
+                                     "NO_IDENTITY_CANDIDATE"])
+def test_no_safe_winner_rejects_reasons_without_corresponding_candidate_facts(reason):
+    payload = _fixture("winner")
+    _stored_no_safe_winner(payload["rows"][0], [reason])
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload)
+
+
+@pytest.mark.parametrize("state", ["INCOMPLETE", "INVALID"])
+def test_reason_requires_candidate_evidence_not_merely_other_returned_evidence(state):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    _stored_unusable_evidence(row, 1, state)
+    _stored_no_safe_winner(row, [f"COMMERCIAL_EVIDENCE_{state}"])
+    assert isinstance(read_tender_sourcing_run(payload), DurableTenderSourcingRunV2)
+    row["commercial_selection"]["candidate_references"] = [_ref(ETM, "a")]
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload)
+
+
+@pytest.mark.parametrize("reasons", [
+    ["COMMERCIAL_EVIDENCE_INCOMPLETE"], ["COMMERCIAL_EVIDENCE_INVALID"],
+    ["COMMERCIAL_EVIDENCE_INCOMPLETE", "COMMERCIAL_EVIDENCE_INVALID"],
+])
+def test_reason_correlation_accepts_present_states_without_requiring_reverse_implication(reasons):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    _stored_unusable_evidence(row, 0, "INCOMPLETE")
+    _stored_unusable_evidence(row, 1, "INVALID")
+    _stored_no_safe_winner(row, reasons)
+    read = read_tender_sourcing_run(payload).rows[0]
+    assert tuple(code.value for code in read.commercial_selection.reason_codes) == tuple(sorted(reasons))
+
+
+@pytest.mark.parametrize("reason", ["COMMERCIAL_EVIDENCE_INCOMPLETE", "COMMERCIAL_EVIDENCE_INVALID"])
+def test_evidence_failure_reason_rejects_empty_candidates(reason):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    row["commercial_selection"]["candidate_references"] = []
+    _stored_no_safe_winner(row, [reason])
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload)
+
+
+@pytest.mark.parametrize("reason", ["NO_IDENTITY_CANDIDATE", "LOWEST_PRICE_TIED"])
+def test_empty_candidates_preserve_stored_reason_without_inferring_identity_policy(reason):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    row["commercial_selection"]["candidate_references"] = []
+    _stored_no_safe_winner(row, [reason])
+    read = read_tender_sourcing_run(payload).rows[0]
+    assert read.commercial_selection.candidate_references == ()
+    assert tuple(code.value for code in read.commercial_selection.reason_codes) == (reason,)
+
+
+def test_correlation_does_not_replace_a_stored_weaker_identity_cohort():
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    row["matches"][1]["decision"] = "ALTERNATIVE"
+    row["matches"][1]["deterministic_evidence"]["preferred_differences"] = ["brand"]
+    row["commercial_selection"].update(selected_reference=_ref(ETM, "b"), candidate_references=[_ref(ETM, "b")],
+                                        selection_basis="SOLE_STRONGEST_IDENTITY")
+    read = read_tender_sourcing_run(payload).rows[0]
+    assert read.matches[0].decision == MatchDecision.MATCH
+    assert read.commercial_selection.selected_reference.offer_id == "b"
+    assert read.commercial_selection.candidate_references == (read.matches[1].offer_reference,)

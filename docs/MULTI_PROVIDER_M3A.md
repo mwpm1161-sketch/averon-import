@@ -150,6 +150,15 @@ scalar structure. SELECTED needs an existing selected candidate, a basis and no
 failure reasons. SOLE_STRONGEST_IDENTITY requires one candidate;
 LOWEST_COMPARABLE_PRICE requires at least two. NO_SAFE_WINNER requires reasons
 and no selected reference/basis. Candidates must be unique existing row offers.
+M3A.1 additionally correlates every commercial candidate to an existing stored
+MATCH, LIKELY_MATCH or ALTERNATIVE match; REVIEW/REJECT candidates reject in either
+selection state. SELECTED requires COMPLETE evidence for every stored candidate,
+including the selected reference already required to belong to that set. A
+NO_SAFE_WINNER reason COMMERCIAL_EVIDENCE_INCOMPLETE/COMMERCIAL_EVIDENCE_INVALID
+requires at least one candidate with the corresponding evidence state; the
+reverse implication is not imposed. NO_IDENTITY_CANDIDATE requires an empty
+candidate set, without inferring that reason from an empty set. These are small
+cross-record checks after exact match/evidence cardinality validation.
 The reader deliberately does not recompute the strongest identity cohort, compare
 commercial bases, prove the minimum price, or replace a stored decision. A future
 reconciliation phase would be separate from this representation contract.
@@ -189,6 +198,11 @@ runtime 400-offer-per-execution cap. Per-record maxima cannot all be saturated
 simultaneously: the independent global byte guard still applies. No runtime cap
 or current storage quota is increased. Timing samples, arbitrary intents and
 provider internals are omitted from this compact read projection.
+
+M3A.1 capacity note: this whole-run 400-offer bound is currently inactive and
+conservative. It MUST be reassessed before M3B production writer activation.
+M3B must not silently truncate runtime offers to satisfy it. M3A.1 changes no
+storage cap, byte budget, runtime limit or production writer.
 
 | String | Maximum characters / exact format |
 | --- | --- |
