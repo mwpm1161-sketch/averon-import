@@ -159,6 +159,17 @@ requires at least one candidate with the corresponding evidence state; the
 reverse implication is not imposed. NO_IDENTITY_CANDIDATE requires an empty
 candidate set, without inferring that reason from an empty set. These are small
 cross-record checks after exact match/evidence cardinality validation.
+M3A.2 restricts NO_SAFE_WINNER to exactly six stored reason families:
+{NO_IDENTITY_CANDIDATE}, {COMMERCIAL_EVIDENCE_INCOMPLETE},
+{COMMERCIAL_EVIDENCE_INVALID}, {COMMERCIAL_EVIDENCE_INCOMPLETE,
+COMMERCIAL_EVIDENCE_INVALID}, {COMMERCIAL_BASIS_NOT_COMPARABLE}, and
+{LOWEST_PRICE_TIED}. Cross-phase combinations reject. NO_IDENTITY_CANDIDATE
+remains a sole reason with empty candidates; evidence families require nonempty
+candidates and retain the one-way M3A.1 reason/state checks. Each comparison
+reason must stand alone, with at least two candidates and COMPLETE evidence for
+every candidate. Only stored branch prerequisites are checked: the reader does
+not compare Decimal prices or prove ties/non-comparability. M3A.2 changes no
+capacity bound, byte budget or production writer.
 The reader deliberately does not recompute the strongest identity cohort, compare
 commercial bases, prove the minimum price, or replace a stored decision. A future
 reconciliation phase would be separate from this representation contract.

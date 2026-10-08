@@ -443,15 +443,29 @@ class DurableTenderSourcingRowV2(DurableContract):
             if candidate_states != {CommercialEvidenceState.COMPLETE}:
                 raise ValueError("selected state requires complete evidence for every candidate")
         else:
-            reasons = selection.reason_codes
+            reasons = set(selection.reason_codes)
+            if CommercialSelectionReason.NO_IDENTITY_CANDIDATE in reasons:
+                if reasons != {CommercialSelectionReason.NO_IDENTITY_CANDIDATE} or candidates:
+                    raise ValueError("no identity candidate requires its sole reason and empty candidates")
+            elif reasons & {CommercialSelectionReason.LOWEST_PRICE_TIED,
+                            CommercialSelectionReason.COMMERCIAL_BASIS_NOT_COMPARABLE}:
+                if len(reasons) != 1:
+                    raise ValueError("comparison reasons cannot mix with other reason families")
+                # Validate only the stored branch prerequisites, without
+                # comparing prices/bases or proving the recorded conclusion.
+                if len(candidates) < 2 or candidate_states != {CommercialEvidenceState.COMPLETE}:
+                    raise ValueError("comparison reasons require multiple complete candidates")
+            elif not candidates or not reasons.issubset({
+                CommercialSelectionReason.COMMERCIAL_EVIDENCE_INCOMPLETE,
+                CommercialSelectionReason.COMMERCIAL_EVIDENCE_INVALID,
+            }):
+                raise ValueError("evidence reason family requires nonempty candidates")
             if (CommercialSelectionReason.COMMERCIAL_EVIDENCE_INCOMPLETE in reasons
                     and CommercialEvidenceState.INCOMPLETE not in candidate_states):
                 raise ValueError("incomplete reason requires an incomplete candidate")
             if (CommercialSelectionReason.COMMERCIAL_EVIDENCE_INVALID in reasons
                     and CommercialEvidenceState.INVALID not in candidate_states):
                 raise ValueError("invalid reason requires an invalid candidate")
-            if CommercialSelectionReason.NO_IDENTITY_CANDIDATE in reasons and candidates:
-                raise ValueError("no identity candidate reason requires an empty candidate set")
         # Canonical ordering changes presentation only, never decisions/ranks.
         object.__setattr__(self, "outcomes", tuple(sorted(self.outcomes, key=lambda item: item.provider_key)))
         object.__setattr__(self, "reused_provider_keys", tuple(sorted(reused)))

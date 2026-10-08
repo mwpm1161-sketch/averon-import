@@ -6,6 +6,7 @@ import socket
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
+from itertools import combinations
 from pathlib import Path
 
 import pytest
@@ -650,6 +651,10 @@ def test_reader_has_no_filesystem_network_provider_or_decision_engine_calls(monk
         raise AssertionError("reader crossed an I/O or decision-engine boundary")
 
     encoded = [_encoded(_fixture(kind)) for kind in ("partial", "multi", "winner")]
+    for reason in ("LOWEST_PRICE_TIED", "COMMERCIAL_BASIS_NOT_COMPARABLE"):
+        payload = _fixture("winner")
+        _stored_no_safe_winner(payload["rows"][0], [reason])
+        encoded.append(_encoded(payload))
     with monkeypatch.context() as guard:
         guard.setattr(builtins, "open", forbidden)
         guard.setattr(Path, "open", forbidden)
@@ -667,6 +672,8 @@ def test_reader_has_no_filesystem_network_provider_or_decision_engine_calls(monk
         guard.setattr(selection, "select_provider_commercial_winner", forbidden)
         runs = [read_tender_sourcing_run(payload) for payload in encoded]
         assert runs[0].partial_failure
+        assert [run.rows[0].commercial_selection.reason_codes[0].value for run in runs[3:]] == [
+            "LOWEST_PRICE_TIED", "COMMERCIAL_BASIS_NOT_COMPARABLE"]
         assert read_tender_sourcing_run({"schema_version": 1, "rows": []}).payload == {"schema_version": 1, "rows": []}
 
 
@@ -810,15 +817,90 @@ def test_evidence_failure_reason_rejects_empty_candidates(reason):
         read_tender_sourcing_run(payload)
 
 
-@pytest.mark.parametrize("reason", ["NO_IDENTITY_CANDIDATE", "LOWEST_PRICE_TIED"])
-def test_empty_candidates_preserve_stored_reason_without_inferring_identity_policy(reason):
+def test_empty_candidates_preserve_stored_no_identity_reason_without_inferring_identity_policy():
     payload = _fixture("winner")
     row = payload["rows"][0]
     row["commercial_selection"]["candidate_references"] = []
-    _stored_no_safe_winner(row, [reason])
+    _stored_no_safe_winner(row, ["NO_IDENTITY_CANDIDATE"])
     read = read_tender_sourcing_run(payload).rows[0]
     assert read.commercial_selection.candidate_references == ()
+    assert tuple(code.value for code in read.commercial_selection.reason_codes) == ("NO_IDENTITY_CANDIDATE",)
+
+
+@pytest.mark.parametrize("reason", ["LOWEST_PRICE_TIED", "COMMERCIAL_BASIS_NOT_COMPARABLE"])
+@pytest.mark.parametrize("count", [0, 1])
+@pytest.mark.parametrize("transport", ["dict", "bytes"])
+def test_comparison_reason_rejects_fewer_than_two_candidates(reason, count, transport):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    row["commercial_selection"]["candidate_references"] = row["commercial_selection"]["candidate_references"][:count]
+    _stored_no_safe_winner(row, [reason])
+    before = deepcopy(payload)
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload if transport == "dict" else _encoded(payload))
+    assert payload == before
+
+
+@pytest.mark.parametrize("reason", ["LOWEST_PRICE_TIED", "COMMERCIAL_BASIS_NOT_COMPARABLE"])
+@pytest.mark.parametrize("count", [2, 3])
+@pytest.mark.parametrize("transport", ["dict", "bytes"])
+def test_comparison_reason_accepts_multiple_complete_candidates_without_proving_conclusion(reason, count, transport):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    if count == 3:
+        offer = _offer(offer_id="c", amount="200")
+        row["offers"].append(offer)
+        row["matches"].append(_match(offer))
+        row["commercial_evidence"].append(_evidence(offer))
+        row["outcomes"][0]["offer_references"].append(_ref(ETM, "c"))
+        row["commercial_selection"]["candidate_references"].append(_ref(ETM, "c"))
+    _stored_no_safe_winner(row, [reason])
+    before = deepcopy(payload)
+    read = read_tender_sourcing_run(payload if transport == "dict" else _encoded(payload)).rows[0]
+    # The stored offers have unequal prices and the same proved commercial
+    # basis. Acceptance must not depend on either comparison conclusion.
+    assert len(read.commercial_selection.candidate_references) == count
+    assert all(item.evidence_state.value == "COMPLETE" for item in read.commercial_evidence)
     assert tuple(code.value for code in read.commercial_selection.reason_codes) == (reason,)
+    assert read.commercial_selection.selected_reference is None
+    assert payload == before
+
+
+@pytest.mark.parametrize("reason", ["LOWEST_PRICE_TIED", "COMMERCIAL_BASIS_NOT_COMPARABLE"])
+@pytest.mark.parametrize("state", ["INCOMPLETE", "INVALID"])
+@pytest.mark.parametrize("index", [0, 1])
+@pytest.mark.parametrize("transport", ["dict", "bytes"])
+def test_comparison_reason_rejects_any_unusable_candidate_evidence(reason, state, index, transport):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    _stored_unusable_evidence(row, index, state)
+    _stored_no_safe_winner(row, [f"COMMERCIAL_EVIDENCE_{state}"])
+    assert isinstance(read_tender_sourcing_run(payload), DurableTenderSourcingRunV2)
+    _stored_no_safe_winner(row, [reason])
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload if transport == "dict" else _encoded(payload))
+
+
+@pytest.mark.parametrize("reasons", [
+    reasons for count in range(2, 6) for reasons in combinations((
+        "NO_IDENTITY_CANDIDATE", "COMMERCIAL_EVIDENCE_INCOMPLETE", "COMMERCIAL_EVIDENCE_INVALID",
+        "COMMERCIAL_BASIS_NOT_COMPARABLE", "LOWEST_PRICE_TIED",
+    ), count) if set(reasons) != {"COMMERCIAL_EVIDENCE_INCOMPLETE", "COMMERCIAL_EVIDENCE_INVALID"}
+])
+@pytest.mark.parametrize("transport", ["dict", "bytes"])
+def test_no_safe_winner_rejects_every_mixed_cross_phase_reason_family(reasons, transport):
+    payload = _fixture("winner")
+    row = payload["rows"][0]
+    if "NO_IDENTITY_CANDIDATE" in reasons:
+        row["commercial_selection"]["candidate_references"] = []
+    else:
+        if "COMMERCIAL_EVIDENCE_INCOMPLETE" in reasons:
+            _stored_unusable_evidence(row, 0, "INCOMPLETE")
+        if "COMMERCIAL_EVIDENCE_INVALID" in reasons:
+            _stored_unusable_evidence(row, 1, "INVALID")
+    _stored_no_safe_winner(row, reasons)
+    with pytest.raises(DurableTenderReadError):
+        read_tender_sourcing_run(payload if transport == "dict" else _encoded(payload))
 
 
 def test_correlation_does_not_replace_a_stored_weaker_identity_cohort():
