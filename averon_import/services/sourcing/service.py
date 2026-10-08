@@ -12,6 +12,10 @@ from averon_import.services.sourcing.provider_commercial import (
     ProviderCommercialEvaluation,
     evaluate_provider_commercial_evidence,
 )
+from averon_import.services.sourcing.provider_commercial_selection import (
+    ProviderCommercialSelection,
+    select_provider_commercial_winner,
+)
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.matching import (
     OfferMatcher,
@@ -144,6 +148,14 @@ class SourcingService:
         """Resolve commercial facts locally after explicit identity evaluation."""
 
         return evaluate_provider_commercial_evidence(evaluation)
+
+    def select_provider_commercial_winner(
+        self,
+        commercial_evaluation: ProviderCommercialEvaluation,
+    ) -> ProviderCommercialSelection:
+        """Select locally within the strongest returned identity cohort."""
+
+        return select_provider_commercial_winner(commercial_evaluation)
 
     def set_ai(self, ai: SourcingAIService) -> None:
         self.ai = ai

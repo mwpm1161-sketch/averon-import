@@ -466,6 +466,8 @@ class ProviderCommercialEvaluation:
 
     _matching: ProviderMatchEvaluation = field(repr=False)
     evidence: tuple[CommercialOfferEvidence, ...]
+    _validated_matching: ProviderMatchEvaluation = field(repr=False, compare=False)
+    _validated_evidence: tuple[CommercialOfferEvidence, ...] = field(repr=False, compare=False)
 
     def __init__(self, matching_evaluation: ProviderMatchEvaluation,
                  evidence: tuple[CommercialOfferEvidence, ...]) -> None:
@@ -485,6 +487,25 @@ class ProviderCommercialEvaluation:
             raise CommercialEvaluationError("evidence does not match the exact execution offers")
         object.__setattr__(self, "_matching", snapshot)
         object.__setattr__(self, "evidence", records)
+        # Keep a detached validation witness for downstream consumers. Checking
+        # this witness must not repeat the provider-specific evidence resolvers.
+        object.__setattr__(self, "_validated_matching", deepcopy(snapshot))
+        object.__setattr__(self, "_validated_evidence", deepcopy(records))
+
+    def _validated_snapshot(self) -> ProviderCommercialEvaluation:
+        try:
+            if self._matching != self._validated_matching or self.evidence != self._validated_evidence:
+                raise CommercialEvaluationError("commercial evaluation changed after validation")
+            if any(
+                actual.model_fields_set != validated.model_fields_set
+                for actual, validated in zip(
+                    self._matching.execution.offers, self._validated_matching.execution.offers,
+                )
+            ):
+                raise CommercialEvaluationError("explicit offer fields changed after validation")
+            return deepcopy(self)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CommercialEvaluationError("commercial evaluation validation witness is invalid") from exc
 
     @property
     def matching_evaluation(self) -> ProviderMatchEvaluation:

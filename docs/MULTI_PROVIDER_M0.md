@@ -322,3 +322,67 @@ writes, caching, or runtime callers. Durable schema remains version 1. Existing
 matching, D4/history, `TenderPriceResolver`, ETM quarantine, manual tender runs,
 and XLSX export remain authoritative and unchanged. There is no VseInstrumenti
 client, adapter, configuration, token/region handling, deployment, or VI work.
+
+M2A is FINAL APPROVED at
+`c62229308d0264b6b6019705c5bbcfd7af0c2b44`.
+
+## M2B inactive safe commercial winner selection
+
+`ProviderCommercialSelection` adds the explicit final request-local layer:
+execution → identity matching → commercial evidence → commercial selection.
+`SourcingService.select_provider_commercial_winner(commercial_evaluation)`
+consumes one exact validated M2A evaluation. Earlier service phases and legacy
+search flows do not call it automatically.
+
+Selection first takes the strongest deterministic identity cohort: the first
+nonempty class in M1D precedence `MATCH`, `LIKELY_MATCH`, `ALTERNATIVE`, retaining
+only the equal best existing M1D quality tuple (conflicts, missing attributes,
+preferred differences, matched attributes, supporting attributes). It reuses
+the approved M1D helper; no new score is introduced. `REVIEW` and `REJECT` are
+excluded. Price, provider, rank, availability, stock, delivery, warehouse and
+input order do not establish identity strength. A cheaper weaker identity
+candidate cannot win or block the stronger cohort.
+
+Every top-cohort candidate must have COMPLETE exact M2A evidence. Any INCOMPLETE
+or INVALID candidate blocks the entire selection; it cannot be discarded to
+select a complete subset. In particular, equal-top ETM COMPLETE and Lemana
+VAT-unknown INCOMPLETE produce NO_SAFE_WINNER. A sole complete strongest
+candidate may be selected with SOLE_STRONGEST_IDENTITY; this basis makes no
+lowest-price claim. Multiple candidates require every pair to pass the
+unchanged M2A `compare_commercial_evidence`. No smaller comparable subset is
+used. Only then does M2B order exact Decimal amounts, selecting a unique minimum
+with LOWEST_COMPARABLE_PRICE. An equal minimum produces NO_SAFE_WINNER /
+LOWEST_PRICE_TIED without a provider, offer ID, selection order or stock tie-break.
+There is no float, epsilon, FX, VAT transformation or unit conversion.
+
+The frozen `ProviderCommercialSelection` contains `state`, `selected_reference`,
+canonical unique `candidate_references`, canonical closed `reason_codes` and
+`selection_basis`. Its strict scalar validation uses bounded frozen Pydantic
+contracts; direct construction of a proposed decision also checks the exact
+strongest cohort, full completeness/comparability and unique minimum. Selected
+references outside the cohort, incomplete evidence, non-minimum prices, tied
+minima, duplicate/malformed references and contradictory states fail closed.
+The existing 400-offer bound applies.
+
+Selection privately owns a deep validated commercial snapshot and exposes only
+a defensive commercial copy plus the scalar `partial_failure` view. M2A now
+retains a private detached validation witness after its existing constructor
+has validated evidence. This is an integrity check for downstream use, not a
+new resolver or a change to M2A facts, states, VAT, units or comparability rules.
+M2B checks that witness and structural correlation without invoking matching
+or commercial evidence resolution again. Mutated legacy data, changed evidence,
+lost explicit unit proof, missing validation witnesses and Pydantic escape-hatch
+corruption are rejected. No raw/config/secret data is added to public selection.
+
+Provider failure remains an execution outcome rather than a synthetic candidate.
+A sole returned complete ETM candidate can be selected while a failed Lemana
+outcome remains visible with `partial_failure=True`. Selection is among actual
+returned candidate offers, not a claim of global market optimality.
+
+M2B makes no runner, provider search, stats, health, access, supplier HTTP, AI,
+Qwen, cache, filesystem or socket call. M1D identity decisions and references,
+M2A evidence and comparison semantics, and existing provider behavior remain
+unchanged. No provider preference, API/UI/export activation, manual-tender
+canonical projection, durable persistence or schema v2 is introduced. Durable
+schema remains v1; D4/history, ETM quarantine, warehouse and XLSX behavior are
+unchanged. There is no VseInstrumenti work, deployment, main merge or tag change.
