@@ -243,3 +243,82 @@ defensive deep copies, so mutable legacy `MatchResult` objects cannot change
 the evaluation's validated recommendation or review state. Legacy
 `MatchResult` semantics remain unchanged outside this request-local boundary;
 commercial selection has not been activated.
+
+M1D (including M1D.1 invariant hardening) is FINAL APPROVED at
+`a122cd0578ce2125ebb6cd32ca70d39a92f667c6`.
+
+## M2A request-local commercial evidence and comparability
+
+`provider_commercial.py` adds an independent commercial evidence layer over an
+already validated `ProviderMatchEvaluation`. The explicit internal method
+`SourcingService.evaluate_provider_commercial_evidence(evaluation)` performs
+only local deterministic validation. Retrieval and identity evaluation do not
+call it automatically. It makes no runner, provider search, stats, health,
+access, supplier HTTP, AI, cache, or persistence call.
+
+`CommercialOfferEvidence` contains only a composite `offer_reference`,
+`amount: Decimal | None`, normalized `currency`, closed `vat_basis`, bounded
+`price_unit`, shared normalized `unit_family`, closed `evidence_state`, a
+canonical tuple of closed `issue_codes`, and a fixed non-secret
+`basis_revision`. It retains no raw payload, provenance dictionary, provider
+configuration, token, mirror revision, or region value. Currency codes are
+explicit uppercase three-letter values; empty/malformed currency stays unknown.
+Amounts must be finite, positive for comparison, and within a bounded decimal
+representation (80 digits, exponent magnitude at most 100). Zero is incomplete;
+malformed, negative, nonfinite, or out-of-bound prices are invalid, never replaced
+with zero. An invalid legacy execution is rejected at the aggregate boundary.
+
+The commercial resolver registry explicitly contains only `etm_ipro`,
+`lemana_b2b`, and `local_catalog`, independently of runtime provider registration.
+An unknown provider receives unproven incomplete evidence rather than implicit
+commercial authority. Evidence states are `COMPLETE`, `INCOMPLETE`, `INVALID`;
+VAT bases are `GROSS_INCLUDING_VAT`, `NET_EXCLUDING_VAT`, `UNKNOWN`.
+
+ETM's existing documented VAT-inclusive `pricewnds` path can produce complete
+gross evidence only with exact provider/source `etm_ipro`, a nonempty bounded
+matching `source_item_id`, `price_field == pricewnds`, a positive finite amount,
+an explicit actual Offer currency, and an explicitly supplied trusted price
+unit. The legacy Offer default unit is not supplier evidence. Contradictory
+source, currency/unit/VAT claims, price status, or retained catalog metadata
+produce invalid evidence. Source identity inconsistency does not authorize
+retaining a currency as proved. There is no generic ETM-to-RUB inference.
+
+Lemana preserves factual price/currency/unit but always leaves VAT `UNKNOWN`,
+with `VAT_BASIS_UNKNOWN` and `PROVIDER_PRICE_BASIS_UNPROVEN`. Its exact source and
+`product_item` must match the Offer; `mirror_revision` must have the current
+mirror's 64-character lowercase SHA-256 format, and `region_id` must be a
+positive bounded integer. Retained outcome region/catalog-version metadata,
+when present, must agree. These metadata values are checked locally and are
+not copied into evidence. Even a raw VAT claim cannot grant Lemana authority.
+Local catalog prices likewise have no automatically trusted VAT, commercial
+source, or price-unit basis and normally remain incomplete.
+
+`ProviderCommercialEvaluation` owns a private deep snapshot of the exact
+matching evaluation, exposes defensive matching/execution/outcome copies, and
+contains an immutable evidence tuple ordered by
+`ProviderOfferReference(provider_key, offer_id)`. Every actual execution offer
+has exactly one record, with exact resolver-derived facts; duplicate, missing,
+foreign, forged, or malformed records fail closed. The existing 400-offer cap
+applies. Failed, suppressed, empty, and partial provider outcomes remain
+separate from commercial completeness: no nonexistent offer receives synthetic
+`PRICE_MISSING` evidence. Identity decisions and recommendation/review references
+remain unchanged.
+
+`compare_commercial_evidence(left, right)` returns only left/right composite
+references, `comparable`, and canonical closed `reason_codes`. Both records
+must be complete and have positive amounts, the same explicit currency, the
+same proved non-unknown VAT basis, and the same trusted unit family. It uses
+the existing shared sourcing alias normalization and permits only exact
+`piece`, `kilogram`, `tonne`, `meter`, `square_meter`, `cubic_meter`, or `litre`
+families. Packages (`pack`, `set`) remain unproven even when both units agree;
+there is no package inference, physical-unit conversion, or FX conversion.
+Reversing the pair preserves the same result and reason set. Amounts are
+checked only for usability, never ordered against each other. Comparability
+does not select a winner, cheapest offer, preferred provider, export offer, or
+price ranking.
+
+M2A does not activate API/UI fields, provider selectors, durable multi-provider
+writes, caching, or runtime callers. Durable schema remains version 1. Existing
+matching, D4/history, `TenderPriceResolver`, ETM quarantine, manual tender runs,
+and XLSX export remain authoritative and unchanged. There is no VseInstrumenti
+client, adapter, configuration, token/region handling, deployment, or VI work.

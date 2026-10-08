@@ -8,6 +8,10 @@ import json
 from typing import Any, Callable
 
 from averon_import.core.unit_normalization import normalize_sourcing_unit_family
+from averon_import.services.sourcing.provider_commercial import (
+    ProviderCommercialEvaluation,
+    evaluate_provider_commercial_evidence,
+)
 from averon_import.services.sourcing.cache import SourcingCache
 from averon_import.services.sourcing.matching import (
     OfferMatcher,
@@ -132,6 +136,14 @@ class SourcingService:
         """Match one existing execution locally, without repeating retrieval."""
 
         return ProviderMatchEvaluator(self.matcher).evaluate(intent, execution)
+
+    def evaluate_provider_commercial_evidence(
+        self,
+        evaluation: ProviderMatchEvaluation,
+    ) -> ProviderCommercialEvaluation:
+        """Resolve commercial facts locally after explicit identity evaluation."""
+
+        return evaluate_provider_commercial_evidence(evaluation)
 
     def set_ai(self, ai: SourcingAIService) -> None:
         self.ai = ai
