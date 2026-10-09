@@ -10,7 +10,10 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .durable_read import DurableTenderSourcingRunV2
 
 from averon_import.services.sourcing.providers.contracts import ProviderOfferReference
 
@@ -312,18 +315,40 @@ class TenderSourcingRunStore:
             return
         for path in runs.glob("[a-f0-9]" * 32 + ".json"):
             try:
-                record = self._read_path(path, tender_id=workspace_path.name)
-                if record.get("status") in _TERMINAL:
-                    terminal.append((str(record.get("completed_at") or record.get("created_at") or ""), path))
+                record = self._read_any_path(path, tender_id=workspace_path.name)
+                if isinstance(record, dict):
+                    status = record.get("status")
+                    completed_at = record.get("completed_at") or record.get("created_at") or ""
+                else:
+                    status = record.status
+                    completed_at = record.completed_at or record.created_at
+                if status in _TERMINAL:
+                    terminal.append((str(completed_at), path))
             except TenderWorkspaceError:
                 continue
-        terminal.sort(key=lambda item: item[0])
+        terminal.sort(key=lambda item: (item[0], item[1].stem))
         for _, path in terminal[:-MAX_TENDER_RUNS_PER_WORKSPACE]:
             try:
                 path.unlink(missing_ok=True)
                 (workspace_path / "history-decisions" / path.name).unlink(missing_ok=True)
             except OSError:
                 continue
+
+    def _read_any_path(self, path: Path, *, tender_id: str) -> dict[str, Any] | DurableTenderSourcingRunV2:
+        from .durable_storage import read_any_path
+        return read_any_path(self.repository, path, tender_id)
+
+    def persist_durable_v2(self, workspace_path: Path, run: DurableTenderSourcingRunV2) -> None:
+        """Explicit internal opt-in only; never called by the current v1 lifecycle."""
+        from .durable_storage import persist_durable_v2
+        with self._lock, self.repository._lock:
+            persist_durable_v2(self.repository, workspace_path, run)
+            self._prune_terminal(workspace_path)
+
+    def read_durable_v2(self, workspace_path: Path, run_id: str) -> DurableTenderSourcingRunV2:
+        from .durable_storage import read_durable_v2
+        with self._lock, self.repository._lock:
+            return read_durable_v2(self.repository, workspace_path, run_id)
 
     def list_public(self, workspace_path: Path, tender_id: str) -> dict[str, Any]:
         runs = workspace_path / "runs"
