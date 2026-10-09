@@ -4928,8 +4928,7 @@ def test_tender_ui_uses_id_only_request_default_selection_runs_and_shared_result
     script = (root / "averon_import" / "static" / "app.js").read_text(encoding="utf-8")
     assert 'id="tender-sourcing-button">Подобрать предложения' in template
     assert "selectedIds = new Set((workspace.rows || []).filter((row) => row.row_type === \"item\").map((row) => row.source_row_id))" in script
-    assert 'body:JSON.stringify({source_row_ids:selectedIds,source_mode:mode,limit:20})' in script
-    assert 'body:JSON.stringify({source_row_ids:selectedIds,source_mode:mode,limit:20})' in script
+    assert 'body:JSON.stringify({source_row_ids:selectedIds,source_mode:mode,limit:20,...(multiProvider ? {providers} : {})})' in script
     assert "renderSourcingResult(job.result)" in script
     assert 'api(`/api/manual-tenders/${encodeURIComponent(tenderId)}/runs`)' in script
     assert "state.excelTender.pollGeneration === generation" in script

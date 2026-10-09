@@ -665,6 +665,30 @@ button { cursor: pointer; }
 .reset-user-card { width:min(520px,calc(100vw - 32px)); }
 .reset-user-card > .field-label { margin-top:13px; }
 .reset-user-card .modal-header p b { color:var(--ink); overflow-wrap:anywhere; }
+.multi-provider-panel { display:grid; gap:8px; margin:10px 0; padding:13px 14px; border:1px solid #bfdbfe; border-radius:11px; background:#f5faff; }
+.multi-provider-panel[hidden] { display:none; }
+.multi-provider-toggle,.multi-provider-option { display:flex; align-items:center; gap:8px; color:#1e3a5f; font-size:13px; font-weight:650; }
+.multi-provider-options { display:flex; flex-wrap:wrap; gap:8px 18px; padding:2px 0; }
+.multi-provider-options[hidden] { display:none; }
+.multi-provider-option { font-weight:500; }
+.multi-provider-panel .sourcing-warning,.multi-provider-panel .mode-status { margin:0; font-size:12px; line-height:1.5; }
+.multi-provider-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-bottom:16px; }
+.multi-provider-summary > div { display:grid; gap:5px; padding:12px; border:1px solid #dbe4ee; border-radius:11px; background:#f8fafc; }
+.multi-provider-summary small { color:#64748b; }
+.multi-provider-summary b { color:#0f172a; font-size:17px; }
+.multi-provider-row { margin:12px 0; padding:14px; border:1px solid #dbe4ee; border-radius:13px; background:#fff; }
+.multi-provider-row > h3 { margin:0 0 10px; }
+.multi-provider-outcomes { margin:8px 0 14px; padding-left:20px; color:#475569; font-size:12px; line-height:1.6; }
+.multi-provider-offers { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.multi-provider-offer { min-width:0; padding:12px; border:1px solid #e2e8f0; border-radius:10px; background:#fbfdff; overflow-wrap:anywhere; }
+.multi-provider-offer.is-selected { border-color:#6ebf98; background:#f1fbf5; }
+.multi-provider-offer h4 { margin:0 0 7px; color:#1e293b; }
+.multi-provider-offer p { margin:6px 0; color:#475569; font-size:12px; line-height:1.5; }
+.multi-provider-offer .multi-provider-price { color:#0f172a; font-size:16px; font-weight:750; }
+.multi-provider-offer a { font-size:12px; }
+.multi-provider-commercial-note,.multi-provider-partial-warning { padding:9px 11px; border-radius:8px; background:#fff7ed; color:#9a3412!important; }
+.multi-provider-row .sourcing-warning p { margin-bottom:0; }
+@media (max-width:760px) { .multi-provider-summary { grid-template-columns:1fr; } .multi-provider-offers { grid-template-columns:1fr; } }
 @media (max-width:760px) {
   .auth-card { padding:23px; }
   .users-card { width:calc(100vw - 24px); max-width:calc(100vw - 24px); padding:17px; }

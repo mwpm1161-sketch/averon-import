@@ -147,7 +147,7 @@
           </div>
           <div id="tender-workspace-pane" hidden>
             <div class="panel-heading tender-workspace-heading"><div><h3>Позиции из Excel</h3><p id="tender-workspace-summary"></p></div><button class="button text" type="button" id="tender-delete-workspace">Удалить тендер</button></div>
-            <div class="tender-sourcing-toolbar"><button class="button primary" type="button" id="tender-sourcing-button">Подобрать предложения</button><p class="hint" id="tender-last-run" role="status">Последние запуски ещё не загружены.</p><button class="button text" type="button" id="tender-open-latest-run" hidden>Открыть последний подбор</button></div>
+            <div class="tender-sourcing-toolbar"><button class="button primary" type="button" id="tender-sourcing-button">Подобрать предложения</button><p class="hint" id="tender-last-run" role="status">Последние запуски ещё не загружены.</p><button class="button text" type="button" id="tender-open-latest-run" hidden>Открыть последний подбор</button><label class="field-label" for="tender-run-history">Сохранённые запуски</label><select class="input" id="tender-run-history" aria-label="Сохранённые запуски тендера"></select><button class="button text" type="button" id="tender-open-selected-run" disabled>Открыть запуск</button></div>
             <div class="tender-price-export">
               <div class="tender-price-export-controls">
                 <label class="field-label" for="tender-export-run">Завершённый запуск</label>
@@ -162,6 +162,7 @@
                 <button class="button ghost" type="button" id="tender-export-download" disabled>Скачать готовый файл</button>
               </div>
               <p class="hint" id="tender-export-status" role="status" aria-live="polite">Выберите завершённый запуск.</p>
+              <p class="hint" id="tender-export-v2-note" role="status" hidden>Для сравнения поставщиков выгрузка XLSX недоступна. Можно выбрать завершённый запуск поставщика, если он есть.</p>
               <p class="hint">Исторические цены 1С включаются только после отдельного подтверждения и отражают прошлые покупки, а не текущую доступность.</p>
             </div>
             <label class="field-label" for="tender-row-search">Поиск позиций</label>
@@ -443,6 +444,12 @@
           <div class="sourcing-mode-status"><p id="sourcing-history-status" role="status">Проверяем доступность истории 1С…</p><button class="button text" type="button" id="sourcing-history-refresh">Обновить статус</button></div>
           <p id="sourcing-mode-change-note" class="sourcing-mode-change-note" role="status" hidden>Режим изменён. Запустите подбор повторно, чтобы применить.</p>
           <p id="sourcing-stale-history-warning" class="sourcing-history-stale-warning" role="status" hidden>История 1С была обновлена после этого подбора. Запустите подбор повторно, чтобы использовать новый отчёт.</p>
+        </section>
+        <section id="multi-provider-panel" class="multi-provider-panel" aria-label="Сравнение поставщиков" hidden>
+          <label class="multi-provider-toggle"><input id="multi-provider-toggle" type="checkbox"> Сравнить предложения двух поставщиков</label>
+          <div id="multi-provider-options" class="multi-provider-options" hidden></div>
+          <p id="multi-provider-warning" class="sourcing-warning" role="note" hidden>Запросы будут отправлены выбранным поставщикам; им передадутся только выбранные позиции. Победитель может отсутствовать. Экспорт XLSX для этого режима недоступен.</p>
+          <p id="multi-provider-admission" class="mode-status warning" role="status" hidden></p>
         </section>
         <div class="modal-footer"><button class="button primary" type="button" id="tender-sourcing-submit" hidden>Запустить подбор по выбранным строкам</button></div>
         <div id="sourcing-content" class="sourcing-content"><p class="hint">Выберите позицию, чтобы начать поиск.</p></div>

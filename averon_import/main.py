@@ -95,6 +95,14 @@ from averon_import.services.manual_tenders.sourcing import (
     TenderSourcingRunStore,
     canonical_tender_projection,
 )
+from averon_import.services.manual_tenders.multi_provider_orchestration import (
+    MultiProviderOrchestrationCode,
+    MultiProviderOrchestrationError,
+    capture_multi_provider_tender_snapshot,
+    execute_multi_provider_tender_run,
+)
+from averon_import.services.manual_tenders.multi_provider_public import project_multi_provider_summary
+from averon_import.services.sourcing.providers.contracts import ProviderSelection
 from averon_import.services.manual_tenders.price_export import (
     XLSX_MIME,
     TenderPriceExportRepository,
@@ -2214,6 +2222,7 @@ class ManualTenderSourcingRequest(BaseModel):
     source_row_ids: list[StrictStr] = Field(min_length=1, max_length=500)
     source_mode: SourcingSourceMode
     provider: StrictStr | None = Field(default=None, min_length=1, max_length=100)
+    providers: list[StrictStr] | None = Field(default=None, max_length=8)
     limit: StrictInt = Field(default=20, ge=1, le=100)
 
     @field_validator("source_row_ids")
@@ -2457,12 +2466,163 @@ def _submit_manual_tender_sourcing(
         raise
 
 
+_M4A_PROVIDER_LABELS = {"etm_ipro": "ЭТМ iPRO", "lemana_b2b": "Лемана ПРО"}
+
+
+@app.get("/api/manual-tenders/sourcing/multi-provider-capabilities", dependencies=[Depends(require_authenticated)])
+def get_multi_provider_sourcing_capabilities(_user: CurrentUser = Depends(require_authenticated)):
+    with _sourcing_runtime_lock:
+        runtime = sourcing_runtime
+        available = set(runtime.execution_provider_keys)
+    providers = [
+        {"key": key, "label": _M4A_PROVIDER_LABELS[key]}
+        for key in ("etm_ipro", "lemana_b2b") if key in available
+    ]
+    return {
+        "enabled": len(providers) == 2,
+        "source_mode": SourcingSourceMode.PROVIDER_ONLY.value,
+        "providers": providers,
+        "min_providers": 2,
+        "max_providers": 2,
+        "max_rows": 100,
+        "max_result_limit": 20,
+        "export_supported": False,
+    }
+
+
+def _submit_manual_tender_multi_provider(
+    tender_id: str,
+    request: ManualTenderSourcingRequest,
+    user: CurrentUser,
+) -> dict[str, Any]:
+    if request.providers is None:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_SELECTION_REQUIRED",
+            "message": "Выберите обоих поставщиков для сравнения.",
+        })
+    if request.source_mode != SourcingSourceMode.PROVIDER_ONLY:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_MODE_UNSUPPORTED",
+            "message": "Сравнение доступно только для поиска у поставщиков.",
+        })
+    if request.provider is not None:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_LEGACY_PROVIDER_FORBIDDEN",
+            "message": "Для сравнения используйте список поставщиков.",
+        })
+    if len(request.providers) != 2 or len(set(request.providers)) != 2:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_SELECTION_INVALID",
+            "message": "Нужно выбрать двух разных доступных поставщиков.",
+        })
+    if any(key not in _M4A_PROVIDER_LABELS for key in request.providers):
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": "Один или несколько выбранных поставщиков недоступны.",
+        })
+    if len(request.source_row_ids) > 100:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_ROW_LIMIT",
+            "message": "Для сравнения можно выбрать не более 100 позиций.",
+        })
+    if request.limit > 20:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_RESULT_LIMIT",
+            "message": "Для сравнения можно запросить не более 20 предложений у поставщика.",
+        })
+
+    with _sourcing_runtime_lock:
+        runtime = sourcing_runtime
+        service = runtime.service
+        available = set(runtime.execution_provider_keys)
+    if not set(request.providers).issubset(available) or service.provider_runner is None:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": "Один или несколько выбранных поставщиков недоступны.",
+        })
+    try:
+        selection = ProviderSelection(provider_keys=tuple(request.providers))
+    except Exception:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_SELECTION_INVALID",
+            "message": "Нужно выбрать двух разных доступных поставщиков.",
+        }) from None
+
+    repository = tender_repository
+    run_store = tender_sourcing_runs
+    owner_id = _tender_owner_key(user)
+    try:
+        snapshot = capture_multi_provider_tender_snapshot(repository, tender_id, owner_id)
+        workspace_path, _ = repository.workspace_path(tender_id, owner_id)
+        if workspace_path.resolve() != snapshot.workspace_path.resolve():
+            raise TenderWorkspaceError("Данные тендера изменились до начала подбора.", 409, "TENDER_WORKSPACE_CHANGED")
+        metadata = repository.verify_sourcing_snapshot(
+            workspace_path, tender_id, owner_id,
+            source_sha256=snapshot.source_sha256, revision=snapshot.workspace_revision,
+        )
+        if _tender_sourcing_integrity_fingerprint(metadata) != snapshot.source_fingerprint:
+            raise TenderWorkspaceError("Данные тендера изменились до начала подбора.", 409, "TENDER_WORKSPACE_CHANGED")
+        source_rows = metadata.get("rows")
+        if not isinstance(source_rows, list):
+            raise TenderWorkspaceError("Строки тендера повреждены.", 409, "TENDER_WORKSPACE_CORRUPT")
+        TenderSourcingRowAdapter.selected_rows(source_rows, list(request.source_row_ids))
+    except MultiProviderOrchestrationError:
+        raise HTTPException(409, detail={
+            "code": MultiProviderOrchestrationCode.SNAPSHOT_CHANGED.value,
+            "message": "Данные тендера изменились. Обновите тендер и повторите попытку.",
+        }) from None
+    except (TenderWorkspaceError, TenderActivityConflict) as exc:
+        raise _tender_http_error(exc) from exc
+
+    source_mode = SourcingSourceMode.PROVIDER_ONLY
+    selected_ids = tuple(request.source_row_ids)
+    dedupe_key = stable_fingerprint({
+        "kind": "manual_tender_multi_provider_m4a_v1",
+        "tender_id": tender_id,
+        "source_sha256": snapshot.source_sha256,
+        "workspace_revision": snapshot.workspace_revision,
+        "source_row_ids": sorted(selected_ids),
+        "provider_keys": selection.provider_keys,
+        "source_mode": source_mode.value,
+        "limit": request.limit,
+    })
+
+    def run(progress):
+        result = execute_multi_provider_tender_run(
+            snapshot=snapshot,
+            selection=selection,
+            selected_source_row_ids=selected_ids,
+            source_mode=source_mode,
+            service=service,
+            store=run_store,
+            limit=request.limit,
+            progress=progress,
+        )
+        summary = project_multi_provider_summary(result.run)
+        summary["run_status"] = summary.pop("status")
+        summary["positions_total"] = len(selected_ids)
+        summary["positions_processed"] = len(result.run.rows)
+        summary["failure_code"] = result.failure_code.value if result.failure_code else None
+        return summary
+
+    try:
+        job = job_service.submit(
+            run, lane=SOURCING, kind="manual_tender_multi_provider_m4a",
+            owner_id=_job_owner_id(user), dedupe_key=dedupe_key,
+        )
+    except JobAdmissionError as exc:
+        raise _job_admission_http_error(exc) from exc
+    return job.public()
+
+
 @app.post("/api/manual-tenders/{tender_id}/sourcing", status_code=202, dependencies=[Depends(require_authenticated)])
 def start_manual_tender_sourcing(
     tender_id: str,
     request: ManualTenderSourcingRequest,
     user: CurrentUser = Depends(require_authenticated),
 ):
+    if "providers" in request.model_fields_set:
+        return _submit_manual_tender_multi_provider(tender_id, request, user)
     return _submit_manual_tender_sourcing(tender_id, request, user)
 
 
@@ -2471,7 +2631,7 @@ def list_manual_tender_runs(tender_id: str, user: CurrentUser = Depends(require_
     lease = None
     try:
         path, metadata, lease = _tender_run_snapshot(tender_id, _tender_owner_key(user))
-        return tender_sourcing_runs.list_public(path, metadata["tender_id"])
+        return tender_sourcing_runs.list_public_mixed(path, metadata["tender_id"])
     except Exception as exc:
         if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
             raise _tender_http_error(exc) from exc
@@ -2490,7 +2650,7 @@ def get_manual_tender_run(
     lease = None
     try:
         path, metadata, lease = _tender_run_snapshot(tender_id, _tender_owner_key(user))
-        return tender_sourcing_runs.get_public(path, metadata["tender_id"], run_id)
+        return tender_sourcing_runs.get_public_mixed(path, metadata["tender_id"], run_id)
     except Exception as exc:
         if isinstance(exc, (TenderWorkspaceError, TenderActivityConflict)):
             raise _tender_http_error(exc) from exc

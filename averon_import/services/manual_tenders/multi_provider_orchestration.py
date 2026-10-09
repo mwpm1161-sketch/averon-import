@@ -112,6 +112,7 @@ def execute_multi_provider_tender_run(
     *, snapshot: MultiProviderTenderSnapshot, selection: ProviderSelection,
     selected_source_row_ids: tuple[str, ...], source_mode: SourcingSourceMode,
     service: SourcingService, store: TenderSourcingRunStore, limit: int = 20,
+    progress: Callable[[int, int, str], None] | None = None,
     clock: Callable[[], datetime] = _now,
 ) -> MultiProviderTenderRunResult:
     """Run sequential exact row chains and persist exactly one terminal v2.
@@ -181,6 +182,12 @@ def execute_multi_provider_tender_run(
                     identities[source["source_row_id"]], execution=execution,
                     matching=matching, commercial=commercial, selection=winner,
                 ))
+                if progress is not None:
+                    try:
+                        progress(len(rows), len(adapted), "Обработано позиций")
+                    except Exception:
+                        # Progress is observational; it must never change run results.
+                        pass
             except ProviderRunnerConfigurationError:
                 raise MultiProviderOrchestrationError(code.PROVIDER_CONFIGURATION, run_id) from None
             except DurableProjectionError as exc:

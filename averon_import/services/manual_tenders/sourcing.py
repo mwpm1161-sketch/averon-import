@@ -400,6 +400,48 @@ class TenderSourcingRunStore:
         run.pop(HISTORY_TEXT_POOL_KEY, None)
         return run
 
+    def list_public_mixed(self, workspace_path: Path, tender_id: str) -> dict[str, Any]:
+        """List v1 and public-contract v2 summaries without changing v1 fields."""
+        from .durable_read import DurableTenderSourcingRunV2
+        from .multi_provider_public import project_multi_provider_summary
+
+        with self._lock, self.repository._lock:
+            items = list(self.list_public(workspace_path, tender_id)["runs"])
+            runs = workspace_path / "runs"
+            if runs.is_dir():
+                for path in runs.glob("[a-f0-9]" * 32 + ".json"):
+                    try:
+                        record = self._read_any_path(path, tender_id=tender_id)
+                    except TenderWorkspaceError:
+                        continue
+                    if not isinstance(record, DurableTenderSourcingRunV2):
+                        continue
+                    try:
+                        items.append(project_multi_provider_summary(record))
+                    except (TypeError, ValueError):
+                        # Internal v2 records outside the public M4A provider
+                        # selection contract are never exposed through this API.
+                        continue
+            items.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("run_id") or "")), reverse=True)
+            return {"runs": items[:MAX_TENDER_RUNS_PER_WORKSPACE]}
+
+    def get_public_mixed(self, workspace_path: Path, tender_id: str, run_id: str) -> dict[str, Any]:
+        """Read a v1 detail unchanged or return the strict public v2 projection."""
+        from .durable_read import DurableTenderSourcingRunV2
+        from .multi_provider_public import project_multi_provider_run
+
+        with self._lock, self.repository._lock:
+            path = self._path(workspace_path, run_id)
+            record = self._read_any_path(path, tender_id=tender_id)
+            if isinstance(record, dict):
+                return self.get_public(workspace_path, tender_id, run_id)
+            if not isinstance(record, DurableTenderSourcingRunV2):
+                raise TenderWorkspaceError("Запуск подбора не найден.")
+            try:
+                return project_multi_provider_run(record)
+            except (TypeError, ValueError):
+                raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT") from None
+
 
 def _safe_match(match: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(match, dict):
