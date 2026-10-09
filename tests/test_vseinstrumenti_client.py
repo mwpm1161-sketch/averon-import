@@ -190,8 +190,9 @@ def test_fake_clock_and_sleeper_enforce_sliding_window_and_single_slot():
     for _ in range(4):
         with limiter.request_slot():
             starts.append(now[0])
-    assert starts == [0.0, 0.0, 60.0, 60.0]
-    assert sleeps == [60.0]
+    assert starts[:2] == [0.0, 0.0]
+    assert starts[2:] == pytest.approx([60.0, 60.0])
+    assert sleeps[0] > 60.0
 
 
 def test_limiter_rejects_configuration_above_documented_rpm():
@@ -199,6 +200,85 @@ def test_limiter_rejects_configuration_above_documented_rpm():
         VseinstrumentiRateLimiter(max_requests=101)
     with pytest.raises(ValueError):
         VseinstrumentiRateLimiter(max_requests=1, window_seconds=0.1)
+    with pytest.raises(ValueError):
+        VseinstrumentiRateLimiter(max_requests=66, window_seconds=40)
+
+
+def test_limiter_rejects_66_requests_per_40_seconds_counterexample():
+    now = [0.0]
+    sleeps = []
+
+    def sleeper(delay):
+        sleeps.append(delay)
+        now[0] += delay
+
+    with pytest.raises(ValueError, match="60-second window"):
+        VseinstrumentiRateLimiter(
+            max_requests=66,
+            window_seconds=40,
+            clock=lambda: now[0],
+            sleeper=sleeper,
+        )
+    assert now == [0.0]
+    assert sleeps == []
+
+    limiter = VseinstrumentiRateLimiter(
+        max_requests=66,
+        clock=lambda: now[0],
+        sleeper=sleeper,
+    )
+    starts = []
+    for _ in range(66):
+        with limiter.request_slot():
+            starts.append(now[0])
+    now[0] = 40.0
+    with limiter.request_slot():
+        starts.append(now[0])
+
+    assert starts[:66] == [0.0] * 66
+    assert starts[-1] > 60.0
+    assert sleeps[0] > 20.0
+
+
+def test_response_parser_accepts_exact_requested_and_global_page_limits():
+    limited_products = [dict(_product(), sku=f"limit-{index}") for index in range(5)]
+    requested_boundary = parse_product_search_result(
+        _payload(*limited_products),
+        expected_search=SEARCH,
+        expected_region_id=REGION,
+        requested_limit=5,
+    )
+    global_boundary = parse_product_search_result(
+        _payload(*(dict(_product(), sku=f"global-{index}") for index in range(40))),
+        expected_search=SEARCH,
+        expected_region_id=REGION,
+        requested_limit=40,
+    )
+
+    assert len(requested_boundary.products) == 5
+    assert len(global_boundary.products) == 40
+
+
+def test_response_parser_rejects_raw_entries_over_requested_limit_before_normalization():
+    transport = FakeTransport(_response(_payload(*[_product() for _ in range(6)])))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, limit=5)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert transport.requests
+
+
+def test_response_parser_rejects_more_than_global_maximum_raw_product_entries():
+    payload = _payload(*(dict(_product(), sku=f"overflow-{index}") for index in range(41)))
+
+    with pytest.raises(VseinstrumentiResponseError, match="requested page limit"):
+        parse_product_search_result(
+            payload,
+            expected_search=SEARCH,
+            expected_region_id=REGION,
+            requested_limit=40,
+        )
 
 
 @pytest.mark.parametrize("status,category", [
@@ -447,7 +527,8 @@ def test_supplied_clock_and_limiter_are_used_without_startup_requests():
     assert transport.requests == []
     client.search_products(SEARCH, region_id=REGION)
     client.search_products(SEARCH, region_id=REGION)
-    assert sleeps == [60.0]
+    assert len(sleeps) == 1
+    assert sleeps[0] > 60.0
     assert len(transport.requests) == 2
 
 

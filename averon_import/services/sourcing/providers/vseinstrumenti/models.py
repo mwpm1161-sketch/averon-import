@@ -16,6 +16,7 @@ MAX_BRAND_LENGTH = 100
 MAX_UNIT_LENGTH = 80
 MAX_URL_LENGTH = 500
 MAX_SPEC_TEXT_LENGTH = 500
+MAX_PRODUCTS_PER_PAGE = 40
 _DECIMAL_TEXT = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
@@ -182,7 +183,13 @@ def _product(value: object) -> VseinstrumentiProduct:
     )
 
 
-def parse_product_search_result(payload: object, *, expected_search: str, expected_region_id: str) -> VseinstrumentiProductSearchResult:
+def parse_product_search_result(
+    payload: object,
+    *,
+    expected_search: str,
+    expected_region_id: str,
+    requested_limit: int = MAX_PRODUCTS_PER_PAGE,
+) -> VseinstrumentiProductSearchResult:
     """Strictly parse the documented search envelope without inferring facts.
 
     The PDF calls ``products`` an object but its response example is an array.
@@ -190,6 +197,8 @@ def parse_product_search_result(payload: object, *, expected_search: str, expect
     unambiguous empty-object representation); non-empty objects are rejected.
     """
 
+    if type(requested_limit) is not int or not 1 <= requested_limit <= MAX_PRODUCTS_PER_PAGE:
+        raise VseinstrumentiResponseError("requested product limit is outside its allowed bounds")
     if not isinstance(payload, dict):
         raise VseinstrumentiResponseError("response must be an object")
     result = payload.get("result")
@@ -206,6 +215,8 @@ def parse_product_search_result(payload: object, *, expected_search: str, expect
         raw_products = []
     if not isinstance(raw_products, list):
         raise VseinstrumentiResponseError("result.products must be an array or empty object")
+    if len(raw_products) > requested_limit:
+        raise VseinstrumentiResponseError("response contains more products than the requested page limit")
 
     products: list[VseinstrumentiProduct] = []
     seen: dict[str, tuple[VseinstrumentiProduct, dict[str, Any]]] = {}

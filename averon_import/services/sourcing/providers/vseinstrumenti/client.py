@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterator
 from urllib.parse import urlencode, urlsplit
 
 from .models import (
+    MAX_PRODUCTS_PER_PAGE,
     VseinstrumentiProductSearchResult,
     VseinstrumentiResponseError,
     parse_product_search_result,
@@ -29,7 +30,7 @@ VSEINSTRUMENTI_API_BASE_URLS = {
     "test": "https://api.vseinstrumenti.ru/open-api/dev",
 }
 VSEINSTRUMENTI_PRODUCTS_PATH = "/v1/products"
-VSEINSTRUMENTI_MAX_PAGE_SIZE = 40
+VSEINSTRUMENTI_MAX_PAGE_SIZE = MAX_PRODUCTS_PER_PAGE
 VSEINSTRUMENTI_MAX_RPM = 100
 VSEINSTRUMENTI_RATE_WINDOW_SECONDS = 60.0
 VSEINSTRUMENTI_DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -96,10 +97,8 @@ class VseinstrumentiRateLimiter:
             window = float(window_seconds)
         except (TypeError, ValueError, OverflowError):
             raise ValueError("window_seconds must be finite and positive") from None
-        if not math.isfinite(window) or window <= 0 or window > 3600:
-            raise ValueError("window_seconds must be finite and positive")
-        if max_requests * VSEINSTRUMENTI_RATE_WINDOW_SECONDS > VSEINSTRUMENTI_MAX_RPM * window:
-            raise ValueError("limiter settings must not exceed the documented VI RPM")
+        if not math.isfinite(window) or window != VSEINSTRUMENTI_RATE_WINDOW_SECONDS:
+            raise ValueError("window_seconds must equal the documented 60-second window")
         self.max_requests = max_requests
         self.window_seconds = window
         self._clock = clock
@@ -117,12 +116,17 @@ class VseinstrumentiRateLimiter:
             while True:
                 with self._lock:
                     now = self._clock()
-                    while self._timestamps and now - self._timestamps[0] >= self.window_seconds:
+                    while self._timestamps and now >= math.nextafter(
+                        self._timestamps[0] + self.window_seconds, math.inf
+                    ):
                         self._timestamps.popleft()
                     if len(self._timestamps) < self.max_requests:
                         self._timestamps.append(now)
                         break
-                    wait = self.window_seconds - (now - self._timestamps[0])
+                    next_expiry = math.nextafter(
+                        self._timestamps[0] + self.window_seconds, math.inf
+                    )
+                    wait = next_expiry - now
                 self._sleeper(max(wait, 0.0))
             yield
         finally:
@@ -391,7 +395,10 @@ class VseinstrumentiClient:
                     )
                 raise _status_error(api_status, raw)
             return parse_product_search_result(
-                payload, expected_search=search, expected_region_id=region_id,
+                payload,
+                expected_search=search,
+                expected_region_id=region_id,
+                requested_limit=limit,
             )
         except VseinstrumentiApiError:
             raise
