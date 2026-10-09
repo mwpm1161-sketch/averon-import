@@ -23,6 +23,7 @@ from .models import (
     VseinstrumentiResponseError,
     parse_product_search_result,
 )
+from ..outbound import OutboundAttemptObserver
 
 
 VSEINSTRUMENTI_API_BASE_URLS = {
@@ -323,9 +324,14 @@ class VseinstrumentiClient:
         limit: int = VSEINSTRUMENTI_MAX_PAGE_SIZE,
         sort: str = "asc",
         order_by: str = "price",
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> VseinstrumentiProductSearchResult:
         """Search one page at offset zero; no retries or follow-up requests."""
 
+        if (outbound_attempt_observer is not None and not callable(
+            getattr(outbound_attempt_observer, "record_outbound_attempt", None)
+        )):
+            raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED) from None
         if not isinstance(search, str):
             raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED) from None
         search = search.strip()
@@ -356,6 +362,8 @@ class VseinstrumentiClient:
         try:
             with self.rate_limiter.request_slot():
                 try:
+                    if outbound_attempt_observer is not None:
+                        outbound_attempt_observer.record_outbound_attempt()
                     response = self._transport(request, self.timeout_seconds)
                 except urllib.error.HTTPError as exc:
                     try:

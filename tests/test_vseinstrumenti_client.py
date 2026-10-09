@@ -25,6 +25,7 @@ from averon_import.services.sourcing.providers.vseinstrumenti.models import (
     VseinstrumentiResponseError,
     parse_product_search_result,
 )
+from averon_import.services.sourcing.providers.execution import ProviderRequestCounter
 
 
 REGION = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
@@ -120,6 +121,47 @@ def test_search_builds_documented_one_page_request_with_bearer_header_only():
     assert response.closed
     assert result.region_id == REGION
     assert len(result.products) == 1
+
+
+def test_outbound_observer_runs_once_immediately_before_transport():
+    events = []
+    response = _response(_payload(_product()))
+
+    class OrderedObserver:
+        def record_outbound_attempt(self):
+            events.append("attempt")
+
+    class OrderedTransport:
+        def __call__(self, request, timeout):
+            events.append("transport")
+            return response
+
+    client = VseinstrumentiClient(TOKEN, transport=OrderedTransport())
+    result = client.search_products(
+        SEARCH,
+        region_id=REGION,
+        outbound_attempt_observer=OrderedObserver(),
+    )
+
+    assert result.products
+    assert events == ["attempt", "transport"]
+
+
+def test_outbound_observer_is_not_called_for_local_request_refusal():
+    counter = ProviderRequestCounter()
+    transport = FakeTransport(_response(_payload(_product())))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(
+            SEARCH,
+            region_id=REGION,
+            limit=41,
+            outbound_attempt_observer=counter,
+        )
+
+    assert caught.value.category == VseinstrumentiErrorCategory.MISCONFIGURED
+    assert counter.request_count == 0
+    assert transport.requests == []
 
 
 @pytest.mark.parametrize("environment,base", [
