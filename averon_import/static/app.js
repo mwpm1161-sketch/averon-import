@@ -2274,8 +2274,8 @@ function renderMultiProviderPublicRun(run) {
   const content = $("#sourcing-content");
   const providerLabels = {etm_ipro:"ЭТМ iPRO", lemana_b2b:"Лемана ПРО"};
   const outcomeLabels = {
-    SUCCESS:"Поиск завершён", EMPTY:"Предложения не найдены", PARTIAL_SUCCESS:"Поиск завершён частично",
-    FAILURE:"Ошибка поставщика", SUPPRESSED:"Запрос не выполнен", NOT_ATTEMPTED:"Запрос не выполнялся",
+    success:"Поиск завершён", empty:"Предложения не найдены", partial_success:"Поиск завершён частично",
+    failure:"Ошибка поставщика", suppressed:"Запрос не выполнен", not_attempted:"Запрос не выполнялся",
   };
   const decisionLabels = {MATCH:"Совпадение", LIKELY_MATCH:"Вероятное совпадение", ALTERNATIVE:"Альтернатива", REVIEW:"Нужна проверка", REJECT:"Не подходит"};
   const reasonLabels = {
@@ -2302,8 +2302,9 @@ function renderMultiProviderPublicRun(run) {
     const evidence = new Map((row.commercial_evidence || []).map((item) => [JSON.stringify([item.provider_key, item.offer_id]), item]));
     const selection = row.commercial_selection || {};
     const selectedKey = refKey(selection.selected_reference);
-    const allFailed = (row.provider_outcomes || []).length > 0 && row.provider_outcomes.every((item) => ["FAILURE", "SUPPRESSED", "NOT_ATTEMPTED"].includes(item.state));
-    const outcomes = (row.provider_outcomes || []).map((item) => {
+    const providerOutcomes = row.provider_outcomes || [];
+    const allFailed = providerOutcomes.length > 0 && providerOutcomes.every((item) => item.state === "failure");
+    const outcomes = providerOutcomes.map((item) => {
       const label = providerLabels[item.provider_key] || "Поставщик";
       const returned = Number(item.offers_returned_count || 0);
       const retained = Number(item.retained_offer_count || 0);

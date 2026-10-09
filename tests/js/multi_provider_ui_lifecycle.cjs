@@ -9,6 +9,23 @@ function sliceBetween(startText, endText) {
   return source.slice(start, end);
 }
 function assert(condition, message) { if (!condition) throw new Error(message); }
+const serializedProviderOutcomes = JSON.parse(process.env.M4A_PUBLIC_PROVIDER_OUTCOMES || JSON.stringify([
+  "success", "empty", "partial_success", "failure", "suppressed", "not_attempted",
+].map(state => ({provider_key:"etm_ipro",state,offers_returned_count:0,retained_offer_count:0,failure_category:null}))));
+function publicOutcome(providerKey, state, overrides = {}) {
+  const serialized = serializedProviderOutcomes.find(item => item.state === state);
+  if (!serialized) throw new Error(`Missing serialized public provider outcome: ${state}`);
+  return {...serialized, provider_key:providerKey, ...overrides};
+}
+
+function renderPublicRun(run) {
+  const node = {innerHTML:""};
+  const subtitle = {textContent:""};
+  const context = {$: selector => selector === "#sourcing-content" ? node : selector === "#sourcing-subtitle" ? subtitle : {open:false}, setSourcingModalPhase() {}, escapeHtml: value => String(value)};
+  const renderer = sliceBetween("function renderMultiProviderPublicRun(run) {", "async function openExcelTenderRunDetail(runId = null)");
+  vm.runInNewContext(`${renderer}; renderMultiProviderPublicRun(${JSON.stringify(run)});`, context);
+  return {html:node.innerHTML, subtitle:subtitle.textContent};
+}
 
 async function testLazyCapabilitiesAndProtectedChoice() {
   const functions = sliceBetween("function resetExcelMultiProviderChoice() {", "function openSourcingModal() {")
@@ -105,16 +122,12 @@ async function testSelectionCapAndExplicitRequestHandshake() {
 }
 
 function testCompositeIdentityAndFailedRendering() {
-  const renderer = sliceBetween("function renderMultiProviderPublicRun(run) {", "async function openExcelTenderRunDetail(runId = null)");
-  const node = {innerHTML:""};
-  const subtitle = {textContent:""};
-  const context = {$: selector => selector === "#sourcing-content" ? node : selector === "#sourcing-subtitle" ? subtitle : {open:false}, setSourcingModalPhase() {}, escapeHtml: value => String(value)};
   const run = {
     status:"failed", selected_positions:1, evaluated_positions:1, safe_winner_rows:1, no_safe_winner_rows:0, partial_failure_rows:1,
     rows:[{excel_row:8, partial_failure:true,
       provider_outcomes:[
-        {provider_key:"etm_ipro",state:"PARTIAL_SUCCESS",offers_returned_count:7,retained_offer_count:1},
-        {provider_key:"lemana_b2b",state:"SUCCESS",offers_returned_count:1,retained_offer_count:1},
+        publicOutcome("etm_ipro", "partial_success", {offers_returned_count:7,retained_offer_count:1}),
+        publicOutcome("lemana_b2b", "success", {offers_returned_count:1,retained_offer_count:1}),
       ],
       offers:[
         {provider_key:"etm_ipro",offer_id:"same-id",title:"ETM winner",price:"0.123456789012345678901",currency:"RUB",price_unit:"шт",availability:null,availability_text:"",url:"https://etm.example/item"},
@@ -125,13 +138,53 @@ function testCompositeIdentityAndFailedRendering() {
       commercial_selection:{state:"SELECTED",selected_reference:{provider_key:"etm_ipro",offer_id:"same-id"},candidate_references:[{provider_key:"etm_ipro",offer_id:"same-id"},{provider_key:"lemana_b2b",offer_id:"same-id"}],selection_basis:"SOLE_STRONGEST_IDENTITY",reason_codes:[]},
     }],
   };
-  vm.runInNewContext(`${renderer}; renderMultiProviderPublicRun(${JSON.stringify(run)});`, context);
-  assert(subtitle.textContent.includes("завершился ошибкой после сохранения безопасно обработанных строк"), "Persisted FAILED runs should render their terminal state");
-  assert(node.innerHTML.includes("Поставщик вернул 7 предложений. Показаны варианты, участвовавшие в решении."), "Returned and retained counts should be distinguished");
-  assert(node.innerHTML.includes("Коммерческая проверка нужна"), "Lemana evidence should explain the verification requirement");
-  assert(node.innerHTML.includes("0.123456789012345678901"), "Exact decimal text should be rendered without numeric coercion");
-  assert(node.innerHTML.includes('<article class="multi-provider-offer is-selected"><h4>ЭТМ iPRO: ETM winner'), "Winner identity must include provider key when offer IDs collide");
-  assert(node.innerHTML.includes('<article class="multi-provider-offer "><h4>Лемана ПРО: Lemana candidate'), "Same-ID other-provider offer must remain a separate candidate");
+  const rendered = renderPublicRun(run);
+  assert(rendered.subtitle.includes("завершился ошибкой после сохранения безопасно обработанных строк"), "Persisted FAILED runs should render their terminal state");
+  assert(rendered.html.includes("Поиск завершён частично") && rendered.html.includes("Поиск завершён"), "Lowercase public provider states should render localized labels");
+  assert(rendered.html.includes("Один из поставщиков завершил поиск с частичной ошибкой."), "Partial provider failure should remain explicit");
+  assert(rendered.html.includes("Поставщик вернул 7 предложений. Показаны варианты, участвовавшие в решении."), "Returned and retained counts should be distinguished");
+  assert(rendered.html.includes("Коммерческая проверка нужна"), "Lemana evidence should explain the verification requirement");
+  assert(rendered.html.includes("0.123456789012345678901"), "Exact decimal text should be rendered without numeric coercion");
+  assert(rendered.html.includes('<article class="multi-provider-offer is-selected"><h4>ЭТМ iPRO: ETM winner'), "Winner identity must include provider key when offer IDs collide");
+  assert(rendered.html.includes('<article class="multi-provider-offer "><h4>Лемана ПРО: Lemana candidate'), "Same-ID other-provider offer must remain a separate candidate");
+}
+
+function testAllProviderStatesAndFailureClassification() {
+  const labels = new Map([
+    ["success", "Поиск завершён"], ["empty", "Предложения не найдены"],
+    ["partial_success", "Поиск завершён частично"], ["failure", "Ошибка поставщика"],
+    ["suppressed", "Запрос не выполнен"], ["not_attempted", "Запрос не выполнялся"],
+  ]);
+  for (const [state, label] of labels) {
+    const rendered = renderPublicRun({status:"completed",selected_positions:1,evaluated_positions:1,safe_winner_rows:0,no_safe_winner_rows:1,partial_failure_rows:0,rows:[{
+      excel_row:12,partial_failure:false,
+      provider_outcomes:[publicOutcome("etm_ipro", state),publicOutcome("lemana_b2b", "success")],
+      offers:[],matches:[],commercial_evidence:[],recommended_reference:null,review_candidate_reference:null,
+      commercial_selection:{state:"NO_SAFE_WINNER",selected_reference:null,candidate_references:[],reason_codes:["COMMERCIAL_BASIS_NOT_COMPARABLE"],selection_basis:null},
+    }]});
+    assert(rendered.html.includes(label), `Public provider state ${state} must have a localized label`);
+    assert(rendered.html.includes("Цены нельзя безопасно сравнить"), "No-safe-winner reason must remain visible");
+    assert(rendered.html.includes("Безопасный победитель не определён."), "No-safe-winner result must remain distinct from a selected offer");
+    assert(!rendered.html.includes("Все выбранные поставщики завершили поиск ошибкой."), `${state} plus a success must not be classified as all failed`);
+  }
+
+  const allFailed = renderPublicRun({status:"completed",selected_positions:1,evaluated_positions:1,safe_winner_rows:0,no_safe_winner_rows:1,partial_failure_rows:0,rows:[{
+    excel_row:12,partial_failure:false,
+    provider_outcomes:[publicOutcome("etm_ipro", "failure"),publicOutcome("lemana_b2b", "failure")],
+    offers:[],matches:[],commercial_evidence:[],recommended_reference:null,review_candidate_reference:null,
+    commercial_selection:{state:"NO_SAFE_WINNER",selected_reference:null,candidate_references:[],reason_codes:["NO_IDENTITY_CANDIDATE"],selection_basis:null},
+  }]});
+  assert(allFailed.html.includes("Все выбранные поставщики завершили поиск ошибкой."), "Only genuine all-provider failure outcomes should use the all-failed message");
+  assert(allFailed.html.includes("Нет кандидата с подходящим совпадением"), "All-failed rows should retain the safe selection reason");
+
+  const nonFailureTerminalStates = renderPublicRun({status:"completed",selected_positions:1,evaluated_positions:1,safe_winner_rows:0,no_safe_winner_rows:1,partial_failure_rows:0,rows:[{
+    excel_row:12,partial_failure:false,
+    provider_outcomes:[publicOutcome("etm_ipro", "suppressed"),publicOutcome("lemana_b2b", "not_attempted")],
+    offers:[],matches:[],commercial_evidence:[],recommended_reference:null,review_candidate_reference:null,
+    commercial_selection:{state:"NO_SAFE_WINNER",selected_reference:null,candidate_references:[],reason_codes:["NO_IDENTITY_CANDIDATE"],selection_basis:null},
+  }]});
+  assert(nonFailureTerminalStates.html.includes("Запрос не выполнен") && nonFailureTerminalStates.html.includes("Запрос не выполнялся"), "Suppressed and not-attempted states must keep their own wire labels");
+  assert(!nonFailureTerminalStates.html.includes("Все выбранные поставщики завершили поиск ошибкой."), "Suppressed/not-attempted outcomes are not provider failures");
 }
 
 async function testSavedV2RunDoesNotRequestHistoryDecisions() {
@@ -160,5 +213,6 @@ Promise.all([
   testSavedV2RunDoesNotRequestHistoryDecisions(),
 ]).then(() => {
   testCompositeIdentityAndFailedRendering();
+  testAllProviderStatesAndFailureClassification();
   process.stdout.write("PASS: M4A lazy opt-in, provider-only request lifecycle, safe v2 rendering, and saved-run retrieval\n");
 }).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
