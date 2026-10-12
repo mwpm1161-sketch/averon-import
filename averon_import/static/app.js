@@ -1186,11 +1186,12 @@ function renderExcelMultiProviderPanel() {
   const capabilities = state.excelTender.multiProviderCapabilities;
   if (!enabled || !capabilities) return;
   const available = Array.isArray(capabilities.providers) ? capabilities.providers : [];
-  const allowed = available.filter((item) => ["etm_ipro", "lemana_b2b"].includes(item?.key));
-  if (capabilities.enabled !== true || allowed.length !== 2) {
+  const allowed = available.filter((item) => ["etm_ipro", "lemana_b2b", "vseinstrumenti"].includes(item?.key));
+  const minProviders = Number(capabilities.min_providers || 2);
+  if (capabilities.enabled !== true || allowed.length < minProviders) {
     if (admission) {
       admission.hidden = false;
-      admission.textContent = "Сравнение двух поставщиков сейчас недоступно.";
+      admission.textContent = "Сравнение нескольких поставщиков сейчас недоступно.";
     }
     return;
   }
@@ -1241,8 +1242,9 @@ async function handleExcelMultiProviderToggle(event) {
   try {
     const capabilities = await loadExcelMultiProviderCapabilities(tenderId);
     if (state.excelTender.workspace?.tender_id !== tenderId || !state.excelTender.multiProviderEnabled) return;
-    if (!capabilities || capabilities.enabled !== true || !Array.isArray(capabilities.providers) || capabilities.providers.length !== 2) {
-      if (admission) { admission.hidden = false; admission.textContent = "Сравнение двух поставщиков сейчас недоступно."; }
+    if (!capabilities || capabilities.enabled !== true || !Array.isArray(capabilities.providers)
+        || capabilities.providers.length < Number(capabilities.min_providers || 2)) {
+      if (admission) { admission.hidden = false; admission.textContent = "Сравнение нескольких поставщиков сейчас недоступно."; }
     } else if (admission) admission.hidden = true;
     renderExcelMultiProviderPanel();
   } catch (error) {
@@ -1253,7 +1255,7 @@ async function handleExcelMultiProviderToggle(event) {
 
 function handleExcelMultiProviderSelection(event) {
   const key = String(event?.target?.dataset?.multiProviderKey || "");
-  if (!["etm_ipro", "lemana_b2b"].includes(key)) return;
+  if (!["etm_ipro", "lemana_b2b", "vseinstrumenti"].includes(key)) return;
   if (event.target.checked) state.excelTender.multiProviderProviders.add(key);
   else state.excelTender.multiProviderProviders.delete(key);
   const admission = $("#multi-provider-admission");
@@ -2272,7 +2274,7 @@ function applyTenderHistoryDecisionSnapshot(result, snapshot) {
 function renderMultiProviderPublicRun(run) {
   if ($("#sourcing-modal")?.open) setSourcingModalPhase("project_result", "excel_tender");
   const content = $("#sourcing-content");
-  const providerLabels = {etm_ipro:"ЭТМ iPRO", lemana_b2b:"Лемана ПРО"};
+  const providerLabels = {etm_ipro:"ЭТМ iPRO", lemana_b2b:"Лемана ПРО", vseinstrumenti:"ВсеИнструменты.ru"};
   const outcomeLabels = {
     success:"Поиск завершён", empty:"Предложения не найдены", partial_success:"Поиск завершён частично",
     failure:"Ошибка поставщика", suppressed:"Запрос не выполнен", not_attempted:"Запрос не выполнялся",
@@ -2758,9 +2760,12 @@ async function startExcelTenderSourcing() {
     return;
   }
   const providers = [...state.excelTender.multiProviderProviders].sort();
-  if (multiProvider && (providers.length !== 2 || !state.excelTender.multiProviderCapabilities?.enabled)) {
+  const capabilities = state.excelTender.multiProviderCapabilities;
+  const minProviders = Number(capabilities?.min_providers || 2);
+  const maxProviders = Number(capabilities?.max_providers || 3);
+  if (multiProvider && (providers.length < minProviders || providers.length > maxProviders || !capabilities?.enabled)) {
     const admission = $("#multi-provider-admission");
-    if (admission) { admission.hidden = false; admission.textContent = "Проверьте доступность и выберите обоих поставщиков."; }
+    if (admission) { admission.hidden = false; admission.textContent = "Проверьте доступность и выберите не менее двух поставщиков."; }
     return;
   }
   const tenderId = workspace.tender_id;

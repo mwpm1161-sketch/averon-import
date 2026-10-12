@@ -154,7 +154,7 @@ from averon_import.services.secrets import (
     create_secret_store,
     resolve_secret,
 )
-from averon_import.services.sourcing.providers.vseinstrumenti.client import is_valid_bearer_token
+from averon_import.services.sourcing.providers.vseinstrumenti.client import is_valid_bearer_token, is_valid_region_id
 from averon_import.services.support_reports import (
     DuplicateReport,
     IncidentNotFound,
@@ -2575,24 +2575,67 @@ def _submit_manual_tender_sourcing(
         raise
 
 
-_M4A_PROVIDER_LABELS = {"etm_ipro": "ЭТМ iPRO", "lemana_b2b": "Лемана ПРО"}
+_TENDER_MULTI_PROVIDER_LABELS = {
+    "etm_ipro": "ЭТМ iPRO",
+    "lemana_b2b": "Лемана ПРО",
+    "vseinstrumenti": "ВсеИнструменты.ru",
+}
+_TENDER_MULTI_PROVIDER_MIN = 2
+
+
+def _available_tender_multi_provider_keys(runtime) -> tuple[str, ...]:
+    """Return configured public tender providers without probing suppliers."""
+    registered = set(runtime.execution_provider_keys)
+    providers = getattr(runtime, "providers", {})
+    available = []
+    for key in sorted(_TENDER_MULTI_PROVIDER_LABELS):
+        if key not in registered:
+            continue
+        if key in {"etm_ipro", "lemana_b2b"}:
+            provider = providers.get(key) if isinstance(providers, dict) else None
+            try:
+                if provider is None or provider.configured is not True:
+                    continue
+            except Exception:
+                continue
+        if key == "vseinstrumenti":
+            try:
+                # Credential changes take this lock before rebuilding the
+                # runtime. Callers release _sourcing_runtime_lock first to
+                # preserve that lock order and avoid an update/capability
+                # deadlock.
+                with VI_CREDENTIAL_LOCK:
+                    vi_settings = app_settings_service.settings.sourcing.vseinstrumenti
+                    vi_adapter = getattr(runtime, "execution_providers", {}).get(key)
+                    if (not vi_settings.enabled or not is_valid_region_id(vi_settings.region_id)
+                            or vi_adapter is None
+                            or getattr(vi_adapter, "credential_generation", None) != vi_settings.credential_generation
+                            or secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+                            != vi_settings.credential_generation):
+                        continue
+            except Exception:
+                continue
+        # VI's execution registration and the current marker are both
+        # required; the token value itself is never read here.
+        available.append(key)
+    return tuple(available)
 
 
 @app.get("/api/manual-tenders/sourcing/multi-provider-capabilities", dependencies=[Depends(require_authenticated)])
 def get_multi_provider_sourcing_capabilities(_user: CurrentUser = Depends(require_authenticated)):
     with _sourcing_runtime_lock:
         runtime = sourcing_runtime
-        available = set(runtime.execution_provider_keys)
+    available = _available_tender_multi_provider_keys(runtime)
     providers = [
-        {"key": key, "label": _M4A_PROVIDER_LABELS[key]}
-        for key in ("etm_ipro", "lemana_b2b") if key in available
+        {"key": key, "label": _TENDER_MULTI_PROVIDER_LABELS[key]}
+        for key in available
     ]
     return {
-        "enabled": len(providers) == 2,
+        "enabled": len(providers) >= _TENDER_MULTI_PROVIDER_MIN,
         "source_mode": SourcingSourceMode.PROVIDER_ONLY.value,
         "providers": providers,
-        "min_providers": 2,
-        "max_providers": 2,
+        "min_providers": _TENDER_MULTI_PROVIDER_MIN,
+        "max_providers": len(_TENDER_MULTI_PROVIDER_LABELS),
         "max_rows": 100,
         "max_result_limit": 20,
         "export_supported": False,
@@ -2607,7 +2650,7 @@ def _submit_manual_tender_multi_provider(
     if request.providers is None:
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_SELECTION_REQUIRED",
-            "message": "Выберите обоих поставщиков для сравнения.",
+            "message": "Выберите не менее двух поставщиков для сравнения.",
         })
     if request.source_mode != SourcingSourceMode.PROVIDER_ONLY:
         raise HTTPException(400, detail={
@@ -2619,12 +2662,14 @@ def _submit_manual_tender_multi_provider(
             "code": "MULTI_PROVIDER_LEGACY_PROVIDER_FORBIDDEN",
             "message": "Для сравнения используйте список поставщиков.",
         })
-    if len(request.providers) != 2 or len(set(request.providers)) != 2:
+    if (len(request.providers) < _TENDER_MULTI_PROVIDER_MIN
+            or len(request.providers) > len(_TENDER_MULTI_PROVIDER_LABELS)
+            or len(set(request.providers)) != len(request.providers)):
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_SELECTION_INVALID",
-            "message": "Нужно выбрать двух разных доступных поставщиков.",
+            "message": "Нужно выбрать от двух до трёх разных доступных поставщиков.",
         })
-    if any(key not in _M4A_PROVIDER_LABELS for key in request.providers):
+    if any(key not in _TENDER_MULTI_PROVIDER_LABELS for key in request.providers):
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_UNAVAILABLE",
             "message": "Один или несколько выбранных поставщиков недоступны.",
@@ -2643,7 +2688,7 @@ def _submit_manual_tender_multi_provider(
     with _sourcing_runtime_lock:
         runtime = sourcing_runtime
         service = runtime.service
-        available = set(runtime.execution_provider_keys)
+    available = set(_available_tender_multi_provider_keys(runtime))
     if not set(request.providers).issubset(available) or service.provider_runner is None:
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_UNAVAILABLE",

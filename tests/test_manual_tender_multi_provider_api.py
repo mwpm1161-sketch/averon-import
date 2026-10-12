@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import socket
 import threading
+from types import SimpleNamespace
 
 import pytest
 
+from averon_import.services.app_settings import AppSettings
 from averon_import.services.jobs import SOURCING
-from test_manual_tender_multi_provider_orchestration import Adapter, ETM, LEMANA, _service
+from averon_import.services.secrets import MemorySecretStore, VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED
+from test_manual_tender_multi_provider_orchestration import Adapter, ETM, LEMANA, VI, VI_REGION, _service
 from test_manual_tender_xlsx import (
     _api_request,
     _auth_headers,
@@ -20,9 +23,16 @@ from test_manual_tender_xlsx import (
 
 
 class Runtime:
-    def __init__(self, service, keys=(ETM, LEMANA)):
+    def __init__(self, service, keys=(ETM, LEMANA), configured=(ETM, LEMANA)):
         self.service = service
         self._keys = tuple(keys)
+        self.execution_providers = service.provider_runner._registry
+        if VI in self._keys:
+            self.execution_providers[VI].credential_generation = "a" * 32
+        self.providers = {
+            key: type("ProviderConfiguration", (), {"configured": key in configured})()
+            for key in (ETM, LEMANA)
+        }
 
     @property
     def execution_provider_keys(self):
@@ -42,10 +52,10 @@ def forbid_external_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("external network is forbidden")))
 
 
-def _runtime(monkeypatch, main, *, keys=(ETM, LEMANA), adapters=None):
+def _runtime(monkeypatch, main, *, keys=(ETM, LEMANA), configured=(ETM, LEMANA), adapters=None):
     adapters = adapters or (Adapter(ETM, amount="1234.5600"), Adapter(LEMANA, amount="1234.5600"))
     service = _service(*adapters)
-    monkeypatch.setattr(main, "sourcing_runtime", Runtime(service, keys))
+    monkeypatch.setattr(main, "sourcing_runtime", Runtime(service, keys, configured))
     return service, adapters
 
 
@@ -54,6 +64,17 @@ def _payload(workspace, **updates):
     value = {"source_row_ids": [row_id], "source_mode": "provider_only", "providers": [LEMANA, ETM], "limit": 20}
     value.update(updates)
     return value
+
+
+def _enable_vi_public_configuration(monkeypatch, main):
+    generation = "a" * 32
+    settings = AppSettings.model_validate({"sourcing": {"vseinstrumenti": {
+        "enabled": True, "region_id": VI_REGION, "credential_generation": generation,
+    }}})
+    store = MemorySecretStore()
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, generation)
+    monkeypatch.setattr(main, "app_settings_service", SimpleNamespace(settings=settings))
+    monkeypatch.setattr(main, "secret_store", store)
 
 
 def test_m4a_capabilities_are_authenticated_local_and_intersect_registered_runtime(tender_api, monkeypatch):
@@ -69,7 +90,7 @@ def test_m4a_capabilities_are_authenticated_local_and_intersect_registered_runti
         "source_mode": "provider_only",
         "providers": [{"key": ETM, "label": "ЭТМ iPRO"}, {"key": LEMANA, "label": "Лемана ПРО"}],
         "min_providers": 2,
-        "max_providers": 2,
+        "max_providers": 3,
         "max_rows": 100,
         "max_result_limit": 20,
         "export_supported": False,
@@ -80,6 +101,88 @@ def test_m4a_capabilities_are_authenticated_local_and_intersect_registered_runti
     unavailable = _api_request(main.app, "GET", endpoint, headers=_auth_headers()).json()
     assert unavailable["enabled"] is False
     assert unavailable["providers"] == [{"key": ETM, "label": "ЭТМ iPRO"}]
+
+
+def test_m5d_capabilities_include_registered_vi_but_hide_unconfigured_lemana(
+    tender_api, monkeypatch,
+):
+    main, _ = tender_api
+    _enable_vi_public_configuration(monkeypatch, main)
+    adapters = (Adapter(ETM), Adapter(LEMANA), Adapter(VI))
+    _, runtime_adapters = _runtime(
+        monkeypatch, main, keys=(ETM, LEMANA, VI), configured=(ETM,), adapters=adapters,
+    )
+
+    response = _api_request(
+        main.app, "GET", "/api/manual-tenders/sourcing/multi-provider-capabilities", headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is True
+    assert payload["providers"] == [
+        {"key": ETM, "label": "ЭТМ iPRO"},
+        {"key": VI, "label": "ВсеИнструменты.ru"},
+    ]
+    assert payload["min_providers"] == 2 and payload["max_providers"] == 3
+    assert all(not adapter.calls for adapter in runtime_adapters)
+
+
+def test_m5d_capabilities_hide_vi_when_generation_marker_is_missing(tender_api, tmp_path, monkeypatch):
+    main, repository = tender_api
+    _enable_vi_public_configuration(monkeypatch, main)
+    main.secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    adapters = (Adapter(ETM), Adapter(LEMANA), Adapter(VI))
+    _runtime(monkeypatch, main, keys=(ETM, LEMANA, VI), adapters=adapters)
+
+    response = _api_request(
+        main.app, "GET", "/api/manual-tenders/sourcing/multi-provider-capabilities", headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert VI not in {provider["key"] for provider in response.json()["providers"]}
+    rejected = _post_tender_sourcing(main, workspace["tender_id"], _payload(workspace, providers=[ETM, VI]))
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"]["code"] == "MULTI_PROVIDER_UNAVAILABLE"
+    assert not main.job_service.jobs
+    assert all(not adapter.calls for adapter in adapters)
+
+
+def test_m5d_public_selection_runs_vi_outcome_only_and_projects_safe_provider_facts(
+    tender_api, tmp_path, monkeypatch,
+):
+    main, repository = tender_api
+    _enable_vi_public_configuration(monkeypatch, main)
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    adapters = (Adapter(ETM, amount="100"), Adapter(LEMANA, amount="90"), Adapter(VI, amount="80"))
+    service, runtime_adapters = _runtime(
+        monkeypatch, main, keys=(ETM, LEMANA, VI), adapters=adapters,
+    )
+
+    response = _post_tender_sourcing(main, workspace["tender_id"], _payload(
+        workspace, providers=[VI, ETM, LEMANA],
+    ))
+    assert response.status_code == 202, response.text
+    job = _wait_tender_job(main, response.json()["id"])
+    assert job["status"] == "completed", job
+    assert job["result"]["providers"] == [ETM, LEMANA, VI]
+    assert [len(adapter.calls) for adapter in runtime_adapters] == [1, 1, 1]
+
+    detail = _api_request(
+        main.app,
+        "GET",
+        f"/api/manual-tenders/{workspace['tender_id']}/runs/{job['result']['run_id']}",
+        headers=_auth_headers(),
+    )
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert {item["provider_key"] for item in payload["rows"][0]["provider_outcomes"]} == {ETM, LEMANA, VI}
+    assert {item["provider_key"] for item in payload["rows"][0]["offers"]} == {ETM, LEMANA, VI}
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for forbidden in ("config_revision", "credential_generation", "Bearer", "must-not-be-retained-or-public"):
+        assert forbidden not in serialized
+    assert service.provider_runner is main.sourcing_runtime.service.provider_runner
 
 
 @pytest.mark.parametrize(

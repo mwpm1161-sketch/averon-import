@@ -20,13 +20,15 @@ from averon_import.services.manual_tenders.repository import TenderWorkspaceErro
 from averon_import.services.manual_tenders.sourcing import TenderSourcingRunStore
 from averon_import.services.sourcing.models import MatchDecision, Offer, SourcingSourceMode
 from averon_import.services.sourcing.providers.contracts import (
-    ProviderFailureCategory, ProviderSearchOutcome, ProviderSearchRequestIdentity, ProviderSearchState, ProviderSelection,
+    ProviderAffinity, ProviderFailureCategory, ProviderSearchOutcome, ProviderSearchRequestIdentity, ProviderSearchState, ProviderSelection,
 )
 from averon_import.services.sourcing.providers.execution import ProviderRunner
 from averon_import.services.sourcing.service import SourcingService
 from test_manual_tender_xlsx import tender_api  # noqa: F401: reuse isolated public-route fixture
 
 ETM, LEMANA, LOCAL = "etm_ipro", "lemana_b2b", "local_catalog"
+VI = "vseinstrumenti"
+VI_REGION = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
 NOW = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
 Code = orchestration.MultiProviderOrchestrationCode
 
@@ -78,11 +80,12 @@ class Adapter:
         self.weaker, self.invalid, self.review, self.reject = weaker, invalid, review, reject
         self.equivalent, self.hook, self.calls = equivalent, hook, []
         self.second_amount, self.second_currency, self.representative = second_amount, second_currency, representative
+        self.affinity = ProviderAffinity(environment="prod", region_id=VI_REGION) if key == VI else ProviderAffinity()
 
     def request_identity(self, intent, *, limit, execution_scope_id):
         fingerprint = hashlib.sha256(("same" if self.equivalent else intent.source_row_id).encode()).hexdigest()
         return ProviderSearchRequestIdentity(provider_key=self.key, request_fingerprint=fingerprint,
-            execution_scope_id=execution_scope_id, limit=limit)
+            execution_scope_id=execution_scope_id, limit=limit, affinity=self.affinity)
 
     def execute_search(self, intent, *, limit, request_counter):
         self.calls.append(intent.source_row_id)
@@ -99,6 +102,9 @@ class Adapter:
                     proof["source_item_id"] = "foreign"
             elif self.key == LEMANA:
                 proof.update(product_item="123", mirror_revision="a" * 64, region_id=1)
+            elif self.key == VI:
+                proof.update(source_item_id="123", price_field="prices.price", environment="prod", region_id=VI_REGION,
+                             config_revision="must-not-be-retained-or-public")
             offers = (Offer(provider=self.key, offer_id="123", source_item_id="123",
                 title=intent.normalized_name + (" " + intent.model if self.weaker else ""),
                 article="" if self.review else "foreign" if self.reject else intent.article,
@@ -114,6 +120,7 @@ class Adapter:
                     availability=True, availability_text="In stock")) for item in offers)
         return ProviderSearchOutcome(provider_key=self.key, state=self.state, offers=offers,
             request_count=request_counter.request_count,
+            affinity=self.affinity,
             failure_category=ProviderFailureCategory.TIMEOUT if self.state == ProviderSearchState.FAILURE else
                 ProviderFailureCategory.AUTHENTICATION if self.state == ProviderSearchState.SUPPRESSED else None)
 
@@ -442,7 +449,7 @@ def test_strict_admission_and_registry_fail_closed_zero_calls(tmp_path, case):
     adapter = Adapter(ETM)
     service = _service(adapter)
     keys, options = (ETM,), {}
-    if case == "unknown": keys = (ETM, "vseinstrumenti")
+    if case == "unknown": keys = (ETM, "unknown_supplier")
     elif case == "unavailable": keys = (ETM, LEMANA)
     elif case == "unconfigured": service.provider_runner = None
     elif case == "dict": workspace = (*workspace[:2], {}, workspace[3])
@@ -452,6 +459,22 @@ def test_strict_admission_and_registry_fail_closed_zero_calls(tmp_path, case):
         _execute(workspace, service, keys, **options)
     assert error.value.run_id and not adapter.calls
     assert str(error.value) == "Internal multi-provider run could not be produced."
+
+
+def test_vi_outcome_native_provider_provenance_survives_durable_v2(tmp_path):
+    workspace = _workspace(tmp_path)
+    etm, vi = Adapter(ETM), Adapter(VI, amount="150")
+
+    result = _execute(workspace, _service(etm, vi), (ETM, VI))
+    run = _read(workspace, result)
+
+    assert tuple(item.provider_key for item in run.rows[0].outcomes) == (ETM, VI)
+    vi_offer = next(item for item in run.rows[0].offers if item.offer_reference.provider_key == VI)
+    assert vi_offer.provenance.model_dump(mode="json") == {
+        "source": VI, "source_item_id": "123", "price_field": "prices.price",
+        "environment": "prod", "region_id": VI_REGION,
+    }
+    assert "config_revision" not in vi_offer.provenance.model_dump(mode="json")
 
 
 @pytest.mark.parametrize("count", [370, 500])

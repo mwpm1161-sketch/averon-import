@@ -31,6 +31,7 @@ _OFFER = ("offer_reference", "source_item_id", "title", "article", "manufacturer
 _PROOF = {
     "etm_ipro": ("source", "source_item_id", "price_field", "catalog_version", "price_status"),
     "lemana_b2b": ("source", "product_item", "mirror_revision", "region_id"),
+    "vseinstrumenti": ("source", "source_item_id", "price_field", "environment", "region_id"),
     "unproven": ("source",),
 }
 _MATCH = ("offer_reference", "decision", "rank", "matched_attributes", "supporting_attributes",

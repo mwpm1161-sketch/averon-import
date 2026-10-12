@@ -1,4 +1,4 @@
-"""Explicit internal provider-only orchestration; no public/runtime activation."""
+"""Explicit provider-only orchestration over the outcome-native runtime."""
 
 from __future__ import annotations
 
@@ -138,7 +138,9 @@ def execute_multi_provider_tender_run(
                 or any(type(item) is not str or not re.fullmatch(r"[a-f0-9]{32}", item) for item in selected_source_row_ids)
                 or len(set(selected_source_row_ids)) != len(selected_source_row_ids)):
             raise MultiProviderOrchestrationError(code.INVALID_ROWS, run_id)
-        if service.provider_runner is None or not set(selection.provider_keys).issubset({"etm_ipro", "lemana_b2b", "local_catalog"}):
+        if service.provider_runner is None or not set(selection.provider_keys).issubset(
+            {"etm_ipro", "lemana_b2b", "local_catalog", "vseinstrumenti"}
+        ):
             raise MultiProviderOrchestrationError(code.PROVIDER_CONFIGURATION, run_id)
         started = _timestamp(clock)
         repository = store.repository

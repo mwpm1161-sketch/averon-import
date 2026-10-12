@@ -799,7 +799,7 @@ def test_vseinstrumenti_invalid_token_and_invalid_configuration_fail_closed(api)
     assert "credential_generation" not in service.path.read_text(encoding="utf-8") if service.path.exists() else True
 
 
-def test_vseinstrumenti_credentials_do_not_activate_public_multi_provider(api, monkeypatch):
+def test_vseinstrumenti_is_publicly_available_only_with_current_local_configuration(api, monkeypatch):
     app_module, store, _ = api
     for name in (
         "AVERON_VSEINSTRUMENTI_ENABLED",
@@ -827,7 +827,10 @@ def test_vseinstrumenti_credentials_do_not_activate_public_multi_provider(api, m
     capabilities = app_module.get_multi_provider_sourcing_capabilities(None)
 
     assert "vseinstrumenti" in app_module.sourcing_runtime.execution_providers
-    assert [item["key"] for item in capabilities["providers"]] == ["etm_ipro", "lemana_b2b"]
+    assert [item["key"] for item in capabilities["providers"]] == ["vseinstrumenti"]
+    assert capabilities["enabled"] is False  # One configured provider cannot start a comparison.
+    assert "vi.public-test-token" not in str(capabilities)
+    assert "credential_generation" not in str(capabilities)
 
 
 def test_put_rejects_invalid_payload_values():

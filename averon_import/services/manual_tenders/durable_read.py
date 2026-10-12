@@ -230,12 +230,23 @@ class DurableLemanaProvenance(DurableContract):
     region_id: Annotated[StrictInt, Field(ge=1, le=2_147_483_647)] | None
 
 
+class DurableVseinstrumentiProvenance(DurableContract):
+    source: Literal["vseinstrumenti"]
+    source_item_id: ItemId
+    price_field: Literal["", "prices.price"]
+    environment: Literal["test", "prod"]
+    region_id: Annotated[
+        StrictStr,
+        Field(min_length=36, max_length=36, pattern=r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"),
+    ]
+
+
 class DurableUnprovenProvenance(DurableContract):
     source: Literal["unproven"]
 
 
 DurableProvenance = Annotated[
-    DurableEtmProvenance | DurableLemanaProvenance | DurableUnprovenProvenance,
+    DurableEtmProvenance | DurableLemanaProvenance | DurableVseinstrumentiProvenance | DurableUnprovenProvenance,
     Field(discriminator="source"),
 ]
 
@@ -447,6 +458,21 @@ class DurableTenderSourcingRowV2(DurableContract):
                     or (outcome.affinity.region_id and str(proof.region_id) != outcome.affinity.region_id)
                 ):
                     raise ValueError("Lemana evidence contradicts its source identity")
+            elif provider == "vseinstrumenti":
+                if not isinstance(proof, DurableVseinstrumentiProvenance) or evidence.vat_basis != VatBasis.UNKNOWN:
+                    raise ValueError("VseInstrumenti commercial basis remains unproved")
+                if (evidence.evidence_state == CommercialEvidenceState.COMPLETE
+                        or not {CommercialIssueCode.PROVIDER_PRICE_BASIS_UNPROVEN,
+                                CommercialIssueCode.PRICE_UNIT_UNTRUSTED}.issubset(evidence.issue_codes)):
+                    raise ValueError("VseInstrumenti requires its stored unproved-basis issue facts")
+                outcome = outcomes[provider]
+                if evidence.evidence_state != CommercialEvidenceState.INVALID and (
+                    proof.source_item_id != offer.source_item_id or not offer.source_item_id.strip()
+                    or proof.environment != outcome.affinity.environment
+                    or proof.region_id != outcome.affinity.region_id
+                    or bool(proof.price_field) != (offer.price is not None)
+                ):
+                    raise ValueError("VseInstrumenti evidence contradicts its source identity")
             elif not isinstance(proof, DurableUnprovenProvenance) or evidence.vat_basis != VatBasis.UNKNOWN:
                 raise ValueError("other provider commercial basis remains unproved")
             elif not {CommercialIssueCode.PROVIDER_PRICE_BASIS_UNPROVEN,

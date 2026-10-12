@@ -35,6 +35,11 @@ and export behavior are not routed through VI. No UI activation, provider
 probe, startup search, sync, retry, or health request is added. M5D is outside
 this stage.
 
+M5D follow-up: the authenticated Excel tender comparison now includes VI only
+when the active outcome-native runtime, enabled local settings, valid region,
+and generation-bound credential marker all agree. See
+[MULTI_PROVIDER_M5D.md](MULTI_PROVIDER_M5D.md) for the public-selection boundary.
+
 ## Verification
 
 Tests use `MemorySecretStore` and fake transports. They cover write-only token

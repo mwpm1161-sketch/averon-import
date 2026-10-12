@@ -55,7 +55,8 @@ async function testLazyCapabilitiesAndProtectedChoice() {
       context.capabilityRequests += 1;
       return {enabled: true, source_mode: "provider_only", providers: [
         {key: "etm_ipro", label: "ЭТМ iPRO"}, {key: "lemana_b2b", label: "Лемана ПРО"},
-      ]};
+        {key: "vseinstrumenti", label: "ВсеИнструменты.ru"},
+      ], min_providers: 2, max_providers: 3};
     },
     renderSourcingHistoryControls() {}, renderStaleSourcingHistoryWarning() {},
     sourcingResultMode: () => "provider_only", renderExcelMultiProviderPanel() {},
@@ -68,9 +69,11 @@ async function testLazyCapabilitiesAndProtectedChoice() {
     await handleExcelMultiProviderToggle({target:{checked:true}});
     if (capabilityRequests !== 1) throw new Error("Explicit opt-in should issue exactly one capabilities request");
     if (!nodes["#multi-provider-options"].innerHTML.includes("lemana_b2b")) throw new Error("Provider choices must come from capabilities");
+    if (!nodes["#multi-provider-options"].innerHTML.includes("vseinstrumenti")) throw new Error("Configured VI must appear in the public selection");
     handleExcelMultiProviderSelection({target:{dataset:{multiProviderKey:"etm_ipro"},checked:true}});
     handleExcelMultiProviderSelection({target:{dataset:{multiProviderKey:"lemana_b2b"},checked:true}});
-    if (state.excelTender.multiProviderProviders.size !== 2) throw new Error("Both explicit provider choices should be retained");
+    handleExcelMultiProviderSelection({target:{dataset:{multiProviderKey:"vseinstrumenti"},checked:true}});
+    if (state.excelTender.multiProviderProviders.size !== 3) throw new Error("All explicit provider choices should be retained");
     state.sourcing.historyStatus = {available:true};
     handleSourcingModeChange({target:{value:"one_c_only"}});
     if (state.excelTender.multiProviderEnabled || state.excelTender.multiProviderProviders.size) throw new Error("Switching to history must clear comparison choice");
@@ -84,7 +87,7 @@ async function testLazyCapabilitiesAndProtectedChoice() {
 
 async function testSelectionCapAndExplicitRequestHandshake() {
   const functionSource = sliceBetween("async function startExcelTenderSourcing() {", "function parseManualPaste(text)");
-  async function submitWithCount(count, enabled = true) {
+  async function submitWithCount(count, enabled = true, selectedProviders = ["lemana_b2b", "etm_ipro"]) {
     const calls = [];
     const admission = {hidden: true, textContent: ""};
     const modeSelect = {disabled: false};
@@ -97,7 +100,8 @@ async function testSelectionCapAndExplicitRequestHandshake() {
     };
     const state = {excelTender: {
       workspace:{tender_id:"tender"}, sourcingActive:false, exportActive:false, selectedIds:new Set(Array.from({length:count}, (_, i) => `row-${i}`)), pollGeneration:1,
-      multiProviderEnabled:enabled, multiProviderProviders:new Set(["lemana_b2b", "etm_ipro"]), multiProviderCapabilities:{enabled:true},
+      multiProviderEnabled:enabled, multiProviderProviders:new Set(selectedProviders),
+      multiProviderCapabilities:{enabled:true,min_providers:2,max_providers:3},
     }, sourcing:{sourceMode:"provider_only"}};
     const context = {
       state, $: selector => nodes[selector],
@@ -117,6 +121,9 @@ async function testSelectionCapAndExplicitRequestHandshake() {
   assert(max.calls[0].source_row_ids.length === 100, "The 100-row request must not discard rows");
   assert(max.calls[0].providers.join(",") === "etm_ipro,lemana_b2b", "The explicit provider handshake should be canonical");
   assert(max.calls[0].limit === 20 && !("provider" in max.calls[0]), "M4A request should cap at 20 and omit the scalar legacy provider");
+  const generalized = await submitWithCount(2, true, ["vseinstrumenti", "etm_ipro", "lemana_b2b"]);
+  assert(generalized.calls.length === 1, "Generalized three-provider selection should be admitted");
+  assert(generalized.calls[0].providers.join(",") === "etm_ipro,lemana_b2b,vseinstrumenti", "M5D should send the canonical explicit provider set");
   const legacy = await submitWithCount(1, false);
   assert(legacy.calls.length === 1 && !("providers" in legacy.calls[0]), "The legacy request must omit the multi-provider handshake when opt-in is off");
 }

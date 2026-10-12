@@ -76,6 +76,12 @@ def _offer(value):
     elif value.provider == "lemana_b2b":
         provenance = {"source": proof.get("source"), "product_item": proof.get("product_item", ""),
                       "mirror_revision": proof.get("mirror_revision"), "region_id": proof.get("region_id")}
+    elif value.provider == "vseinstrumenti":
+        # Preserve supplier item/source facts, while deliberately dropping the
+        # generation-derived config revision from the adapter's affinity data.
+        provenance = {"source": proof.get("source"), "source_item_id": proof.get("source_item_id", ""),
+                      "price_field": proof.get("price_field", ""), "environment": proof.get("environment"),
+                      "region_id": proof.get("region_id")}
     else:
         provenance = {"source": "unproven"}
     return dict(offer_reference=_reference(ProviderOfferReference.from_offer(value)),

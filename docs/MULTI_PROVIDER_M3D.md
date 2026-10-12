@@ -1,5 +1,14 @@
 # M3D: controlled internal multi-provider orchestration
 
+## M5D follow-up
+
+At M3D completion, the orchestration had no public caller and VI was outside
+its runtime allowlist. M5D adds one authenticated Excel tender comparison route
+as the explicit caller and allows the already-registered outcome-native VI
+adapter. The row fences, sequential exact evaluation chain, fresh per-run
+dedup scope, bounded durable v2 publication, failure behavior, and export/1C/
+PDF boundaries documented below remain in force.
+
 M3C is FINAL APPROVED at exact base
 `91b827056bc8d8c3c6999ab7e6d168763a46f972`, on
 `feature/manual-tender-xlsx-v1`. M0 through M3C contracts and legacy production

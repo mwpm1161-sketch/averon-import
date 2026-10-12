@@ -509,12 +509,19 @@ def test_cheaper_vi_offer_cannot_win_against_proven_etm_through_m1d_m2a_m2b():
     assert len(vi_transport.requests) == 1
 
 
-def test_vi_durable_projection_uses_existing_generic_unproven_provenance():
+def test_vi_durable_projection_preserves_safe_provider_provenance_without_generation():
     adapter, _transport = _adapter(_response(_payload(_product())))
     offer = adapter.execute_search(_intent(), limit=5, request_counter=ProviderRequestCounter()).offers[0]
 
     durable = DurableOffer.model_validate(durable_offer_payload(offer))
 
-    assert durable.provenance.source == "unproven"
+    assert durable.provenance.model_dump(mode="json") == {
+        "source": "vseinstrumenti",
+        "source_item_id": "VI-001",
+        "price_field": "prices.price",
+        "environment": "prod",
+        "region_id": REGION,
+    }
+    assert "config_revision" not in durable.provenance.model_dump(mode="json")
     assert durable.offer_reference.provider_key == "vseinstrumenti"
     assert durable.offer_reference.offer_id == "VI-001"
