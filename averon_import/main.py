@@ -1203,12 +1203,75 @@ def _settings_public() -> dict:
     payload["sourcing"]["etm_ipro"]["password_configured"] = resolve_secret(
         os.environ.get("AVERON_ETM_IPRO_PASSWORD"), secret_store, ETM_IPRO_PASSWORD
     ) is not None
-    payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] = secret_store.has(
-        VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED
-    )
+    try:
+        vi_generation = app_settings_service.settings.sourcing.vseinstrumenti.credential_generation
+        payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] = (
+            secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED) == vi_generation
+        )
+    except Exception:
+        payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] = False
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
     return payload
+
+
+def _fail_closed_vseinstrumenti_credential_change() -> None:
+    """Invalidate any generation that might have been partially written."""
+
+    try:
+        app_settings_service.update({
+            "sourcing": {
+                "vseinstrumenti": {"credential_generation": uuid4().hex},
+            },
+        })
+    except Exception:
+        # Even if persistence fails, try to remove the commit marker. Runtime
+        # clients also compare their generation before resolving the token.
+        pass
+    try:
+        secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    except Exception:
+        pass
+    try:
+        _rebuild_sourcing_runtime()
+    except Exception:
+        # Existing runtime instances are stale after generation invalidation.
+        pass
+    raise HTTPException(
+        503,
+        "Не удалось безопасно изменить учетные данные ВсеИнструменты.",
+    ) from None
+
+
+def _change_vseinstrumenti_credentials(patch: dict, token: str | None) -> None:
+    """Change VI token and marker as one fail-closed generation transition."""
+
+    # Reject invalid settings before temporarily disabling an existing token.
+    app_settings_service.validate_update(patch)
+    generation = patch["sourcing"]["vseinstrumenti"]["credential_generation"]
+    with VI_CREDENTIAL_LOCK:
+        try:
+            # Disable every current runtime before changing either the token
+            # or its generation-bound marker.
+            secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+        except Exception:
+            _fail_closed_vseinstrumenti_credential_change()
+        try:
+            app_settings_service.update(patch)
+            if token is not None:
+                secret_store.set(VSEINSTRUMENTI_BEARER_TOKEN, token)
+                secret_store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, generation)
+            else:
+                secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN)
+            expected_marker = generation if token is not None else None
+            if secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED) != expected_marker:
+                raise RuntimeError("VI credential marker verification failed")
+        except Exception:
+            _fail_closed_vseinstrumenti_credential_change()
+        try:
+            _rebuild_sourcing_runtime()
+        except Exception:
+            _fail_closed_vseinstrumenti_credential_change()
 
 
 @app.get("/api/settings", dependencies=[Depends(require_admin)])
@@ -1271,17 +1334,10 @@ def put_settings(request: SettingsUpdate):
         ] = uuid4().hex
     try:
         if rotate_vi_generation:
-            with VI_CREDENTIAL_LOCK:
-                app_settings_service.update(patch)
-                if vi_token:
-                    secret_store.set(VSEINSTRUMENTI_BEARER_TOKEN, vi_token)
-                    secret_store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
-                else:
-                    secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
-                    secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN)
+            _change_vseinstrumenti_credentials(patch, vi_token or None)
         else:
             app_settings_service.update(patch)
-        _rebuild_sourcing_runtime()
+            _rebuild_sourcing_runtime()
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {}
         location = ".".join(str(part) for part in first.get("loc", ()))
@@ -1324,15 +1380,11 @@ def delete_etm_ipro_password():
 
 @app.delete("/api/settings/vseinstrumenti-bearer-token", dependencies=[Depends(require_admin)])
 def delete_vseinstrumenti_bearer_token():
-    with VI_CREDENTIAL_LOCK:
-        app_settings_service.update({
-            "sourcing": {
-                "vseinstrumenti": {"credential_generation": uuid4().hex},
-            },
-        })
-        secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
-        secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN)
-    _rebuild_sourcing_runtime()
+    _change_vseinstrumenti_credentials({
+        "sourcing": {
+            "vseinstrumenti": {"credential_generation": uuid4().hex},
+        },
+    }, None)
     return {"deleted": True}
 
 

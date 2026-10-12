@@ -164,7 +164,8 @@ def create_sourcing_runtime(
         vi_is_configured = (
             vi_settings.enabled
             and is_valid_region_id(vi_settings.region_id)
-            and secret_store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+            and secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+            == vi_settings.credential_generation
         )
         if vi_is_configured:
             vi_client = SecretBackedVseinstrumentiClient(

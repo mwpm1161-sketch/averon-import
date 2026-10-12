@@ -398,7 +398,10 @@ def test_runtime_registers_configured_vi_only_for_outcome_execution_without_supp
     })
     secrets = MemorySecretStore()
     secrets.set(VSEINSTRUMENTI_BEARER_TOKEN, "vi.runtime-secret-token")
-    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
+    secrets.set(
+        VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+        settings.settings.sourcing.vseinstrumenti.credential_generation,
+    )
     transport_calls = []
     secret_reads = []
     original_get = secrets.get
@@ -436,6 +439,7 @@ def test_runtime_registers_configured_vi_only_for_outcome_execution_without_supp
     )
     assert stale_outcome.state.value == "failure"
     assert stale_outcome.failure_category.value == "misconfigured"
+    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "a" * 32)
     rebuilt = create_sourcing_runtime(tmp_path / "data", settings, secrets)
     second = rebuilt.execution_providers["vseinstrumenti"].request_identity(
         _intent("vi-runtime"), limit=5, execution_scope_id="scope-1",
@@ -460,7 +464,10 @@ def test_configured_vi_runtime_resolves_secret_only_on_explicit_fake_search(tmp_
     })
     secrets = MemorySecretStore()
     secrets.set(VSEINSTRUMENTI_BEARER_TOKEN, "vi.runtime-execution-token")
-    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
+    secrets.set(
+        VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+        settings.settings.sourcing.vseinstrumenti.credential_generation,
+    )
     secret_reads = []
     original_get = secrets.get
 

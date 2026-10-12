@@ -340,27 +340,43 @@ class AppSettingsService:
                 )
         if value := os.environ.get("AVERON_VSEINSTRUMENTI_REGION_ID", "").strip():
             try:
-                settings.sourcing.vseinstrumenti.region_id = value
-            except (TypeError, ValueError):
+                validated = VseinstrumentiSettings.model_validate({
+                    **settings.sourcing.vseinstrumenti.model_dump(),
+                    "region_id": value,
+                })
+            except (TypeError, ValueError, ValidationError):
                 self.warnings.append(
                     "AVERON_VSEINSTRUMENTI_REGION_ID должен быть FIAS UUID; используется значение из settings.json."
                 )
-        if (value := _env_float("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S")) is not None:
+            else:
+                settings.sourcing.vseinstrumenti.region_id = validated.region_id
+        raw_timeout = os.environ.get("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S", "").strip()
+        if raw_timeout:
             try:
-                settings.sourcing.vseinstrumenti.request_timeout_s = value
-            except (TypeError, ValueError):
+                validated = VseinstrumentiSettings.model_validate({
+                    **settings.sourcing.vseinstrumenti.model_dump(),
+                    "request_timeout_s": raw_timeout,
+                })
+            except (TypeError, ValueError, ValidationError):
                 self.warnings.append(
                     "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S имеет недопустимое значение; используется значение из settings.json."
                 )
+            else:
+                settings.sourcing.vseinstrumenti.request_timeout_s = validated.request_timeout_s
 
     def update(self, patch: dict) -> AppSettings:
-        current = json.loads(self.settings.model_dump_json())
-        current = _deep_merge_settings(current, patch)
-        candidate = AppSettings.model_validate(current)
+        candidate = self.validate_update(patch)
         self.settings = candidate
         self.apply_env_overrides()
         self.save()
         return self.settings
+
+    def validate_update(self, patch: dict) -> AppSettings:
+        """Validate a settings patch without changing or saving current state."""
+
+        current = json.loads(self.settings.model_dump_json())
+        current = _deep_merge_settings(current, patch)
+        return AppSettings.model_validate(current)
 
     def save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

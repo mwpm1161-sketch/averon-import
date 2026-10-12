@@ -22,11 +22,55 @@ from averon_import.services.secrets import (
     YANDEX_API_KEY,
     InsecureFileSecretStore,
     MemorySecretStore,
+    SecretStoreError,
     create_secret_store,
     resolve_secret,
 )
 
 SECRET_VALUE = "yc-test-key-12345"
+
+
+class FaultInjectingMemorySecretStore(MemorySecretStore):
+    """Memory store that can fail once before or after one operation."""
+
+    def __init__(self):
+        super().__init__()
+        self._next_failure: tuple[str, str, bool] | None = None
+        self.read_keys: list[str] = []
+
+    def fail_once_at(self, method: str, key: str, *, after: bool = False) -> None:
+        self._next_failure = (method, key, after)
+
+    def _consume_failure(self, method: str, key: str) -> bool | None:
+        if self._next_failure is None:
+            return None
+        expected_method, expected_key, after = self._next_failure
+        if (method, key) != (expected_method, expected_key):
+            return None
+        self._next_failure = None
+        if not after:
+            raise SecretStoreError("injected SecretStore failure")
+        return True
+
+    def set(self, key: str, value: str) -> None:
+        fail_after = self._consume_failure("set", key)
+        super().set(key, value)
+        if fail_after:
+            raise SecretStoreError("injected SecretStore failure")
+
+    def get(self, key: str) -> str | None:
+        self.read_keys.append(key)
+        fail_after = self._consume_failure("get", key)
+        value = super().get(key)
+        if fail_after:
+            raise SecretStoreError("injected SecretStore failure")
+        return value
+
+    def delete(self, key: str) -> None:
+        fail_after = self._consume_failure("delete", key)
+        super().delete(key)
+        if fail_after:
+            raise SecretStoreError("injected SecretStore failure")
 
 
 # ---------- AppSettings: defaults / load / cascade ----------
@@ -75,6 +119,50 @@ def test_env_overrides_settings_file(monkeypatch, tmp_path):
     assert service.settings.local.model == "from-env"
     assert service.settings.pipeline.min_confidence == 0.7
     assert service.settings.sourcing.demo_store_base_url == "https://demo.example"
+
+
+@pytest.mark.parametrize("value", ["not-a-uuid", "1234", "{0c5b2444-70a0-4932-980c-b4dc0d3f02b5}"])
+def test_invalid_vi_region_env_override_preserves_settings_json(monkeypatch, tmp_path, value):
+    region = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "sourcing": {"vseinstrumenti": {"region_id": region, "request_timeout_s": 8.5}},
+    }), encoding="utf-8")
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_REGION_ID", value)
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S", raising=False)
+
+    service = AppSettingsService(tmp_path)
+
+    assert service.settings.sourcing.vseinstrumenti.region_id == region
+    assert any("AVERON_VSEINSTRUMENTI_REGION_ID" in warning for warning in service.warnings)
+    assert all(value not in warning for warning in service.warnings)
+
+
+@pytest.mark.parametrize("value", ["-1", "30.01", "nan", "NaN", "inf", "Infinity", "-inf", "1e9999", "not-a-number"])
+def test_invalid_vi_timeout_env_override_preserves_settings_json(monkeypatch, tmp_path, value):
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "sourcing": {"vseinstrumenti": {"region_id": "", "request_timeout_s": 8.5}},
+    }), encoding="utf-8")
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_REGION_ID", raising=False)
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S", value)
+
+    service = AppSettingsService(tmp_path)
+
+    assert service.settings.sourcing.vseinstrumenti.request_timeout_s == 8.5
+    assert any("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S" in warning for warning in service.warnings)
+    assert all(value not in warning for warning in service.warnings)
+
+
+def test_valid_vi_env_overrides_are_model_validated_and_applied(monkeypatch, tmp_path):
+    region = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_REGION_ID", region.upper())
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S", "12.5")
+
+    service = AppSettingsService(tmp_path)
+
+    assert service.settings.sourcing.vseinstrumenti.region_id == region
+    assert service.settings.sourcing.vseinstrumenti.request_timeout_s == 12.5
+    assert not any("AVERON_VSEINSTRUMENTI_REGION_ID" in warning for warning in service.warnings)
+    assert not any("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S" in warning for warning in service.warnings)
 
 
 def test_demo_store_url_is_validated_and_persisted(tmp_path):
@@ -539,6 +627,7 @@ def test_vseinstrumenti_bearer_token_is_write_only_rotates_generation_and_rebuil
     assert secret_reads == []
     assert original_get(VSEINSTRUMENTI_BEARER_TOKEN) == token_one
     assert store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    assert original_get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED) == first_generation
     assert first_payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] is True
     assert token_one not in json.dumps(first_payload, ensure_ascii=False)
     assert "credential_generation" not in json.dumps(first_payload, ensure_ascii=False)
@@ -555,6 +644,7 @@ def test_vseinstrumenti_bearer_token_is_write_only_rotates_generation_and_rebuil
     assert secret_reads == []
     assert original_get(VSEINSTRUMENTI_BEARER_TOKEN) == token_two
     assert store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    assert original_get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED) == second_generation
     assert second_payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] is True
     assert second_generation != first_generation
     assert second_revision != first_revision
@@ -571,6 +661,117 @@ def test_vseinstrumenti_bearer_token_is_write_only_rotates_generation_and_rebuil
     assert secret_reads == []
     assert not store.has(VSEINSTRUMENTI_BEARER_TOKEN)
     assert "vseinstrumenti" not in app_module.sourcing_runtime.execution_providers
+
+
+@pytest.mark.parametrize(
+    ("operation", "method", "key", "after"),
+    [
+        ("save", "delete", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("save", "set", VSEINSTRUMENTI_BEARER_TOKEN, False),
+        ("save", "set", VSEINSTRUMENTI_BEARER_TOKEN, True),
+        ("save", "set", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("save", "set", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, True),
+        ("save", "get", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("replace", "delete", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("replace", "set", VSEINSTRUMENTI_BEARER_TOKEN, False),
+        ("replace", "set", VSEINSTRUMENTI_BEARER_TOKEN, True),
+        ("replace", "set", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("replace", "set", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, True),
+        ("replace", "get", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("delete", "delete", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+        ("delete", "delete", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, True),
+        ("delete", "delete", VSEINSTRUMENTI_BEARER_TOKEN, False),
+        ("delete", "delete", VSEINSTRUMENTI_BEARER_TOKEN, True),
+        ("delete", "get", VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, False),
+    ],
+)
+def test_vi_credential_store_failures_fail_closed_and_survive_restart(
+    api, monkeypatch, tmp_path, operation, method, key, after,
+):
+    from fastapi import HTTPException
+
+    from averon_import.services.sourcing.runtime import create_sourcing_runtime
+    from averon_import.services.sourcing.providers.vseinstrumenti import client as vi_client_module
+
+    app_module, _, service = api
+    transport_calls = []
+
+    def forbidden_transport(*args, **kwargs):
+        transport_calls.append((args, kwargs))
+        raise AssertionError("credential failure tests must not contact VI")
+
+    monkeypatch.setattr(vi_client_module, "_default_transport", forbidden_transport)
+    for name in (
+        "AVERON_VSEINSTRUMENTI_ENABLED",
+        "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
+        "AVERON_VSEINSTRUMENTI_REGION_ID",
+        "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store = FaultInjectingMemorySecretStore()
+    monkeypatch.setattr(app_module, "secret_store", store)
+
+    settings_patch = app_module.SourcingSettingsUpdate(
+        vseinstrumenti=app_module.VseinstrumentiSettingsUpdate(
+            enabled=True,
+            environment="test",
+            region_id="0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+            request_timeout_s=5,
+        ),
+    )
+    old_adapter = None
+    if operation != "save":
+        app_module.put_settings(app_module.SettingsUpdate(
+            sourcing=settings_patch,
+            vseinstrumenti_bearer_token="vi.old-private-token",
+        ))
+        old_adapter = app_module.sourcing_runtime.execution_providers["vseinstrumenti"]
+
+    prior_generation = service.settings.sourcing.vseinstrumenti.credential_generation
+    store.fail_once_at(method, key, after=after)
+    if operation == "save":
+        request = lambda: app_module.put_settings(app_module.SettingsUpdate(
+            sourcing=settings_patch,
+            vseinstrumenti_bearer_token="vi.new-private-token",
+        ))
+    elif operation == "replace":
+        request = lambda: app_module.put_settings(app_module.SettingsUpdate(
+            vseinstrumenti_bearer_token="vi.replacement-private-token",
+        ))
+    else:
+        request = app_module.delete_vseinstrumenti_bearer_token
+
+    with pytest.raises(HTTPException) as failure:
+        request()
+
+    current_generation = service.settings.sourcing.vseinstrumenti.credential_generation
+    assert failure.value.status_code == 503
+    assert "private-token" not in str(failure.value.detail)
+    assert current_generation != prior_generation
+    assert store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED) != current_generation
+    assert app_module.get_settings()["sourcing"]["vseinstrumenti"]["bearer_token_configured"] is False
+    assert "vseinstrumenti" not in app_module.sourcing_runtime.execution_providers
+
+    if old_adapter is not None:
+        from averon_import.services.sourcing.providers.vseinstrumenti.client import (
+            VseinstrumentiApiError,
+            VseinstrumentiErrorCategory,
+        )
+
+        with pytest.raises(VseinstrumentiApiError) as stale_runtime:
+            old_adapter.client.search_products(
+                "test", region_id="0c5b2444-70a0-4932-980c-b4dc0d3f02b5", limit=1,
+            )
+        assert stale_runtime.value.category == VseinstrumentiErrorCategory.MISCONFIGURED
+
+    restarted_settings = AppSettingsService(service.data_dir)
+    restarted = create_sourcing_runtime(tmp_path / "restarted-runtime", restarted_settings, store)
+    assert "vseinstrumenti" not in restarted.execution_providers
+    assert transport_calls == []
+    assert VSEINSTRUMENTI_BEARER_TOKEN not in store.read_keys
+    settings_json = service.path.read_text(encoding="utf-8")
+    assert "private-token" not in settings_json
+    assert "bearer_token" not in settings_json
 
 
 def test_vseinstrumenti_invalid_token_and_invalid_configuration_fail_closed(api):
@@ -608,7 +809,6 @@ def test_vseinstrumenti_credentials_do_not_activate_public_multi_provider(api, m
     ):
         monkeypatch.delenv(name, raising=False)
     store.set(VSEINSTRUMENTI_BEARER_TOKEN, "vi.public-test-token")
-    store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
     app_module.app_settings_service.update({
         "sourcing": {
             "vseinstrumenti": {
@@ -618,6 +818,10 @@ def test_vseinstrumenti_credentials_do_not_activate_public_multi_provider(api, m
             },
         },
     })
+    store.set(
+        VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+        app_module.app_settings_service.settings.sourcing.vseinstrumenti.credential_generation,
+    )
     app_module._rebuild_sourcing_runtime()
 
     capabilities = app_module.get_multi_provider_sourcing_capabilities(None)

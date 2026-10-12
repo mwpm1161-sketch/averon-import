@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from averon_import.services.secrets import VSEINSTRUMENTI_BEARER_TOKEN
+from averon_import.services.secrets import (
+    VSEINSTRUMENTI_BEARER_TOKEN,
+    VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+)
 
 from .client import (
     VseinstrumentiApiError,
@@ -63,6 +66,8 @@ class SecretBackedVseinstrumentiClient:
         with self._credential_lock:
             try:
                 if self._current_generation() != self._credential_generation:
+                    raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED)
+                if self._secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED) != self._credential_generation:
                     raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED)
                 token = self._secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN)
             except VseinstrumentiApiError:

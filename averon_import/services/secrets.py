@@ -24,8 +24,8 @@ ETM_IPRO_LOGIN = "etm_ipro.login"
 ETM_IPRO_PASSWORD = "etm_ipro.password"
 # VI OpenAPI Bearer credential is write-only in settings APIs.
 VSEINSTRUMENTI_BEARER_TOKEN = "vseinstrumenti.bearer_token"
-# Non-secret presence marker lets status and runtime composition avoid loading
-# the Bearer credential from Windows Credential Manager.
+# Non-secret marker stores the credential generation. Status and runtime
+# composition can verify a complete credential pair without loading the token.
 VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED = "vseinstrumenti.bearer_token_configured"
 
 
