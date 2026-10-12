@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
@@ -25,6 +26,15 @@ from averon_import.services.sourcing.providers.execution_adapters import (
     LemanaB2BExecutionAdapter,
     LocalCatalogExecutionAdapter,
 )
+from averon_import.services.sourcing.providers.vseinstrumenti.adapter import (
+    VseinstrumentiExecutionAdapter,
+)
+from averon_import.services.sourcing.providers.vseinstrumenti.client import (
+    is_valid_region_id,
+)
+from averon_import.services.sourcing.providers.vseinstrumenti.runtime_client import (
+    SecretBackedVseinstrumentiClient,
+)
 from averon_import.services.sourcing.providers.local_catalog import LocalCatalogProvider
 from averon_import.services.sourcing.providers.lemana_b2b import LemanaB2BProvider
 from averon_import.services.sourcing.providers.etm_ipro import EtmIproProvider
@@ -32,7 +42,14 @@ from averon_import.services.sourcing.providers.one_c_history import OneCHistoryP
 from averon_import.services.sourcing.product_understanding import SourcingAIService
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
-from averon_import.services.secrets import YANDEX_AI_API_KEY, resolve_secret
+from averon_import.services.secrets import (
+    VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+    YANDEX_AI_API_KEY,
+    resolve_secret,
+)
+
+
+VI_CREDENTIAL_LOCK = RLock()
 
 
 def _v1_base_url(value: str) -> str:
@@ -142,6 +159,31 @@ def create_sourcing_runtime(
         lemana_provider.key: LemanaB2BExecutionAdapter(lemana_provider),
         local_provider.key: LocalCatalogExecutionAdapter(local_provider),
     }
+    vi_settings = settings_service.settings.sourcing.vseinstrumenti
+    try:
+        vi_is_configured = (
+            vi_settings.enabled
+            and is_valid_region_id(vi_settings.region_id)
+            and secret_store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+        )
+        if vi_is_configured:
+            vi_client = SecretBackedVseinstrumentiClient(
+                secret_store,
+                environment=vi_settings.environment,
+                timeout_seconds=vi_settings.request_timeout_s,
+                credential_generation=vi_settings.credential_generation,
+                current_generation=lambda: settings_service.settings.sourcing.vseinstrumenti.credential_generation,
+                credential_lock=VI_CREDENTIAL_LOCK,
+            )
+            execution_providers[VseinstrumentiExecutionAdapter.key] = VseinstrumentiExecutionAdapter(
+                vi_client,
+                region_id=vi_settings.region_id,
+                credential_generation=vi_settings.credential_generation,
+            )
+    except Exception:
+        # Invalid or unavailable local credentials fail closed for this
+        # optional execution-only provider without disabling other sourcing.
+        pass
     provider_runner = ProviderRunner(execution_providers)
     configured_provider = str(settings_service.settings.sourcing.provider or "")
     default_provider = (

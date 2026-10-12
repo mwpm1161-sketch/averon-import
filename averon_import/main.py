@@ -12,6 +12,7 @@ import threading
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -146,11 +147,14 @@ from averon_import.services.secrets import (
     ETM_IPRO_LOGIN,
     ETM_IPRO_PASSWORD,
     LEMANA_B2B_CLIENT_SECRET,
+    VSEINSTRUMENTI_BEARER_TOKEN,
+    VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
     YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
     create_secret_store,
     resolve_secret,
 )
+from averon_import.services.sourcing.providers.vseinstrumenti.client import is_valid_bearer_token
 from averon_import.services.support_reports import (
     DuplicateReport,
     IncidentNotFound,
@@ -167,7 +171,7 @@ from averon_import.services.sourcing.demo_catalog import (
     DEMO_CATALOG_SOURCE,
 )
 from averon_import.services.sourcing.models import ProductIntent, SourcingSourceMode
-from averon_import.services.sourcing.runtime import create_sourcing_runtime
+from averon_import.services.sourcing.runtime import VI_CREDENTIAL_LOCK, create_sourcing_runtime
 from averon_import.services.sourcing.product_understanding import build_fallback_intent
 from averon_import.services.sourcing.run_history import SourcingRunHistory
 from averon_import.services.workspace import WorkspaceService, validate_document_id
@@ -1126,6 +1130,15 @@ class EtmIproSettingsUpdate(BaseModel):
     max_live_candidates: int | None = None
 
 
+class VseinstrumentiSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool | None = None
+    environment: Literal["test", "prod"] | None = None
+    region_id: str | None = None
+    request_timeout_s: float | None = None
+
+
 class SourcingSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -1133,6 +1146,7 @@ class SourcingSettingsUpdate(BaseModel):
     demo_store_base_url: str | None = None
     lemana_b2b: LemanaB2BSettingsUpdate | None = None
     etm_ipro: EtmIproSettingsUpdate | None = None
+    vseinstrumenti: VseinstrumentiSettingsUpdate | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -1151,11 +1165,14 @@ class SettingsUpdate(BaseModel):
     lemana_client_secret: str | None = None
     etm_login: str | None = None
     etm_password: str | None = None
+    # Write-only: the bearer credential is stored only in SecretStore.
+    vseinstrumenti_bearer_token: str | None = None
     delete_yandex_api_key: bool = False
     delete_yandex_ai_api_key: bool = False
     delete_lemana_client_secret: bool = False
     delete_etm_login: bool = False
     delete_etm_password: bool = False
+    delete_vseinstrumenti_bearer_token: bool = False
 
 
 def _settings_public() -> dict:
@@ -1186,6 +1203,9 @@ def _settings_public() -> dict:
     payload["sourcing"]["etm_ipro"]["password_configured"] = resolve_secret(
         os.environ.get("AVERON_ETM_IPRO_PASSWORD"), secret_store, ETM_IPRO_PASSWORD
     ) is not None
+    payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] = secret_store.has(
+        VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED
+    )
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
     return payload
@@ -1199,6 +1219,12 @@ def get_settings():
 @app.put("/api/settings", dependencies=[Depends(require_admin)])
 def put_settings(request: SettingsUpdate):
     global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
+
+    vi_token = (request.vseinstrumenti_bearer_token or "").strip()
+    if vi_token and request.delete_vseinstrumenti_bearer_token:
+        raise HTTPException(400, "Нельзя одновременно сохранить и удалить токен ВсеИнструменты.")
+    if vi_token and not is_valid_bearer_token(vi_token):
+        raise HTTPException(400, "Токен ВсеИнструменты имеет недопустимый формат.")
 
     if request.api_key is not None and request.api_key.strip():
         secret_store.set(YANDEX_API_KEY, request.api_key.strip())
@@ -1233,11 +1259,28 @@ def put_settings(request: SettingsUpdate):
             "etm_password",
             "delete_etm_login",
             "delete_etm_password",
+            "vseinstrumenti_bearer_token",
+            "delete_vseinstrumenti_bearer_token",
         },
     )
     patch = {key: value for key, value in patch.items() if value is not None}
+    rotate_vi_generation = bool(vi_token) or request.delete_vseinstrumenti_bearer_token
+    if rotate_vi_generation:
+        patch.setdefault("sourcing", {}).setdefault("vseinstrumenti", {})[
+            "credential_generation"
+        ] = uuid4().hex
     try:
-        app_settings_service.update(patch)
+        if rotate_vi_generation:
+            with VI_CREDENTIAL_LOCK:
+                app_settings_service.update(patch)
+                if vi_token:
+                    secret_store.set(VSEINSTRUMENTI_BEARER_TOKEN, vi_token)
+                    secret_store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
+                else:
+                    secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+                    secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN)
+        else:
+            app_settings_service.update(patch)
         _rebuild_sourcing_runtime()
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {}
@@ -1275,6 +1318,20 @@ def delete_etm_ipro_login():
 @app.delete("/api/settings/etm-ipro-password", dependencies=[Depends(require_admin)])
 def delete_etm_ipro_password():
     secret_store.delete(ETM_IPRO_PASSWORD)
+    _rebuild_sourcing_runtime()
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/vseinstrumenti-bearer-token", dependencies=[Depends(require_admin)])
+def delete_vseinstrumenti_bearer_token():
+    with VI_CREDENTIAL_LOCK:
+        app_settings_service.update({
+            "sourcing": {
+                "vseinstrumenti": {"credential_generation": uuid4().hex},
+            },
+        })
+        secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+        secret_store.delete(VSEINSTRUMENTI_BEARER_TOKEN)
     _rebuild_sourcing_runtime()
     return {"deleted": True}
 

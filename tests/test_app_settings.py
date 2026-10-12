@@ -16,6 +16,8 @@ from averon_import.services.secrets import (
     ETM_IPRO_LOGIN,
     ETM_IPRO_PASSWORD,
     LEMANA_B2B_CLIENT_SECRET,
+    VSEINSTRUMENTI_BEARER_TOKEN,
+    VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
     YANDEX_AI_API_KEY,
     YANDEX_API_KEY,
     InsecureFileSecretStore,
@@ -122,6 +124,28 @@ def test_etm_ipro_settings_are_non_secret_and_warehouse_codes_are_normalized(tmp
     assert "password" not in (tmp_path / "settings.json").read_text(encoding="utf-8") if (tmp_path / "settings.json").exists() else True
 
 
+def test_vseinstrumenti_settings_validate_local_configuration_and_hide_generation(tmp_path):
+    service = AppSettingsService(tmp_path)
+    service.update({
+        "sourcing": {
+            "vseinstrumenti": {
+                "enabled": True,
+                "environment": "test",
+                "region_id": "0C5B2444-70A0-4932-980C-B4DC0D3F02B5",
+                "request_timeout_s": 5,
+            }
+        }
+    })
+
+    assert service.settings.sourcing.vseinstrumenti.region_id == "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
+    assert service.settings.sourcing.vseinstrumenti.environment == "test"
+    assert "credential_generation" not in json.dumps(service.public(), ensure_ascii=False)
+    assert service.settings.sourcing.vseinstrumenti.credential_generation in service.path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        service.update({"sourcing": {"vseinstrumenti": {"region_id": "not-a-fias-uuid"}}})
+
+
 def test_invalid_json_falls_back_to_defaults_with_warning(tmp_path):
     (tmp_path / "settings.json").write_text("{not valid json", encoding="utf-8")
     service = AppSettingsService(tmp_path)
@@ -133,6 +157,7 @@ def test_unknown_keys_ignored_and_file_secrets_scrubbed(tmp_path):
     (tmp_path / "settings.json").write_text(json.dumps({
         "future_flag": True,
         "yandex": {"api_key": "LEAKED", "folder_id": "ok"},
+        "sourcing": {"vseinstrumenti": {"bearer_token": "LEAKED", "region_id": ""}},
     }), encoding="utf-8")
     service = AppSettingsService(tmp_path)
     assert not hasattr(service.settings, "future_flag")
@@ -140,7 +165,7 @@ def test_unknown_keys_ignored_and_file_secrets_scrubbed(tmp_path):
     assert any("проигнорировано" in warning for warning in service.warnings)
     service.save()
     saved = (tmp_path / "settings.json").read_text(encoding="utf-8")
-    assert "LEAKED" not in saved and "api_key" not in saved and "future_flag" not in saved
+    assert "LEAKED" not in saved and "api_key" not in saved and "bearer_token" not in saved and "future_flag" not in saved
 
 
 def test_invalid_processing_mode_in_file_falls_back(tmp_path):
@@ -477,6 +502,128 @@ def test_etm_credentials_are_write_only_and_runtime_rebuilds(api, monkeypatch):
     assert app_module.delete_etm_ipro_password() == {"deleted": True}
     assert not store.has(ETM_IPRO_LOGIN)
     assert not store.has(ETM_IPRO_PASSWORD)
+
+
+def test_vseinstrumenti_bearer_token_is_write_only_rotates_generation_and_rebuilds(api, monkeypatch):
+    app_module, store, service = api
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_ENABLED", raising=False)
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_REGION_ID", raising=False)
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S", raising=False)
+    token_one = "vi.secret-token-one"
+    token_two = "vi.secret-token-two"
+    secret_reads = []
+    original_get = store.get
+
+    def tracked_get(key):
+        if key == VSEINSTRUMENTI_BEARER_TOKEN:
+            secret_reads.append(key)
+        return original_get(key)
+
+    monkeypatch.setattr(store, "get", tracked_get)
+
+    first_payload = app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            vseinstrumenti=app_module.VseinstrumentiSettingsUpdate(
+                enabled=True,
+                environment="test",
+                region_id="0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+                request_timeout_s=5,
+            ),
+        ),
+        vseinstrumenti_bearer_token=token_one,
+    ))
+    first_generation = service.settings.sourcing.vseinstrumenti.credential_generation
+    first_revision = app_module.sourcing_runtime.execution_providers["vseinstrumenti"]._affinity().config_revision
+
+    assert secret_reads == []
+    assert original_get(VSEINSTRUMENTI_BEARER_TOKEN) == token_one
+    assert store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    assert first_payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] is True
+    assert token_one not in json.dumps(first_payload, ensure_ascii=False)
+    assert "credential_generation" not in json.dumps(first_payload, ensure_ascii=False)
+    saved = service.path.read_text(encoding="utf-8")
+    assert token_one not in saved and "bearer_token" not in saved
+    assert "vseinstrumenti" not in app_module.sourcing_runtime.providers
+
+    second_payload = app_module.put_settings(app_module.SettingsUpdate(
+        vseinstrumenti_bearer_token=token_two,
+    ))
+    second_generation = service.settings.sourcing.vseinstrumenti.credential_generation
+    second_revision = app_module.sourcing_runtime.execution_providers["vseinstrumenti"]._affinity().config_revision
+
+    assert secret_reads == []
+    assert original_get(VSEINSTRUMENTI_BEARER_TOKEN) == token_two
+    assert store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    assert second_payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] is True
+    assert second_generation != first_generation
+    assert second_revision != first_revision
+
+    app_module.put_settings(app_module.SettingsUpdate(delete_vseinstrumenti_bearer_token=True))
+    third_generation = service.settings.sourcing.vseinstrumenti.credential_generation
+    assert third_generation != second_generation
+    assert not store.has(VSEINSTRUMENTI_BEARER_TOKEN)
+    assert not store.has(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    assert "vseinstrumenti" not in app_module.sourcing_runtime.execution_providers
+    assert secret_reads == []
+
+    assert app_module.delete_vseinstrumenti_bearer_token() == {"deleted": True}
+    assert secret_reads == []
+    assert not store.has(VSEINSTRUMENTI_BEARER_TOKEN)
+    assert "vseinstrumenti" not in app_module.sourcing_runtime.execution_providers
+
+
+def test_vseinstrumenti_invalid_token_and_invalid_configuration_fail_closed(api):
+    from fastapi import HTTPException
+
+    app_module, store, service = api
+    with pytest.raises(HTTPException) as invalid_token:
+        app_module.put_settings(app_module.SettingsUpdate(vseinstrumenti_bearer_token="bad token"))
+    assert invalid_token.value.status_code == 400
+    assert "bad token" not in str(invalid_token.value.detail)
+    assert not store.has(VSEINSTRUMENTI_BEARER_TOKEN)
+
+    with pytest.raises(HTTPException) as invalid_region:
+        app_module.put_settings(app_module.SettingsUpdate(
+            sourcing=app_module.SourcingSettingsUpdate(
+                vseinstrumenti=app_module.VseinstrumentiSettingsUpdate(
+                    enabled=True,
+                    region_id="not-a-fias-uuid",
+                ),
+            ),
+            vseinstrumenti_bearer_token="vi.valid-token",
+        ))
+    assert invalid_region.value.status_code == 400
+    assert not store.has(VSEINSTRUMENTI_BEARER_TOKEN)
+    assert "credential_generation" not in service.path.read_text(encoding="utf-8") if service.path.exists() else True
+
+
+def test_vseinstrumenti_credentials_do_not_activate_public_multi_provider(api, monkeypatch):
+    app_module, store, _ = api
+    for name in (
+        "AVERON_VSEINSTRUMENTI_ENABLED",
+        "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
+        "AVERON_VSEINSTRUMENTI_REGION_ID",
+        "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN, "vi.public-test-token")
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
+    app_module.app_settings_service.update({
+        "sourcing": {
+            "vseinstrumenti": {
+                "enabled": True,
+                "environment": "test",
+                "region_id": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+            },
+        },
+    })
+    app_module._rebuild_sourcing_runtime()
+
+    capabilities = app_module.get_multi_provider_sourcing_capabilities(None)
+
+    assert "vseinstrumenti" in app_module.sourcing_runtime.execution_providers
+    assert [item["key"] for item in capabilities["providers"]] == ["etm_ipro", "lemana_b2b"]
 
 
 def test_put_rejects_invalid_payload_values():

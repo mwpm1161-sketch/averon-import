@@ -204,6 +204,11 @@ def test_request_identity_fingerprints_actual_plan_limit_and_safe_affinity_witho
     changed_configuration = VseinstrumentiExecutionAdapter(
         _client(FakeTransport(), timeout_seconds=5.0), region_id=REGION,
     ).request_identity(intent, limit=5, execution_scope_id="scope-a")
+    changed_credential_generation = VseinstrumentiExecutionAdapter(
+        _client(FakeTransport()),
+        region_id=REGION,
+        credential_generation="a" * 32,
+    ).request_identity(intent, limit=5, execution_scope_id="scope-a")
 
     assert first == same
     assert first.request_fingerprint != changed_query.request_fingerprint
@@ -211,10 +216,13 @@ def test_request_identity_fingerprints_actual_plan_limit_and_safe_affinity_witho
     assert first.request_fingerprint != changed_region.request_fingerprint
     assert first.request_fingerprint != changed_environment.request_fingerprint
     assert first.request_fingerprint != changed_configuration.request_fingerprint
+    assert first.request_fingerprint != changed_credential_generation.request_fingerprint
     assert first.affinity.environment == "prod"
     assert first.affinity.region_id == REGION
     assert len(first.affinity.config_revision) == 64
     assert first.affinity.config_revision != changed_configuration.affinity.config_revision
+    assert first.affinity.config_revision != changed_credential_generation.affinity.config_revision
+    assert "a" * 32 not in json.dumps(changed_credential_generation.model_dump(mode="json"))
     assert TOKEN not in json.dumps(first.model_dump(mode="json"))
     assert transport.requests == []
 
@@ -234,6 +242,41 @@ def test_runner_executes_vi_outcome_and_request_local_dedup_does_not_double_coun
     assert second.outcomes[0].request_count == 0
     assert second.reused_provider_keys == ("vseinstrumenti",)
     assert len(transport.requests) == 1
+
+
+def test_credential_generation_prevents_reuse_across_rotated_vi_credentials():
+    first_transport = FakeTransport(_response(_payload(_product(sku="old-generation"))))
+    second_transport = FakeTransport(_response(_payload(_product(sku="new-generation"))))
+    first_adapter = VseinstrumentiExecutionAdapter(
+        _client(first_transport),
+        region_id=REGION,
+        credential_generation="a" * 32,
+    )
+    second_adapter = VseinstrumentiExecutionAdapter(
+        _client(second_transport),
+        region_id=REGION,
+        credential_generation="b" * 32,
+    )
+    selection = ProviderSelection(provider_keys=("vseinstrumenti",))
+    scope = ProviderExecutionScope(execution_scope_id="rotation-scope")
+
+    first = ProviderRunner({"vseinstrumenti": first_adapter}).run(
+        selection=selection,
+        intent=_intent(),
+        limit=5,
+        scope=scope,
+    )
+    second = ProviderRunner({"vseinstrumenti": second_adapter}).run(
+        selection=selection,
+        intent=_intent(),
+        limit=5,
+        scope=scope,
+    )
+
+    assert first.outcomes[0].request_count == 1
+    assert second.outcomes[0].request_count == 1
+    assert second.reused_provider_keys == ()
+    assert len(first_transport.requests) == len(second_transport.requests) == 1
 
 
 def test_runner_limit_over_vi_page_cap_uses_only_one_maximum_page():

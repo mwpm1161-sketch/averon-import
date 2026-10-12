@@ -42,6 +42,24 @@ _BEARER_RE = re.compile(r"^[A-Za-z0-9._~+/-]+=*$")
 _MAX_BEARER_TOKEN_LENGTH = 8192
 
 
+def is_valid_bearer_token(value: object) -> bool:
+    """Validate token shape without retaining it or exposing it in errors."""
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _MAX_BEARER_TOKEN_LENGTH
+        and value == value.strip()
+        and bool(_BEARER_RE.fullmatch(value))
+    )
+
+
+def is_valid_region_id(value: object) -> bool:
+    """Return whether value is the documented FIAS UUID shape."""
+
+    return isinstance(value, str) and bool(_FIAS_RE.fullmatch(value))
+
+
 class VseinstrumentiErrorCategory(str, Enum):
     AUTHENTICATION = "authentication"
     INVALID_REQUEST = "invalid_request"
@@ -139,6 +157,12 @@ _DEFAULT_SLEEPER = time.sleep
 # Kept at module scope so clients created after settings/runtime rebuilds still
 # share one process-local provider budget. It starts no thread and does no I/O.
 _SHARED_RATE_LIMITER = VseinstrumentiRateLimiter()
+
+
+def shared_rate_limiter() -> VseinstrumentiRateLimiter:
+    """Return the one process-wide VI request budget used across rebuilds."""
+
+    return _SHARED_RATE_LIMITER
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -288,8 +312,7 @@ class VseinstrumentiClient:
     ) -> None:
         if not isinstance(environment, str) or environment not in VSEINSTRUMENTI_API_BASE_URLS:
             raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED) from None
-        if (not isinstance(bearer_token, str) or len(bearer_token) > _MAX_BEARER_TOKEN_LENGTH
-                or bearer_token != bearer_token.strip() or not _BEARER_RE.fullmatch(bearer_token)):
+        if not is_valid_bearer_token(bearer_token):
             raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED) from None
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
             raise VseinstrumentiApiError(VseinstrumentiErrorCategory.MISCONFIGURED) from None

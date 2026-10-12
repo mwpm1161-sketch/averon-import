@@ -193,6 +193,7 @@ def test_client_role_header_is_ignored(auth_client):
         ("delete", "/api/settings/lemana-client-secret", {}),
         ("delete", "/api/settings/etm-ipro-login", {}),
         ("delete", "/api/settings/etm-ipro-password", {}),
+        ("delete", "/api/settings/vseinstrumenti-bearer-token", {}),
         ("post", "/api/sourcing/providers/etm_ipro/manufacturers/sync", {}),
         ("get", "/api/sourcing/providers/etm_ipro/health", {}),
         ("post", "/api/sourcing/providers/etm_ipro/catalog/sync", {}),

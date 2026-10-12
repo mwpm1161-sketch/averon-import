@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -30,7 +31,12 @@ _FORBIDDEN_FILE_KEYS = {
     "client_secret",
     "etm_login",
     "etm_password",
+    "bearer_token",
+    "vseinstrumenti_bearer_token",
+    "access_token",
 }
+
+_VI_REGION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 
 
 class LocalAiSettings(BaseModel):
@@ -110,6 +116,36 @@ class EtmIproSettings(BaseModel):
         return normalize_http_base_url(value)
 
 
+class VseinstrumentiSettings(BaseModel):
+    """Non-secret local configuration for the VI OpenAPI provider."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    environment: Literal["test", "prod"] = "prod"
+    region_id: str = ""
+    request_timeout_s: float = Field(default=10.0, ge=0.1, le=30.0)
+    # Random server-owned generation. It is persisted so token rotation changes
+    # request affinity across runtime rebuilds without deriving identity from
+    # the credential itself.
+    credential_generation: str = Field(
+        default="00000000000000000000000000000000",
+        min_length=32,
+        max_length=32,
+        pattern=r"^[a-f0-9]{32}$",
+    )
+
+    @field_validator("region_id")
+    @classmethod
+    def _validate_region_id(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        if not _VI_REGION_ID_RE.fullmatch(value):
+            raise ValueError("region_id must be a FIAS UUID")
+        return value.lower()
+
+
 class SourcingSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -117,6 +153,7 @@ class SourcingSettings(BaseModel):
     demo_store_base_url: str = "http://127.0.0.1:8877"
     lemana_b2b: LemanaB2BSettings = Field(default_factory=LemanaB2BSettings)
     etm_ipro: EtmIproSettings = Field(default_factory=EtmIproSettings)
+    vseinstrumenti: VseinstrumentiSettings = Field(default_factory=VseinstrumentiSettings)
 
     @field_validator("demo_store_base_url")
     @classmethod
@@ -139,7 +176,9 @@ class AppSettings(BaseModel):
             "local": self.local.model_dump(),
             "yandex": self.yandex.model_dump(),
             "pipeline": self.pipeline.model_dump(),
-            "sourcing": self.sourcing.model_dump(),
+            "sourcing": self.sourcing.model_dump(
+                exclude={"vseinstrumenti": {"credential_generation"}},
+            ),
         }
 
 
@@ -289,6 +328,29 @@ class AppSettingsService:
             except (TypeError, ValueError):
                 self.warnings.append(
                     "AVERON_ETM_IPRO_MAX_LIVE_CANDIDATES имеет недопустимое значение; используется значение из settings.json."
+                )
+        if (value := _env_bool(os.environ.get("AVERON_VSEINSTRUMENTI_ENABLED", ""))) is not None:
+            settings.sourcing.vseinstrumenti.enabled = value
+        if value := os.environ.get("AVERON_VSEINSTRUMENTI_ENVIRONMENT", "").strip().lower():
+            if value in {"test", "prod"}:
+                settings.sourcing.vseinstrumenti.environment = value
+            else:
+                self.warnings.append(
+                    "AVERON_VSEINSTRUMENTI_ENVIRONMENT должен быть test или prod; используется значение из settings.json."
+                )
+        if value := os.environ.get("AVERON_VSEINSTRUMENTI_REGION_ID", "").strip():
+            try:
+                settings.sourcing.vseinstrumenti.region_id = value
+            except (TypeError, ValueError):
+                self.warnings.append(
+                    "AVERON_VSEINSTRUMENTI_REGION_ID должен быть FIAS UUID; используется значение из settings.json."
+                )
+        if (value := _env_float("AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S")) is not None:
+            try:
+                settings.sourcing.vseinstrumenti.request_timeout_s = value
+            except (TypeError, ValueError):
+                self.warnings.append(
+                    "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S имеет недопустимое значение; используется значение из settings.json."
                 )
 
     def update(self, patch: dict) -> AppSettings:

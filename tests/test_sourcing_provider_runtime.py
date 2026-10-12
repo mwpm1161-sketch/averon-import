@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pydantic import ConfigDict, ValidationError
@@ -19,11 +20,16 @@ from averon_import.services.sourcing.providers.base import (
     SourcingProviderError,
     normalize_provider_runtime_state,
 )
+from averon_import.services.sourcing.providers.execution import ProviderRequestCounter
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.sourcing.runtime import create_sourcing_runtime
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.app_settings import AppSettingsService
-from averon_import.services.secrets import MemorySecretStore
+from averon_import.services.secrets import (
+    MemorySecretStore,
+    VSEINSTRUMENTI_BEARER_TOKEN,
+    VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+)
 
 
 RUNTIME_FIELDS = {
@@ -364,6 +370,148 @@ def test_runtime_factory_registers_only_current_providers_without_health_calls(t
     assert runtime.repository.path == tmp_path / "data" / "sourcing" / "catalog.sqlite3"
     assert runtime.service.providers is runtime.providers
     assert len(ai_transport_calls) == 1
+
+
+def test_runtime_registers_configured_vi_only_for_outcome_execution_without_supplier_traffic(
+    tmp_path,
+    monkeypatch,
+):
+    from averon_import.services.sourcing.providers.vseinstrumenti import client as vi_client_module
+
+    for name in (
+        "AVERON_VSEINSTRUMENTI_ENABLED",
+        "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
+        "AVERON_VSEINSTRUMENTI_REGION_ID",
+        "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = AppSettingsService(tmp_path / "settings")
+    settings.update({
+        "sourcing": {
+            "vseinstrumenti": {
+                "enabled": True,
+                "environment": "test",
+                "region_id": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+                "request_timeout_s": 5,
+            }
+        }
+    })
+    secrets = MemorySecretStore()
+    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN, "vi.runtime-secret-token")
+    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
+    transport_calls = []
+    secret_reads = []
+    original_get = secrets.get
+
+    def tracked_get(key):
+        if key == VSEINSTRUMENTI_BEARER_TOKEN:
+            secret_reads.append(key)
+        return original_get(key)
+
+    monkeypatch.setattr(secrets, "get", tracked_get)
+
+    def forbidden_transport(*args, **kwargs):
+        transport_calls.append((args, kwargs))
+        raise AssertionError("runtime composition must not contact VI")
+
+    monkeypatch.setattr(vi_client_module, "_default_transport", forbidden_transport)
+
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, secrets)
+
+    assert "vseinstrumenti" in runtime.execution_providers
+    assert "vseinstrumenti" not in runtime.providers
+    assert runtime.providers.keys() == {"local_catalog", "demo_store_http", "lemana_b2b", "etm_ipro"}
+    adapter = runtime.execution_providers["vseinstrumenti"]
+    first = adapter.request_identity(_intent("vi-runtime"), limit=5, execution_scope_id="scope-1")
+    assert transport_calls == []
+    assert secret_reads == []
+
+    settings.update({
+        "sourcing": {"vseinstrumenti": {"credential_generation": "a" * 32}},
+    })
+    stale_outcome = adapter.execute_search(
+        _intent("vi-stale-runtime"),
+        limit=5,
+        request_counter=ProviderRequestCounter(),
+    )
+    assert stale_outcome.state.value == "failure"
+    assert stale_outcome.failure_category.value == "misconfigured"
+    rebuilt = create_sourcing_runtime(tmp_path / "data", settings, secrets)
+    second = rebuilt.execution_providers["vseinstrumenti"].request_identity(
+        _intent("vi-runtime"), limit=5, execution_scope_id="scope-1",
+    )
+    assert first.request_fingerprint != second.request_fingerprint
+    assert transport_calls == []
+    assert secret_reads == []
+
+
+def test_configured_vi_runtime_resolves_secret_only_on_explicit_fake_search(tmp_path, monkeypatch):
+    from averon_import.services.sourcing.providers.vseinstrumenti import client as vi_client_module
+
+    settings = AppSettingsService(tmp_path / "settings")
+    settings.update({
+        "sourcing": {
+            "vseinstrumenti": {
+                "enabled": True,
+                "environment": "test",
+                "region_id": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+            }
+        }
+    })
+    secrets = MemorySecretStore()
+    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN, "vi.runtime-execution-token")
+    secrets.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "true")
+    secret_reads = []
+    original_get = secrets.get
+
+    def tracked_get(key):
+        if key == VSEINSTRUMENTI_BEARER_TOKEN:
+            secret_reads.append(key)
+        return original_get(key)
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def read(self, limit):
+            return self.body[:limit]
+
+        def close(self):
+            return None
+
+    requests = []
+
+    def fake_transport(request, timeout):
+        requests.append(request)
+        query = parse_qs(urlsplit(request.full_url).query)
+        body = json.dumps({
+            "result": {
+                "search": query["search"][0],
+                "regionId": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+                "products": [],
+            }
+        }).encode("utf-8")
+        return FakeResponse(body)
+
+    monkeypatch.setattr(secrets, "get", tracked_get)
+    monkeypatch.setattr(vi_client_module, "_default_transport", fake_transport)
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, secrets)
+    adapter = runtime.execution_providers["vseinstrumenti"]
+
+    assert secret_reads == []
+    outcome = adapter.execute_search(
+        _intent("vi-explicit-search"),
+        limit=5,
+        request_counter=ProviderRequestCounter(),
+    )
+
+    assert outcome.state.value == "empty"
+    assert outcome.request_count == 1
+    assert secret_reads == [VSEINSTRUMENTI_BEARER_TOKEN]
+    assert len(requests) == 1
+    assert requests[0].get_header("Authorization") == "Bearer vi.runtime-execution-token"
 
 
 def test_runtime_factory_preserves_provider_capabilities_and_normalizes_runtime_state(tmp_path):

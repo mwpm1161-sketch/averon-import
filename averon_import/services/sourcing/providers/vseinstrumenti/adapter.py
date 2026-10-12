@@ -25,6 +25,7 @@ from .client import (
     VseinstrumentiApiError,
     VseinstrumentiClient,
     VseinstrumentiErrorCategory,
+    is_valid_region_id,
 )
 from .models import VseinstrumentiProduct, VseinstrumentiTechnicalSpecification
 
@@ -233,11 +234,17 @@ class VseinstrumentiExecutionAdapter:
         client: VseinstrumentiClient,
         *,
         region_id: str,
+        credential_generation: str = "00000000000000000000000000000000",
     ) -> None:
-        if not isinstance(region_id, str) or len(region_id) > 80:
+        if not isinstance(region_id, str) or len(region_id) > 80 or not is_valid_region_id(region_id):
             raise ValueError("VI region id is outside its allowed bounds")
+        if not isinstance(credential_generation, str) or not re.fullmatch(
+            r"[a-f0-9]{32}", credential_generation,
+        ):
+            raise ValueError("VI credential generation is outside its allowed bounds")
         self.client = client
         self.region_id = region_id
+        self.credential_generation = credential_generation
 
     def _affinity(self) -> ProviderAffinity:
         # Fingerprint only explicit non-secret client/query settings. The
@@ -249,6 +256,7 @@ class VseinstrumentiExecutionAdapter:
             "max_requests": self.client.rate_limiter.max_requests,
             "rate_window_seconds": self.client.rate_limiter.window_seconds,
             "max_page_size": VSEINSTRUMENTI_MAX_PAGE_SIZE,
+            "credential_generation": self.credential_generation,
         })
         return ProviderAffinity(
             environment=self.client.environment,

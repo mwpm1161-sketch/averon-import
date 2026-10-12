@@ -22,6 +22,11 @@ LEMANA_B2B_CLIENT_SECRET = "lemana_b2b.client_secret"
 # ETM iPRO owns two independent credentials; neither is part of settings.json.
 ETM_IPRO_LOGIN = "etm_ipro.login"
 ETM_IPRO_PASSWORD = "etm_ipro.password"
+# VI OpenAPI Bearer credential is write-only in settings APIs.
+VSEINSTRUMENTI_BEARER_TOKEN = "vseinstrumenti.bearer_token"
+# Non-secret presence marker lets status and runtime composition avoid loading
+# the Bearer credential from Windows Credential Manager.
+VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED = "vseinstrumenti.bearer_token_configured"
 
 
 class SecretStoreError(RuntimeError):
