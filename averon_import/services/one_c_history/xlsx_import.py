@@ -26,9 +26,10 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_ZIP_MEMBERS = 1500
 MAX_UNCOMPRESSED_BYTES = 120 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 100
-MAX_ROWS = 50_000
+MAX_ROWS = 75_000
 MAX_COLUMNS = 100
 MAX_HEADER_SCAN_ROWS = 50
+TOO_MANY_ROWS_MESSAGE = "Отчёт содержит слишком много строк. Поддерживается не более 75 000 строк данных"
 MAX_HEADER_LENGTH = 512
 MAX_PREVIEW_ROWS = 12
 MAX_WARNING_EXAMPLES = 5
@@ -331,6 +332,23 @@ def _open_workbook(path: Path):
         raise OneCImportError("Не удалось прочитать книгу XLSX. Проверьте формат и структуру файла.") from exc
 
 
+def _check_data_row_limit(sheet, first_data_row: int) -> None:
+    if sheet.max_row is None:
+        for data_row_count, _row in enumerate(
+            sheet.iter_rows(min_row=first_data_row, values_only=True), start=1,
+        ):
+            if data_row_count > MAX_ROWS:
+                raise OneCImportError(TOO_MANY_ROWS_MESSAGE)
+        return
+    data_row_count = max(0, sheet.max_row - first_data_row + 1)
+    if data_row_count > MAX_ROWS:
+        raise OneCImportError(TOO_MANY_ROWS_MESSAGE)
+
+
+def _header_scan_limit(sheet) -> int:
+    return min(MAX_HEADER_SCAN_ROWS, sheet.max_row if sheet.max_row is not None else MAX_HEADER_SCAN_ROWS)
+
+
 def _detect_header(sheet) -> tuple[int, list[str], dict[str, int | None]]:
     best: tuple[int, int, list[str], dict[str, int | None]] | None = None
     for row_number, row in enumerate(sheet.iter_rows(min_row=1, max_row=MAX_HEADER_SCAN_ROWS, values_only=True), start=1):
@@ -379,7 +397,7 @@ def _header_values(sheet, row_number: int) -> list[str]:
 
 def _detect_two_level_header(sheet) -> dict | None:
     """Detect an adjacent group-label/event-header pair within the bounded scan."""
-    last_row = min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0)
+    last_row = _header_scan_limit(sheet)
     candidates = []
     for group_row in range(1, last_row):
         event_row = group_row + 1
@@ -487,19 +505,22 @@ def inspect_sheet_mapping(
         if sheet_name not in workbook.sheetnames:
             raise OneCImportError("Выбранный лист отсутствует в книге.")
         sheet = workbook[sheet_name]
-        if (sheet.max_column or 0) > MAX_COLUMNS or (sheet.max_row or 0) > MAX_ROWS + MAX_HEADER_SCAN_ROWS:
+        if (sheet.max_column or 0) > MAX_COLUMNS:
             raise OneCImportError("Размер листа XLSX превышает допустимые пределы.")
         if group_header_row is None and event_header_row is None:
-            return {**_detect_sheet_structure(sheet), "sheet_names": list(workbook.sheetnames), "sheet_name": sheet_name}
+            structure = _detect_sheet_structure(sheet)
+            data_header_row = structure.get("event_header_row") or structure["header_row"]
+            _check_data_row_limit(sheet, data_header_row + 1)
+            return {**structure, "sheet_names": list(workbook.sheetnames), "sheet_name": sheet_name}
 
         selected_event_row = event_header_row or group_header_row
-        if selected_event_row is None or selected_event_row > min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0):
+        if selected_event_row is None or selected_event_row > _header_scan_limit(sheet):
             raise OneCImportError("Строка заголовков выходит за допустимый диапазон.")
         automatic = _detect_two_level_header(sheet)
         if automatic and selected_event_row == automatic["event_header_row"] and group_header_row in (None, automatic["group_header_row"]):
             structure = automatic
         elif group_header_row is not None and group_header_row != selected_event_row:
-            if group_header_row > min(MAX_HEADER_SCAN_ROWS, sheet.max_row or 0):
+            if group_header_row > _header_scan_limit(sheet):
                 raise OneCImportError("Строка заголовков группы выходит за допустимый диапазон.")
             group_headers = _header_values(sheet, group_header_row)
             event_headers = _header_values(sheet, selected_event_row)
@@ -548,6 +569,8 @@ def inspect_sheet_mapping(
                 "item_name_parse_strategy": "comma_suffix_unit" if mapping.get("unit") is None else "none",
                 "warehouse_header_ambiguous": _warehouse_header_ambiguous(headers),
             }
+        data_header_row = structure.get("event_header_row") or structure["header_row"]
+        _check_data_row_limit(sheet, data_header_row + 1)
         return {**structure, "sheet_names": list(workbook.sheetnames), "sheet_name": sheet_name}
     finally:
         workbook.close()
@@ -633,7 +656,7 @@ def detect_workbook(path: Path) -> dict:
         candidates = []
         for sheet_name in sheets:
             sheet = workbook[sheet_name]
-            if (sheet.max_column or 0) > MAX_COLUMNS or (sheet.max_row or 0) > MAX_ROWS + MAX_HEADER_SCAN_ROWS:
+            if (sheet.max_column or 0) > MAX_COLUMNS:
                 continue
             try:
                 structure = _detect_sheet_structure(sheet)
@@ -650,8 +673,8 @@ def detect_workbook(path: Path) -> dict:
         sheet_name, structure, sheet, _score = selected
         if len(structure["headers"]) > MAX_COLUMNS or (sheet.max_column or 0) > MAX_COLUMNS:
             raise OneCImportError("В листе XLSX слишком много столбцов.")
-        if (sheet.max_row or 0) > MAX_ROWS + structure["header_row"]:
-            raise OneCImportError("В листе XLSX слишком много строк.")
+        data_header_row = structure.get("event_header_row") or structure["header_row"]
+        _check_data_row_limit(sheet, data_header_row + 1)
         return {
             "sheet_names": sheets,
             "sheet_name": sheet_name,
@@ -847,9 +870,8 @@ def parse_workbook(
         if (sheet.max_column or 0) > MAX_COLUMNS or len(headers) > MAX_COLUMNS:
             raise OneCImportError("В листе XLSX слишком много столбцов.")
         first_data_row = event_header_row + 1
-        if (sheet.max_row or 0) > MAX_ROWS + first_data_row:
-            raise OneCImportError("В листе XLSX слишком много строк.")
-        physical_row_count = sheet.max_row or 0
+        _check_data_row_limit(sheet, first_data_row)
+        physical_row_count = max(sheet.max_row or 0, event_header_row)
 
         events: list[ParsedEvent] = []
         current_item: _GroupContext | None = None
@@ -869,8 +891,9 @@ def parse_workbook(
             sheet.iter_rows(min_row=first_data_row, values_only=False), start=first_data_row
         ):
             observed_rows += 1
+            physical_row_count = max(physical_row_count, row_number)
             if observed_rows > MAX_ROWS:
-                raise OneCImportError("В листе XLSX слишком много строк.")
+                raise OneCImportError(TOO_MANY_ROWS_MESSAGE)
             row = tuple(cell.value for cell in cells)
             if not any(_cell_value(value) is not None for value in row):
                 continue

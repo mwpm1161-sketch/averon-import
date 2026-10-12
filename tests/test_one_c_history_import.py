@@ -24,8 +24,12 @@ from averon_import.services.one_c_history.service import OneCHistoryImportServic
 from averon_import.services.one_c_history.xlsx_import import (
     OneCImportError,
     EFFECTIVE_UNIT_PRICE_PRECISION,
+    MAX_HEADER_SCAN_ROWS,
+    MAX_ROWS,
+    TOO_MANY_ROWS_MESSAGE,
     _parse_decimal,
     detect_workbook,
+    inspect_sheet_mapping,
     parse_workbook,
     preflight_xlsx,
 )
@@ -140,6 +144,170 @@ def _parse_detected_workbook(path: Path):
         event_header_signature=detected.get("event_header_signature"),
     )
     return detected, parsed
+
+
+def _write_flat_comment_rows_xlsx(path: Path, *, data_rows: int, header_row: int = 50) -> None:
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("TDSheet")
+    for row_number in range(1, header_row):
+        sheet.append(["Отчёт о закупках"] if row_number == 1 else [None] * 8)
+    sheet.append([
+        "Код номенклатуры", "Наименование", "Ед. изм.", "Количество",
+        "Цена с НДС", "Сумма с НДС", "Контрагент", "Комментарий",
+    ])
+    for index in range(data_rows):
+        if index == 0:
+            sheet.append(["ITEM-1", "Шайба", "шт", 1, 5, 5, "Поставщик", "первая строка данных"])
+        else:
+            sheet.append([None, None, None, None, None, None, None, f"строка данных {index:06d}"])
+    workbook.save(path)
+
+
+def _write_large_two_level_history_xlsx(path: Path, *, total_physical_rows: int = 61_907) -> int:
+    """Write a deterministic TDSheet report with distinct purchase references."""
+    group_header_row, event_header_row = 10, 11
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("TDSheet")
+    for row_number in range(1, group_header_row):
+        sheet.append(["Отчёт о закупках"] if row_number == 1 else [None] * 8)
+    sheet.append([
+        "Номенклатура, ед. изм.", "Код номенклатуры", "Ед. изм.",
+        None, None, None, None, None,
+    ])
+    sheet.append([
+        "Цена с НДС", "Количество", "Сумма с НДС", "Дата документа",
+        "Документ прихода", "Контрагент", "Договор", "Склад",
+    ])
+    sheet.append(["Шайба", "ITEM-1", "шт", None, None, None, None, None])
+    event_count = total_physical_rows - event_header_row - 1
+    for index in range(event_count):
+        sheet.append([
+            12.5, 2, 25, datetime(2025 + index % 2, index % 12 + 1, index % 28 + 1),
+            f"Поступление-{index:06d}", f"Поставщик-{index % 17:02d}",
+            f"Договор-{index % 11:02d}", f"Склад-{index % 5:02d}",
+        ])
+    workbook.save(path)
+    return event_count
+
+
+@pytest.mark.parametrize(
+    "layout,header_row",
+    [
+        ("flat", 1),
+        ("flat", 10),
+        ("two_level", 10),
+        ("two_level", 11),
+        ("flat", 50),
+        ("two_level", 50),
+    ],
+)
+def test_one_c_header_scan_boundary_rows_preserve_flat_and_two_level_headers(tmp_path, layout, header_row):
+    path = tmp_path / f"header-{layout}-{header_row}.xlsx"
+    if layout == "flat":
+        _flat_xlsx_bytes(path, shift=header_row - 1)
+    else:
+        _two_level_xlsx_bytes(path, shift=header_row - 10)
+
+    detected, parsed = _parse_detected_workbook(path)
+
+    assert detected["sheet_name"] == "TDSheet"
+    assert (detected.get("event_header_row") or detected["header_row"]) == header_row
+    assert detected["layout_type"] == ("hierarchical_grouped" if layout == "two_level" else "flat")
+    assert len(parsed.events) == (2 if layout == "two_level" else 1)
+
+
+def test_one_c_import_accepts_61907_physical_rows_and_persists_each_event_once(tmp_path):
+    path = tmp_path / "synthetic-tdsheet-61907.xlsx"
+    expected_events = _write_large_two_level_history_xlsx(path, total_physical_rows=61_907)
+    detected = detect_workbook(path)
+    service = _make_service(tmp_path / "history-service")
+
+    preview = asyncio.run(service.create_preview(_upload(path.read_bytes())))
+
+    assert preview["sheet_name"] == "TDSheet"
+    assert detected["layout_type"] == preview["layout_type"] == "hierarchical_grouped", detected
+    assert preview["group_header_row"] == 10
+    assert preview["event_header_row"] == 11
+    assert preview["summary"]["physical_row_count"] == 61_907
+    assert preview["summary"]["event_count"] == expected_events
+    assert expected_events == 61_895
+
+    request = ImportMappingRequest(
+        preview_id=preview["preview_id"], sheet_name=preview["sheet_name"],
+        header_row=preview["header_row"], group_header_row=preview["group_header_row"],
+        event_header_row=preview["event_header_row"], layout_type=preview["layout_type"],
+        field_mapping=preview["field_mapping"], group_field_mapping=preview["group_field_mapping"],
+        event_field_mapping=preview["event_field_mapping"],
+        item_name_parse_strategy=preview["item_name_parse_strategy"],
+    )
+    imported = asyncio.run(service.import_confirmed(request))
+    assert imported["status"] == "succeeded"
+
+    with sqlite3.connect(service.repository.database_path) as connection:
+        event_count, distinct_event_ids, distinct_source_rows = connection.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT event_id), COUNT(DISTINCT source_row) FROM purchase_events"
+        ).fetchone()
+    assert event_count == distinct_event_ids == distinct_source_rows == expected_events
+
+
+def test_one_c_import_accepts_exactly_75000_data_rows_with_header_at_scan_limit(tmp_path):
+    assert MAX_ROWS == 75_000
+    assert MAX_HEADER_SCAN_ROWS == 50
+    path = tmp_path / "exactly-75000-data-rows.xlsx"
+    _write_flat_comment_rows_xlsx(path, data_rows=MAX_ROWS, header_row=MAX_HEADER_SCAN_ROWS)
+
+    detected = detect_workbook(path)
+    inspected = inspect_sheet_mapping(path, "TDSheet")
+    parsed = parse_workbook(
+        path, filename=path.name, file_sha256="b" * 64,
+        sheet_name=detected["sheet_name"], header_row=detected["header_row"],
+        headers=detected["headers"], layout_type=detected["layout_type"],
+        field_mapping=detected["field_mapping"],
+        item_name_parse_strategy=detected["item_name_parse_strategy"],
+        group_header_row=detected.get("group_header_row"), event_header_row=detected.get("event_header_row"),
+        group_headers=detected.get("group_headers"), group_field_mapping=detected["group_field_mapping"],
+        event_field_mapping=detected["event_field_mapping"],
+    )
+
+    assert detected["header_row"] == inspected["header_row"] == MAX_HEADER_SCAN_ROWS
+    assert parsed.physical_row_count == MAX_HEADER_SCAN_ROWS + MAX_ROWS
+    assert len(parsed.events) == 1
+    assert parsed.skipped_row_count == MAX_ROWS - 1
+
+
+def test_one_c_import_rejects_75001_rows_with_specific_error_at_every_stage(tmp_path):
+    path = tmp_path / "over-75000-data-rows.xlsx"
+    _write_flat_comment_rows_xlsx(path, data_rows=75_001, header_row=MAX_HEADER_SCAN_ROWS)
+    headers = [
+        "Код номенклатуры", "Наименование", "Ед. изм.", "Количество",
+        "Цена с НДС", "Сумма с НДС", "Контрагент", "Комментарий",
+    ]
+    field_mapping = {
+        "item_code": 0, "item_name": 1, "unit": 2, "quantity": 3,
+        "reported_unit_price_gross": 4, "amount_gross": 5, "counterparty": 6,
+    }
+
+    with pytest.raises(OneCImportError) as detected_error:
+        detect_workbook(path)
+    assert str(detected_error.value) == TOO_MANY_ROWS_MESSAGE
+
+    with pytest.raises(OneCImportError) as inspected_error:
+        inspect_sheet_mapping(path, "TDSheet", event_header_row=MAX_HEADER_SCAN_ROWS)
+    assert str(inspected_error.value) == TOO_MANY_ROWS_MESSAGE
+
+    with pytest.raises(OneCImportError) as parsed_error:
+        parse_workbook(
+            path, filename=path.name, file_sha256="c" * 64,
+            sheet_name="TDSheet", header_row=MAX_HEADER_SCAN_ROWS,
+            headers=headers, layout_type="flat", field_mapping=field_mapping,
+            item_name_parse_strategy="none", event_header_row=MAX_HEADER_SCAN_ROWS,
+        )
+    assert str(parsed_error.value) == TOO_MANY_ROWS_MESSAGE
+
+    service = _make_service(tmp_path / "over-limit-service")
+    with pytest.raises(OneCImportError) as preview_error:
+        asyncio.run(service.create_preview(_upload(path.read_bytes())))
+    assert str(preview_error.value) == TOO_MANY_ROWS_MESSAGE
 
 
 def test_flat_and_two_level_warehouse_is_event_provenance_only(tmp_path):
