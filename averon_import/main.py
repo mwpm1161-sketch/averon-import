@@ -2621,6 +2621,34 @@ def _available_tender_multi_provider_keys(runtime) -> tuple[str, ...]:
     return tuple(available)
 
 
+def _manual_tender_vi_config_revision(runtime) -> str | None:
+    """Return an opaque, current VI configuration revision for private dedupe."""
+    try:
+        # This reads only the configured marker, never the bearer token. The
+        # same lock makes the adapter revision and current settings coherent
+        # with credential replacement/runtime rebuild.
+        with VI_CREDENTIAL_LOCK:
+            vi_settings = app_settings_service.settings.sourcing.vseinstrumenti
+            vi_adapter = getattr(runtime, "execution_providers", {}).get("vseinstrumenti")
+            if (not vi_settings.enabled or not is_valid_region_id(vi_settings.region_id)
+                    or vi_adapter is None
+                    or getattr(vi_adapter, "credential_generation", None) != vi_settings.credential_generation
+                    or secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+                    != vi_settings.credential_generation):
+                return None
+            affinity_factory = getattr(vi_adapter, "_affinity", None)
+            affinity = affinity_factory() if callable(affinity_factory) else None
+            config_revision = getattr(affinity, "config_revision", None)
+            if not isinstance(config_revision, str) or not re.fullmatch(r"[a-f0-9]{64}", config_revision):
+                return None
+            return stable_fingerprint({
+                "adapter_config_revision": config_revision,
+                "region_id": str(vi_settings.region_id),
+            })
+    except Exception:
+        return None
+
+
 @app.get("/api/manual-tenders/sourcing/multi-provider-capabilities", dependencies=[Depends(require_authenticated)])
 def get_multi_provider_sourcing_capabilities(_user: CurrentUser = Depends(require_authenticated)):
     with _sourcing_runtime_lock:
@@ -2730,7 +2758,7 @@ def _submit_manual_tender_multi_provider(
 
     source_mode = SourcingSourceMode.PROVIDER_ONLY
     selected_ids = tuple(request.source_row_ids)
-    dedupe_key = stable_fingerprint({
+    dedupe_payload = {
         "kind": "manual_tender_multi_provider_m4a_v1",
         "tender_id": tender_id,
         "source_sha256": snapshot.source_sha256,
@@ -2739,7 +2767,20 @@ def _submit_manual_tender_multi_provider(
         "provider_keys": selection.provider_keys,
         "source_mode": source_mode.value,
         "limit": request.limit,
-    })
+    }
+    if "vseinstrumenti" in selection.provider_keys:
+        vi_config_revision = _manual_tender_vi_config_revision(runtime)
+        if vi_config_revision is None:
+            raise HTTPException(400, detail={
+                "code": "MULTI_PROVIDER_UNAVAILABLE",
+                "message": "Один или несколько выбранных поставщиков недоступны.",
+            })
+        # Keep this safe opaque revision solely inside the in-memory job
+        # dedupe fingerprint. It is not part of any public or durable model.
+        dedupe_payload["provider_config_revisions"] = {
+            "vseinstrumenti": vi_config_revision,
+        }
+    dedupe_key = stable_fingerprint(dedupe_payload)
 
     def run(progress):
         result = execute_multi_provider_tender_run(

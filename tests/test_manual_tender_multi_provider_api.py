@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import threading
@@ -23,12 +24,17 @@ from test_manual_tender_xlsx import (
 
 
 class Runtime:
-    def __init__(self, service, keys=(ETM, LEMANA), configured=(ETM, LEMANA)):
+    def __init__(self, service, keys=(ETM, LEMANA), configured=(ETM, LEMANA), vi_generation="a" * 32):
         self.service = service
         self._keys = tuple(keys)
         self.execution_providers = service.provider_runner._registry
         if VI in self._keys:
-            self.execution_providers[VI].credential_generation = "a" * 32
+            adapter = self.execution_providers[VI]
+            adapter.credential_generation = vi_generation
+            adapter._affinity = lambda: SimpleNamespace(
+                config_revision=hashlib.sha256(vi_generation.encode("ascii")).hexdigest(),
+                region_id=VI_REGION,
+            )
         self.providers = {
             key: type("ProviderConfiguration", (), {"configured": key in configured})()
             for key in (ETM, LEMANA)
@@ -52,10 +58,13 @@ def forbid_external_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("external network is forbidden")))
 
 
-def _runtime(monkeypatch, main, *, keys=(ETM, LEMANA), configured=(ETM, LEMANA), adapters=None):
+def _runtime(
+    monkeypatch, main, *, keys=(ETM, LEMANA), configured=(ETM, LEMANA), adapters=None,
+    vi_generation="a" * 32,
+):
     adapters = adapters or (Adapter(ETM, amount="1234.5600"), Adapter(LEMANA, amount="1234.5600"))
     service = _service(*adapters)
-    monkeypatch.setattr(main, "sourcing_runtime", Runtime(service, keys, configured))
+    monkeypatch.setattr(main, "sourcing_runtime", Runtime(service, keys, configured, vi_generation))
     return service, adapters
 
 
@@ -66,8 +75,7 @@ def _payload(workspace, **updates):
     return value
 
 
-def _enable_vi_public_configuration(monkeypatch, main):
-    generation = "a" * 32
+def _enable_vi_public_configuration(monkeypatch, main, generation="a" * 32):
     settings = AppSettings.model_validate({"sourcing": {"vseinstrumenti": {
         "enabled": True, "region_id": VI_REGION, "credential_generation": generation,
     }}})
@@ -75,6 +83,56 @@ def _enable_vi_public_configuration(monkeypatch, main):
     store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, generation)
     monkeypatch.setattr(main, "app_settings_service", SimpleNamespace(settings=settings))
     monkeypatch.setattr(main, "secret_store", store)
+
+
+def test_m5d_vi_credential_rotation_breaks_active_multi_provider_dedupe(
+    tender_api, tmp_path, monkeypatch,
+):
+    main, repository = tender_api
+    generation_a, generation_b = "a" * 32, "b" * 32
+    _enable_vi_public_configuration(monkeypatch, main, generation_a)
+    workspace = _confirm_synthetic_tender(main, repository, tmp_path, count=1)
+    started, release = threading.Event(), threading.Event()
+
+    def block_first_generation(_intent):
+        started.set()
+        assert release.wait(5), "test did not release the first-generation fake adapter"
+
+    first_adapters = (Adapter(ETM, hook=block_first_generation), Adapter(VI, hook=block_first_generation))
+    _runtime(
+        monkeypatch, main, keys=(ETM, VI), configured=(ETM,), adapters=first_adapters,
+        vi_generation=generation_a,
+    )
+    payload = _payload(workspace, providers=[ETM, VI])
+
+    first = _post_tender_sourcing(main, workspace["tender_id"], payload)
+    assert first.status_code == 202, first.text
+    first_job_id = first.json()["id"]
+    try:
+        assert started.wait(2), "first fake provider execution did not start"
+        same_generation = _post_tender_sourcing(main, workspace["tender_id"], payload)
+        assert same_generation.status_code == 202, same_generation.text
+        assert same_generation.json()["id"] == first_job_id
+
+        # Simulate a completed local credential rotation without reading or
+        # storing a bearer token; both generations are test-only markers.
+        _enable_vi_public_configuration(monkeypatch, main, generation_b)
+        _runtime(
+            monkeypatch, main, keys=(ETM, VI), configured=(ETM,),
+            adapters=(Adapter(ETM), Adapter(VI)), vi_generation=generation_b,
+        )
+        rotated = _post_tender_sourcing(main, workspace["tender_id"], payload)
+        assert rotated.status_code in {202, 409}, rotated.text
+        if rotated.status_code == 202:
+            assert rotated.json()["id"] != first_job_id
+        else:
+            assert rotated.json()["detail"]["code"] == "JOB_LANE_BUSY"
+    finally:
+        release.set()
+
+    assert _wait_tender_job(main, first_job_id)["status"] == "completed"
+    if rotated.status_code == 202:
+        assert _wait_tender_job(main, rotated.json()["id"])["status"] == "completed"
 
 
 def test_m4a_capabilities_are_authenticated_local_and_intersect_registered_runtime(tender_api, monkeypatch):
