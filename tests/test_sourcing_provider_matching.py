@@ -258,6 +258,9 @@ def test_provider_and_offer_input_order_do_not_change_matches_or_recommendation(
     assert [item.deterministic_evidence for item in first.matches] == [
         item.deterministic_evidence for item in second.matches
     ]
+    assert len(first.matches) == 3
+    assert len({ProviderOfferReference.from_offer(item.offer) for item in first.matches}) == 3
+    assert sum(item.offer.offer_id == "same" for item in first.matches) == 2
     assert first.recommended_offer_reference == second.recommended_offer_reference is None
 
 

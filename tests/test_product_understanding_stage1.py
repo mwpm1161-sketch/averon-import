@@ -475,6 +475,36 @@ def test_cache_configured_qwen_success_is_cached(tmp_path):
     assert provider.calls == 1
 
 
+def test_m6b_article_alias_participates_in_cold_warm_and_restart_cache_identity(tmp_path):
+    ai, provider = ai_for({
+        "normalized_name": "Клапан",
+        "article": "AI-PROPOSED-ARTICLE",
+    })
+    article_a = {
+        "id": "same-row",
+        "source_text": "Клапан",
+        "name": "Клапан",
+        "article": "A-1",
+        "quantity": "1",
+        "unit": "шт.",
+    }
+    article_b = {**article_a, "article": "B-2"}
+    code_a = {**article_a, "article": "", "code": "A-1"}
+    first_service = make_service(tmp_path, ai)
+
+    assert first_service._intent_cache_key(article_a) != first_service._intent_cache_key(article_b)
+    assert first_service._intent_cache_key(article_a) != first_service._intent_cache_key(code_a)
+    first, first_hit = first_service._understand_row_result_with_cache(article_a)
+    second, second_hit = first_service._understand_row_result_with_cache(article_b)
+    restarted, restart_hit = make_service(tmp_path, ai)._understand_row_result_with_cache(article_b)
+
+    assert first.mode == second.mode == restarted.mode == "qwen"
+    assert first.resolved_intent.article == "A-1"
+    assert second.resolved_intent.article == restarted.resolved_intent.article == "B-2"
+    assert (first_hit, second_hit, restart_hit) == (False, False, True)
+    assert provider.calls == 2
+
+
 def test_cache_configured_qwen_transient_failure_is_not_cached(tmp_path):
     ai, provider = ai_for(RuntimeError("temporary provider failure"))
     service = make_service(tmp_path, ai)

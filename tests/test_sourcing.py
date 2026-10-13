@@ -259,8 +259,8 @@ def test_s10b_ai_ranking_reorders_known_candidates_only():
     second = make_offer(offer_id="second", price=Decimal("20"), url="")
     matches = OfferMatcher().match(make_intent(), [first, second])
     provider = FakeAIProvider(json.dumps({
-        "offer_order": ["second", "unknown", "first"],
-        "evidence": {"second": ["closer model"], "unknown": ["ignored"]},
+        "offer_order": ["second", "first"],
+        "evidence": {"second": ["closer model"]},
     }))
     ai = SourcingAIService(FakeAIService(provider))
     ranked, warnings = ai.rank_matches(make_intent(), matches)
@@ -269,6 +269,97 @@ def test_s10b_ai_ranking_reorders_known_candidates_only():
     assert ranked[0].offer.price == Decimal("20")
     assert ranked[0].offer.url == ""
     assert ranked[0].ai_evidence == {"reasons": ["closer model"]}
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_ids", "invalid"),
+    [
+        ({"offer_order": ["b"]}, ["b", "a"], False),
+        ({"offer_order": ["a", "a", "b"]}, ["a", "b"], True),
+        ({"offer_order": ["a", "unknown", "b"]}, ["a", "b"], True),
+        ({"offer_order": []}, ["a", "b"], True),
+        ({"offer_order": "b"}, ["a", "b"], True),
+        ({"offer_order": ["b"], "evidence": []}, ["a", "b"], True),
+        ("not-json", ["a", "b"], True),
+    ],
+    ids=["partial-completes-deterministically", "duplicate-id", "unknown-id", "empty", "wrong-type", "wrong-evidence-type", "invalid-json"],
+)
+def test_m6b_ai_ranking_response_contract_falls_back_safely(response, expected_ids, invalid):
+    intent = make_intent()
+    offers = [
+        make_offer(offer_id="a", price=Decimal("10")),
+        make_offer(offer_id="b", price=Decimal("20")),
+    ]
+    deterministic = OfferMatcher().match(intent, offers)
+    provider = FakeAIProvider(
+        response if isinstance(response, str) else json.dumps(response)
+    )
+
+    result = SourcingAIService(FakeAIService(provider)).rank_matches(intent, deterministic)
+
+    assert [item.offer.offer_id for item in result.matches] == expected_ids
+    assert len({(item.offer.provider, item.offer.offer_id) for item in result.matches}) == 2
+    assert {item.offer.offer_id: item.decision for item in result.matches} == {
+        item.offer.offer_id: item.decision for item in deterministic
+    }
+    if invalid:
+        assert result.notices[0].code == "AI_INVALID_RESPONSE"
+        assert "детерминированный порядок" in result.warnings[0]
+        assert all(item.ai_evidence == {} for item in result.matches)
+    else:
+        assert result.notices == []
+        assert result.warnings == []
+
+
+def test_m6b_ai_ranking_uses_composite_candidate_identity():
+    intent = make_intent()
+    etm = make_offer(offer_id="same-id", provider="etm_ipro")
+    duplicate_etm = make_offer(
+        offer_id="same-id", provider="etm_ipro", price=Decimal("999"),
+    )
+    lemana = make_offer(offer_id="same-id", provider="lemana_b2b")
+    deterministic = OfferMatcher().match(intent, [etm, duplicate_etm, lemana])
+
+    class ReverseCandidateProvider(FakeAIProvider):
+        def complete(self, messages, **kwargs):
+            request = json.loads(messages[-1]["content"])
+            candidate_ids = [item["candidate_id"] for item in request["offers"]]
+            return json.dumps({"offer_order": list(reversed(candidate_ids))})
+
+    provider = ReverseCandidateProvider("")
+
+    result = SourcingAIService(FakeAIService(provider)).rank_matches(intent, deterministic)
+
+    assert [(item.offer.provider, item.offer.offer_id) for item in result.matches] == [
+        ("lemana_b2b", "same-id"),
+        ("etm_ipro", "same-id"),
+    ]
+
+
+def test_m6b_ai_ranking_does_not_change_deterministic_recommendation():
+    intent = make_intent(model="K-100", required_attributes={"power": 1})
+    stronger = make_offer(
+        offer_id="a-strong", attributes={"model": "K-100", "power": 1},
+    )
+    weaker = make_offer(
+        offer_id="b-weak", title="Valve K-100", attributes={"power": 1},
+    )
+    deterministic = OfferMatcher().match(intent, [stronger, weaker])
+    assert recommended_offer(deterministic).offer_id == "a-strong"
+
+    provider = RowOffersProvider({"row-1": [weaker, stronger]})
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+            "offer_order": ["b-weak", "a-strong"],
+        })))),
+        cache=SourcingCache(),
+    )
+    result = service.search_intent(intent, ai_rerank=True)
+
+    assert [item.offer.offer_id for item in result.match_results] == ["b-weak", "a-strong"]
+    assert result.recommended_offer.offer_id == "a-strong"
 
 
 def test_ai_ranking_notices_are_request_local_without_last_notice_side_channel():
@@ -944,6 +1035,339 @@ def test_m6a_search_cache_separates_origins_cold_warm_and_after_restart(tmp_path
     assert restarted.match_results[0].decision == MatchDecision.REJECT
     assert restarted.timings["search_cache_hit"] == 1.0
     assert restarted_provider.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("cold_rerank", "warm_rerank", "cold_order", "warm_order"),
+    [
+        (True, False, ["b", "a"], ["a", "b"]),
+        (False, True, ["a", "b"], ["b", "a"]),
+    ],
+    ids=["ai-then-deterministic", "deterministic-then-ai"],
+)
+def test_m6b_search_cache_keeps_ai_ranking_request_local_across_restart(
+    tmp_path, cold_rerank, warm_rerank, cold_order, warm_order
+):
+    class CountingProvider(StubProvider):
+        def __init__(self, offers):
+            super().__init__(offers)
+            self.calls = 0
+
+        def search(self, intent, *, limit=20):
+            self.calls += 1
+            return super().search(intent, limit=limit)
+
+    offers = [
+        make_offer(offer_id="a", price=Decimal("10")),
+        make_offer(offer_id="b", price=Decimal("20")),
+    ]
+    cache_path = tmp_path / "m6b-ranking-cache.json"
+    first_provider = CountingProvider(offers)
+    first_ai = SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+        "offer_order": ["b", "a"],
+    }))))
+    first_service = SourcingService(
+        {first_provider.key: first_provider},
+        default_provider=first_provider.key,
+        ai=first_ai,
+        cache=SourcingCache(cache_path),
+    )
+    cold = first_service.search_intent(make_intent(), ai_rerank=cold_rerank)
+
+    restarted_provider = CountingProvider(offers)
+    warm_ai = SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+        "offer_order": ["b", "a"],
+    })))) if warm_rerank else SourcingAIService()
+    restarted_service = SourcingService(
+        {restarted_provider.key: restarted_provider},
+        default_provider=restarted_provider.key,
+        ai=warm_ai,
+        cache=SourcingCache(cache_path),
+    )
+    warm = restarted_service.search_intent(make_intent(), ai_rerank=warm_rerank)
+
+    assert [item.offer.offer_id for item in cold.match_results] == cold_order
+    assert [item.offer.offer_id for item in warm.match_results] == warm_order
+    assert first_provider.calls == 1
+    assert restarted_provider.calls == 0
+    assert warm.timings["search_cache_hit"] == 1.0
+    persisted = json.loads(cache_path.read_text(encoding="utf-8"))
+    search_entries = [
+        value for key, value in persisted.items() if key.startswith("search:v2:")
+    ]
+    assert len(search_entries) == 1
+    assert [item["offer"]["offer_id"] for item in search_entries[0]["match_results"]] == ["a", "b"]
+    assert all(item["ai_evidence"] == {} for item in search_entries[0]["match_results"])
+
+
+def test_m6b_ai_failure_is_request_local_and_restored_on_warm_cache(tmp_path):
+    class CountingProvider(StubProvider):
+        def __init__(self, offers):
+            super().__init__(offers)
+            self.calls = 0
+
+        def search(self, intent, *, limit=20):
+            self.calls += 1
+            return super().search(intent, limit=limit)
+
+    class RaisingRankingProvider(FakeAIProvider):
+        def complete(self, messages, **kwargs):
+            self.calls += 1
+            raise RuntimeError("temporary provider outage")
+
+    offers = [make_offer(offer_id="a"), make_offer(offer_id="b")]
+    cache_path = tmp_path / "m6b-ai-recovery-cache.json"
+
+    def service(ai):
+        provider = CountingProvider(offers)
+        value = SourcingService(
+            {provider.key: provider},
+            default_provider=provider.key,
+            ai=ai,
+            cache=SourcingCache(cache_path),
+        )
+        return value, provider
+
+    successful_ai = SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+        "offer_order": ["b", "a"],
+    }))))
+    successful_service, first_provider = service(successful_ai)
+    success = successful_service.search_intent(make_intent(), ai_rerank=True)
+
+    unavailable_ai = SourcingAIService(FakeAIService(RaisingRankingProvider("")))
+    unavailable_service, unavailable_search_provider = service(unavailable_ai)
+    unavailable = unavailable_service.search_intent(make_intent(), ai_rerank=True)
+
+    restored_ai = SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+        "offer_order": ["a", "b"],
+    }))))
+    restored_service, restored_search_provider = service(restored_ai)
+    restored = restored_service.search_intent(make_intent(), ai_rerank=True)
+
+    assert [item.offer.offer_id for item in success.match_results] == ["b", "a"]
+    assert [item.offer.offer_id for item in unavailable.match_results] == ["a", "b"]
+    assert unavailable.notices[-1].code == "AI_UNAVAILABLE"
+    assert all(item.ai_evidence == {} for item in unavailable.match_results)
+    assert [item.offer.offer_id for item in restored.match_results] == ["a", "b"]
+    assert not any(notice.code == "AI_UNAVAILABLE" for notice in restored.notices)
+    assert not any("Qwen недоступен" in warning for warning in restored.warnings)
+    assert first_provider.calls == 1
+    assert unavailable_search_provider.calls == restored_search_provider.calls == 0
+    assert unavailable.timings["search_cache_hit"] == restored.timings["search_cache_hit"] == 1.0
+
+
+def test_m6b_search_cache_rebinds_current_understanding_warnings_and_ai_mode(tmp_path):
+    from averon_import.services.sourcing.models import (
+        ProductUnderstandingProvenance,
+        ProductUnderstandingResult,
+    )
+
+    intent = make_intent()
+    cache_path = tmp_path / "m6b-current-understanding-cache.json"
+    prior_notice = SourcingNotice(code="AI_TIMEOUT", message="old AI warning")
+    current_notice = SourcingNotice(code="AI_NOT_CONFIGURED", message="current AI warning")
+    qwen_understanding = ProductUnderstandingResult(
+        baseline_intent=intent,
+        resolved_intent=intent,
+        warnings=["old AI understanding warning"],
+        notices=[prior_notice],
+        mode="qwen",
+        provenance=ProductUnderstandingProvenance(
+            provider="test", parser_revision="m6b-test",
+        ),
+    )
+    fallback_understanding = ProductUnderstandingResult(
+        baseline_intent=intent,
+        resolved_intent=intent,
+        warnings=["current AI understanding warning"],
+        notices=[current_notice],
+        mode="fallback",
+        provenance=ProductUnderstandingProvenance(
+            provider="test", parser_revision="m6b-test",
+        ),
+    )
+    first_provider = StubProvider([make_offer(offer_id="cached-a")])
+    first = SourcingService(
+        {first_provider.key: first_provider},
+        default_provider=first_provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    ).search_intent(
+        intent,
+        understanding=qwen_understanding,
+        warnings=qwen_understanding.warnings,
+        notices=qwen_understanding.notices,
+        ai_rerank=False,
+    )
+    warm_provider = StubProvider([make_offer(offer_id="must-not-be-read")])
+    warm = SourcingService(
+        {warm_provider.key: warm_provider},
+        default_provider=warm_provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    ).search_intent(
+        intent,
+        understanding=fallback_understanding,
+        warnings=fallback_understanding.warnings,
+        notices=fallback_understanding.notices,
+        ai_rerank=False,
+    )
+
+    assert first.ai_mode == "qwen"
+    assert warm.ai_mode == "fallback"
+    assert "current AI understanding warning" in warm.warnings
+    assert "old AI understanding warning" not in warm.warnings
+    assert all(item.code != "AI_TIMEOUT" for item in warm.notices)
+    assert any(item.code == "AI_NOT_CONFIGURED" for item in warm.notices)
+    assert warm.timings["search_cache_hit"] == 1.0
+    assert warm.offers[0].offer_id == "cached-a"
+
+
+def test_m6b_ai_and_cache_modes_do_not_promote_review_into_confirmed_total(tmp_path):
+    class CountingRowProvider(RowOffersProvider):
+        def __init__(self, offers_by_row):
+            super().__init__(offers_by_row)
+            self.calls = 0
+
+        def search(self, intent, *, limit=20):
+            self.calls += 1
+            return super().search(intent, limit=limit)
+
+    offer = make_offer(
+        offer_id="ambiguous-review",
+        title="Насос ABC-100 V2",
+        attributes={},
+        price=Decimal("500"),
+    )
+    cache_path = tmp_path / "m6b-confirmed-total-cache.json"
+    rows = [{
+        "id": "abc-row",
+        "row_type": "item",
+        "name": "Насос",
+        "type_mark": "ABC-100",
+        "quantity": "2",
+        "unit": "шт.",
+    }]
+    first_provider = CountingRowProvider({"abc-row": [offer]})
+    first_service = SourcingService(
+        {first_provider.key: first_provider},
+        default_provider=first_provider.key,
+        ai=SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+            "offer_order": ["ambiguous-review"],
+        })))),
+        cache=SourcingCache(cache_path),
+    )
+    first = first_service.search_project(rows, ai_rerank=True)
+
+    warm_provider = CountingRowProvider({"abc-row": [offer]})
+    warm_service = SourcingService(
+        {warm_provider.key: warm_provider},
+        default_provider=warm_provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    )
+    warm = warm_service.search_project(rows, ai_rerank=False)
+
+    for result in (first, warm):
+        assert result.positions_matched == 0
+        assert result.positions_review == 1
+        assert result.confirmed_totals == {}
+        assert result.confirmed_total is None
+        assert result.results[0].recommended_offer is None
+        assert result.results[0].match_results[0].decision == MatchDecision.REVIEW
+    assert first_provider.calls == 1
+    assert warm_provider.calls == 0
+    assert warm.timings["search_cache_hits"] == 1.0
+
+
+def test_m6b_search_cache_separates_catalog_version_and_intent(tmp_path):
+    class VersionedProvider(StubProvider):
+        def __init__(self, offers, version):
+            super().__init__(offers)
+            self.version = version
+            self.calls = 0
+
+        def search(self, intent, *, limit=20):
+            self.calls += 1
+            return super().search(intent, limit=limit)
+
+        def stats(self):
+            return {"item_count": len(self.offers), "catalog_version": self.version}
+
+    cache = SourcingCache(tmp_path / "m6b-version-cache.json")
+    intent = make_intent()
+    first_provider = VersionedProvider([make_offer(offer_id="catalog-v1")], "catalog-v1")
+    first = SourcingService(
+        {first_provider.key: first_provider},
+        default_provider=first_provider.key,
+        ai=SourcingAIService(),
+        cache=cache,
+    ).search_intent(intent, ai_rerank=False)
+    warm_provider = VersionedProvider([make_offer(offer_id="ignored-warm")], "catalog-v1")
+    warm = SourcingService(
+        {warm_provider.key: warm_provider},
+        default_provider=warm_provider.key,
+        ai=SourcingAIService(),
+        cache=cache,
+    ).search_intent(intent, ai_rerank=False)
+    changed_catalog_provider = VersionedProvider([make_offer(offer_id="catalog-v2")], "catalog-v2")
+    changed_catalog = SourcingService(
+        {changed_catalog_provider.key: changed_catalog_provider},
+        default_provider=changed_catalog_provider.key,
+        ai=SourcingAIService(),
+        cache=cache,
+    ).search_intent(intent, ai_rerank=False)
+    changed_intent_provider = VersionedProvider([make_offer(offer_id="changed-intent")], "catalog-v2")
+    changed_intent = SourcingService(
+        {changed_intent_provider.key: changed_intent_provider},
+        default_provider=changed_intent_provider.key,
+        ai=SourcingAIService(),
+        cache=cache,
+    ).search_intent(intent.model_copy(update={"article": "NEW-ARTICLE"}), ai_rerank=False)
+
+    assert first.offers[0].offer_id == warm.offers[0].offer_id == "catalog-v1"
+    assert warm.timings["search_cache_hit"] == 1.0
+    assert warm_provider.calls == 0
+    assert changed_catalog.offers[0].offer_id == "catalog-v2"
+    assert changed_catalog_provider.calls == 1
+    assert changed_intent.offers[0].offer_id == "changed-intent"
+    assert changed_intent_provider.calls == 1
+
+
+def test_m6b_search_cache_uses_new_versioned_namespace(tmp_path):
+    intent = make_intent()
+    cache_path = tmp_path / "m6b-namespace-cache.json"
+    stale_offer = make_offer(offer_id="stale-ai-ranked")
+    stale_result = SourcingResult(
+        intent=intent,
+        offers=[stale_offer],
+        match_results=OfferMatcher().match(intent, [stale_offer]),
+    )
+    SourcingCache(cache_path).set(
+        f"search:stub:stub-1:{intent.fingerprint}:20",
+        stale_result,
+    )
+
+    class CountingProvider(StubProvider):
+        def __init__(self, offers):
+            super().__init__(offers)
+            self.calls = 0
+
+        def search(self, request_intent, *, limit=20):
+            self.calls += 1
+            return super().search(request_intent, limit=limit)
+
+    provider = CountingProvider([make_offer(offer_id="fresh-v2")])
+    result = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    ).search_intent(intent, ai_rerank=False)
+
+    assert result.offers[0].offer_id == "fresh-v2"
+    assert result.timings["search_cache_hit"] == 0.0
+    assert provider.calls == 1
 
 
 @pytest.mark.parametrize(

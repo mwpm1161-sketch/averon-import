@@ -751,11 +751,15 @@ class SourcingService:
                     notices,
                     _as_provider_error(exc),
                 )
-        cache_key = f"search:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
+        # v2 stores only retrieval plus deterministic evaluation. Old entries
+        # may contain request-local AI ranking and must not be read as a base.
+        cache_key = f"search:v2:{provider.key}:{catalog_version}:{intent.fingerprint}:{max(1, min(int(limit), 100))}"
         if cache_policy.cache_search_results:
             cached = self.cache.get(cache_key)
             if cached is not None:
-                return self._compose_cached_result(cached, understanding, warnings, notices)
+                return self._compose_cached_result(
+                    cached, understanding, warnings, notices, ai_rerank=ai_rerank,
+                )
         started = time.perf_counter()
         try:
             offers = provider.search(intent, limit=limit)
@@ -777,22 +781,6 @@ class SourcingService:
         matching_started = time.perf_counter()
         match_results = self.matcher.match(intent, offers)
         matching_time = time.perf_counter() - matching_started
-        ranking_warnings: list[str] = []
-        ranking_notices: list[SourcingNotice] = []
-        ranking_time = 0.0
-        if ai_rerank:
-            ranking_started = time.perf_counter()
-            ranking_result = self.ai.rank_matches(intent, match_results)
-            if isinstance(ranking_result, SourcingRankingResult):
-                match_results = ranking_result.matches
-                ranking_warnings = ranking_result.warnings
-                ranking_notices = ranking_result.notices
-            else:
-                # Compatibility for injected legacy AI adapters that still
-                # return the original two-value tuple contract.
-                match_results, ranking_warnings, *extra_notices = ranking_result
-                ranking_notices = list(extra_notices[0]) if extra_notices else []
-            ranking_time = time.perf_counter() - ranking_started
         result = SourcingResult(
             intent=intent,
             understanding=understanding,
@@ -800,12 +788,12 @@ class SourcingService:
             review_candidate=review_candidate(match_results),
             offers=offers,
             match_results=match_results,
-            warnings=list(dict.fromkeys([*(warnings or []), *ranking_warnings])),
-            notices=dedupe_sourcing_notices([*(notices or []), *ranking_notices]),
+            warnings=list(dict.fromkeys(warnings or [])),
+            notices=dedupe_sourcing_notices(notices or []),
             timings={
                 "retrieval_s": round(retrieval_time, 6),
                 "matching_s": round(matching_time, 6),
-                "ai_rank_s": round(ranking_time, 6),
+                "ai_rank_s": 0.0,
                 "search_cache_hit": 0.0,
             },
             ai_mode=self._current_ai_mode(understanding),
@@ -823,6 +811,8 @@ class SourcingService:
                     "ai_mode": "fallback",
                 }),
             )
+        result = self._apply_request_local_ranking(result, ai_rerank=ai_rerank)
+        result._provider_call_attempted = True
         return result
 
     @staticmethod
@@ -892,6 +882,8 @@ class SourcingService:
         understanding: ProductUnderstandingResult | None,
         warnings: list[str] | None,
         notices: list[SourcingNotice] | None,
+        *,
+        ai_rerank: bool,
     ) -> SourcingResult:
         # Deliberately overwrite any legacy cached understanding/ai_mode too:
         # old cache entries must not leak stale parser provenance.
@@ -916,7 +908,61 @@ class SourcingService:
             "timings": {**cached.timings, "search_cache_hit": 1.0},
         })
         result._provider_call_attempted = False
-        return result
+        return self._apply_request_local_ranking(result, ai_rerank=ai_rerank)
+
+    def _apply_request_local_ranking(
+        self,
+        result: SourcingResult,
+        *,
+        ai_rerank: bool,
+    ) -> SourcingResult:
+        """Apply optional presentation ranking to the current response only."""
+
+        if not ai_rerank:
+            return result
+        started = time.perf_counter()
+        ranking_result = self.ai.rank_matches(result.intent, result.match_results)
+        if isinstance(ranking_result, SourcingRankingResult):
+            ranked_matches = ranking_result.matches
+            ranking_warnings = ranking_result.warnings
+            ranking_notices = ranking_result.notices
+        else:
+            # Compatibility for injected legacy AI adapters that still return
+            # the original two-value tuple contract.
+            ranked_matches, ranking_warnings, *extra_notices = ranking_result
+            ranking_notices = list(extra_notices[0]) if extra_notices else []
+
+        rank_by_identity = {
+            (item.offer.provider, item.offer.offer_id): item
+            for item in ranked_matches
+        }
+        recommended = result.recommended_offer
+        if recommended is not None:
+            recommended = rank_by_identity.get(
+                (recommended.provider, recommended.offer_id),
+                None,
+            )
+            recommended = recommended.offer if recommended is not None else result.recommended_offer
+        review = result.review_candidate
+        if review is not None:
+            review = rank_by_identity.get(
+                (review.offer.provider, review.offer.offer_id),
+                review,
+            )
+
+        return result.model_copy(update={
+            "match_results": ranked_matches,
+            # The identity recommendation remains the deterministic one; only
+            # its rank/evidence snapshot is refreshed for this response.
+            "recommended_offer": recommended,
+            "review_candidate": review,
+            "warnings": list(dict.fromkeys([*result.warnings, *ranking_warnings])),
+            "notices": dedupe_sourcing_notices([*result.notices, *ranking_notices]),
+            "timings": {
+                **result.timings,
+                "ai_rank_s": round(time.perf_counter() - started, 6),
+            },
+        })
 
     def search_project(
         self,
@@ -1205,19 +1251,23 @@ class SourcingService:
         return {"ai": self.ai.public_config()}
 
     def _intent_cache_key(self, row: dict[str, Any]) -> str:
+        # These are the supported source aliases consumed by
+        # build_fallback_intent/understand_with_audit. Keep aliases distinct so
+        # changing one source-owned identifier cannot reuse another's intent.
         payload = {
             key: row.get(key, "")
             for key in (
                 "id", "source_row_id", "source_text", "page", "source_row", "name", "title",
-                "type_mark", "model", "code", "manufacturer", "unit", "quantity", "note",
+                "type_mark", "model", "code", "article", "manufacturer", "unit", "quantity", "note",
             )
         }
         identity = {
+            "cache_revision": "v2",
             "source": payload,
             "parser": self.ai.cache_identity(),
         }
         encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
-        return "intent:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return "intent:v2:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _trusted_quantity(row: dict[str, Any]) -> Decimal | None:

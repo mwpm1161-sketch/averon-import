@@ -78,6 +78,27 @@ def _ai_notice(status: str) -> SourcingNotice:
         message = "AI временно недоступен — использован детерминированный разбор позиции. Повторите попытку позже."
     return SourcingNotice(code=code, message=message)
 
+
+class _InvalidRankingResponse(ValueError):
+    category = "invalid_response"
+
+
+def _unique_match_identities(matches: list[MatchResult]) -> list[MatchResult]:
+    """Keep one deterministic result per provider-owned candidate identity."""
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[MatchResult] = []
+    for match in matches:
+        identity = (match.offer.provider, match.offer.offer_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(match)
+    return [
+        match.model_copy(update={"rank": index})
+        for index, match in enumerate(unique, 1)
+    ]
+
 # Existing matcher/catalog attribute names are the canonical compatibility
 # contract. Values use these stable units throughout sourcing.
 CANONICAL_ATTRIBUTE_UNITS = {
@@ -835,14 +856,25 @@ class SourcingAIService:
     ) -> str:
         category = category or self._record_error(exc)
         text = str(exc).casefold()
+        ranking = prefix.casefold().startswith("ai sourcing ranking")
         if category == "access_denied" or "401" in text or "403" in text:
+            if ranking:
+                return f"{prefix}: нет доступа к AI Studio; сохранён детерминированный порядок"
             return f"{prefix}: ключ не имеет доступа к AI Studio; использован детерминированный fallback"
+        if ranking and category in {"invalid_json", "validation_error", "invalid_response"}:
+            return f"{prefix}: Qwen вернул некорректный ответ; сохранён детерминированный порядок"
         if category == "invalid_json" or "json" in text:
             return f"{prefix}: Qwen вернул некорректный JSON; использован детерминированный fallback"
         if category == "validation_error":
             return f"{prefix}: Qwen вернул данные вне ProductIntent; использован детерминированный fallback"
+        if category == "invalid_response":
+            return f"{prefix}: Qwen вернул некорректный порядок предложений; сохранён детерминированный порядок"
         if category == "timeout":
+            if ranking:
+                return f"{prefix}: Qwen не ответил вовремя; сохранён детерминированный порядок"
             return f"{prefix}: истекло время ожидания Qwen; использован детерминированный fallback"
+        if ranking:
+            return f"{prefix}: Qwen недоступен; сохранён детерминированный порядок"
         return f"{prefix}: Qwen недоступен; использован детерминированный fallback"
 
     def _fallback_result(
@@ -1013,11 +1045,14 @@ class SourcingAIService:
     ) -> SourcingRankingResult:
         """Optionally reorder existing candidates without changing their facts.
 
-        The provider receives a bounded comparison view and may return only
-        known offer ids.  It cannot create offers, change decisions, or edit
-        provider-owned commercial fields.
+        The provider receives bounded candidate ids mapped to composite
+        provider/offer identities. It cannot create candidates, change
+        decisions, or edit provider-owned commercial fields.
         """
 
+        # A repeated provider identity is the same candidate, while equal ids
+        # from different providers remain distinct candidates.
+        matches = _unique_match_identities(matches)
         if not self.available:
             self._last_status = "not_configured"
             return SourcingRankingResult(matches=matches)
@@ -1025,8 +1060,27 @@ class SourcingAIService:
             return SourcingRankingResult(matches=matches)
         try:
             provider = self.ai_service.ensure_provider(self.provider_key)
+            eligible = [item for item in matches if item.decision != "REJECT"]
+            offer_id_counts: dict[str, int] = {}
+            for result in eligible:
+                offer_id_counts[result.offer.offer_id] = (
+                    offer_id_counts.get(result.offer.offer_id, 0) + 1
+                )
+            reserved_ids = {result.offer.offer_id for result in eligible}
+            used_candidate_ids: set[str] = set()
+            candidates = []
+            for index, result in enumerate(eligible, 1):
+                candidate_id = result.offer.offer_id
+                if offer_id_counts[candidate_id] > 1:
+                    candidate_id = f"candidate_{index}"
+                    while candidate_id in reserved_ids or candidate_id in used_candidate_ids:
+                        candidate_id = f"_{candidate_id}"
+                used_candidate_ids.add(candidate_id)
+                candidates.append((candidate_id, result))
             comparison = [
                 {
+                    "candidate_id": candidate_id,
+                    "provider_key": result.offer.provider,
                     "offer_id": result.offer.offer_id,
                     "title": result.offer.title,
                     "article": result.offer.article,
@@ -1038,16 +1092,17 @@ class SourcingAIService:
                     "conflicting_attributes": result.conflicting_attributes,
                     "missing_attributes": result.missing_attributes,
                 }
-                for result in matches
-                if result.decision != "REJECT"
+                for candidate_id, result in candidates
             ]
             raw = provider.complete([
                 {
                     "role": "system",
                     "content": (
-                        "Return only JSON: {\"offer_order\":[known offer ids],"
-                        "\"evidence\":{offer_id:[short reasons]}}. "
-                        "Rank only known non-rejected offers. Do not create ids "
+                        "Return only JSON: {\"offer_order\":[known candidate ids],"
+                        "\"evidence\":{candidate_id:[short reasons]}}. "
+                        "A non-empty partial order is allowed; omitted candidates "
+                        "will retain their deterministic order. Never repeat or "
+                        "invent candidate ids. Rank only known non-rejected offers. Do not create ids "
                         "or change prices, URLs, articles, availability, or decisions."
                     ),
                 },
@@ -1060,26 +1115,30 @@ class SourcingAIService:
                 },
             ])
             payload = _extract_json(raw)
-            known = {result.offer.offer_id: result for result in matches if result.decision != "REJECT"}
+            known = {candidate_id: result for candidate_id, result in candidates}
             requested = payload.get("offer_order", [])
-            if not isinstance(requested, list):
-                raise ValueError("offer_order must be a list")
+            if (
+                not isinstance(requested, list)
+                or not requested
+                or any(not isinstance(candidate_id, str) for candidate_id in requested)
+                or len(set(requested)) != len(requested)
+                or any(candidate_id not in known for candidate_id in requested)
+            ):
+                raise _InvalidRankingResponse("offer_order must contain unique known candidate ids")
             evidence = payload.get("evidence", {})
             if not isinstance(evidence, dict):
-                evidence = {}
-            grouped: dict[str, list[MatchResult]] = {}
-            for result in matches:
-                if result.decision != "REJECT":
-                    grouped.setdefault(result.decision.value, []).append(result)
+                raise _InvalidRankingResponse("evidence must be an object")
+            candidates_by_decision: dict[str, list[str]] = {}
+            for candidate_id, result in candidates:
+                candidates_by_decision.setdefault(result.decision.value, []).append(candidate_id)
             ordered = []
             for decision in ("MATCH", "LIKELY_MATCH", "ALTERNATIVE", "REVIEW"):
-                group = grouped.get(decision, [])
-                group_ids = {result.offer.offer_id for result in group}
-                group_order = [offer_id for offer_id in requested if offer_id in group_ids]
-                group_order.extend(result.offer.offer_id for result in group if result.offer.offer_id not in group_order)
-                for offer_id in group_order:
-                    result = known[offer_id]
-                    reasons = evidence.get(offer_id, [])
+                group_ids = candidates_by_decision.get(decision, [])
+                group_order = [candidate_id for candidate_id in requested if candidate_id in group_ids]
+                group_order.extend(candidate_id for candidate_id in group_ids if candidate_id not in group_order)
+                for candidate_id in group_order:
+                    result = known[candidate_id]
+                    reasons = evidence.get(candidate_id, [])
                     if not isinstance(reasons, list):
                         reasons = []
                     ordered.append(result.model_copy(update={"ai_evidence": {"reasons": [str(item) for item in reasons[:5]]}}))
