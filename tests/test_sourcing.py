@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from decimal import Decimal
 
@@ -30,6 +31,7 @@ from averon_import.services.sourcing.models import (
 from averon_import.services.sourcing.product_understanding import (
     SourcingAIService,
     build_fallback_intent,
+    extract_generic_attributes,
 )
 from averon_import.services.sourcing.runtime import create_sourcing_ai_transport
 from averon_import.services.sourcing.providers.base import SourcingProvider
@@ -446,6 +448,257 @@ def test_q22_cyrillic_latin_product_identifier_is_equivalent():
     assert result.decision == MatchDecision.MATCH
     assert result.conflicting_attributes == []
     assert set(result.matched_attributes) >= {"article", "model", "manufacturer"}
+
+
+@pytest.mark.parametrize(
+    ("key", "expected", "actual"),
+    [
+        ("dimensions", "20×30", "20×40"),
+        ("dimensions", "32×3,2", "32×4"),
+        ("material", "Сталь 20", "Алюминий 20"),
+    ],
+)
+def test_m6a_composite_and_material_conflicts_reject(key, expected, actual):
+    intent = make_intent(
+        model="",
+        normalized_name="",
+        manufacturer="",
+        article="",
+        attributes={key: expected},
+        required_attributes={key: expected},
+        preferred_attributes={},
+        evidence={"attribute_origins": {key: "source_deterministic"}},
+    )
+    offer = make_offer(attributes={key: actual})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.REJECT
+    assert result.conflicting_attributes == [key]
+
+
+@pytest.mark.parametrize(
+    ("key", "expected", "actual"),
+    [
+        ("dimensions", "20×30", "20x30"),
+        ("power", 0.75, "750 W"),
+        ("power", {"value": 1, "unit": "kW"}, {"value": 1000, "unit": "Вт"}),
+    ],
+)
+def test_m6a_safe_composite_and_unit_normalizations_still_match(key, expected, actual):
+    intent = make_intent(
+        model="",
+        normalized_name="",
+        manufacturer="",
+        article="",
+        attributes={key: expected},
+        required_attributes={key: expected},
+        preferred_attributes={},
+    )
+    offer = make_offer(attributes={key: actual})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.MATCH
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [("M200", "M2000"), ("ABC-100", "ABC-1000")],
+)
+def test_m6a_explicit_model_prefix_collision_is_an_alternative(expected, actual):
+    intent = make_intent(
+        model=expected,
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    offer = make_offer(attributes={"model": actual})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.ALTERNATIVE
+    assert result.deterministic_evidence["preferred_differences"] == ["model"]
+
+
+def test_m6a_ai_ranking_cannot_promote_technical_conflict():
+    intent = make_intent(
+        model="",
+        normalized_name="",
+        attributes={"dimensions": "20x30"},
+        required_attributes={"dimensions": "20x30"},
+        preferred_attributes={},
+    )
+    rejected = make_offer(offer_id="rejected", attributes={"dimensions": "20x40"})
+    safe = make_offer(offer_id="safe", attributes={"dimensions": "20x30"})
+    matches = OfferMatcher().match(intent, [rejected, safe])
+    ai = SourcingAIService(FakeAIService(FakeAIProvider(json.dumps({
+        "offer_order": ["rejected", "safe"],
+    }))))
+
+    ranked = ai.rank_matches(intent, matches).matches
+
+    assert [item.offer.offer_id for item in ranked] == ["safe", "rejected"]
+    assert ranked[-1].decision == MatchDecision.REJECT
+    assert ranked[-1].conflicting_attributes == ["dimensions"]
+
+
+def test_m6a_model_in_title_requires_complete_token_sequence():
+    intent = make_intent(model="M200", attributes={}, required_attributes={}, preferred_attributes={})
+    offer = make_offer(title="Насос M2000", attributes={})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.REVIEW
+    assert result.missing_attributes == ["model"]
+
+
+def test_m6a_model_separators_remain_normalized_without_prefix_matching():
+    intent = make_intent(model="ABC-100", attributes={}, required_attributes={}, preferred_attributes={})
+    offer = make_offer(attributes={"model": "abc 100"})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.MATCH
+
+
+def test_m6a_title_model_allows_separator_inside_complete_identifier():
+    intent = make_intent(model="П17", attributes={}, required_attributes={}, preferred_attributes={})
+    offer = make_offer(title="Смеситель П 17", attributes={})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.LIKELY_MATCH
+    assert result.deterministic_evidence["model_evidence_source"] == "title"
+
+
+def test_m6a_fingerprint_includes_only_decision_relevant_attribute_origins():
+    source = make_intent(
+        required_attributes={"mounting_type": "wall"},
+        evidence={"attribute_origins": {"mounting_type": "source_deterministic"}},
+    )
+    inferred = source.model_copy(update={
+        "evidence": {"attribute_origins": {"mounting_type": "ai_inferred"}},
+    })
+    unrelated = source.model_copy(update={"evidence": {"debug_note": "not used for matching"}})
+
+    assert source.fingerprint != inferred.fingerprint
+    assert source.fingerprint == unrelated.fingerprint
+
+
+def test_m6a_matcher_policy_revision_does_not_reuse_legacy_search_cache(tmp_path):
+    intent = make_intent()
+    old_payload = intent.model_dump(mode="json")
+    old_payload.pop("evidence", None)
+    old_payload.pop("uncertainties", None)
+    old_fingerprint = hashlib.sha256(
+        json.dumps(old_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_path = tmp_path / "legacy-search-cache.json"
+    legacy_offer = make_offer(offer_id="legacy-cached-offer")
+    SourcingCache(cache_path).set(
+        f"search:stub:stub-1:{old_fingerprint}:20",
+        SourcingResult(
+            intent=intent,
+            offers=[legacy_offer],
+            match_results=OfferMatcher().match(intent, [legacy_offer]),
+        ),
+    )
+
+    class CountingProvider(StubProvider):
+        def __init__(self, offers):
+            super().__init__(offers)
+            self.calls = 0
+
+        def search(self, request_intent, *, limit=20):
+            self.calls += 1
+            return super().search(request_intent, limit=limit)
+
+    provider = CountingProvider([make_offer(offer_id="fresh-offer")])
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    )
+
+    result = service.search_intent(intent)
+
+    assert result.offers[0].offer_id == "fresh-offer"
+    assert provider.calls == 1
+
+
+def test_m6a_search_cache_separates_origins_cold_warm_and_after_restart(tmp_path):
+    offer = make_offer(
+        attributes={"model": "DN50 PN16", "mounting_type": "ceiling"},
+    )
+
+    class CountingProvider(StubProvider):
+        def __init__(self, offers):
+            super().__init__(offers)
+            self.calls = 0
+
+        def search(self, intent, *, limit=20):
+            self.calls += 1
+            return super().search(intent, limit=limit)
+
+    cache_path = tmp_path / "m6a-search-cache.json"
+    inferred = make_intent(
+        required_attributes={"mounting_type": "wall"},
+        evidence={"attribute_origins": {"mounting_type": "ai_inferred"}},
+    )
+    source = inferred.model_copy(update={
+        "evidence": {"attribute_origins": {"mounting_type": "source_deterministic"}},
+    })
+    first_provider = CountingProvider([offer])
+    first_service = SourcingService(
+        {first_provider.key: first_provider},
+        default_provider=first_provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    )
+
+    cold = first_service.search_intent(inferred)
+    assert cold.match_results[0].decision == MatchDecision.MATCH
+    assert first_provider.calls == 1
+
+    warm_provider = CountingProvider([offer])
+    warm_service = SourcingService(
+        {warm_provider.key: warm_provider},
+        default_provider=warm_provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    )
+    warm = warm_service.search_intent(source)
+    assert warm.match_results[0].decision == MatchDecision.REJECT
+    assert warm_provider.calls == 1
+
+    restarted_provider = CountingProvider([offer])
+    restarted_service = SourcingService(
+        {restarted_provider.key: restarted_provider},
+        default_provider=restarted_provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    )
+    restarted = restarted_service.search_intent(source)
+    assert restarted.match_results[0].decision == MatchDecision.REJECT
+    assert restarted.timings["search_cache_hit"] == 1.0
+    assert restarted_provider.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Бетон В15 П3 F200 W6", None),
+        ("Мощность 200 Вт", 0.2),
+        ("Насос 1,5 кВт", 1.5),
+        ("Светильник 200 W", 0.2),
+    ],
+)
+def test_m6a_power_extraction_respects_complete_unit_tokens(text, expected):
+    attributes = extract_generic_attributes(text)
+
+    assert attributes.get("power") == expected
 
 
 def test_model_evidence_uses_explicit_model_then_title_then_article():

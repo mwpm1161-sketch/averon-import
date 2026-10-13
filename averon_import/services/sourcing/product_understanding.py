@@ -249,7 +249,9 @@ def extract_generic_attributes(text: str) -> dict[str, Any]:
             attributes[name] = _number(match.group(1))
 
     power = re.search(
-        r"(\d+(?:[.,]\d+)?)\s*(к\s*вт|kw|вт|w)(?![a-zа-яё])",
+        # Keep model/designation tokens such as F200 W6 out of electrical
+        # extraction: the number and unit must be complete tokens.
+        r"(?<![\w.-])(\d+(?:[.,]\d+)?)\s*(к\s*вт|kw|вт|w)(?![\w])",
         value,
         flags=re.IGNORECASE,
     )

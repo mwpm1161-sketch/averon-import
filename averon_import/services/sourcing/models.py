@@ -12,6 +12,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 
+# Bump when deterministic sourcing identity or matching semantics change. This
+# namespaces persisted search results without rewriting their stored payloads.
+MATCHER_POLICY_REVISION = "m6a-deterministic-matching-v1"
+
+
 class SourcingModel(BaseModel):
     """Strict transport/domain model shared by providers and API layers."""
 
@@ -166,6 +171,24 @@ class ProductIntent(SourcingModel):
         payload = self.model_dump(mode="json")
         payload.pop("evidence", None)
         payload.pop("uncertainties", None)
+        origins = self.evidence.get("attribute_origins", {})
+        if not isinstance(origins, dict):
+            origins = {}
+        decision_attributes = sorted(
+            set(self.required_attributes) | set(self.preferred_attributes)
+        )
+        # Origins affect whether a required/preferred fact may participate in
+        # matching. Include only those low-sensitivity decision facts; the
+        # rest of the evidence envelope remains outside cache identity.
+        payload["attribute_origins"] = {
+            key: (
+                "advisory"
+                if str(origins.get(key) or "").strip() == "ai_inferred"
+                else "enforced"
+            )
+            for key in decision_attributes
+        }
+        payload["matcher_policy_revision"] = MATCHER_POLICY_REVISION
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
