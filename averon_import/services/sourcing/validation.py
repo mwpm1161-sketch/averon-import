@@ -143,14 +143,7 @@ def _model_in_title(model: object, title: object) -> bool:
                 raw_suffix = raw_title[title_tokens[stop].end():]
                 if _TITLE_MODEL_VARIANT_RE.search(raw_suffix):
                     continue
-                if not any(char.isalnum() for char in raw_suffix):
-                    if any(char in "-_/\\" for char in raw_suffix):
-                        continue
-                    return True
-                technical = _TITLE_TECHNICAL_ATTRIBUTE_RE.search(raw_suffix)
-                if technical and not any(
-                    char.isalnum() for char in raw_suffix[:technical.start()]
-                ):
+                if _has_safe_title_model_suffix(raw_suffix):
                     return True
                 # A non-technical suffix may be a description, a model
                 # continuation, or a version we do not recognize. Keep that
@@ -159,6 +152,57 @@ def _model_in_title(model: object, title: object) -> bool:
             if not target.startswith(combined):
                 break
     return False
+
+
+def _has_safe_title_model_suffix(raw_suffix: str) -> bool:
+    """Accept only a complete chain of recognized technical attributes.
+
+    This deliberately handles a small set of common title measurements. It
+    must consume the complete suffix so a known measurement cannot mask an
+    unknown model, revision, or free-text continuation after it.
+    """
+
+    if _TITLE_MODEL_VARIANT_RE.search(raw_suffix):
+        return False
+
+    remaining = raw_suffix
+    while True:
+        if not any(char.isalnum() for char in remaining):
+            return not any(char in "-_/\\" for char in remaining)
+
+        # Whitespace, ordinary list punctuation, and an opening parenthesis
+        # can separate independent specs. A slash is accepted only when it is
+        # visibly separated on both sides; a joined slash may extend an ID.
+        position = 0
+        consumed_separator = False
+        while position < len(remaining):
+            char = remaining[position]
+            if char.isspace() or char in ",;:([{":
+                consumed_separator = True
+                position += 1
+                continue
+            if (
+                char == "/"
+                and position > 0
+                and remaining[position - 1].isspace()
+                and position + 1 < len(remaining)
+                and remaining[position + 1].isspace()
+            ):
+                consumed_separator = True
+                position += 1
+                continue
+            break
+
+        if not consumed_separator:
+            return False
+        remaining = remaining[position:]
+        if not remaining:
+            return True
+
+        technical = _TITLE_TECHNICAL_ATTRIBUTE_RE.match(remaining)
+        if technical is None:
+            return False
+        remaining = remaining[technical.end():]
 
 
 def _same_text_identity(left: object, right: object) -> bool:

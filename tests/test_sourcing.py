@@ -597,7 +597,14 @@ def test_m6a_r1_required_model_attribute_uses_strict_identity(expected, actual, 
         ("ABC-100", "Насос ABC-100", MatchDecision.LIKELY_MATCH, "title"),
         ("П17", "Смеситель П 17", MatchDecision.LIKELY_MATCH, "title"),
         ("КЭВ-9П2012Е", "Завеса KEV-9P2012E", MatchDecision.LIKELY_MATCH, "title"),
+        ("ABC-100", "Насос ABC-100, 2 кВт", MatchDecision.LIKELY_MATCH, "title"),
         ("ABC-100", "Насос ABC-100, 2 кВт, 220 В", MatchDecision.LIKELY_MATCH, "title"),
+        ("ABC-100", "Насос ABC-100, 2 кВт; 220 В", MatchDecision.LIKELY_MATCH, "title"),
+        ("ABC-100", "Насос ABC-100, 2 кВт / 220 В", MatchDecision.LIKELY_MATCH, "title"),
+        ("ABC-100", "Насос ABC-100, 2 кВт, ABC-200", MatchDecision.REVIEW, ""),
+        ("ABC-100", "Насос ABC-100, 2 кВт, Type X", MatchDecision.REVIEW, ""),
+        ("ABC-100", "Насос ABC-100, 2 кВт, ревизия B", MatchDecision.REVIEW, ""),
+        ("ABC-100", "Насос ABC-100-220 В", MatchDecision.REVIEW, ""),
         ("ABC-100", "Насос ABC-100 V2", MatchDecision.REVIEW, ""),
         ("ABC-100", "Насос ABC-100-PLUS", MatchDecision.REVIEW, ""),
         ("ABC-100", "Насос ABC-100 -PLUS", MatchDecision.REVIEW, ""),
@@ -629,7 +636,7 @@ def test_m6a_r2_title_model_requires_safe_context(model, title, decision, source
         assert result.missing_attributes == ["model"]
 
 
-def test_m6a_r2_policy_revision_invalidates_r1_search_cache(tmp_path):
+def test_m6a_r3_policy_revision_invalidates_r2_search_cache(tmp_path):
     intent = make_intent()
     old_payload = intent.model_dump(mode="json")
     old_payload.pop("evidence", None)
@@ -640,7 +647,7 @@ def test_m6a_r2_policy_revision_invalidates_r1_search_cache(tmp_path):
         key: ("advisory" if str(origins.get(key) or "").strip() == "ai_inferred" else "enforced")
         for key in decision_attributes
     }
-    old_payload["matcher_policy_revision"] = "m6a-r1-strict-model-identity-v1"
+    old_payload["matcher_policy_revision"] = "m6a-r2-title-model-variant-safety-v1"
     old_fingerprint = hashlib.sha256(
         json.dumps(old_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -720,6 +727,58 @@ def test_m6a_r2_title_variant_never_enters_project_confirmed_total(tmp_path, rou
     assert result.results[0].match_results[0].decision == MatchDecision.REVIEW
     if routed:
         assert result.results[0].route.final_source_kind == "provider"
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["provider-only", "routed-fallback"])
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Насос ABC-100, 2 кВт, ABC-200",
+        "Насос ABC-100, 2 кВт, Type X",
+        "Насос ABC-100, 2 кВт, ревизия B",
+        "Насос ABC-100-220 В",
+    ],
+)
+def test_m6a_r3_unvalidated_title_suffix_never_enters_confirmed_total(
+    tmp_path, routed, title
+):
+    offer = make_offer(
+        offer_id="abc-100-suffix-ambiguous",
+        title=title,
+        attributes={},
+        price=Decimal("1250"),
+    )
+    provider = RowOffersProvider({"abc-row": [offer]})
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(tmp_path / f"r3-cache-{routed}-{abs(hash(title))}.json"),
+    )
+    rows = [{
+        "id": "abc-row",
+        "row_type": "item",
+        "name": "Насос",
+        "type_mark": "ABC-100",
+        "quantity": "2",
+        "unit": "шт.",
+    }]
+
+    if routed:
+        result = service.search_project_routed(
+            rows,
+            source_mode=SourcingSourceMode.ONE_C_THEN_PROVIDER,
+            ai_rerank=False,
+        )
+    else:
+        result = service.search_project(rows, ai_rerank=False)
+
+    assert result.positions_matched == 0
+    assert result.positions_review == 1
+    assert result.confirmed_totals == {}
+    assert result.confirmed_total is None
+    assert result.results[0].recommended_offer is None
+    assert result.results[0].match_results[0].decision == MatchDecision.REVIEW
 
 
 def test_m6a_ai_ranking_cannot_promote_technical_conflict():

@@ -279,7 +279,17 @@ def test_success_match_and_partial_provider_failure_remain_separate():
     assert not any(item.decision == MatchDecision.REJECT for item in evaluation.matches)
 
 
-def test_outcome_native_matching_does_not_recommend_title_model_variant():
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Насос ABC-100 V2",
+        "Насос ABC-100, 2 кВт, ABC-200",
+        "Насос ABC-100, 2 кВт, Type X",
+        "Насос ABC-100, 2 кВт, ревизия B",
+        "Насос ABC-100-220 В",
+    ],
+)
+def test_outcome_native_matching_does_not_recommend_ambiguous_title_model(title):
     intent = _intent(
         source_text="Насос ABC-100",
         normalized_name="Насос",
@@ -287,7 +297,7 @@ def test_outcome_native_matching_does_not_recommend_title_model_variant():
     )
     offer = _offer(
         "etm_ipro",
-        title="Насос ABC-100 V2",
+        title=title,
         attributes={},
     )
 
