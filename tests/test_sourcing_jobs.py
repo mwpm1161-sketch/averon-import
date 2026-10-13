@@ -107,7 +107,7 @@ def test_project_reports_real_progress_preserves_order_and_skips_rerank(tmp_path
     assert provider.search_calls == ["row-1", "row-2"]
 
 
-def test_single_search_keeps_rerank_enabled(tmp_path):
+def test_single_search_skips_rerank_when_only_one_candidate_is_eligible(tmp_path):
     provider = CountingProvider()
     ai = SourcingAIService()
     rank_calls = []
@@ -121,7 +121,7 @@ def test_single_search_keeps_rerank_enabled(tmp_path):
     service = service_for(tmp_path, provider, ai)
     result = service.search_intent(intent("single"))
     assert result.match_results[0].decision == MatchDecision.MATCH
-    assert rank_calls == ["single"]
+    assert rank_calls == []
 
 
 def test_project_resolves_provider_stats_once_per_run_and_reuses_both_caches(tmp_path):

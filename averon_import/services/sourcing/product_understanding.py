@@ -84,20 +84,53 @@ class _InvalidRankingResponse(ValueError):
 
 
 def _unique_match_identities(matches: list[MatchResult]) -> list[MatchResult]:
-    """Keep one deterministic result per provider-owned candidate identity."""
+    """Canonicalize exact repeated results without hiding identity conflicts.
 
-    seen: set[tuple[str, str]] = set()
+    Equal offer ids from different providers are independent candidates. For a
+    repeated identity from one provider, only fully identical match records
+    (apart from their positional rank) can be safely collapsed. The caller
+    detects retained same-identity variants and fails closed before invoking
+    AI.
+    """
+
     unique: list[MatchResult] = []
+    seen: dict[tuple[str, str], set[str]] = {}
     for match in matches:
         identity = (match.offer.provider, match.offer.offer_id)
-        if identity in seen:
+        signature = json.dumps(
+            match.model_dump(mode="json", exclude={"rank"}),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        signatures = seen.setdefault(identity, set())
+        if signature in signatures:
             continue
-        seen.add(identity)
+        signatures.add(signature)
         unique.append(match)
     return [
         match.model_copy(update={"rank": index})
         for index, match in enumerate(unique, 1)
     ]
+
+
+def _has_conflicting_match_identities(matches: list[MatchResult]) -> bool:
+    """Return whether one provider identity carries distinct match records."""
+
+    signatures: dict[tuple[str, str], set[str]] = {}
+    for match in matches:
+        identity = (match.offer.provider, match.offer.offer_id)
+        signature = json.dumps(
+            match.model_dump(mode="json", exclude={"rank"}),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        values = signatures.setdefault(identity, set())
+        values.add(signature)
+        if len(values) > 1:
+            return True
+    return False
 
 # Existing matcher/catalog attribute names are the canonical compatibility
 # contract. Values use these stable units throughout sourcing.
@@ -1050,13 +1083,46 @@ class SourcingAIService:
         decisions, or edit provider-owned commercial fields.
         """
 
-        # A repeated provider identity is the same candidate, while equal ids
-        # from different providers remain distinct candidates.
+        # Exact repeated records are harmless; conflicting records from one
+        # provider identity must remain visible and must never be ranked by AI.
         matches = _unique_match_identities(matches)
+        if _has_conflicting_match_identities(matches):
+            matches = sorted(
+                matches,
+                key=lambda item: (
+                    item.offer.provider,
+                    item.offer.offer_id,
+                    json.dumps(
+                        item.model_dump(mode="json", exclude={"rank"}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            matches = [
+                item.model_copy(update={"rank": index})
+                for index, item in enumerate(matches, 1)
+            ]
+            return SourcingRankingResult(
+                matches=matches,
+                warnings=[
+                    "Поставщик вернул конфликтующие данные для одного предложения; "
+                    "сохранён детерминированный результат для ручной проверки."
+                ],
+                notices=[SourcingNotice(
+                    code="PROVIDER_IDENTITY_CONFLICT",
+                    severity="error",
+                    message=(
+                        "Поставщик вернул конфликтующие данные для одного предложения. "
+                        "Результат переведён на ручную проверку."
+                    ),
+                )],
+            )
+        if sum(item.decision != "REJECT" for item in matches) < 2:
+            return SourcingRankingResult(matches=matches)
         if not self.available:
             self._last_status = "not_configured"
-            return SourcingRankingResult(matches=matches)
-        if len(matches) < 2:
             return SourcingRankingResult(matches=matches)
         try:
             provider = self.ai_service.ensure_provider(self.provider_key)

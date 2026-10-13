@@ -24,6 +24,7 @@ from averon_import.services.sourcing.matching import (
 )
 from averon_import.services.sourcing.models import (
     MatchDecision,
+    MatchResult,
     ProductIntent,
     ProductUnderstandingProvenance,
     ProductUnderstandingResult,
@@ -53,7 +54,10 @@ from averon_import.services.sourcing.providers.base import (
     get_provider_cache_policy,
     normalize_provider_runtime_state,
 )
-from averon_import.services.sourcing.providers.contracts import ProviderSelection
+from averon_import.services.sourcing.providers.contracts import (
+    ProviderSelection,
+    index_offers_by_provider_identity,
+)
 from averon_import.services.sourcing.providers.execution import (
     ProviderExecutionResult,
     ProviderExecutionScope,
@@ -76,6 +80,87 @@ def _units_compatible(source_unit: Any, price_unit: Any) -> bool:
     source_family = _price_unit_family(source_unit)
     price_family = _price_unit_family(price_unit)
     return source_family is not None and source_family == price_family
+
+
+_PROVIDER_IDENTITY_CONFLICT_MESSAGE = (
+    "Поставщик вернул конфликтующие данные для одного предложения. "
+    "Результат переведён на ручную проверку."
+)
+
+
+def _offer_stable_signature(offer) -> str:
+    return json.dumps(
+        offer.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonicalize_provider_offers(offers):
+    """Deduplicate equal provider records and retain conflicting variants."""
+
+    offers = list(offers)
+    try:
+        index_offers_by_provider_identity(offers)
+    except ValueError:
+        pass
+    else:
+        # Preserve the provider's established ordering while selecting only
+        # byte-for-byte equivalent records for repeated composite identities.
+        canonical = []
+        seen = set()
+        for offer in offers:
+            identity = (offer.provider, offer.offer_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            canonical.append(offer)
+        return canonical, set()
+
+    grouped = {}
+    identity_order = []
+    for offer in offers:
+        identity = (offer.provider, offer.offer_id)
+        if identity not in grouped:
+            grouped[identity] = []
+            identity_order.append(identity)
+        if not any(existing == offer for existing in grouped[identity]):
+            grouped[identity].append(offer)
+
+    conflicts = {
+        identity for identity, variants in grouped.items() if len(variants) > 1
+    }
+    canonical = []
+    for identity in identity_order:
+        variants = grouped[identity]
+        if identity in conflicts:
+            variants = sorted(variants, key=_offer_stable_signature)
+        canonical.extend(variants)
+    return canonical, conflicts
+
+
+def _match_provider_identity_conflicts(matches, conflicts):
+    """Demote only ambiguous identity variants and keep their facts aligned."""
+
+    return [
+        match.model_copy(update={
+            "decision": MatchDecision.REVIEW,
+            "explanation": _PROVIDER_IDENTITY_CONFLICT_MESSAGE,
+            "ai_evidence": {},
+        })
+        if (match.offer.provider, match.offer.offer_id) in conflicts
+        else match
+        for match in matches
+    ]
+
+
+def _provider_identity_conflict_notice() -> SourcingNotice:
+    return SourcingNotice(
+        code="PROVIDER_IDENTITY_CONFLICT",
+        severity="error",
+        message=_PROVIDER_IDENTITY_CONFLICT_MESSAGE,
+    )
 
 
 class SourcingService:
@@ -606,7 +691,10 @@ class SourcingService:
                 unresolved += 1
             else:
                 decision_match = next(
-                    (item.decision for item in result.match_results if item.offer.offer_id == best.offer_id),
+                    (
+                        item.decision for item in result.match_results
+                        if (item.offer.provider, item.offer.offer_id) == (best.provider, best.offer_id)
+                    ),
                     MatchDecision.REVIEW,
                 )
                 decision = decision_match.value
@@ -779,17 +867,30 @@ class SourcingService:
             )
         retrieval_time = time.perf_counter() - started
         matching_started = time.perf_counter()
+        offers, conflicting_identities = _canonicalize_provider_offers(offers)
         match_results = self.matcher.match(intent, offers)
+        match_results = _match_provider_identity_conflicts(
+            match_results,
+            conflicting_identities,
+        )
         matching_time = time.perf_counter() - matching_started
+        current_warnings = list(warnings or [])
+        current_notices = list(notices or [])
+        if conflicting_identities:
+            current_warnings.append(_PROVIDER_IDENTITY_CONFLICT_MESSAGE)
+            current_notices.append(_provider_identity_conflict_notice())
         result = SourcingResult(
             intent=intent,
             understanding=understanding,
             recommended_offer=recommended_offer(match_results),
-            review_candidate=review_candidate(match_results),
+            review_candidate=review_candidate([
+                item for item in match_results
+                if (item.offer.provider, item.offer.offer_id) not in conflicting_identities
+            ]),
             offers=offers,
             match_results=match_results,
-            warnings=list(dict.fromkeys(warnings or [])),
-            notices=dedupe_sourcing_notices(notices or []),
+            warnings=list(dict.fromkeys(current_warnings)),
+            notices=dedupe_sourcing_notices(current_notices),
             timings={
                 "retrieval_s": round(retrieval_time, 6),
                 "matching_s": round(matching_time, 6),
@@ -887,12 +988,19 @@ class SourcingService:
     ) -> SourcingResult:
         # Deliberately overwrite any legacy cached understanding/ai_mode too:
         # old cache entries must not leak stale parser provenance.
+        offers, conflicting_identities = _canonicalize_provider_offers(cached.offers)
+        matches = _match_provider_identity_conflicts(
+            self.matcher.match(cached.intent, offers),
+            conflicting_identities,
+        )
         merged_warnings = list(dict.fromkeys([
             *(warnings or []),
             "Результат взят из актуального cache каталога",
+            *([_PROVIDER_IDENTITY_CONFLICT_MESSAGE] if conflicting_identities else []),
         ]))
         merged_notices = dedupe_sourcing_notices([
             *(notices or []),
+            *([_provider_identity_conflict_notice()] if conflicting_identities else []),
             SourcingNotice(
                 code="CATALOG_CACHE_HIT",
                 severity="info",
@@ -902,6 +1010,13 @@ class SourcingService:
         ])
         result = cached.model_copy(update={
             "understanding": understanding,
+            "offers": offers,
+            "match_results": matches,
+            "recommended_offer": recommended_offer(matches),
+            "review_candidate": review_candidate([
+                item for item in matches
+                if (item.offer.provider, item.offer.offer_id) not in conflicting_identities
+            ]),
             "ai_mode": self._current_ai_mode(understanding),
             "warnings": merged_warnings,
             "notices": merged_notices,
@@ -920,17 +1035,52 @@ class SourcingService:
 
         if not ai_rerank:
             return result
+        if any(notice.code == "PROVIDER_IDENTITY_CONFLICT" for notice in result.notices):
+            return result
+        if sum(item.decision != MatchDecision.REJECT for item in result.match_results) < 2:
+            return result
         started = time.perf_counter()
-        ranking_result = self.ai.rank_matches(result.intent, result.match_results)
-        if isinstance(ranking_result, SourcingRankingResult):
-            ranked_matches = ranking_result.matches
-            ranking_warnings = ranking_result.warnings
-            ranking_notices = ranking_result.notices
+        try:
+            ranking_result = self.ai.rank_matches(result.intent, result.match_results)
+        except Exception:
+            ranked_matches = result.match_results
+            ranking_warnings = [
+                "AI-ранжирование недоступно — сохранены детерминированные результаты кандидатов."
+            ]
+            ranking_notices = [SourcingNotice(
+                code="AI_UNAVAILABLE",
+                message="AI ранжирование временно недоступно — сохранён детерминированный результат.",
+            )]
         else:
-            # Compatibility for injected legacy AI adapters that still return
-            # the original two-value tuple contract.
-            ranked_matches, ranking_warnings, *extra_notices = ranking_result
-            ranking_notices = list(extra_notices[0]) if extra_notices else []
+            try:
+                if isinstance(ranking_result, SourcingRankingResult):
+                    ranked_matches = ranking_result.matches
+                    ranking_warnings = ranking_result.warnings
+                    ranking_notices = ranking_result.notices
+                else:
+                    # Compatibility for injected legacy adapters using the
+                    # original two-value tuple contract.
+                    ranked_matches, ranking_warnings, *extra_notices = ranking_result
+                    ranking_notices = list(extra_notices[0]) if extra_notices else []
+                if not self._valid_ai_ranked_candidates(result.match_results, ranked_matches):
+                    raise ValueError("AI ranking changed the deterministic candidates")
+                if not isinstance(ranking_warnings, list) or not all(
+                    isinstance(item, str) for item in ranking_warnings
+                ):
+                    raise ValueError("AI ranking warnings are invalid")
+                if not isinstance(ranking_notices, list) or not all(
+                    isinstance(item, SourcingNotice) for item in ranking_notices
+                ):
+                    raise ValueError("AI ranking notices are invalid")
+            except Exception:
+                ranked_matches = result.match_results
+                ranking_warnings = [
+                    "AI вернул некорректное ранжирование — сохранены детерминированные результаты кандидатов."
+                ]
+                ranking_notices = [SourcingNotice(
+                    code="AI_INVALID_RESPONSE",
+                    message="AI вернул некорректное ранжирование — сохранён детерминированный результат.",
+                )]
 
         rank_by_identity = {
             (item.offer.provider, item.offer.offer_id): item
@@ -963,6 +1113,39 @@ class SourcingService:
                 "ai_rank_s": round(time.perf_counter() - started, 6),
             },
         })
+
+    @staticmethod
+    def _valid_ai_ranked_candidates(
+        deterministic_matches,
+        ranked_matches,
+    ) -> bool:
+        """Allow only a permutation and AI evidence over the same facts."""
+
+        if not isinstance(ranked_matches, list):
+            return False
+        deterministic_by_identity = {}
+        ranked_by_identity = {}
+        for target, matches in (
+            (deterministic_by_identity, deterministic_matches),
+            (ranked_by_identity, ranked_matches),
+        ):
+            for match in matches:
+                if not isinstance(match, MatchResult):
+                    return False
+                identity = (match.offer.provider, match.offer.offer_id)
+                if identity in target:
+                    return False
+                target[identity] = match
+        if deterministic_by_identity.keys() != ranked_by_identity.keys():
+            return False
+        for identity, deterministic in deterministic_by_identity.items():
+            ranked = ranked_by_identity[identity]
+            if ranked.model_dump(mode="json", exclude={"rank", "ai_evidence"}) != deterministic.model_dump(
+                mode="json",
+                exclude={"rank", "ai_evidence"},
+            ):
+                return False
+        return True
 
     def search_project(
         self,
@@ -1067,7 +1250,10 @@ class SourcingService:
                 unresolved += 1
             else:
                 decision_match = next(
-                    (item.decision for item in result.match_results if item.offer.offer_id == best.offer_id),
+                    (
+                        item.decision for item in result.match_results
+                        if (item.offer.provider, item.offer.offer_id) == (best.provider, best.offer_id)
+                    ),
                     MatchDecision.REVIEW,
                 )
                 decision = decision_match.value

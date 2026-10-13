@@ -314,14 +314,12 @@ def test_m6b_ai_ranking_response_contract_falls_back_safely(response, expected_i
 def test_m6b_ai_ranking_uses_composite_candidate_identity():
     intent = make_intent()
     etm = make_offer(offer_id="same-id", provider="etm_ipro")
-    duplicate_etm = make_offer(
-        offer_id="same-id", provider="etm_ipro", price=Decimal("999"),
-    )
     lemana = make_offer(offer_id="same-id", provider="lemana_b2b")
-    deterministic = OfferMatcher().match(intent, [etm, duplicate_etm, lemana])
+    deterministic = OfferMatcher().match(intent, [etm, lemana])
 
     class ReverseCandidateProvider(FakeAIProvider):
         def complete(self, messages, **kwargs):
+            self.calls += 1
             request = json.loads(messages[-1]["content"])
             candidate_ids = [item["candidate_id"] for item in request["offers"]]
             return json.dumps({"offer_order": list(reversed(candidate_ids))})
@@ -334,6 +332,198 @@ def test_m6b_ai_ranking_uses_composite_candidate_identity():
         ("lemana_b2b", "same-id"),
         ("etm_ipro", "same-id"),
     ]
+    assert provider.calls == 1
+
+
+def test_m6b_identical_provider_duplicate_is_canonicalized_without_empty_ai_call():
+    intent = make_intent()
+    offer = make_offer(offer_id="repeat", provider="etm_ipro")
+    deterministic = OfferMatcher().match(intent, [offer, offer])
+    provider = FakeAIProvider("not-json")
+
+    result = SourcingAIService(FakeAIService(provider)).rank_matches(intent, deterministic)
+
+    assert len(result.matches) == 1
+    assert result.matches[0].offer == offer
+    assert provider.calls == 0
+    assert result.notices == []
+
+
+@pytest.mark.parametrize(
+    "variants",
+    [
+        (
+            {"price": Decimal("100")},
+            {"price": Decimal("999")},
+        ),
+        (
+            {"attributes": {"diameter": 50, "pressure": 16}},
+            {"attributes": {"diameter": 50, "pressure": 16, "voltage": 220}},
+        ),
+    ],
+    ids=["different-prices", "different-characteristics"],
+)
+def test_m6b_conflicting_identity_variants_are_retained_and_not_ai_ranked(variants):
+    intent = make_intent()
+    offers = [
+        make_offer(offer_id="conflict", provider="etm_ipro", **variant)
+        for variant in variants
+    ]
+    providers = [FakeAIProvider('{"offer_order":["candidate_1"]}') for _ in range(2)]
+    results = [
+        SourcingAIService(FakeAIService(provider)).rank_matches(
+            intent,
+            OfferMatcher().match(intent, order),
+        )
+        for provider, order in zip(providers, (offers, list(reversed(offers))))
+    ]
+
+    expected = [
+        (item.offer.offer_id, item.offer.price, item.offer.attributes)
+        for item in results[0].matches
+    ]
+    assert len(expected) == 2
+    assert [
+        (item.offer.offer_id, item.offer.price, item.offer.attributes)
+        for item in results[1].matches
+    ] == expected
+    for result, provider in zip(results, providers):
+        assert len(result.matches) == 2
+        assert result.notices[0].code == "PROVIDER_IDENTITY_CONFLICT"
+        assert provider.calls == 0
+
+
+def test_m6b_ranker_skips_ai_when_only_one_candidate_is_eligible_or_all_reject():
+    intent = make_intent()
+    provider = FakeAIProvider("not-json")
+    ai = SourcingAIService(FakeAIService(provider))
+    one_eligible = OfferMatcher().match(intent, [
+        make_offer(offer_id="match"),
+        make_offer(
+            offer_id="reject",
+            title="Клапан DN100 PN16",
+            attributes={"diameter": 100, "pressure": 16},
+        ),
+    ])
+    all_reject = OfferMatcher().match(intent, [
+        make_offer(offer_id="reject-a", title="Клапан DN100", attributes={"diameter": 100}),
+        make_offer(offer_id="reject-b", title="Клапан DN150", attributes={"diameter": 150}),
+    ])
+
+    one_result = ai.rank_matches(intent, one_eligible)
+    reject_result = ai.rank_matches(intent, all_reject)
+
+    assert provider.calls == 0
+    assert one_result.notices == reject_result.notices == []
+    assert [item.decision for item in reject_result.matches] == [
+        MatchDecision.REJECT,
+        MatchDecision.REJECT,
+    ]
+
+
+def test_m6b_conflicting_identity_is_review_only_across_cold_warm_and_restart_cache(tmp_path):
+    class CountingRowOffersProvider(RowOffersProvider):
+        def __init__(self, offers_by_row):
+            super().__init__(offers_by_row)
+            self.calls = 0
+
+        def search(self, intent, *, limit=20):
+            self.calls += 1
+            return super().search(intent, limit=limit)
+
+    class CountingRankingAI(SourcingAIService):
+        def __init__(self):
+            super().__init__()
+            self.rank_calls = 0
+
+        def rank_matches(self, intent, matches):
+            self.rank_calls += 1
+            return super().rank_matches(intent, matches)
+
+    row = {
+        "id": "conflict-row",
+        "row_type": "item",
+        "name": "Клапан",
+        "type_mark": "DN50 PN16",
+        "quantity": "2",
+        "unit": "шт.",
+    }
+    offers = [
+        make_offer(offer_id="conflict", provider="row-offers", price=Decimal("100")),
+        make_offer(offer_id="conflict", provider="row-offers", price=Decimal("999")),
+    ]
+    cache_path = tmp_path / "m6b-r1-conflicting-offers.json"
+
+    def run(*, expected_ai_calls):
+        provider = CountingRowOffersProvider({row["id"]: offers})
+        fake_ai = CountingRankingAI()
+        service = SourcingService(
+            {provider.key: provider},
+            default_provider=provider.key,
+            ai=fake_ai,
+            cache=SourcingCache(cache_path),
+        )
+        result = service.search_project([row], ai_rerank=True)
+        assert fake_ai.rank_calls == expected_ai_calls
+        return result, provider
+
+    cold, cold_provider = run(expected_ai_calls=0)
+    warm, warm_provider = run(expected_ai_calls=0)
+    restarted, restarted_provider = run(expected_ai_calls=0)
+
+    for result in (cold, warm, restarted):
+        position = result.results[0]
+        assert result.positions_matched == 0
+        assert result.positions_review == 1
+        assert result.confirmed_totals == {}
+        assert result.confirmed_total is None
+        assert position.recommended_offer is None
+        assert position.review_candidate is None
+        assert [item.decision for item in position.match_results] == [
+            MatchDecision.REVIEW,
+            MatchDecision.REVIEW,
+        ]
+        offer_signatures = sorted(
+            json.dumps(offer.model_dump(mode="json"), sort_keys=True)
+            for offer in position.offers
+        )
+        match_signatures = sorted(
+            json.dumps(item.offer.model_dump(mode="json"), sort_keys=True)
+            for item in position.match_results
+        )
+        assert offer_signatures == match_signatures
+        assert any(item.code == "PROVIDER_IDENTITY_CONFLICT" for item in position.notices)
+    assert cold_provider.calls == 1
+    assert warm_provider.calls == restarted_provider.calls == 0
+    assert warm.timings["search_cache_hits"] == restarted.timings["search_cache_hits"] == 1.0
+
+
+def test_m6b_service_rejects_ai_output_that_drops_or_changes_candidate_facts():
+    class MutatingAI:
+        def rank_matches(self, intent, matches):
+            changed_offer = matches[0].offer.model_copy(update={"price": Decimal("1")})
+            changed = matches[0].model_copy(update={"offer": changed_offer})
+            return SourcingRankingResult(matches=[changed])
+
+    offers = [
+        make_offer(offer_id="candidate-a", price=Decimal("100")),
+        make_offer(offer_id="candidate-b", price=Decimal("200")),
+    ]
+    provider = StubProvider(offers)
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=MutatingAI(),
+        cache=SourcingCache(),
+    )
+
+    result = service.search_intent(make_intent(), ai_rerank=True)
+
+    assert len(result.offers) == len(result.match_results) == 2
+    assert {item.price for item in result.offers} == {Decimal("100"), Decimal("200")}
+    assert {item.offer.price for item in result.match_results} == {Decimal("100"), Decimal("200")}
+    assert any(item.code == "AI_INVALID_RESPONSE" for item in result.notices)
+    assert result.recommended_offer is None
 
 
 def test_m6b_ai_ranking_does_not_change_deterministic_recommendation():
