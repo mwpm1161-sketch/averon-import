@@ -16,6 +16,26 @@ _CYRILLIC_IDENTIFIER_TRANSLATION = str.maketrans({
 _STRICT_NUMBER = re.compile(
     r"[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][+-]?\d+)?\Z"
 )
+_TITLE_MODEL_VARIANT_RE = re.compile(
+    r"(?<![\w])(?:"
+    r"v(?:er(?:sion)?)?\.?\s*\d+[a-zа-яё0-9]*|"
+    r"version\s*\d+[a-zа-яё0-9]*|версия\s*\d+[a-zа-яё0-9]*|"
+    r"gen(?:eration)?\s*\d+[a-zа-яё0-9]*|поколение\s*\d+[a-zа-яё0-9]*|"
+    r"mk\s*\d+[a-zа-яё0-9]*|"
+    r"plus|плюс|pro|max|mini|xl|xxl|"
+    r"модификац\w*|исполнение\w*|серия\s*\d*[a-zа-яё]*"
+    r")(?![\w])",
+    re.IGNORECASE,
+)
+_TITLE_TECHNICAL_ATTRIBUTE_RE = re.compile(
+    r"(?<![\w])(?:"
+    r"(?:dn|ду|pn|ру)\s*\d+(?:[.,]\d+)?|"
+    r"\d+(?:[.,]\d+)?\s*(?:kw|квт|w|вт|v|в|mm|мм|cm|см|hz|гц|bar|бар)|"
+    r"(?:ip|ик)\s*\d{2}|"
+    r"\d+(?:[.,]\d+)?\s*[xх×]\s*\d+(?:[.,]\d+)?"
+    r")(?![\w])",
+    re.IGNORECASE,
+)
 _DIMENSION_NUMBER = r"\d+(?:[.,]\d+)?"
 _UNIT_ALIASES = {
     "power": {"kw": ("power", Decimal("1")), "квт": ("power", Decimal("1")),
@@ -84,17 +104,18 @@ def _same_identity(left: object, right: object) -> bool:
 
 
 def _model_in_title(model: object, title: object) -> bool:
-    """Find a model as supporting title evidence, not structured identity.
+    """Find a model as supporting title evidence when its context is safe.
 
-    Separators inside a model may differ, but a candidate embedded as a
-    component of a larger hyphenated/dotted identifier is not accepted. This
-    avoids treating A-01 as evidence for B-A-01 or ABC-100 as evidence for
-    ABC-100-PLUS. Whitespace-delimited title text may still support a search
-    result; it never enters the strict structured-model comparison path.
+    A joined or version-like suffix can identify a different model, so it
+    blocks support. A recognized independent technical specification (such
+    as power, voltage, diameter, pressure, IP class, or dimensions) may follow
+    the model. Other alphanumeric suffixes remain ambiguous and yield no model
+    evidence; none of these cases is emitted as a model conflict.
     """
 
     model_tokens = _identity_tokens(model)
-    title_text = str(title or "").casefold().replace("ё", "е").translate(
+    raw_title = str(title or "").casefold().replace("ё", "е")
+    title_text = raw_title.translate(
         _CYRILLIC_IDENTIFIER_TRANSLATION
     )
     title_text = title_text.replace("×", "x").replace("х", "x")
@@ -112,20 +133,29 @@ def _model_in_title(model: object, title: object) -> bool:
                     title_text[title_tokens[start - 1].end():token.start()]
                     if start else ""
                 )
-                after_join = (
-                    title_text[title_tokens[stop].end():title_tokens[stop + 1].start()]
-                    if stop + 1 < len(title_tokens) else ""
-                )
-                # A hyphen, dot, slash, or underscore joins adjacent parts of
-                # one identifier. Do not accept only the inner model segment.
+                # A compact prefixed/suffixed token remains one identifier;
+                # do not accept only the inner model segment.
                 if (
                     (before_join and not any(char.isspace() for char in before_join)
                      and any(char in "-._/\\" for char in before_join))
-                    or (after_join and not any(char.isspace() for char in after_join)
-                        and any(char in "-._/\\" for char in after_join))
                 ):
                     break
-                return True
+                raw_suffix = raw_title[title_tokens[stop].end():]
+                if _TITLE_MODEL_VARIANT_RE.search(raw_suffix):
+                    continue
+                if not any(char.isalnum() for char in raw_suffix):
+                    if any(char in "-_/\\" for char in raw_suffix):
+                        continue
+                    return True
+                technical = _TITLE_TECHNICAL_ATTRIBUTE_RE.search(raw_suffix)
+                if technical and not any(
+                    char.isalnum() for char in raw_suffix[:technical.start()]
+                ):
+                    return True
+                # A non-technical suffix may be a description, a model
+                # continuation, or a version we do not recognize. Keep that
+                # ambiguity at REVIEW instead of upgrading it to likely.
+                continue
             if not target.startswith(combined):
                 break
     return False

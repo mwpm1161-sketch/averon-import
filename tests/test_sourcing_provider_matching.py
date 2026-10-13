@@ -279,6 +279,25 @@ def test_success_match_and_partial_provider_failure_remain_separate():
     assert not any(item.decision == MatchDecision.REJECT for item in evaluation.matches)
 
 
+def test_outcome_native_matching_does_not_recommend_title_model_variant():
+    intent = _intent(
+        source_text="Насос ABC-100",
+        normalized_name="Насос",
+        model="ABC-100",
+    )
+    offer = _offer(
+        "etm_ipro",
+        title="Насос ABC-100 V2",
+        attributes={},
+    )
+
+    evaluation = _evaluate(_execution({"etm_ipro": [offer]}), intent)
+
+    assert evaluation.matches[0].decision == MatchDecision.REVIEW
+    assert evaluation.matches[0].missing_attributes == ["model"]
+    assert evaluation.recommended_offer_reference is None
+
+
 def test_empty_plus_failure_has_no_fake_match_and_retains_both_outcomes():
     execution = _execution(
         {},
