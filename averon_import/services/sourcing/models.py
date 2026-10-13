@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 # Bump when deterministic sourcing identity or matching semantics change. This
 # namespaces persisted search results without rewriting their stored payloads.
-MATCHER_POLICY_REVISION = "m6a-deterministic-matching-v1"
+MATCHER_POLICY_REVISION = "m6a-r1-strict-model-identity-v1"
 
 
 class SourcingModel(BaseModel):

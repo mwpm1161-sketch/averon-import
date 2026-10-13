@@ -107,7 +107,7 @@ def test_exact_nobo_model_is_strongest_and_conflicting_power_is_rejected(demo_re
     assert exact.rank < conflicting.rank
 
 
-def test_quoted_manufacturer_and_extended_model_keep_exact_offer_first(demo_repository):
+def test_quoted_manufacturer_matches_and_multiline_model_stays_distinct(demo_repository):
     row = nobo_row()
     row["manufacturer"] = "“NOBO”"
     intent = build_fallback_intent(row)
@@ -135,8 +135,12 @@ def test_quoted_manufacturer_and_extended_model_keep_exact_offer_first(demo_repo
         kev_intent,
         LocalCatalogProvider(demo_repository).search(kev_intent, limit=20),
     )
-    assert kev_matches[0].offer.offer_id == "demo-aircurtain-kev-9p2012e"
-    assert kev_matches[0].decision == MatchDecision.MATCH
+    kev9 = next(
+        item for item in kev_matches
+        if item.offer.offer_id == "demo-aircurtain-kev-9p2012e"
+    )
+    assert kev9.decision == MatchDecision.ALTERNATIVE
+    assert "model" not in kev9.matched_attributes
     assert next(
         item for item in kev_matches
         if item.offer.offer_id == "demo-aircurtain-kev-12p3041e"
@@ -310,14 +314,14 @@ def test_representative_p58_subset_uses_provider_prices(demo_repository, tmp_pat
     )
     result = service.search_project(rows)
     assert result.positions_total == result.positions_processed == 5
-    assert result.positions_matched == 3
+    assert result.positions_matched == 2
     assert result.positions_alternatives == 0
-    assert result.positions_review == 2
+    assert result.positions_review == 3
     assert result.positions_without_offers == 0
-    assert result.estimated_total == Decimal("208800")
-    assert result.confirmed_total == Decimal("208800")
+    assert result.estimated_total == Decimal("161900")
+    assert result.confirmed_total == Decimal("161900")
     assert result.alternative_total is None
-    assert result.confirmed_totals == {"RUB": Decimal("208800")}
+    assert result.confirmed_totals == {"RUB": Decimal("161900")}
     assert result.alternative_totals == {}
     assert result.currency == "RUB"
     assert [
@@ -328,5 +332,5 @@ def test_representative_p58_subset_uses_provider_prices(demo_repository, tmp_pat
         "demo-nobo-nfk4n-10",
         None,
         None,
-        "demo-aircurtain-kev-9p2012e",
+        None,
     ]

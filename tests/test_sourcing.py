@@ -521,6 +521,155 @@ def test_m6a_explicit_model_prefix_collision_is_an_alternative(expected, actual)
     assert result.deterministic_evidence["preferred_differences"] == ["model"]
 
 
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("ABC-100", "ABC-100-PLUS"),
+        ("ABC-100", "ABC-100 V2"),
+        ("A-01", "B-A-01"),
+    ],
+)
+def test_m6a_r1_structured_model_requires_complete_identity(expected, actual):
+    intent = make_intent(
+        model=expected,
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    offer = make_offer(attributes={"model": actual})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.ALTERNATIVE
+    assert result.matched_attributes == []
+    assert result.deterministic_evidence["preferred_differences"] == ["model"]
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [("ABC100", "ABC-100"), ("П17", "П 17"), ("КЭВ-9П2012Е", "KEV-9P2012E")],
+)
+def test_m6a_r1_structured_model_keeps_safe_normalization(expected, actual):
+    intent = make_intent(
+        model=expected,
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    offer = make_offer(attributes={"model": actual})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == MatchDecision.MATCH
+    assert result.matched_attributes == ["model"]
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual", "decision"),
+    [
+        ("ABC-100", "ABC-100", MatchDecision.MATCH),
+        ("П17", "П 17", MatchDecision.MATCH),
+        ("ABC-100", "ABC-100-PLUS", MatchDecision.REJECT),
+        ("ABC-100", "ABC-100 V2", MatchDecision.REJECT),
+        ("A-01", "B-A-01", MatchDecision.REJECT),
+    ],
+)
+def test_m6a_r1_required_model_attribute_uses_strict_identity(expected, actual, decision):
+    intent = make_intent(
+        model="",
+        attributes={},
+        required_attributes={"model": expected},
+        preferred_attributes={},
+    )
+    offer = make_offer(attributes={"model": actual})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == decision
+    if decision == MatchDecision.REJECT:
+        assert result.conflicting_attributes == ["model"]
+
+
+@pytest.mark.parametrize(
+    ("model", "title", "decision", "source"),
+    [
+        ("П17", "Смеситель П 17", MatchDecision.LIKELY_MATCH, "title"),
+        ("ABC-100", "Насос ABC-100 V2", MatchDecision.LIKELY_MATCH, "title"),
+        ("ABC-100", "Насос ABC-100-PLUS", MatchDecision.REVIEW, ""),
+        ("A-01", "Механизм B-A-01", MatchDecision.REVIEW, ""),
+    ],
+)
+def test_m6a_r1_title_model_is_only_supporting_evidence(model, title, decision, source):
+    intent = make_intent(
+        model=model,
+        attributes={},
+        required_attributes={},
+        preferred_attributes={},
+    )
+    offer = make_offer(title=title, attributes={})
+
+    result = OfferMatcher().match(intent, [offer])[0]
+
+    assert result.decision == decision
+    assert "model" not in result.matched_attributes
+    if source:
+        assert result.supporting_attributes == ["model"]
+        assert result.deterministic_evidence["model_evidence_source"] == source
+    else:
+        assert result.supporting_attributes == []
+        assert result.missing_attributes == ["model"]
+
+
+def test_m6a_r1_policy_revision_invalidates_m6a_search_cache(tmp_path):
+    intent = make_intent()
+    old_payload = intent.model_dump(mode="json")
+    old_payload.pop("evidence", None)
+    old_payload.pop("uncertainties", None)
+    origins = intent.evidence.get("attribute_origins", {})
+    decision_attributes = sorted(set(intent.required_attributes) | set(intent.preferred_attributes))
+    old_payload["attribute_origins"] = {
+        key: ("advisory" if str(origins.get(key) or "").strip() == "ai_inferred" else "enforced")
+        for key in decision_attributes
+    }
+    old_payload["matcher_policy_revision"] = "m6a-deterministic-matching-v1"
+    old_fingerprint = hashlib.sha256(
+        json.dumps(old_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_path = tmp_path / "m6a-search-cache.json"
+    stale_offer = make_offer(offer_id="old-policy-result")
+    SourcingCache(cache_path).set(
+        f"search:stub:stub-1:{old_fingerprint}:20",
+        SourcingResult(
+            intent=intent,
+            offers=[stale_offer],
+            match_results=OfferMatcher().match(intent, [stale_offer]),
+        ),
+    )
+
+    class CountingProvider(StubProvider):
+        def __init__(self, offers):
+            super().__init__(offers)
+            self.calls = 0
+
+        def search(self, request_intent, *, limit=20):
+            self.calls += 1
+            return super().search(request_intent, limit=limit)
+
+    provider = CountingProvider([make_offer(offer_id="fresh-policy-result")])
+    service = SourcingService(
+        {provider.key: provider},
+        default_provider=provider.key,
+        ai=SourcingAIService(),
+        cache=SourcingCache(cache_path),
+    )
+
+    result = service.search_intent(intent)
+
+    assert result.offers[0].offer_id == "fresh-policy-result"
+    assert result.timings["search_cache_hit"] == 0.0
+    assert provider.calls == 1
+
+
 def test_m6a_ai_ranking_cannot_promote_technical_conflict():
     intent = make_intent(
         model="",

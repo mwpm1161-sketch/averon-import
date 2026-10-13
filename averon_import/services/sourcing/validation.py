@@ -69,33 +69,85 @@ def _identity_tokens(value: object) -> tuple[str, ...]:
     return tuple(re.findall(r"[a-zа-яё0-9]+", text))
 
 
-def _contains_token_sequence(container: tuple[str, ...], sequence: tuple[str, ...]) -> bool:
-    if not sequence or len(sequence) > len(container):
+def _same_identity(left: object, right: object) -> bool:
+    """Compare two complete structured identifiers, never a substring."""
+
+    expected = _identity_tokens(left)
+    actual = _identity_tokens(right)
+    if not expected or not actual:
         return False
-    target = "".join(sequence)
-    for start in range(len(container)):
+    # Joining token parts treats separators and whitespace consistently
+    # (ABC100 == ABC-100, П17 == П 17), while requiring every model token on
+    # both sides to be present. Versions, prefixes, and suffix modifications
+    # therefore remain distinct structured identities.
+    return "".join(expected) == "".join(actual)
+
+
+def _model_in_title(model: object, title: object) -> bool:
+    """Find a model as supporting title evidence, not structured identity.
+
+    Separators inside a model may differ, but a candidate embedded as a
+    component of a larger hyphenated/dotted identifier is not accepted. This
+    avoids treating A-01 as evidence for B-A-01 or ABC-100 as evidence for
+    ABC-100-PLUS. Whitespace-delimited title text may still support a search
+    result; it never enters the strict structured-model comparison path.
+    """
+
+    model_tokens = _identity_tokens(model)
+    title_text = str(title or "").casefold().replace("ё", "е").translate(
+        _CYRILLIC_IDENTIFIER_TRANSLATION
+    )
+    title_text = title_text.replace("×", "x").replace("х", "x")
+    title_tokens = list(re.finditer(r"[a-zа-яё0-9]+", title_text))
+    if not model_tokens or not title_tokens:
+        return False
+
+    target = "".join(model_tokens)
+    for start, token in enumerate(title_tokens):
         combined = ""
-        for stop in range(start, len(container)):
-            combined += container[stop]
+        for stop in range(start, len(title_tokens)):
+            combined += title_tokens[stop].group(0)
             if combined == target:
+                before_join = (
+                    title_text[title_tokens[start - 1].end():token.start()]
+                    if start else ""
+                )
+                after_join = (
+                    title_text[title_tokens[stop].end():title_tokens[stop + 1].start()]
+                    if stop + 1 < len(title_tokens) else ""
+                )
+                # A hyphen, dot, slash, or underscore joins adjacent parts of
+                # one identifier. Do not accept only the inner model segment.
+                if (
+                    (before_join and not any(char.isspace() for char in before_join)
+                     and any(char in "-._/\\" for char in before_join))
+                    or (after_join and not any(char.isspace() for char in after_join)
+                        and any(char in "-._/\\" for char in after_join))
+                ):
+                    break
                 return True
             if not target.startswith(combined):
                 break
     return False
 
 
-def _same_identity(left: object, right: object) -> bool:
+def _same_text_identity(left: object, right: object) -> bool:
+    """Legacy weak containment for non-model product-name evidence."""
+
     expected = _identity_tokens(left)
     actual = _identity_tokens(right)
     if not expected or not actual:
         return False
-    # Exact token sequences allow harmless separator differences while
-    # preventing M200 from being treated as the prefix of M2000.
-    return (
-        expected == actual
-        or _contains_token_sequence(expected, actual)
-        or _contains_token_sequence(actual, expected)
-    )
+    target = "".join(expected)
+    for start in range(len(actual)):
+        combined = ""
+        for stop in range(start, len(actual)):
+            combined += actual[stop]
+            if combined == target:
+                return True
+            if not target.startswith(combined):
+                break
+    return False
 
 
 def _number(value: object) -> Decimal | None:
@@ -251,7 +303,7 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
                 # matching the existing catalog-selection contract, while
                 # never qualifying as MATCH or LIKELY_MATCH.
                 preferred.append("model")
-        elif _same_identity(intent.model, offer.title):
+        elif _model_in_title(intent.model, offer.title):
             model_evidence_source = "title"
             supporting.append("model")
         elif _same_identity(intent.model, offer.article):
@@ -259,7 +311,7 @@ def validate_offer(intent: ProductIntent, offer: Offer) -> ValidationResult:
             supporting.append("model")
         else:
             missing.append("model")
-    elif intent.normalized_name and _same_identity(intent.normalized_name, offer.title):
+    elif intent.normalized_name and _same_text_identity(intent.normalized_name, offer.title):
         # A name-only intent still has deterministic product evidence.  Keep
         # this separate from model evidence so a missing requested model can
         # never be hidden by a generic title match.
