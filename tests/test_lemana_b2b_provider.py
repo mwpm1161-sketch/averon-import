@@ -105,7 +105,7 @@ def test_unconfigured_provider_stats_fail_closed_without_network(tmp_path):
     assert "не настроен" in state.error
 
 
-def test_configured_provider_exposes_mirror_revision_and_auth_health(tmp_path):
+def test_configured_provider_exposes_local_mirror_without_auth_probe(tmp_path):
     provider, client, mirror = configured_provider(tmp_path)
     class SyncClient(ProviderClient):
         def get_products(self, **kwargs):
@@ -115,10 +115,10 @@ def test_configured_provider_exposes_mirror_revision_and_auth_health(tmp_path):
     state = provider.stats()
 
     assert state.configured is True
-    assert state.reachable is True
+    assert state.reachable is None
     assert state.item_count == 1
     assert state.catalog_version == mirror.revision
-    assert client.access_calls == 1
+    assert client.access_calls == 0
 
 
 def test_provider_search_uses_local_candidates_and_bounded_live_batch_prices(tmp_path):
@@ -236,10 +236,10 @@ def test_environment_affinity_mismatch_blocks_health_and_sync_restores_it(tmp_pa
     client.get_products = SyncClient().get_products
     provider.sync()
     restored = provider.stats()
-    assert restored.reachable is True
+    assert restored.reachable is None
     assert mirror.environment == "prod"
     assert mirror.region_id == 34
-    assert client.access_calls == 1
+    assert client.access_calls == 0
 
 
 def test_project_continues_after_one_lemana_price_failure(tmp_path):

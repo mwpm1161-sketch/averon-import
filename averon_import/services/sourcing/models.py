@@ -94,7 +94,9 @@ class SourcingProviderRuntimeState(SourcingModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     configured: bool = True
-    reachable: bool = True
+    # None means reachability was not probed. Passive status readers must not
+    # turn into supplier requests just to populate this field.
+    reachable: bool | None = True
     item_count: int = Field(default=0, ge=0)
     catalog_version: str = "unknown"
     latency_ms: float | None = Field(default=None, ge=0)

@@ -61,6 +61,7 @@ def test_runtime_state_defaults_is_frozen_and_strict():
         SourcingProviderRuntimeState(latency_ms=-1)
     with pytest.raises(ValidationError):
         SourcingProviderRuntimeState(debug_payload="private")
+    assert SourcingProviderRuntimeState(reachable=None).reachable is None
 
 
 def test_runtime_state_error_is_bounded_and_safe():
@@ -383,6 +384,7 @@ def test_runtime_registers_configured_vi_only_for_outcome_execution_without_supp
         "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
         "AVERON_VSEINSTRUMENTI_REGION_ID",
         "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+        "AVERON_VSEINSTRUMENTI_BEARER_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = AppSettingsService(tmp_path / "settings")
@@ -424,6 +426,8 @@ def test_runtime_registers_configured_vi_only_for_outcome_execution_without_supp
     assert "vseinstrumenti" in runtime.execution_providers
     assert "vseinstrumenti" not in runtime.providers
     assert runtime.providers.keys() == {"local_catalog", "demo_store_http", "lemana_b2b", "etm_ipro"}
+    status = runtime.service.public_config()
+    assert status["providers"]
     adapter = runtime.execution_providers["vseinstrumenti"]
     first = adapter.request_identity(_intent("vi-runtime"), limit=5, execution_scope_id="scope-1")
     assert transport_calls == []
@@ -441,6 +445,7 @@ def test_runtime_registers_configured_vi_only_for_outcome_execution_without_supp
     assert stale_outcome.failure_category.value == "misconfigured"
     secrets.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, "a" * 32)
     rebuilt = create_sourcing_runtime(tmp_path / "data", settings, secrets)
+    rebuilt.service.public_config()
     second = rebuilt.execution_providers["vseinstrumenti"].request_identity(
         _intent("vi-runtime"), limit=5, execution_scope_id="scope-1",
     )
@@ -595,6 +600,94 @@ def test_runtime_factory_public_config_keeps_shape_and_does_not_expose_secrets(
     assert "authorization" not in encoded
     assert "secret" not in encoded
     assert "token" not in encoded
+
+
+def test_runtime_public_status_and_capabilities_do_not_probe_any_provider(
+    tmp_path,
+    monkeypatch,
+):
+    from averon_import.services.sourcing.providers.etm_ipro.client import EtmIproClient
+    from averon_import.services.sourcing.providers.lemana_b2b.client import LemanaB2BClient
+    from averon_import.services.sourcing.providers.vseinstrumenti import client as vi_client_module
+
+    for name in (
+        "AVERON_LEMANA_B2B_CLIENT_SECRET",
+        "AVERON_ETM_IPRO_LOGIN",
+        "AVERON_ETM_IPRO_PASSWORD",
+        "AVERON_VSEINSTRUMENTI_ENABLED",
+        "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
+        "AVERON_VSEINSTRUMENTI_REGION_ID",
+        "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    calls = []
+
+    def forbidden_transport(*_args, **_kwargs):
+        calls.append("supplier-http")
+        raise AssertionError("passive runtime reads must not send supplier HTTP")
+
+    monkeypatch.setattr(
+        "averon_import.services.sourcing.providers.demo_store_http._default_transport",
+        forbidden_transport,
+    )
+    monkeypatch.setattr(EtmIproClient, "check_access", forbidden_transport)
+    monkeypatch.setattr(LemanaB2BClient, "check_access", forbidden_transport)
+    monkeypatch.setattr(vi_client_module, "_default_transport", forbidden_transport)
+
+    settings = AppSettingsService(tmp_path / "settings")
+    secrets = MemorySecretStore()
+    runtime = create_sourcing_runtime(tmp_path / "data", settings, secrets)
+
+    for _ in range(2):
+        payload = runtime.service.public_config()
+        assert {row["key"] for row in payload["providers"]} == {
+            "local_catalog", "demo_store_http", "lemana_b2b", "etm_ipro",
+        }
+        assert runtime.execution_provider_keys == ("etm_ipro", "lemana_b2b", "local_catalog")
+        for provider in runtime.providers.values():
+            provider.stats()
+
+    rebuilt = create_sourcing_runtime(tmp_path / "data", settings, secrets)
+    rebuilt.service.public_config()
+    assert calls == []
+
+
+def test_demo_search_stats_are_only_read_during_explicit_search():
+    from averon_import.services.sourcing.providers.demo_store_http import DemoStoreHttpProvider
+
+    calls = []
+    class Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self, limit=None):
+            raw = json.dumps(self.payload).encode("utf-8")
+            return raw if limit is None else raw[:limit]
+
+        def close(self):
+            return None
+
+    def transport(request, _timeout):
+        calls.append(request.full_url)
+        if request.method == "GET":
+            return Response({"items": 4, "catalog_version": "demo-search-1"})
+        return Response({"catalog_version": "demo-search-1", "items": []})
+
+    provider = DemoStoreHttpProvider(transport=transport)
+    service = _service({provider.key: provider}, default_provider=provider.key)
+
+    public = service.public_config()
+    assert calls == []
+    assert next(row for row in public["providers"] if row["key"] == provider.key)["reachable"] is None
+
+    result = service.search_intent(_intent("demo-explicit-search"), ai_rerank=False)
+
+    assert result.provider_error_category is None
+    assert result.offers == []
+    assert [url.rsplit("/", 1)[-1].split("?", 1)[0] for url in calls] == ["stats", "search"]
 
 
 def test_runtime_uses_the_application_owned_history_repository_without_registering_it_as_live_provider(tmp_path):

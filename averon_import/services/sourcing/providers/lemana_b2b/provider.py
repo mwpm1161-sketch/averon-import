@@ -97,27 +97,9 @@ class LemanaB2BProvider:
                 catalog_version=revision,
                 error="Локальное зеркало Лемана ПРО B2B ещё не синхронизировано",
             )
-        try:
-            self.client.check_access()
-        except SourcingProviderError as exc:
-            return SourcingProviderRuntimeState(
-                configured=True,
-                reachable=False,
-                item_count=item_count,
-                catalog_version=revision,
-                error=exc.public_message,
-            )
-        except Exception:
-            return SourcingProviderRuntimeState(
-                configured=True,
-                reachable=False,
-                item_count=item_count,
-                catalog_version=revision,
-                error="Проверка каталога Lemana PRO B2B не выполнена",
-            )
         return SourcingProviderRuntimeState(
             configured=True,
-            reachable=True,
+            reachable=None,
             item_count=item_count,
             catalog_version=revision,
         )

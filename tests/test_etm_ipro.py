@@ -930,7 +930,7 @@ def test_direct_article_lookup_works_without_catalog_mirror_through_service(tmp_
 
     assert result.offers
     assert result.offers[0].source_item_id == "A-100"
-    assert provider.stats().reachable is True
+    assert provider.stats().reachable is None
 
 
 def test_name_only_search_without_catalog_returns_catalog_not_ready_notice(tmp_path):
@@ -1917,8 +1917,22 @@ def test_runtime_stats_are_safe_and_do_not_authenticate_on_startup(tmp_path):
     provider, mirror = configured_provider(tmp_path)
     state = provider.stats()
     assert state.configured is True
-    assert state.reachable is True
+    assert state.reachable is None
     assert state.catalog_version == mirror.revision
+
+
+def test_admin_health_status_does_not_authenticate(tmp_path):
+    provider, mirror = configured_provider(tmp_path)
+    access_calls = []
+    provider.client.check_access = lambda: access_calls.append("called")
+
+    health = provider.health()
+
+    assert health["configured"] is True
+    assert health["reachable"] is None
+    assert health["reachability_checked"] is False
+    assert health["catalog_version"] == mirror.revision
+    assert access_calls == []
 
 
 def test_project_continues_after_one_etm_provider_row_failure(tmp_path):

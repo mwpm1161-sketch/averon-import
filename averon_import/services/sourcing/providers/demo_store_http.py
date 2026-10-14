@@ -160,6 +160,18 @@ class DemoStoreHttpProvider:
         return offers
 
     def stats(self) -> dict[str, Any]:
+        """Return local configuration state without contacting the store."""
+
+        return {
+            "configured": bool(self.base_url),
+            "reachable": None,
+            "item_count": 0,
+            "catalog_version": "unknown",
+        }
+
+    def search_stats(self) -> dict[str, Any]:
+        """Probe catalog metadata as part of an explicitly started search."""
+
         try:
             data = self._request_json(
                 "GET",

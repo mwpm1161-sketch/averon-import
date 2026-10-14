@@ -392,7 +392,7 @@ def test_demo_store_stays_usable_on_legacy_path_but_has_no_execution_adapter(tmp
     runtime, _, _ = _runtime(tmp_path, monkeypatch)
     demo = runtime.providers["demo_store_http"]
     calls = []
-    monkeypatch.setattr(demo, "stats", lambda: {"configured": True, "reachable": True, "catalog_version": "demo-v1"})
+    monkeypatch.setattr(demo, "search_stats", lambda: {"configured": True, "reachable": True, "catalog_version": "demo-v1"})
     monkeypatch.setattr(demo, "search", lambda intent, *, limit: calls.append((intent, limit)) or [_offer("demo_store_http", "demo-1")])
 
     result = runtime.service.search_intent(_intent(), provider_key="demo_store_http", ai_rerank=False)
@@ -410,9 +410,10 @@ def test_search_intent_provider_key_remains_on_legacy_provider_path(tmp_path, mo
     provider = runtime.providers[provider_key]
     stats_calls = []
     search_calls = []
+    stats_method = "search_stats" if callable(getattr(provider, "search_stats", None)) else "stats"
     monkeypatch.setattr(
         provider,
-        "stats",
+        stats_method,
         lambda: stats_calls.append(provider_key)
         or SourcingProviderRuntimeState(catalog_version="legacy-fixture"),
     )

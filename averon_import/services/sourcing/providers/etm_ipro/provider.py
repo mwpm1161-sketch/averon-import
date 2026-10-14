@@ -99,34 +99,19 @@ class EtmIproProvider:
             )
         return SourcingProviderRuntimeState(
             configured=True,
-            reachable=True,
+            reachable=None,
             item_count=item_count,
             catalog_version=self.mirror.revision,
         )
 
     def health(self) -> dict[str, Any]:
-        if not self.configured:
-            return {
-                "configured": False,
-                "reachable": False,
-                "catalog_version": self.mirror.revision,
-                "search_index_ready": self.mirror.search_index_ready,
-            }
-        try:
-            self.client.check_access()
-        except SourcingProviderError as exc:
-            return {
-                "configured": True,
-                "reachable": False,
-                "catalog_version": self.mirror.revision,
-                "search_index_ready": self.mirror.search_index_ready,
-                "error": exc.public_message,
-            }
+        state = self.stats()
         return {
-            "configured": True,
-            "reachable": True,
-            "catalog_version": self.mirror.revision,
-            "item_count": self.mirror.count(),
+            "configured": state.configured,
+            "reachable": None if state.reachable is True else state.reachable,
+            "reachability_checked": False,
+            "catalog_version": state.catalog_version,
+            "item_count": state.item_count,
             "search_index_ready": self.mirror.search_index_ready,
         }
 

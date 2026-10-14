@@ -706,6 +706,7 @@ def test_vi_credential_store_failures_fail_closed_and_survive_restart(
         "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
         "AVERON_VSEINSTRUMENTI_REGION_ID",
         "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+        "AVERON_VSEINSTRUMENTI_BEARER_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     store = FaultInjectingMemorySecretStore()
@@ -831,6 +832,89 @@ def test_vseinstrumenti_is_publicly_available_only_with_current_local_configurat
     assert capabilities["enabled"] is False  # One configured provider cannot start a comparison.
     assert "vi.public-test-token" not in str(capabilities)
     assert "credential_generation" not in str(capabilities)
+
+
+def test_config_status_capabilities_and_runtime_rebuild_are_supplier_network_free(
+    api,
+    tmp_path,
+    monkeypatch,
+):
+    from averon_import.services.sourcing.providers.etm_ipro.client import EtmIproClient
+    from averon_import.services.sourcing.providers.lemana_b2b.client import LemanaB2BClient
+    from averon_import.services.sourcing.providers.vseinstrumenti import client as vi_client_module
+
+    app_module, store, service = api
+    for name in (
+        "AVERON_LEMANA_B2B_CLIENT_SECRET",
+        "AVERON_ETM_IPRO_LOGIN",
+        "AVERON_ETM_IPRO_PASSWORD",
+        "AVERON_VSEINSTRUMENTI_ENABLED",
+        "AVERON_VSEINSTRUMENTI_ENVIRONMENT",
+        "AVERON_VSEINSTRUMENTI_REGION_ID",
+        "AVERON_VSEINSTRUMENTI_REQUEST_TIMEOUT_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    service.update({
+        "sourcing": {
+            "vseinstrumenti": {
+                "enabled": True,
+                "environment": "test",
+                "region_id": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5",
+            },
+        },
+    })
+    store.set(
+        VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
+        service.settings.sourcing.vseinstrumenti.credential_generation,
+    )
+    token_reads = []
+    original_get = store.get
+
+    def tracked_get(key):
+        if key == VSEINSTRUMENTI_BEARER_TOKEN:
+            token_reads.append(key)
+        return original_get(key)
+
+    monkeypatch.setattr(store, "get", tracked_get)
+    calls = []
+
+    def forbidden_transport(*_args, **_kwargs):
+        calls.append("supplier-http")
+        raise AssertionError("passive config/status/capability reads must not call suppliers")
+
+    monkeypatch.setattr(
+        "averon_import.services.sourcing.providers.demo_store_http._default_transport",
+        forbidden_transport,
+    )
+    monkeypatch.setattr(EtmIproClient, "check_access", forbidden_transport)
+    monkeypatch.setattr(LemanaB2BClient, "check_access", forbidden_transport)
+    monkeypatch.setattr(vi_client_module, "_default_transport", forbidden_transport)
+
+    for name in (
+        "demo_store_provider", "sourcing_provider", "sourcing_repository",
+        "sourcing_runtime", "sourcing_service",
+    ):
+        monkeypatch.setattr(app_module, name, getattr(app_module, name))
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "app-data")
+
+    app_module._rebuild_sourcing_runtime()
+    config_payload = app_module.config()
+    providers_payload = app_module.sourcing_providers()
+    capabilities = app_module.get_multi_provider_sourcing_capabilities(None)
+    demo_status = next(
+        item for item in providers_payload["providers"]
+        if item["key"] == "demo_store_http"
+    )
+
+    assert "vseinstrumenti" in app_module.sourcing_runtime.execution_providers
+    assert capabilities["providers"] == [
+        {"key": "vseinstrumenti", "label": "ВсеИнструменты.ru"},
+    ]
+    assert demo_status["reachable"] is None
+    assert config_payload["sourcing"]["provider"]["key"] == "local_catalog"
+    assert calls == []
+    assert token_reads == []
 
 
 def test_put_rejects_invalid_payload_values():

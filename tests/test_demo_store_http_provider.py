@@ -64,10 +64,23 @@ def test_base_url_is_normalized_and_only_http_schemes_are_allowed():
         DemoStoreHttpProvider("https://user:password@store.example")
 
 
-def test_stats_maps_store_shape_and_uses_short_bounded_timeout():
+def test_passive_stats_reports_unprobed_state_without_network():
+    transport = FakeTransport([])
+    provider = DemoStoreHttpProvider("http://127.0.0.1:8877/", transport=transport)
+
+    assert provider.stats() == {
+        "configured": True,
+        "reachable": None,
+        "item_count": 0,
+        "catalog_version": "unknown",
+    }
+    assert transport.calls == []
+
+
+def test_search_stats_maps_store_shape_and_uses_short_bounded_timeout():
     transport = FakeTransport([FakeResponse({"items": 36, "catalog_version": "demo-v4"})])
     provider = DemoStoreHttpProvider("http://127.0.0.1:8877/", transport=transport)
-    assert provider.stats() == {
+    assert provider.search_stats() == {
         "configured": True,
         "reachable": True,
         "item_count": 36,
@@ -79,10 +92,10 @@ def test_stats_maps_store_shape_and_uses_short_bounded_timeout():
     assert timeout <= 3.0
 
 
-def test_offline_stats_is_safe_and_does_not_raise():
+def test_offline_search_stats_is_safe_and_does_not_raise():
     transport = FakeTransport([urllib.error.URLError(TimeoutError())])
     provider = DemoStoreHttpProvider("http://127.0.0.1:8877", transport=transport)
-    stats = provider.stats()
+    stats = provider.search_stats()
     assert stats["configured"] is True
     assert stats["reachable"] is False
     assert stats["catalog_version"] == "unavailable"

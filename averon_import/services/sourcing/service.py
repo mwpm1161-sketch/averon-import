@@ -821,7 +821,7 @@ class SourcingService:
         cache_policy = get_provider_cache_policy(provider)
         if catalog_version is None:
             try:
-                stats = provider.stats() if hasattr(provider, "stats") else {}
+                stats = self._search_provider_stats(provider)
                 runtime_state = normalize_provider_runtime_state(stats)
                 if runtime_state.reachable is False:
                     raise SourcingProviderError(
@@ -1363,7 +1363,7 @@ class SourcingService:
 
     def _project_catalog_version(self, provider: SourcingProvider) -> str:
         try:
-            stats = provider.stats() if hasattr(provider, "stats") else {}
+            stats = self._search_provider_stats(provider)
         except SourcingProviderError:
             raise
         except Exception as exc:
@@ -1378,6 +1378,16 @@ class SourcingService:
                 category="health_error",
             )
         return runtime_state.catalog_version
+
+    @staticmethod
+    def _search_provider_stats(provider: SourcingProvider) -> object:
+        """Read freshness metadata only inside an explicitly started search."""
+
+        search_stats_method = getattr(provider, "search_stats", None)
+        if callable(search_stats_method):
+            return search_stats_method()
+        stats_method = getattr(provider, "stats", None)
+        return stats_method() if callable(stats_method) else {}
 
     def public_config(self) -> dict[str, Any]:
         active = self.provider()
