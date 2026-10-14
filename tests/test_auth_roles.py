@@ -194,6 +194,8 @@ def test_client_role_header_is_ignored(auth_client):
         ("delete", "/api/settings/etm-ipro-login", {}),
         ("delete", "/api/settings/etm-ipro-password", {}),
         ("delete", "/api/settings/vseinstrumenti-bearer-token", {}),
+        ("delete", "/api/settings/tstn-authorization-credentials", {}),
+        ("delete", "/api/settings/tstn-x-sp-secret", {}),
         ("post", "/api/sourcing/providers/etm_ipro/manufacturers/sync", {}),
         ("get", "/api/sourcing/providers/etm_ipro/health", {}),
         ("post", "/api/sourcing/providers/etm_ipro/catalog/sync", {}),
@@ -214,6 +216,70 @@ def test_admin_settings_endpoint_remains_available(auth_client):
 
     assert response.status_code == 200
     assert "yandex" in response.json()
+
+
+def test_tstn_credential_api_is_admin_only_and_never_echoes_values(auth_client, monkeypatch, tmp_path):
+    from averon_import import main
+    from averon_import.services.app_settings import AppSettingsService
+    from averon_import.services.secrets import MemorySecretStore
+
+    store = MemorySecretStore()
+    service = AppSettingsService(tmp_path / "settings")
+    monkeypatch.setattr(main, "secret_store", store)
+    monkeypatch.setattr(main, "app_settings_service", service)
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path / "runtime")
+    private_service = "tn3-api-service-private"
+    private_key = "tn3-api-key-private"
+    private_xsp = "tn3-api-xsp-private"
+
+    denied = auth_client.put(
+        "/api/settings",
+        headers=_headers("colleague"),
+        json={
+            "tstn_service_identifier": private_service,
+            "tstn_client_key": private_key,
+            "tstn_x_sp_secret": private_xsp,
+        },
+    )
+    assert denied.status_code == 403
+
+    saved = auth_client.put(
+        "/api/settings",
+        headers=_headers("averon"),
+        json={
+            "tstn_service_identifier": private_service,
+            "tstn_client_key": private_key,
+            "tstn_x_sp_secret": private_xsp,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["sourcing"]["tstn"]["credentials_configured"] is True
+    assert saved.json()["sourcing"]["tstn"]["x_sp_secret_configured"] is True
+    assert "credential_generation" not in saved.text
+    for value in (private_service, private_key, private_xsp):
+        assert value not in saved.text
+
+    malformed_secret = "tn3-invalid-api-service-must-not-echo"
+    malformed = auth_client.put(
+        "/api/settings",
+        headers=_headers("averon"),
+        json={"tstn_service_identifier": malformed_secret, "tstn_client_key": 123},
+    )
+    assert malformed.status_code == 400
+    assert malformed_secret not in malformed.text
+
+    assert auth_client.delete(
+        "/api/settings/tstn-authorization-credentials",
+        headers=_headers("colleague"),
+    ).status_code == 403
+    deleted = auth_client.delete(
+        "/api/settings/tstn-authorization-credentials",
+        headers=_headers("averon"),
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
+    assert store.get("tstn.service_identifier") is None
+    assert store.get("tstn.client_key") is None
 
 
 def test_one_c_history_status_is_available_to_admin_only(auth_client):

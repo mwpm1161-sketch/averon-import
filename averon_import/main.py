@@ -147,6 +147,11 @@ from averon_import.services.secrets import (
     ETM_IPRO_LOGIN,
     ETM_IPRO_PASSWORD,
     LEMANA_B2B_CLIENT_SECRET,
+    TSTN_CLIENT_KEY,
+    TSTN_CREDENTIALS_CONFIGURED,
+    TSTN_SERVICE_IDENTIFIER,
+    TSTN_X_SP_SECRET,
+    TSTN_X_SP_SECRET_CONFIGURED,
     VSEINSTRUMENTI_BEARER_TOKEN,
     VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
     YANDEX_AI_API_KEY,
@@ -154,6 +159,8 @@ from averon_import.services.secrets import (
     create_secret_store,
     resolve_secret,
 )
+from averon_import.services.sourcing.providers.tstn.authorization import TSTN_CREDENTIAL_LOCK
+from averon_import.services.sourcing.providers.tstn.models import MAX_TSTN_CREDENTIAL_LENGTH
 from averon_import.services.sourcing.providers.vseinstrumenti.client import is_valid_bearer_token, is_valid_region_id
 from averon_import.services.support_reports import (
     DuplicateReport,
@@ -1139,6 +1146,13 @@ class VseinstrumentiSettingsUpdate(BaseModel):
     request_timeout_s: float | None = None
 
 
+class TstnSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: StrictBool | None = None
+    request_timeout_s: float | None = None
+
+
 class SourcingSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -1147,6 +1161,7 @@ class SourcingSettingsUpdate(BaseModel):
     lemana_b2b: LemanaB2BSettingsUpdate | None = None
     etm_ipro: EtmIproSettingsUpdate | None = None
     vseinstrumenti: VseinstrumentiSettingsUpdate | None = None
+    tstn: TstnSettingsUpdate | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -1167,12 +1182,29 @@ class SettingsUpdate(BaseModel):
     etm_password: str | None = None
     # Write-only: the bearer credential is stored only in SecretStore.
     vseinstrumenti_bearer_token: str | None = None
+    # TSTN secrets deliberately use Any here so FastAPI's request-validation
+    # response cannot echo a malformed credential value. They are validated
+    # manually with fixed, value-free messages in put_settings().
+    tstn_service_identifier: Any = None
+    tstn_client_key: Any = None
+    tstn_x_sp_secret: Any = None
     delete_yandex_api_key: bool = False
     delete_yandex_ai_api_key: bool = False
     delete_lemana_client_secret: bool = False
     delete_etm_login: bool = False
     delete_etm_password: bool = False
     delete_vseinstrumenti_bearer_token: bool = False
+    delete_tstn_authorization_credentials: StrictBool = False
+    delete_tstn_x_sp_secret: StrictBool = False
+
+    def __repr_args__(self):
+        write_only = {
+            "tstn_service_identifier",
+            "tstn_client_key",
+            "tstn_x_sp_secret",
+        }
+        for name, value in super().__repr_args__():
+            yield name, "<write-only>" if name in write_only and value is not None else value
 
 
 def _settings_public() -> dict:
@@ -1210,6 +1242,17 @@ def _settings_public() -> dict:
         )
     except Exception:
         payload["sourcing"]["vseinstrumenti"]["bearer_token_configured"] = False
+    try:
+        tstn_generation = app_settings_service.settings.sourcing.tstn.credential_generation
+        payload["sourcing"]["tstn"]["credentials_configured"] = (
+            secret_store.get(TSTN_CREDENTIALS_CONFIGURED) == tstn_generation
+        )
+        payload["sourcing"]["tstn"]["x_sp_secret_configured"] = (
+            secret_store.get(TSTN_X_SP_SECRET_CONFIGURED) == tstn_generation
+        )
+    except Exception:
+        payload["sourcing"]["tstn"]["credentials_configured"] = False
+        payload["sourcing"]["tstn"]["x_sp_secret_configured"] = False
     payload["secret_backend"] = secret_store.backend_name
     payload["secret_insecure"] = secret_store.is_insecure
     return payload
@@ -1274,6 +1317,206 @@ def _change_vseinstrumenti_credentials(patch: dict, token: str | None) -> None:
             _fail_closed_vseinstrumenti_credential_change()
 
 
+def _validate_tstn_admin_credential(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise HTTPException(400, f"Поле {field_name} должно быть непустой строкой.")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > MAX_TSTN_CREDENTIAL_LENGTH
+        or any(ord(char) < 32 or ord(char) == 127 for char in normalized)
+    ):
+        raise HTTPException(400, f"Поле {field_name} имеет недопустимый формат.")
+    return normalized
+
+
+def _tstn_credentials_from_request(request: SettingsUpdate) -> dict[str, Any]:
+    raw_service = request.tstn_service_identifier
+    raw_key = request.tstn_client_key
+    raw_x_sp_secret = request.tstn_x_sp_secret
+    pair_set = raw_service is not None or raw_key is not None
+    if pair_set and (raw_service is None or raw_key is None):
+        raise HTTPException(400, "Для ТЕХНОНИКОЛЬ необходимо передать пару service identifier и client key.")
+    if pair_set and request.delete_tstn_authorization_credentials:
+        raise HTTPException(400, "Нельзя одновременно установить и удалить credentials ТЕХНОНИКОЛЬ.")
+    if raw_x_sp_secret is not None and request.delete_tstn_x_sp_secret:
+        raise HTTPException(400, "Нельзя одновременно заменить и удалить X-SP-Secret.")
+    return {
+        "service_identifier": (
+            _validate_tstn_admin_credential(raw_service, "tstn_service_identifier")
+            if raw_service is not None else None
+        ),
+        "client_key": (
+            _validate_tstn_admin_credential(raw_key, "tstn_client_key")
+            if raw_key is not None else None
+        ),
+        "x_sp_secret": (
+            _validate_tstn_admin_credential(raw_x_sp_secret, "tstn_x_sp_secret")
+            if raw_x_sp_secret is not None else None
+        ),
+        "delete_authorization_credentials": request.delete_tstn_authorization_credentials,
+        "delete_x_sp_secret": request.delete_tstn_x_sp_secret,
+        "changed": bool(
+            pair_set
+            or request.delete_tstn_authorization_credentials
+            or raw_x_sp_secret is not None
+            or request.delete_tstn_x_sp_secret
+        ),
+    }
+
+
+def _is_tstn_credential(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= MAX_TSTN_CREDENTIAL_LENGTH
+        and value == value.strip()
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def _fail_closed_tstn_credential_change() -> None:
+    """Invalidate generation-bound markers after any partial credential write."""
+
+    for marker in (TSTN_CREDENTIALS_CONFIGURED, TSTN_X_SP_SECRET_CONFIGURED):
+        try:
+            secret_store.delete(marker)
+        except Exception:
+            pass
+    try:
+        app_settings_service.update({
+            "sourcing": {"tstn": {"credential_generation": uuid4().hex}},
+        })
+    except Exception:
+        pass
+    try:
+        _rebuild_sourcing_runtime()
+    except Exception:
+        pass
+    raise HTTPException(
+        503,
+        "Не удалось безопасно изменить учётные данные ТЕХНОНИКОЛЬ.",
+    ) from None
+
+
+def _change_tstn_credentials(
+    patch: dict,
+    *,
+    service_identifier: str | None,
+    client_key: str | None,
+    x_sp_secret: str | None,
+    delete_authorization_credentials: bool,
+    delete_x_sp_secret: bool,
+) -> None:
+    """Rotate the generation and commit SecretStore values behind markers."""
+
+    generation = uuid4().hex
+    patch.setdefault("sourcing", {}).setdefault("tstn", {})[
+        "credential_generation"
+    ] = generation
+    app_settings_service.validate_update(patch)
+
+    pair_is_being_set = service_identifier is not None and client_key is not None
+    pair_is_being_deleted = delete_authorization_credentials
+    x_sp_is_being_set = x_sp_secret is not None
+    x_sp_is_being_deleted = delete_x_sp_secret
+
+    with TSTN_CREDENTIAL_LOCK:
+        old_generation = app_settings_service.settings.sourcing.tstn.credential_generation
+        preserve_pair = False
+        preserve_x_sp_secret = False
+        old_service = old_key = old_x_sp_secret = None
+        try:
+            old_pair_marker = secret_store.get(TSTN_CREDENTIALS_CONFIGURED)
+            old_x_sp_marker = secret_store.get(TSTN_X_SP_SECRET_CONFIGURED)
+            if (
+                not pair_is_being_set
+                and not pair_is_being_deleted
+                and old_pair_marker == old_generation
+            ):
+                old_service = secret_store.get(TSTN_SERVICE_IDENTIFIER)
+                old_key = secret_store.get(TSTN_CLIENT_KEY)
+                preserve_pair = _is_tstn_credential(old_service) and _is_tstn_credential(old_key)
+            if (
+                not x_sp_is_being_set
+                and not x_sp_is_being_deleted
+                and old_x_sp_marker == old_generation
+            ):
+                old_x_sp_secret = secret_store.get(TSTN_X_SP_SECRET)
+                preserve_x_sp_secret = _is_tstn_credential(old_x_sp_secret)
+        except Exception:
+            raise HTTPException(
+                503,
+                "Не удалось безопасно проверить конфигурацию ТЕХНОНИКОЛЬ.",
+            ) from None
+
+        try:
+            # Mark the old generation unavailable before settings or values move.
+            secret_store.delete(TSTN_CREDENTIALS_CONFIGURED)
+            secret_store.delete(TSTN_X_SP_SECRET_CONFIGURED)
+            app_settings_service.update(patch)
+
+            if pair_is_being_set:
+                secret_store.set(TSTN_SERVICE_IDENTIFIER, service_identifier)
+                secret_store.set(TSTN_CLIENT_KEY, client_key)
+            elif pair_is_being_deleted:
+                secret_store.delete(TSTN_SERVICE_IDENTIFIER)
+                secret_store.delete(TSTN_CLIENT_KEY)
+
+            if x_sp_is_being_set:
+                secret_store.set(TSTN_X_SP_SECRET, x_sp_secret)
+            elif x_sp_is_being_deleted:
+                secret_store.delete(TSTN_X_SP_SECRET)
+
+            if pair_is_being_set:
+                if (
+                    secret_store.get(TSTN_SERVICE_IDENTIFIER) != service_identifier
+                    or secret_store.get(TSTN_CLIENT_KEY) != client_key
+                ):
+                    raise RuntimeError("TSTN credential write verification failed")
+                preserve_pair = True
+            elif pair_is_being_deleted:
+                if (
+                    secret_store.get(TSTN_SERVICE_IDENTIFIER) is not None
+                    or secret_store.get(TSTN_CLIENT_KEY) is not None
+                ):
+                    raise RuntimeError("TSTN credential deletion verification failed")
+                preserve_pair = False
+            elif preserve_pair:
+                if (
+                    secret_store.get(TSTN_SERVICE_IDENTIFIER) != old_service
+                    or secret_store.get(TSTN_CLIENT_KEY) != old_key
+                ):
+                    raise RuntimeError("TSTN credential consistency check failed")
+
+            if x_sp_is_being_set:
+                if secret_store.get(TSTN_X_SP_SECRET) != x_sp_secret:
+                    raise RuntimeError("TSTN X-SP-Secret write verification failed")
+                preserve_x_sp_secret = True
+            elif x_sp_is_being_deleted:
+                if secret_store.get(TSTN_X_SP_SECRET) is not None:
+                    raise RuntimeError("TSTN X-SP-Secret deletion verification failed")
+                preserve_x_sp_secret = False
+            elif preserve_x_sp_secret:
+                if secret_store.get(TSTN_X_SP_SECRET) != old_x_sp_secret:
+                    raise RuntimeError("TSTN X-SP-Secret consistency check failed")
+
+            if preserve_pair:
+                secret_store.set(TSTN_CREDENTIALS_CONFIGURED, generation)
+            if preserve_x_sp_secret:
+                secret_store.set(TSTN_X_SP_SECRET_CONFIGURED, generation)
+            if (
+                secret_store.get(TSTN_CREDENTIALS_CONFIGURED)
+                != (generation if preserve_pair else None)
+                or secret_store.get(TSTN_X_SP_SECRET_CONFIGURED)
+                != (generation if preserve_x_sp_secret else None)
+            ):
+                raise RuntimeError("TSTN configuration marker verification failed")
+            _rebuild_sourcing_runtime()
+        except Exception:
+            _fail_closed_tstn_credential_change()
+
+
 @app.get("/api/settings", dependencies=[Depends(require_admin)])
 def get_settings():
     return _settings_public()
@@ -1283,11 +1526,29 @@ def get_settings():
 def put_settings(request: SettingsUpdate):
     global demo_store_provider, sourcing_provider, sourcing_repository, sourcing_runtime, sourcing_service
 
+    tstn_credentials = _tstn_credentials_from_request(request)
     vi_token = (request.vseinstrumenti_bearer_token or "").strip()
     if vi_token and request.delete_vseinstrumenti_bearer_token:
         raise HTTPException(400, "Нельзя одновременно сохранить и удалить токен ВсеИнструменты.")
     if vi_token and not is_valid_bearer_token(vi_token):
         raise HTTPException(400, "Токен ВсеИнструменты имеет недопустимый формат.")
+    rotate_vi_generation = bool(vi_token) or request.delete_vseinstrumenti_bearer_token
+    if tstn_credentials["changed"] and rotate_vi_generation:
+        raise HTTPException(400, "Учётные данные поставщиков изменяются отдельными операциями.")
+    other_credential_changes = any((
+        request.api_key is not None and bool(request.api_key.strip()),
+        request.ai_api_key is not None and bool(request.ai_api_key.strip()),
+        request.lemana_client_secret is not None and bool(request.lemana_client_secret.strip()),
+        request.etm_login is not None and bool(request.etm_login.strip()),
+        request.etm_password is not None and bool(request.etm_password.strip()),
+        request.delete_yandex_api_key,
+        request.delete_yandex_ai_api_key,
+        request.delete_lemana_client_secret,
+        request.delete_etm_login,
+        request.delete_etm_password,
+    ))
+    if tstn_credentials["changed"] and other_credential_changes:
+        raise HTTPException(400, "Учётные данные поставщиков изменяются отдельными операциями.")
 
     if request.api_key is not None and request.api_key.strip():
         secret_store.set(YANDEX_API_KEY, request.api_key.strip())
@@ -1324,10 +1585,14 @@ def put_settings(request: SettingsUpdate):
             "delete_etm_password",
             "vseinstrumenti_bearer_token",
             "delete_vseinstrumenti_bearer_token",
+            "tstn_service_identifier",
+            "tstn_client_key",
+            "tstn_x_sp_secret",
+            "delete_tstn_authorization_credentials",
+            "delete_tstn_x_sp_secret",
         },
     )
     patch = {key: value for key, value in patch.items() if value is not None}
-    rotate_vi_generation = bool(vi_token) or request.delete_vseinstrumenti_bearer_token
     if rotate_vi_generation:
         patch.setdefault("sourcing", {}).setdefault("vseinstrumenti", {})[
             "credential_generation"
@@ -1335,6 +1600,15 @@ def put_settings(request: SettingsUpdate):
     try:
         if rotate_vi_generation:
             _change_vseinstrumenti_credentials(patch, vi_token or None)
+        elif tstn_credentials["changed"]:
+            _change_tstn_credentials(
+                patch,
+                service_identifier=tstn_credentials["service_identifier"],
+                client_key=tstn_credentials["client_key"],
+                x_sp_secret=tstn_credentials["x_sp_secret"],
+                delete_authorization_credentials=tstn_credentials["delete_authorization_credentials"],
+                delete_x_sp_secret=tstn_credentials["delete_x_sp_secret"],
+            )
         else:
             app_settings_service.update(patch)
             _rebuild_sourcing_runtime()
@@ -1385,6 +1659,32 @@ def delete_vseinstrumenti_bearer_token():
             "vseinstrumenti": {"credential_generation": uuid4().hex},
         },
     }, None)
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/tstn-authorization-credentials", dependencies=[Depends(require_admin)])
+def delete_tstn_authorization_credentials():
+    _change_tstn_credentials(
+        {},
+        service_identifier=None,
+        client_key=None,
+        x_sp_secret=None,
+        delete_authorization_credentials=True,
+        delete_x_sp_secret=False,
+    )
+    return {"deleted": True}
+
+
+@app.delete("/api/settings/tstn-x-sp-secret", dependencies=[Depends(require_admin)])
+def delete_tstn_x_sp_secret():
+    _change_tstn_credentials(
+        {},
+        service_identifier=None,
+        client_key=None,
+        x_sp_secret=None,
+        delete_authorization_credentials=False,
+        delete_x_sp_secret=True,
+    )
     return {"deleted": True}
 
 

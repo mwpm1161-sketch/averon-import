@@ -9,6 +9,12 @@ from .client import (
     TstnErrorCategory,
     TstnHttpResponse,
 )
+from .authorization import (
+    TSTN_CREDENTIAL_LOCK,
+    SecretStoreTstnAuthorizer,
+    TstnAuthorizationClient,
+    create_tstn_authorization_client,
+)
 from .models import (
     TstnAuthorizationRequest,
     TstnAuthorizationResponse,
@@ -42,6 +48,10 @@ __all__ = [
     "TstnApiError",
     "TstnErrorCategory",
     "TstnHttpResponse",
+    "TSTN_CREDENTIAL_LOCK",
+    "SecretStoreTstnAuthorizer",
+    "TstnAuthorizationClient",
+    "create_tstn_authorization_client",
     "TstnAuthorizationRequest",
     "TstnAuthorizationResponse",
     "TstnAvailableItem",

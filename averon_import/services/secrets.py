@@ -27,6 +27,13 @@ VSEINSTRUMENTI_BEARER_TOKEN = "vseinstrumenti.bearer_token"
 # Non-secret marker stores the credential generation. Status and runtime
 # composition can verify a complete credential pair without loading the token.
 VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED = "vseinstrumenti.bearer_token_configured"
+# TSTN /user/ credentials and the optional X-SP-Secret are write-only values.
+# Configuration markers contain only the current server-owned generation.
+TSTN_SERVICE_IDENTIFIER = "tstn.service_identifier"
+TSTN_CLIENT_KEY = "tstn.client_key"
+TSTN_X_SP_SECRET = "tstn.x_sp_secret"
+TSTN_CREDENTIALS_CONFIGURED = "tstn.credentials_configured"
+TSTN_X_SP_SECRET_CONFIGURED = "tstn.x_sp_secret_configured"
 
 
 class SecretStoreError(RuntimeError):

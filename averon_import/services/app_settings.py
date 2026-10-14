@@ -34,6 +34,20 @@ _FORBIDDEN_FILE_KEYS = {
     "bearer_token",
     "vseinstrumenti_bearer_token",
     "access_token",
+    "tstn_service_identifier",
+    "tstn_client_key",
+    "tstn_x_sp_secret",
+    "service_identifier",
+    "client_key",
+    "x_sp_secret",
+}
+_TSTN_FORBIDDEN_FILE_KEYS = {
+    "service",
+    "key",
+    "service_identifier",
+    "client_key",
+    "x_sp_secret",
+    "access_token",
 }
 
 _VI_REGION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
@@ -146,6 +160,22 @@ class VseinstrumentiSettings(BaseModel):
         return value.lower()
 
 
+class TstnSettings(BaseModel):
+    """Local TSTN settings; credentials are owned by SecretStore."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    request_timeout_s: float = Field(default=10.0, ge=0.1, le=30.0)
+    # Server-owned generation. It is intentionally excluded from public DTOs.
+    credential_generation: str = Field(
+        default="00000000000000000000000000000000",
+        min_length=32,
+        max_length=32,
+        pattern=r"^[a-f0-9]{32}$",
+    )
+
+
 class SourcingSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -154,6 +184,7 @@ class SourcingSettings(BaseModel):
     lemana_b2b: LemanaB2BSettings = Field(default_factory=LemanaB2BSettings)
     etm_ipro: EtmIproSettings = Field(default_factory=EtmIproSettings)
     vseinstrumenti: VseinstrumentiSettings = Field(default_factory=VseinstrumentiSettings)
+    tstn: TstnSettings = Field(default_factory=TstnSettings)
 
     @field_validator("demo_store_base_url")
     @classmethod
@@ -177,24 +208,34 @@ class AppSettings(BaseModel):
             "yandex": self.yandex.model_dump(),
             "pipeline": self.pipeline.model_dump(),
             "sourcing": self.sourcing.model_dump(
-                exclude={"vseinstrumenti": {"credential_generation"}},
+                exclude={
+                    "vseinstrumenti": {"credential_generation"},
+                    "tstn": {"credential_generation"},
+                },
             ),
         }
 
 
-def _scrub_forbidden_keys(node, warnings: list[str]) -> object:
+def _scrub_forbidden_keys(
+    node, warnings: list[str], path: tuple[str, ...] = ()
+) -> object:
     if isinstance(node, dict):
         cleaned = {}
         for key, value in node.items():
-            if str(key).lower() in _FORBIDDEN_FILE_KEYS:
+            normalized_key = str(key).casefold()
+            in_tstn_settings = len(path) >= 2 and path[-2:] == ("sourcing", "tstn")
+            if (normalized_key in _FORBIDDEN_FILE_KEYS
+                    or in_tstn_settings and normalized_key in _TSTN_FORBIDDEN_FILE_KEYS):
                 warnings.append(
                     f"Поле «{key}» в settings.json проигнорировано: секреты не хранятся в файле настроек."
                 )
                 continue
-            cleaned[key] = _scrub_forbidden_keys(value, warnings)
+            cleaned[key] = _scrub_forbidden_keys(
+                value, warnings, (*path, normalized_key)
+            )
         return cleaned
     if isinstance(node, list):
-        return [_scrub_forbidden_keys(item, warnings) for item in node]
+        return [_scrub_forbidden_keys(item, warnings, path) for item in node]
     return node
 
 

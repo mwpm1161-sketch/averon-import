@@ -16,6 +16,11 @@ from averon_import.services.secrets import (
     ETM_IPRO_LOGIN,
     ETM_IPRO_PASSWORD,
     LEMANA_B2B_CLIENT_SECRET,
+    TSTN_CLIENT_KEY,
+    TSTN_CREDENTIALS_CONFIGURED,
+    TSTN_SERVICE_IDENTIFIER,
+    TSTN_X_SP_SECRET,
+    TSTN_X_SP_SECRET_CONFIGURED,
     VSEINSTRUMENTI_BEARER_TOKEN,
     VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
     YANDEX_AI_API_KEY,
@@ -35,17 +40,22 @@ class FaultInjectingMemorySecretStore(MemorySecretStore):
 
     def __init__(self):
         super().__init__()
-        self._next_failure: tuple[str, str, bool] | None = None
+        self._next_failure: tuple[str, str, bool, int] | None = None
         self.read_keys: list[str] = []
 
-    def fail_once_at(self, method: str, key: str, *, after: bool = False) -> None:
-        self._next_failure = (method, key, after)
+    def fail_once_at(
+        self, method: str, key: str, *, after: bool = False, skip: int = 0
+    ) -> None:
+        self._next_failure = (method, key, after, skip)
 
     def _consume_failure(self, method: str, key: str) -> bool | None:
         if self._next_failure is None:
             return None
-        expected_method, expected_key, after = self._next_failure
+        expected_method, expected_key, after, skip = self._next_failure
         if (method, key) != (expected_method, expected_key):
+            return None
+        if skip:
+            self._next_failure = (expected_method, expected_key, after, skip - 1)
             return None
         self._next_failure = None
         if not after:
@@ -90,6 +100,9 @@ def test_defaults_match_documented_values():
     assert settings.yandex.request_timeout_s == 120.0
     assert settings.yandex.operation_timeout_s == 600.0
     assert settings.pipeline.min_confidence == 0.85
+    assert settings.sourcing.tstn.enabled is False
+    assert settings.sourcing.tstn.request_timeout_s == 10.0
+    assert "credential_generation" not in json.dumps(settings.public(), ensure_ascii=False)
 
 
 def test_load_from_settings_json(tmp_path):
@@ -232,6 +245,40 @@ def test_vseinstrumenti_settings_validate_local_configuration_and_hide_generatio
 
     with pytest.raises(ValidationError):
         service.update({"sourcing": {"vseinstrumenti": {"region_id": "not-a-fias-uuid"}}})
+
+
+def test_tstn_settings_are_bounded_and_hide_server_generation(tmp_path):
+    service = AppSettingsService(tmp_path)
+    service.update({"sourcing": {"tstn": {"enabled": True, "request_timeout_s": 12.5}}})
+
+    assert service.settings.sourcing.tstn.enabled is True
+    assert service.settings.sourcing.tstn.request_timeout_s == 12.5
+    assert "credential_generation" not in json.dumps(service.public(), ensure_ascii=False)
+    assert service.settings.sourcing.tstn.credential_generation in service.path.read_text(encoding="utf-8")
+    with pytest.raises(ValidationError):
+        service.update({"sourcing": {"tstn": {"request_timeout_s": 30.1}}})
+
+
+def test_tstn_secret_like_fields_in_settings_json_are_scrubbed(tmp_path):
+    fake_service = "tn3-file-service-synthetic"
+    fake_key = "tn3-file-key-synthetic"
+    fake_xsp = "tn3-file-xsp-synthetic"
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "sourcing": {"tstn": {
+            "enabled": True,
+            "service": fake_service,
+            "key": fake_key,
+            "x_sp_secret": fake_xsp,
+        }},
+    }), encoding="utf-8")
+
+    service = AppSettingsService(tmp_path)
+
+    assert service.settings.sourcing.tstn.enabled is True
+    assert service.warnings
+    service.save()
+    saved = (tmp_path / "settings.json").read_text(encoding="utf-8")
+    assert fake_service not in saved and fake_key not in saved and fake_xsp not in saved
 
 
 def test_invalid_json_falls_back_to_defaults_with_warning(tmp_path):
@@ -590,6 +637,275 @@ def test_etm_credentials_are_write_only_and_runtime_rebuilds(api, monkeypatch):
     assert app_module.delete_etm_ipro_password() == {"deleted": True}
     assert not store.has(ETM_IPRO_LOGIN)
     assert not store.has(ETM_IPRO_PASSWORD)
+
+
+def test_tstn_credentials_rotate_generation_and_remain_write_only(api, monkeypatch, tmp_path):
+    app_module, store, service = api
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "runtime")
+    first_service = "tn3-service-first-synthetic"
+    first_key = "tn3-key-first-synthetic"
+    first_xsp = "tn3-xsp-first-synthetic"
+    first_payload = app_module.put_settings(app_module.SettingsUpdate(
+        sourcing=app_module.SourcingSettingsUpdate(
+            tstn=app_module.TstnSettingsUpdate(enabled=True, request_timeout_s=4.5),
+        ),
+        tstn_service_identifier=first_service,
+        tstn_client_key=first_key,
+        tstn_x_sp_secret=first_xsp,
+    ))
+    first_generation = service.settings.sourcing.tstn.credential_generation
+
+    assert store.get(TSTN_SERVICE_IDENTIFIER) == first_service
+    assert store.get(TSTN_CLIENT_KEY) == first_key
+    assert store.get(TSTN_X_SP_SECRET) == first_xsp
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) == first_generation
+    assert store.get(TSTN_X_SP_SECRET_CONFIGURED) == first_generation
+    assert first_payload["sourcing"]["tstn"]["credentials_configured"] is True
+    assert first_payload["sourcing"]["tstn"]["x_sp_secret_configured"] is True
+    assert "credential_generation" not in json.dumps(first_payload, ensure_ascii=False)
+    for secret in (first_service, first_key, first_xsp):
+        assert secret not in json.dumps(first_payload, ensure_ascii=False)
+        assert secret not in service.path.read_text(encoding="utf-8")
+
+    replacement_service = "tn3-service-replacement-synthetic"
+    replacement_key = "tn3-key-replacement-synthetic"
+    second_payload = app_module.put_settings(app_module.SettingsUpdate(
+        tstn_service_identifier=replacement_service,
+        tstn_client_key=replacement_key,
+    ))
+    second_generation = service.settings.sourcing.tstn.credential_generation
+    assert second_generation != first_generation
+    assert store.get(TSTN_SERVICE_IDENTIFIER) == replacement_service
+    assert store.get(TSTN_CLIENT_KEY) == replacement_key
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) == second_generation
+    assert store.get(TSTN_X_SP_SECRET) == first_xsp
+    assert store.get(TSTN_X_SP_SECRET_CONFIGURED) == second_generation
+    assert "credential_generation" not in json.dumps(second_payload, ensure_ascii=False)
+
+    second_xsp = "tn3-xsp-replacement-synthetic"
+    third_payload = app_module.put_settings(app_module.SettingsUpdate(
+        tstn_x_sp_secret=second_xsp,
+    ))
+    third_generation = service.settings.sourcing.tstn.credential_generation
+    assert third_generation != second_generation
+    assert store.get(TSTN_X_SP_SECRET) == second_xsp
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) == third_generation
+    assert store.get(TSTN_X_SP_SECRET_CONFIGURED) == third_generation
+    assert second_xsp not in json.dumps(third_payload, ensure_ascii=False)
+
+    assert app_module.delete_tstn_x_sp_secret() == {"deleted": True}
+    fourth_generation = service.settings.sourcing.tstn.credential_generation
+    assert fourth_generation != third_generation
+    assert store.get(TSTN_X_SP_SECRET) is None
+    assert store.get(TSTN_X_SP_SECRET_CONFIGURED) is None
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) == fourth_generation
+
+    assert app_module.delete_tstn_authorization_credentials() == {"deleted": True}
+    fifth_generation = service.settings.sourcing.tstn.credential_generation
+    assert fifth_generation != fourth_generation
+    assert store.get(TSTN_SERVICE_IDENTIFIER) is None
+    assert store.get(TSTN_CLIENT_KEY) is None
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) is None
+
+
+def test_tstn_partial_or_conflicting_credential_updates_are_rejected_without_echo(api, tmp_path):
+    from fastapi import HTTPException
+
+    app_module, store, service = api
+    private_service = "tn3-invalid-service-must-not-echo"
+    generation = service.settings.sourcing.tstn.credential_generation
+    with pytest.raises(HTTPException) as partial:
+        app_module.put_settings(app_module.SettingsUpdate(
+            tstn_service_identifier=private_service,
+        ))
+    assert partial.value.status_code == 400
+    assert private_service not in str(partial.value.detail)
+    assert service.settings.sourcing.tstn.credential_generation == generation
+    assert not store.has(TSTN_SERVICE_IDENTIFIER)
+
+    with pytest.raises(HTTPException) as invalid_type:
+        app_module.put_settings(app_module.SettingsUpdate(
+            tstn_service_identifier=private_service,
+            tstn_client_key=123,
+        ))
+    assert invalid_type.value.status_code == 400
+    assert private_service not in str(invalid_type.value.detail)
+    assert service.settings.sourcing.tstn.credential_generation == generation
+
+    with pytest.raises(HTTPException) as conflicting:
+        app_module.put_settings(app_module.SettingsUpdate(
+            tstn_service_identifier=private_service,
+            tstn_client_key="tn3-invalid-key-synthetic",
+            delete_tstn_authorization_credentials=True,
+        ))
+    assert conflicting.value.status_code == 400
+    assert private_service not in str(conflicting.value.detail)
+    assert not service.path.exists()
+
+
+def test_tstn_passive_status_and_runtime_rebuild_do_not_read_credentials_or_make_http(
+    api, monkeypatch, tmp_path,
+):
+    from averon_import.services.sourcing.providers.tstn import client as tstn_client_module
+
+    app_module, _, service = api
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "runtime")
+    generation = service.settings.sourcing.tstn.credential_generation
+    service.update({
+        "sourcing": {
+            "tstn": {"enabled": True, "credential_generation": generation},
+        },
+    })
+
+    class ReadTrackingStore(MemorySecretStore):
+        def __init__(self):
+            super().__init__()
+            self.read_keys: list[str] = []
+
+        def get(self, key):
+            self.read_keys.append(key)
+            return super().get(key)
+
+    store = ReadTrackingStore()
+    store.set(TSTN_SERVICE_IDENTIFIER, "tn3-status-service-private")
+    store.set(TSTN_CLIENT_KEY, "tn3-status-key-private")
+    store.set(TSTN_X_SP_SECRET, "tn3-status-xsp-private")
+    store.set(TSTN_CREDENTIALS_CONFIGURED, generation)
+    store.set(TSTN_X_SP_SECRET_CONFIGURED, generation)
+    monkeypatch.setattr(app_module, "secret_store", store)
+    outbound = []
+
+    def forbidden_transport(*args, **kwargs):
+        outbound.append((args, kwargs))
+        raise AssertionError("passive TSTN operations must not make HTTP")
+
+    monkeypatch.setattr(tstn_client_module, "_default_transport", forbidden_transport)
+
+    app_module._rebuild_sourcing_runtime()
+    config = app_module.config()
+    settings = app_module.get_settings()
+    providers = app_module.sourcing_providers()
+    capabilities = app_module.get_multi_provider_sourcing_capabilities(None)
+
+    assert settings["sourcing"]["tstn"]["credentials_configured"] is True
+    assert settings["sourcing"]["tstn"]["x_sp_secret_configured"] is True
+    assert "credential_generation" not in json.dumps(config, ensure_ascii=False)
+    assert "tstn" not in str(capabilities).casefold()
+    assert all(provider["key"] != "tstn" for provider in providers["providers"])
+    assert TSTN_SERVICE_IDENTIFIER not in store.read_keys
+    assert TSTN_CLIENT_KEY not in store.read_keys
+    assert TSTN_X_SP_SECRET not in store.read_keys
+    assert outbound == []
+
+
+@pytest.mark.parametrize(
+    ("operation", "method", "key", "after", "skip"),
+    [
+        ("replace", "delete", TSTN_CREDENTIALS_CONFIGURED, False, 0),
+        ("replace", "delete", TSTN_X_SP_SECRET_CONFIGURED, True, 0),
+        ("replace", "set", TSTN_SERVICE_IDENTIFIER, False, 0),
+        ("replace", "set", TSTN_SERVICE_IDENTIFIER, True, 0),
+        ("replace", "set", TSTN_CLIENT_KEY, False, 0),
+        ("replace", "set", TSTN_CLIENT_KEY, True, 0),
+        ("replace", "get", TSTN_SERVICE_IDENTIFIER, False, 0),
+        ("replace", "get", TSTN_CLIENT_KEY, True, 0),
+        ("replace", "set", TSTN_CREDENTIALS_CONFIGURED, False, 0),
+        ("replace", "set", TSTN_CREDENTIALS_CONFIGURED, True, 0),
+        ("replace", "get", TSTN_CREDENTIALS_CONFIGURED, False, 1),
+        ("replace", "set", TSTN_X_SP_SECRET_CONFIGURED, True, 0),
+        ("replace", "get", TSTN_X_SP_SECRET_CONFIGURED, False, 1),
+        ("delete_pair", "delete", TSTN_SERVICE_IDENTIFIER, True, 0),
+        ("delete_pair", "delete", TSTN_CLIENT_KEY, False, 0),
+        ("delete_xsp", "delete", TSTN_X_SP_SECRET, False, 0),
+        ("delete_xsp", "delete", TSTN_X_SP_SECRET, True, 0),
+    ],
+)
+def test_tstn_secret_store_faults_fail_closed_and_never_report_false_success(
+    api, monkeypatch, tmp_path, operation, method, key, after, skip,
+):
+    from fastapi import HTTPException
+
+    app_module, _, service = api
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "runtime")
+    store = FaultInjectingMemorySecretStore()
+    monkeypatch.setattr(app_module, "secret_store", store)
+    app_module.put_settings(app_module.SettingsUpdate(
+        tstn_service_identifier="tn3-old-service-private",
+        tstn_client_key="tn3-old-key-private",
+        tstn_x_sp_secret="tn3-old-xsp-private",
+    ))
+    prior_generation = service.settings.sourcing.tstn.credential_generation
+    store.fail_once_at(method, key, after=after, skip=skip)
+
+    if operation == "replace":
+        request = lambda: app_module.put_settings(app_module.SettingsUpdate(
+            tstn_service_identifier="tn3-new-service-private",
+            tstn_client_key="tn3-new-key-private",
+        ))
+    elif operation == "delete_pair":
+        request = app_module.delete_tstn_authorization_credentials
+    else:
+        request = app_module.delete_tstn_x_sp_secret
+
+    with pytest.raises(HTTPException) as failure:
+        request()
+
+    current_generation = service.settings.sourcing.tstn.credential_generation
+    assert failure.value.status_code == 503
+    for value in (
+        "tn3-old-service-private",
+        "tn3-old-key-private",
+        "tn3-old-xsp-private",
+        "tn3-new-service-private",
+        "tn3-new-key-private",
+    ):
+        assert value not in str(failure.value.detail)
+    assert current_generation != prior_generation
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) != current_generation
+    assert store.get(TSTN_X_SP_SECRET_CONFIGURED) != current_generation
+    restarted = AppSettingsService(service.data_dir)
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) != restarted.settings.sourcing.tstn.credential_generation
+    assert store.get(TSTN_X_SP_SECRET_CONFIGURED) != restarted.settings.sourcing.tstn.credential_generation
+    if service.path.exists():
+        saved = service.path.read_text(encoding="utf-8")
+        assert "tn3-old-service-private" not in saved
+        assert "tn3-old-key-private" not in saved
+        assert "tn3-old-xsp-private" not in saved
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_tstn_settings_save_failure_invalidates_secret_markers(api, monkeypatch, tmp_path, after):
+    from fastapi import HTTPException
+
+    app_module, store, service = api
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "runtime")
+    original_save = service.save
+    injected = False
+
+    def fail_once():
+        nonlocal injected
+        if not injected:
+            injected = True
+            if after:
+                original_save()
+            raise OSError("synthetic settings persistence failure")
+        original_save()
+
+    monkeypatch.setattr(service, "save", fail_once)
+    with pytest.raises(HTTPException) as failure:
+        app_module.put_settings(app_module.SettingsUpdate(
+            tstn_service_identifier="tn3-save-service-private",
+            tstn_client_key="tn3-save-key-private",
+        ))
+
+    generation = service.settings.sourcing.tstn.credential_generation
+    assert failure.value.status_code == 503
+    assert "tn3-save-service-private" not in str(failure.value.detail)
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) != generation
+    restarted = AppSettingsService(service.data_dir)
+    assert store.get(TSTN_CREDENTIALS_CONFIGURED) != restarted.settings.sourcing.tstn.credential_generation
+    assert store.get(TSTN_SERVICE_IDENTIFIER) is None
+    assert store.get(TSTN_CLIENT_KEY) is None
 
 
 def test_vseinstrumenti_bearer_token_is_write_only_rotates_generation_and_rebuilds(api, monkeypatch):
