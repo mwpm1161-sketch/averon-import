@@ -137,6 +137,31 @@ def test_multi_page_sync_builds_local_index_and_survives_restart(tmp_path):
     assert reopened.stats()["item_count"] == 3
 
 
+def test_empty_catalog_requires_and_accepts_an_explicit_zero_total(tmp_path):
+    mirror = TstnCatalogMirror(tmp_path / "empty.sqlite3")
+    client = FakeTstnClient({0: page([], offset=0, limit=2, count_all=0)})
+
+    result = sync(mirror, client)
+
+    assert result.changed is True
+    assert result.item_count == 0
+    assert result.page_count == 1
+    assert mirror.check_integrity() is True
+    assert mirror.search(article="absent") == []
+
+
+def test_same_complete_snapshot_keeps_catalog_revision(tmp_path):
+    mirror = TstnCatalogMirror(tmp_path / "same.sqlite3")
+    client = paged_client([item(10, article="000010", name="Одинаковый снимок")])
+
+    first = sync(mirror, client)
+    second = sync(mirror, client)
+
+    assert first.changed is True
+    assert second.changed is False
+    assert second.revision == first.revision
+
+
 def test_pagination_uses_typed_client_and_bounded_limit_offset_calls(tmp_path):
     rows = [item(i, article=f"00{i}") for i in range(1, 6)]
     client = paged_client(rows)
@@ -330,6 +355,28 @@ def test_interrupted_fetch_preserves_last_complete_revision_after_restart(tmp_pa
     assert reopened.search(article="000002") == []
 
 
+def test_short_snapshot_without_count_all_is_rejected_and_keeps_previous_revision(tmp_path):
+    path = tmp_path / "no-count.sqlite3"
+    mirror = TstnCatalogMirror(path)
+    original = sync(mirror, paged_client([item(1, article="000001", name="Old")]))
+    truncated = FakeTstnClient({
+        0: page(
+            [item(2, article="000002", name="Partial")],
+            offset=0,
+            limit=2,
+            count_all=None,
+        ),
+    })
+
+    with pytest.raises(SourcingProviderError) as caught:
+        sync(mirror, truncated)
+
+    assert caught.value.code == "TSTN_SNAPSHOT_INVALID"
+    assert mirror.revision == original.revision
+    assert mirror.search(article="000001")[0].name == "Old"
+    assert mirror.search(article="000002") == []
+
+
 def test_sqlite_write_interruption_rolls_back_replacement(tmp_path, monkeypatch):
     path = tmp_path / "tstn.sqlite3"
     mirror = TstnCatalogMirror(path)
@@ -456,18 +503,45 @@ def test_actual_item_cap_is_enforced_without_publishing_partial_snapshot(tmp_pat
     assert mirror.search(article="000001")[0].name == "Old"
 
 
-def test_search_and_stats_are_local_and_do_not_call_client_or_store_credentials(tmp_path):
+def test_search_and_stats_are_local_and_do_not_call_client_or_store_credentials(tmp_path, monkeypatch):
     client = paged_client([item(1, article="000001", name="Локальный товар")])
     mirror_path = tmp_path / "tstn.sqlite3"
     mirror = TstnCatalogMirror(mirror_path)
     sync(mirror, client, page_size=2)
     request_count = len(client.calls)
 
+    full_checks = 0
+    original_check = mirror.check_integrity
+
+    def counted_check():
+        nonlocal full_checks
+        full_checks += 1
+        return original_check()
+
+    monkeypatch.setattr(mirror, "check_integrity", counted_check)
     assert mirror.stats()["integrity_ok"] is True
-    assert mirror.search(name="локальный товар")
-    assert mirror.check_integrity() is True
+    assert full_checks == 0
+    for _ in range(20):
+        assert mirror.search(name="локальный товар")
+    assert full_checks == 0
+
     reopened = TstnCatalogMirror(mirror_path)
+    reopened_checks = 0
+    reopened_original_check = reopened.check_integrity
+
+    def counted_reopened_check():
+        nonlocal reopened_checks
+        reopened_checks += 1
+        return reopened_original_check()
+
+    monkeypatch.setattr(reopened, "check_integrity", counted_reopened_check)
+    assert reopened.stats()["integrity_ok"] is None
+    assert reopened_checks == 0
     assert reopened.search(article="000001")
+    assert reopened_checks == 1
+    for _ in range(20):
+        assert reopened.search(article="000001")
+    assert reopened_checks == 1
     assert len(client.calls) == request_count
     assert SYNTHETIC_TOKEN.encode("utf-8") not in mirror_path.read_bytes()
     with sqlite3.connect(mirror_path) as connection:
@@ -475,20 +549,26 @@ def test_search_and_stats_are_local_and_do_not_call_client_or_store_credentials(
     assert not columns.intersection({"price", "currency", "availability", "stock", "vat"})
 
 
-def test_corrupt_record_or_index_is_detected_and_search_fails_closed(tmp_path):
+@pytest.mark.parametrize("corruption", ["record", "index"])
+def test_corrupt_record_or_index_is_detected_on_reopen_and_search_fails_closed(tmp_path, corruption):
     path = tmp_path / "tstn.sqlite3"
     mirror = TstnCatalogMirror(path)
     sync(mirror, paged_client([item(1, article="000001")]), page_size=2)
     with sqlite3.connect(path) as connection:
-        connection.execute(
-            "UPDATE tstn_catalog_products SET name='altered' WHERE identity_value='1'"
-        )
+        if corruption == "record":
+            connection.execute(
+                "UPDATE tstn_catalog_products SET name='altered' WHERE identity_value='1'"
+            )
+        else:
+            connection.execute(
+                "DELETE FROM tstn_search_terms WHERE identity_value='1' AND term='гибкая'"
+            )
     reopened = TstnCatalogMirror(path)
 
-    assert reopened.check_integrity() is False
     with pytest.raises(SourcingProviderError) as caught:
         reopened.search(article="000001")
     assert caught.value.code == "TSTN_CATALOG_NOT_READY"
+    assert reopened.stats()["integrity_ok"] is False
 
 
 def test_index_can_be_rebuilt_locally_without_supplier_traffic(tmp_path):

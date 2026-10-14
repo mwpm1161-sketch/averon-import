@@ -277,6 +277,12 @@ class TstnCatalogMirror:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # A persisted index is not trusted after process restart until one
+        # complete integrity pass has validated its source rows and terms.
+        # The validated revisions are only an in-process fast-path afterwards.
+        self._integrity_validated: bool | None = None
+        self._validated_catalog_revision: str | None = None
+        self._validated_index_revision: str | None = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -385,8 +391,19 @@ class TstnCatalogMirror:
 
     @property
     def search_index_ready(self) -> bool:
-        revision = self.revision
-        return revision != "unknown" and self.search_index_revision == _index_revision(revision)
+        try:
+            with self._connect() as connection:
+                revision = self._meta_from(connection, "catalog_revision")
+                index_revision = self._meta_from(connection, "search_index_revision")
+            return (
+                self._integrity_validated is True
+                and revision != ""
+                and revision == self._validated_catalog_revision
+                and index_revision == self._validated_index_revision
+                and index_revision == _index_revision(revision)
+            )
+        except Exception:
+            return False
 
     def count(self) -> int:
         with self._connect() as connection:
@@ -397,98 +414,156 @@ class TstnCatalogMirror:
 
     def check_integrity(self) -> bool:
         """Check SQLite, identity rows, foreign keys, and index revision locally."""
-
+        revision = ""
+        index_revision = ""
         try:
             with self._connect() as connection:
-                quick = connection.execute("PRAGMA quick_check").fetchone()
-                if quick is None or str(quick[0]).casefold() != "ok":
-                    return False
-                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                    return False
-                rows = connection.execute(
-                    "SELECT * FROM tstn_catalog_products ORDER BY identity_kind,identity_value"
-                ).fetchall()
-                product_count = len(rows)
-                meta_count = int(self._meta_from(connection, "item_count") or "0")
-                if product_count != meta_count:
-                    return False
                 revision = self._meta_from(connection, "catalog_revision")
                 index_revision = self._meta_from(connection, "search_index_revision")
-                if revision:
-                    if index_revision != _index_revision(revision):
-                        return False
-                elif product_count or index_revision:
+                valid = self._check_integrity_connection(connection)
+        except Exception:
+            valid = False
+        self._remember_integrity_result(valid, revision, index_revision)
+        return valid
+
+    @staticmethod
+    def _check_integrity_connection(connection: sqlite3.Connection) -> bool:
+        """Perform the full diagnostic using an existing SQLite transaction."""
+
+        try:
+            quick = connection.execute("PRAGMA quick_check").fetchone()
+            if quick is None or str(quick[0]).casefold() != "ok":
+                return False
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                return False
+            rows = connection.execute(
+                "SELECT * FROM tstn_catalog_products ORDER BY identity_kind,identity_value"
+            ).fetchall()
+            product_count = len(rows)
+            meta_count = int(TstnCatalogMirror._meta_from(connection, "item_count") or "0")
+            if product_count != meta_count:
+                return False
+            revision = TstnCatalogMirror._meta_from(connection, "catalog_revision")
+            index_revision = TstnCatalogMirror._meta_from(connection, "search_index_revision")
+            if revision:
+                if index_revision != _index_revision(revision):
                     return False
-                records: list[TstnCatalogRecord] = []
-                for row in rows:
-                    record = TstnCatalogRecord.model_validate(_load_json(str(row["canonical_payload"])))
-                    identity = (str(row["identity_kind"]), str(row["identity_value"]))
-                    if identity != (record.identity_kind, record.identity_value):
-                        return False
-                    expected_columns = (
-                        record.id,
-                        record.article,
-                        record.name,
-                        record.brand,
-                        record.subbrand,
-                        _dump_json([item.model_dump(mode="python") for item in record.categories or ()]),
-                        record.barcode,
-                        record.base_unit,
-                        _dump_json(record.units_list or []),
-                        record.date_create,
-                        record.date_modify,
-                        record.country_supplier,
-                        _normalize_code(record.article),
-                        _canonical_record(record),
-                    )
-                    actual_columns = tuple(row[key] for key in (
-                        "item_id",
-                        "article",
-                        "name",
-                        "brand",
-                        "subbrand",
-                        "categories_json",
-                        "barcode",
-                        "base_unit",
-                        "units_list_json",
-                        "date_create",
-                        "date_modify",
-                        "country_supplier",
-                        "normalized_article",
-                        "canonical_payload",
-                    ))
-                    if actual_columns != expected_columns:
-                        return False
-                    expected_terms = {
-                        (field, term)
-                        for field, terms in _search_fields(record).items()
-                        for term in terms
-                    }
-                    actual_terms = {
-                        (str(term_row[0]), str(term_row[1]))
-                        for term_row in connection.execute(
-                            "SELECT field,term FROM tstn_search_terms "
-                            "WHERE identity_kind=? AND identity_value=?",
-                            identity,
-                        ).fetchall()
-                    }
-                    if expected_terms != actual_terms:
-                        return False
-                    records.append(record)
-                if revision and _snapshot_revision(records) != revision:
+            elif product_count or index_revision:
+                return False
+            records: list[TstnCatalogRecord] = []
+            for row in rows:
+                record = TstnCatalogRecord.model_validate(_load_json(str(row["canonical_payload"])))
+                identity = (str(row["identity_kind"]), str(row["identity_value"]))
+                if identity != (record.identity_kind, record.identity_value):
                     return False
-                return True
+                expected_columns = (
+                    record.id,
+                    record.article,
+                    record.name,
+                    record.brand,
+                    record.subbrand,
+                    _dump_json([item.model_dump(mode="python") for item in record.categories or ()]),
+                    record.barcode,
+                    record.base_unit,
+                    _dump_json(record.units_list or []),
+                    record.date_create,
+                    record.date_modify,
+                    record.country_supplier,
+                    _normalize_code(record.article),
+                    _canonical_record(record),
+                )
+                actual_columns = tuple(row[key] for key in (
+                    "item_id",
+                    "article",
+                    "name",
+                    "brand",
+                    "subbrand",
+                    "categories_json",
+                    "barcode",
+                    "base_unit",
+                    "units_list_json",
+                    "date_create",
+                    "date_modify",
+                    "country_supplier",
+                    "normalized_article",
+                    "canonical_payload",
+                ))
+                if actual_columns != expected_columns:
+                    return False
+                expected_terms = {
+                    (field, term)
+                    for field, terms in _search_fields(record).items()
+                    for term in terms
+                }
+                actual_terms = {
+                    (str(term_row[0]), str(term_row[1]))
+                    for term_row in connection.execute(
+                        "SELECT field,term FROM tstn_search_terms "
+                        "WHERE identity_kind=? AND identity_value=?",
+                        identity,
+                    ).fetchall()
+                }
+                if expected_terms != actual_terms:
+                    return False
+                records.append(record)
+            if revision and _snapshot_revision(records) != revision:
+                return False
+            return True
         except Exception:
             return False
 
+    def _remember_integrity_result(
+        self, valid: bool, revision: str, index_revision: str
+    ) -> None:
+        self._integrity_validated = valid
+        self._validated_catalog_revision = revision
+        self._validated_index_revision = index_revision
+
+    def _invalidate_integrity_cache(self) -> None:
+        self._integrity_validated = None
+        self._validated_catalog_revision = None
+        self._validated_index_revision = None
+
+    def _ensure_search_integrity(self) -> bool:
+        """Validate once per persisted revision, rescanning only after invalidation."""
+
+        try:
+            with self._connect() as connection:
+                revision = self._meta_from(connection, "catalog_revision")
+                index_revision = self._meta_from(connection, "search_index_revision")
+        except Exception:
+            self._remember_integrity_result(False, "", "")
+            return False
+        if (
+            self._integrity_validated is not None
+            and revision == self._validated_catalog_revision
+            and index_revision == self._validated_index_revision
+        ):
+            return self._integrity_validated
+        return self.check_integrity()
+
     def stats(self) -> dict[str, Any]:
+        try:
+            with self._connect() as connection:
+                item_count = int(self._meta_from(connection, "item_count") or "0")
+                revision = self._meta_from(connection, "catalog_revision") or "unknown"
+                index_revision = self._meta_from(connection, "search_index_revision")
+                last_synced_at = self._meta_from(connection, "last_synced_at")
+        except Exception:
+            item_count, revision, index_revision, last_synced_at = 0, "unknown", "", ""
+        current_validation = (
+            self._integrity_validated
+            if revision == self._validated_catalog_revision
+            and index_revision == self._validated_index_revision
+            else None
+        )
         return {
-            "item_count": self.count(),
-            "catalog_revision": self.revision,
-            "search_index_revision": self.search_index_revision,
+            "item_count": item_count,
+            "catalog_revision": revision,
+            "search_index_revision": index_revision,
             "search_index_ready": self.search_index_ready,
-            "integrity_ok": self.check_integrity(),
-            "last_synced_at": self.last_synced_at,
+            "integrity_ok": current_validation,
+            "last_synced_at": last_synced_at,
         }
 
     def sync(
@@ -566,11 +641,12 @@ class TstnCatalogMirror:
                     raise ValueError("catalog page number is inconsistent")
                 if page.count is not None and page.count < len(page.results):
                     raise ValueError("catalog page count is inconsistent")
-                if page.count_all is not None:
-                    observed_totals.add(page.count_all)
-                    last_count_all = page.count_all
-                    if page.count_all < offset + len(page.results):
-                        raise ValueError("catalog total is below the observed offset")
+                if page.count_all is None:
+                    raise ValueError("catalog total is required to prove snapshot completeness")
+                observed_totals.add(page.count_all)
+                last_count_all = page.count_all
+                if page.count_all < offset + len(page.results):
+                    raise ValueError("catalog total is below the observed offset")
                 if len(observed_totals) > 1:
                     raise ValueError("catalog total changed during pagination")
 
@@ -615,9 +691,11 @@ class TstnCatalogMirror:
                     break
             if not terminal:
                 raise OverflowError("catalog page limit exceeded before terminal page")
-            if last_count_all is not None and last_count_all != raw_count:
+            # A stable count_all confirms traversal coverage, but does not make
+            # the remote pagination a transactional snapshot.
+            if last_count_all is None or last_count_all != raw_count:
                 raise ValueError("catalog total does not match the completed traversal")
-            if raw_count == 0 and last_count_all not in (None, 0):
+            if raw_count == 0 and last_count_all != 0:
                 raise ValueError("empty catalog page contradicts catalog total")
         except OverflowError:
             raise _safe_error(
@@ -640,6 +718,7 @@ class TstnCatalogMirror:
         changed = revision != self.revision
         replace_snapshot = changed or not self.check_integrity()
         synced_at = _utc_marker(now)
+        self._invalidate_integrity_cache()
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -653,12 +732,15 @@ class TstnCatalogMirror:
                 self._set_meta(connection, "search_index_revision", index_revision)
                 self._set_meta(connection, "item_count", len(records))
                 self._set_meta(connection, "last_synced_at", synced_at)
+                if not self._check_integrity_connection(connection):
+                    raise ValueError("new snapshot failed local integrity validation")
         except Exception:
             raise _safe_error(
                 "Локальный каталог ТСТН не обновлён; предыдущая ревизия сохранена",
                 code="TSTN_MIRROR_UPDATE_FAILED",
                 category="storage_error",
             ) from None
+        self._remember_integrity_result(True, revision, index_revision)
         return TstnMirrorSyncResult(
             changed=changed,
             item_count=len(records),
@@ -740,9 +822,13 @@ class TstnCatalogMirror:
                 code="TSTN_CATALOG_NOT_READY",
                 category="not_configured",
             )
+        self._invalidate_integrity_cache()
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                revision = self._meta_from(connection, "catalog_revision")
+                if not revision:
+                    raise ValueError("catalog revision is missing")
                 connection.execute("DELETE FROM tstn_search_terms")
                 rows = connection.execute(
                     "SELECT canonical_payload FROM tstn_catalog_products "
@@ -756,14 +842,18 @@ class TstnCatalogMirror:
                     if index_terms > TSTN_MAX_TOTAL_INDEX_TERMS:
                         raise OverflowError("index term limit exceeded")
                     self._insert_terms_for_record(connection, record, fields)
-                self._set_meta(connection, "search_index_revision", _index_revision(revision))
+                index_revision = _index_revision(revision)
+                self._set_meta(connection, "search_index_revision", index_revision)
+                if not self._check_integrity_connection(connection):
+                    raise ValueError("rebuilt index failed local integrity validation")
         except Exception:
             raise _safe_error(
                 "Локальный поисковый индекс ТСТН не перестроен",
                 code="TSTN_INDEX_REBUILD_FAILED",
                 category="storage_error",
             ) from None
-        return self.search_index_revision
+        self._remember_integrity_result(True, revision, index_revision)
+        return index_revision
 
     def search(
         self,
@@ -823,9 +913,7 @@ class TstnCatalogMirror:
         normalized_article = _normalize_code(exact_article)
         if not any((exact_id, exact_article, query_terms)):
             return []
-        if not self.search_index_ready or not self.check_integrity():
-            if self.revision == "unknown" and self.count() == 0:
-                return []
+        if not self._ensure_search_integrity():
             raise _safe_error(
                 "Локальный каталог ТСТН или его индекс не прошёл проверку",
                 code="TSTN_CATALOG_NOT_READY",
