@@ -123,7 +123,16 @@ class SecretStoreTstnAuthorizer:
             return response.access_token
 
 
-def create_tstn_authorization_client(timeout_seconds: float) -> TstnApiClient:
-    """Build a fresh bounded TN1 client for one future sourcing request."""
+def create_tstn_authorization_client(
+    timeout_seconds: float,
+    *,
+    max_attempts: int = 64,
+    outbound_attempt_observer: Callable[[], None] | None = None,
+) -> TstnApiClient:
+    """Build one bounded TN1 client, optionally sharing an attempt budget."""
 
-    return TstnApiClient(timeout_seconds=timeout_seconds, max_attempts=64)
+    return TstnApiClient(
+        timeout_seconds=timeout_seconds,
+        max_attempts=max_attempts,
+        outbound_attempt_observer=outbound_attempt_observer,
+    )

@@ -114,6 +114,7 @@ class TstnHttpResponse:
 
 
 Transport = Callable[[urllib.request.Request, float], TstnHttpResponse]
+OutboundAttemptObserver = Callable[[], None]
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 
 
@@ -233,6 +234,7 @@ class TstnApiClient:
         timeout_seconds: float = TSTN_DEFAULT_TIMEOUT_SECONDS,
         max_response_bytes: int = TSTN_MAX_RESPONSE_BYTES,
         max_attempts: int = TSTN_MAX_HTTP_ATTEMPTS,
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> None:
         try:
             timeout = float(timeout_seconds)
@@ -245,11 +247,14 @@ class TstnApiClient:
                 or not 1 <= max_response_bytes <= TSTN_MAX_RESPONSE_BYTES
                 or type(max_attempts) is not int
                 or not 1 <= max_attempts <= TSTN_MAX_HTTP_ATTEMPTS
-                or transport is not None and not callable(transport)):
+                or transport is not None and not callable(transport)
+                or outbound_attempt_observer is not None
+                and not callable(outbound_attempt_observer)):
             raise TstnApiError(TstnErrorCategory.MISCONFIGURED) from None
         self.timeout_seconds = timeout
         self.max_response_bytes = max_response_bytes
         self.max_attempts = max_attempts
+        self._outbound_attempt_observer = outbound_attempt_observer
         self._transport = _default_transport if transport is None else transport
         self._attempt_count = 0
         self._attempt_lock = threading.Lock()
@@ -477,6 +482,10 @@ class TstnApiClient:
         response = None
         transport_failure: TstnErrorCategory | None = None
         status_from_exception: int | None = None
+        if self._outbound_attempt_observer is not None:
+            # The observer runs immediately before transport dispatch. A failed
+            # reservation is not counted as a supplier attempt.
+            self._outbound_attempt_observer()
         try:
             response = self._transport(request, self.timeout_seconds)
         except (TimeoutError, socket.timeout):
