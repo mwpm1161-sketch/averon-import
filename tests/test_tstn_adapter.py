@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 import json
 import logging
+import sqlite3
 import socket
 from urllib.parse import parse_qs, urlsplit
 
@@ -38,9 +39,11 @@ from averon_import.services.sourcing.providers.execution import (
 )
 from averon_import.services.sourcing.providers.tstn import (
     TstnApiClient,
+    TstnCatalogMirror,
     TstnCatalogRecord,
     TstnCommercialExecutionAdapter,
     TstnHttpResponse,
+    TstnItemListResponse,
 )
 
 
@@ -79,6 +82,7 @@ class FakeMirror:
         self.search_calls = 0
         self.last_limit = None
         self.article_queries: list[str] = []
+        self.search_index_ready = True
 
     def search(self, intent=None, *, article=None, limit):
         self.search_calls += 1
@@ -92,6 +96,52 @@ class FakeMirror:
             ][:limit]
         self.last_limit = limit
         return list(self.records[:limit])
+
+
+CATALOG_SYNC_TOKEN = "tn4a-r2-offline-catalog-synthetic"
+
+
+class FakeCatalogPageClient:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+        self.calls = 0
+
+    def list_items(self, *, access_token, limit, offset):
+        assert access_token == CATALOG_SYNC_TOKEN
+        assert limit is not None and offset == 0
+        self.calls += 1
+        selected = self.rows[offset : offset + limit]
+        return TstnItemListResponse.model_validate({
+            "count": len(selected),
+            "count_all": len(self.rows),
+            "page_num": 1,
+            "results": selected,
+        })
+
+
+def _ready_real_mirror(path, rows):
+    mirror = TstnCatalogMirror(path)
+    client = FakeCatalogPageClient(rows)
+    result = mirror.sync(
+        client,
+        access_token=CATALOG_SYNC_TOKEN,
+        page_size=10,
+        max_pages=2,
+    )
+    assert client.calls == 1
+    assert result.item_count == len(rows)
+    assert mirror.search_index_ready is True
+    return mirror
+
+
+def _catalog_row(*, item_id=101, article="000101", name="Крепёжный элемент"):
+    return {
+        "id": item_id,
+        "article": article,
+        "name": name,
+        "brand": "ТЕХНОНИКОЛЬ",
+        "categories": [{"id": 10, "name": "Крепёж", "parent": 1}],
+    }
 
 
 class FakeTransport:
@@ -270,6 +320,75 @@ def test_empty_local_search_returns_empty_without_http_or_credential_reads():
     assert outcome.state == ProviderSearchState.EMPTY
     assert outcome.request_count == 0
     assert mirror.search_calls == 1
+    assert store.read_keys == []
+    assert transport.requests == []
+
+
+def test_unsynced_real_catalog_fails_closed_without_credentials_or_http(tmp_path, monkeypatch):
+    mirror = TstnCatalogMirror(tmp_path / "unsynced.sqlite3")
+    adapter, _mirror, store, transport, _config = _setup(mirror=mirror)
+
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("unknown catalog revision must be rejected before search")
+
+    monkeypatch.setattr(mirror, "search", unexpected_search)
+
+    outcome = _execution(adapter, limit=3).outcomes[0]
+
+    assert mirror.revision == "unknown"
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.failure_category == ProviderFailureCategory.UNAVAILABLE
+    assert outcome.request_count == 0
+    assert outcome.offers == ()
+    assert store.read_keys == []
+    assert transport.requests == []
+
+
+def test_synced_empty_real_catalog_returns_empty_without_credentials_or_http(tmp_path):
+    mirror = _ready_real_mirror(tmp_path / "empty.sqlite3", [])
+    adapter, _mirror, store, transport, _config = _setup(mirror=mirror)
+
+    outcome = _execution(adapter, limit=3).outcomes[0]
+
+    assert mirror.revision != "unknown"
+    assert outcome.state == ProviderSearchState.EMPTY
+    assert outcome.request_count == 0
+    assert outcome.offers == ()
+    assert store.read_keys == []
+    assert transport.requests == []
+
+
+def test_ready_real_catalog_without_matching_rows_returns_empty(tmp_path):
+    mirror = _ready_real_mirror(
+        tmp_path / "no-match.sqlite3",
+        [_catalog_row(item_id=999, article="009999", name="Дренажная мембрана")],
+    )
+    adapter, _mirror, store, transport, _config = _setup(mirror=mirror)
+
+    outcome = _execution(adapter, limit=3).outcomes[0]
+
+    assert outcome.state == ProviderSearchState.EMPTY
+    assert outcome.request_count == 0
+    assert outcome.offers == ()
+    assert store.read_keys == []
+    assert transport.requests == []
+
+
+def test_corrupt_real_catalog_fails_closed_without_credentials_or_http(tmp_path):
+    path = tmp_path / "corrupt.sqlite3"
+    _ready_real_mirror(path, [_catalog_row()])
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE tstn_catalog_products SET canonical_payload='{}'",
+        )
+    mirror = TstnCatalogMirror(path)
+    adapter, _mirror, store, transport, _config = _setup(mirror=mirror)
+
+    outcome = _execution(adapter, limit=3).outcomes[0]
+
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.request_count == 0
+    assert outcome.offers == ()
     assert store.read_keys == []
     assert transport.requests == []
 
@@ -852,6 +971,155 @@ def test_runner_dedupe_binds_intent_limit_catalog_generation_city_and_policy():
         intent, limit=1, execution_scope_id="dedupe",
     ).request_fingerprint != first_identity.request_fingerprint
     assert transport.requests and all(ACCESS_TOKEN not in repr(item.data_provenance) for item in first.offers)
+
+
+def test_runner_returns_current_tstn_cache_hit_without_search_or_supplier_http(tmp_path, monkeypatch):
+    mirror = _ready_real_mirror(tmp_path / "cached.sqlite3", [_catalog_row()])
+    adapter, _mirror, store, transport, _config = _setup(
+        mirror=mirror,
+        responses=[
+            _auth_response(),
+            _price_response("000101", "12.50"),
+            _availability_response("000101", "В наличии"),
+        ],
+    )
+    runner = ProviderRunner({"tstn": adapter})
+    selection = ProviderSelection(provider_keys=("tstn",))
+    scope = ProviderExecutionScope(execution_scope_id="cache-valid")
+    intent = _intent()
+    first = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+    assert first.outcomes[0].request_count == 3
+    assert len(transport.requests) == 3
+
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("cache validation must not search SQLite")
+
+    def unexpected_integrity_scan(*args, **kwargs):
+        raise AssertionError("cache validation must not run an integrity scan")
+
+    monkeypatch.setattr(mirror, "search", unexpected_search)
+    monkeypatch.setattr(mirror, "check_integrity", unexpected_integrity_scan)
+    store.read_keys.clear()
+    repeated = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+
+    assert repeated.outcomes[0].state == ProviderSearchState.SUCCESS
+    assert repeated.outcomes[0].request_count == 0
+    assert repeated.outcomes[0].offers == first.outcomes[0].offers
+    assert repeated.reused_provider_keys == ("tstn",)
+    assert len(transport.requests) == 3
+    assert set(store.read_keys) <= {TSTN_CREDENTIALS_CONFIGURED}
+
+
+def test_runner_rejects_tstn_cache_when_catalog_revision_changes_after_identity(tmp_path):
+    mirror = _ready_real_mirror(tmp_path / "cache-revision.sqlite3", [_catalog_row()])
+    adapter, _mirror, store, transport, _config = _setup(
+        mirror=mirror,
+        responses=[
+            _auth_response(),
+            _price_response("000101", "12.50"),
+            _availability_response("000101", "В наличии"),
+        ],
+    )
+    runner = ProviderRunner({"tstn": adapter})
+    selection = ProviderSelection(provider_keys=("tstn",))
+    scope = ProviderExecutionScope(execution_scope_id="cache-revision")
+    intent = _intent()
+    first = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+    assert first.outcomes[0].state == ProviderSearchState.SUCCESS
+    original_identity = adapter.request_identity
+
+    def identity_then_replace_catalog(*args, **kwargs):
+        identity = original_identity(*args, **kwargs)
+        mirror.sync(
+            FakeCatalogPageClient([_catalog_row(item_id=102, article="000102", name="Другая позиция")]),
+            access_token=CATALOG_SYNC_TOKEN,
+            page_size=10,
+            max_pages=2,
+        )
+        return identity
+
+    adapter.request_identity = identity_then_replace_catalog
+    store.read_keys.clear()
+    repeated = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+
+    assert repeated.outcomes[0].state == ProviderSearchState.FAILURE
+    assert repeated.outcomes[0].failure_category == ProviderFailureCategory.UNAVAILABLE
+    assert repeated.outcomes[0].request_count == 0
+    assert repeated.outcomes[0].offers == ()
+    assert repeated.reused_provider_keys == ()
+    assert len(transport.requests) == 3
+    assert store.read_keys == []
+
+
+@pytest.mark.parametrize("changed_value", ["generation", "configured_marker"])
+def test_runner_rejects_tstn_cache_when_credential_state_changes(
+    tmp_path,
+    changed_value,
+):
+    mirror = _ready_real_mirror(
+        tmp_path / f"cache-credentials-{changed_value}.sqlite3",
+        [_catalog_row()],
+    )
+    adapter, _mirror, store, transport, config = _setup(
+        mirror=mirror,
+        responses=[
+            _auth_response(),
+            _price_response("000101", "12.50"),
+            _availability_response("000101", "В наличии"),
+        ],
+    )
+    runner = ProviderRunner({"tstn": adapter})
+    selection = ProviderSelection(provider_keys=("tstn",))
+    scope = ProviderExecutionScope(execution_scope_id=f"cache-{changed_value}")
+    intent = _intent()
+    first = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+    assert first.outcomes[0].state == ProviderSearchState.SUCCESS
+    if changed_value == "generation":
+        config["generation"] = "c" * 32
+    else:
+        store.set(TSTN_CREDENTIALS_CONFIGURED, "c" * 32)
+    store.read_keys.clear()
+
+    repeated = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+
+    assert repeated.outcomes[0].state == ProviderSearchState.FAILURE
+    assert repeated.outcomes[0].failure_category == ProviderFailureCategory.UNAVAILABLE
+    assert repeated.outcomes[0].request_count == 0
+    assert repeated.outcomes[0].offers == ()
+    assert repeated.reused_provider_keys == ()
+    assert len(transport.requests) == 3
+    assert set(store.read_keys) <= {TSTN_CREDENTIALS_CONFIGURED}
+
+
+def test_cached_identity_validation_errors_do_not_expose_secret_material(tmp_path, caplog):
+    mirror = _ready_real_mirror(tmp_path / "cache-safe-error.sqlite3", [_catalog_row()])
+    adapter, _mirror, _store, transport, _config = _setup(
+        mirror=mirror,
+        responses=[
+            _auth_response(),
+            _price_response("000101", "12.50"),
+            _availability_response("000101", "В наличии"),
+        ],
+    )
+    runner = ProviderRunner({"tstn": adapter})
+    selection = ProviderSelection(provider_keys=("tstn",))
+    scope = ProviderExecutionScope(execution_scope_id="cache-safe-error")
+    intent = _intent()
+    runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+
+    def invalid_cache_state(_identity):
+        raise RuntimeError(f"synthetic failure contains {ACCESS_TOKEN}")
+
+    adapter.is_cached_identity_current = invalid_cache_state
+    repeated = runner.run(selection=selection, intent=intent, limit=1, scope=scope)
+
+    assert repeated.outcomes[0].state == ProviderSearchState.FAILURE
+    assert repeated.outcomes[0].request_count == 0
+    assert repeated.outcomes[0].offers == ()
+    assert repeated.reused_provider_keys == ()
+    assert ACCESS_TOKEN not in repr(repeated)
+    assert ACCESS_TOKEN not in caplog.text
+    assert len(transport.requests) == 3
 
 
 def test_provider_runner_rejects_catalog_revision_changed_after_request_identity():

@@ -336,6 +336,19 @@ class ProviderRunner:
 
         cached = scope._cached_outcome(identity)
         if cached is not None:
+            cached_identity_validator = getattr(adapter, "is_cached_identity_current", None)
+            if callable(cached_identity_validator):
+                try:
+                    cache_is_current = cached_identity_validator(identity) is True
+                except Exception:
+                    cache_is_current = False
+                if not cache_is_current:
+                    return self._failure(
+                        provider_key,
+                        ProviderFailureCategory.UNAVAILABLE,
+                        request_count=0,
+                        affinity=identity.affinity,
+                    ), False
             payload = cached.model_dump(mode="python")
             payload["request_count"] = 0
             payload["timings"] = ()

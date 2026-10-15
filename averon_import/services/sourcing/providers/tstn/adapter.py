@@ -224,6 +224,23 @@ class TstnCommercialExecutionAdapter:
             revision=revision,
         )
 
+    def is_cached_identity_current(
+        self,
+        identity: ProviderSearchRequestIdentity,
+    ) -> bool:
+        """Validate a cache hit using only local revision and config metadata."""
+
+        if not isinstance(identity, ProviderSearchRequestIdentity) or identity.provider_key != self.key:
+            return False
+        with TSTN_CREDENTIAL_LOCK:
+            revision = self._catalog_revision()
+            return (
+                revision != "unknown"
+                and self._catalog_search_ready()
+                and identity.affinity == self._affinity(revision)
+                and self._configuration_matches()
+            )
+
     def _identity_for_revision(
         self,
         intent: ProductIntent,
@@ -308,6 +325,12 @@ class TstnCommercialExecutionAdapter:
 
     def _catalog_revision_matches(self, expected_revision: str) -> bool:
         return self._catalog_revision() == expected_revision
+
+    def _catalog_search_ready(self) -> bool:
+        try:
+            return self.mirror is not None and self.mirror.search_index_ready is True
+        except Exception:
+            return False
 
     def _configuration_matches(self) -> bool:
         try:
@@ -598,6 +621,13 @@ class TstnCommercialExecutionAdapter:
                 ProviderFailureCategory.MISCONFIGURED,
                 catalog_revision=catalog_revision,
             )
+        if catalog_revision == "unknown":
+            return self._failure(
+                request_counter,
+                affinity,
+                ProviderFailureCategory.UNAVAILABLE,
+                catalog_revision=None,
+            )
         if not self._catalog_revision_matches(catalog_revision):
             return self._revision_failure(request_counter, affinity)
         try:
@@ -616,6 +646,13 @@ class TstnCommercialExecutionAdapter:
             )
         if not self._catalog_revision_matches(catalog_revision):
             return self._revision_failure(request_counter, affinity)
+        if not self._catalog_search_ready():
+            return self._failure(
+                request_counter,
+                affinity,
+                ProviderFailureCategory.UNAVAILABLE,
+                catalog_revision=None,
+            )
         if (
             not isinstance(candidates, (list, tuple))
             or len(candidates) > min(limit, self.max_candidates)
