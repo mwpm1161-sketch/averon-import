@@ -55,6 +55,9 @@ from averon_import.services.sourcing.providers.tstn.authorization import (
     TSTN_CREDENTIAL_LOCK,
 )
 from averon_import.services.sourcing.providers.tstn.mirror import TstnCatalogMirror
+from averon_import.services.sourcing.providers.tstn.sync_coordinator import (
+    TstnCatalogSyncCoordinator,
+)
 
 
 VI_CREDENTIAL_LOCK = RLock()
@@ -82,11 +85,47 @@ class TstnRuntimePreparation:
     _prepared_enabled: bool = field(repr=False)
     _prepared_generation: str = field(repr=False)
     _catalog_path: Path | None = field(default=None, repr=False, compare=False)
+    _data_dir: Path | None = field(default=None, repr=False, compare=False)
     _storage_error: bool = field(default=False, repr=False)
     _preparation_error: bool = field(default=False, repr=False)
 
     def __repr__(self) -> str:
         return "TstnRuntimePreparation(<private>)"
+
+    def create_catalog_sync_coordinator(self) -> TstnCatalogSyncCoordinator | None:
+        """Create a passive private coordinator; it performs no sync by itself."""
+
+        if not self._prepared_enabled or self._data_dir is None:
+            return None
+
+        def current_configuration() -> tuple[bool, str]:
+            current = self._settings_service.settings.sourcing.tstn
+            return current.enabled, current.credential_generation
+
+        return TstnCatalogSyncCoordinator(
+            self._data_dir,
+            self._secret_store,
+            current_configuration=current_configuration,
+        )
+
+    def create_private_provider_runner(self) -> ProviderRunner | None:
+        """Build an isolated TSTN-only runner after explicit local readiness validation."""
+
+        if self.adapter is None or self._mirror is None:
+            return None
+        try:
+            if not self.readiness.configured:
+                return None
+            # This is an explicit private execution preparation, not a boot or
+            # status path. It performs at most the mirror's one-time integrity
+            # validation after process restart, without any supplier traffic.
+            if not self._mirror.ensure_search_ready():
+                return None
+            if not self.readiness.configured or not self._mirror.search_index_ready:
+                return None
+            return ProviderRunner({"tstn": self.adapter})
+        except Exception:
+            return None
 
     @property
     def readiness(self) -> TstnReadiness:
@@ -194,6 +233,7 @@ def _prepare_tstn_runtime(
             _mirror=None,
             _prepared_enabled=False,
             _prepared_generation="",
+            _data_dir=data_root,
             _preparation_error=True,
         )
 
@@ -205,6 +245,7 @@ def _prepare_tstn_runtime(
             _mirror=None,
             _prepared_enabled=False,
             _prepared_generation=generation,
+            _data_dir=data_root,
         )
 
     catalog_path = data_root / "sourcing" / "providers" / "tstn" / "catalog.sqlite3"
@@ -250,6 +291,7 @@ def _prepare_tstn_runtime(
         _prepared_enabled=enabled,
         _prepared_generation=generation,
         _catalog_path=catalog_path,
+        _data_dir=data_root,
         _storage_error=storage_error,
         _preparation_error=preparation_error,
     )

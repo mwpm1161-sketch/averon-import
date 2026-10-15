@@ -6,11 +6,12 @@ import re
 import sqlite3
 import unicodedata
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, ContextManager, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -90,6 +91,10 @@ class TstnMirrorSyncResult:
     revision: str
     search_index_revision: str
     synced_at: str
+
+
+class TstnMirrorSyncGuardRejected(RuntimeError):
+    """A local synchronization guard rejected an attempt or publication."""
 
 
 class TstnCatalogPageClient(Protocol):
@@ -560,6 +565,16 @@ class TstnCatalogMirror:
             return self._integrity_validated
         return self.check_integrity()
 
+    def ensure_search_ready(self) -> bool:
+        """Explicitly validate a persisted index before private execution.
+
+        Passive readiness deliberately does not call this method. The first
+        explicit runner preparation may perform the same one-time integrity
+        validation that the first search would otherwise perform.
+        """
+
+        return self._ensure_search_integrity() and self.search_index_ready
+
     def stats(self) -> dict[str, Any]:
         try:
             with self._connect() as connection:
@@ -594,6 +609,8 @@ class TstnCatalogMirror:
         max_items: int | None = None,
         max_snapshot_bytes: int = TSTN_MAX_SNAPSHOT_BYTES,
         now: datetime | None = None,
+        supplier_attempt_guard: Callable[[], ContextManager[Any]] | None = None,
+        publication_guard: Callable[[], ContextManager[Any]] | None = None,
     ) -> TstnMirrorSyncResult:
         """Fetch a bounded snapshot through an injected typed client, then swap atomically."""
 
@@ -631,6 +648,17 @@ class TstnCatalogMirror:
                 code="TSTN_CLIENT_MISSING",
                 category="not_configured",
             )
+        if (
+            supplier_attempt_guard is not None
+            and not callable(supplier_attempt_guard)
+            or publication_guard is not None
+            and not callable(publication_guard)
+        ):
+            raise _safe_error(
+                "Для синхронизации каталога ТСТН заданы неверные локальные проверки",
+                code="TSTN_SYNC_GUARD_INVALID",
+                category="invalid_request",
+            )
 
         records: dict[tuple[str, str], tuple[TstnCatalogRecord, str, dict[str, tuple[str, ...]]]] = {}
         raw_count = 0
@@ -645,11 +673,17 @@ class TstnCatalogMirror:
         try:
             for page_index in range(max_pages):
                 offset = page_index * page_size
-                page = client.list_items(
-                    access_token=access_token,
-                    limit=page_size,
-                    offset=offset,
+                attempt_context = (
+                    supplier_attempt_guard()
+                    if supplier_attempt_guard is not None
+                    else nullcontext()
                 )
+                with attempt_context:
+                    page = client.list_items(
+                        access_token=access_token,
+                        limit=page_size,
+                        offset=offset,
+                    )
                 page_count += 1
                 if not isinstance(page, TstnItemListResponse) or page.results is None:
                     raise ValueError("typed catalog page with results is required")
@@ -715,6 +749,8 @@ class TstnCatalogMirror:
                 raise ValueError("catalog total does not match the completed traversal")
             if raw_count == 0 and last_count_all != 0:
                 raise ValueError("empty catalog page contradicts catalog total")
+        except TstnMirrorSyncGuardRejected:
+            raise
         except OverflowError:
             raise _safe_error(
                 "Каталог ТСТН превышает безопасные ограничения синхронизации",
@@ -733,26 +769,39 @@ class TstnCatalogMirror:
         sorted_records = [records[key][0] for key in sorted(records)]
         revision = _snapshot_revision(sorted_records)
         index_revision = _index_revision(revision)
-        changed = revision != self.revision
-        replace_snapshot = changed or not self.check_integrity()
-        synced_at = _utc_marker(now)
-        self._invalidate_integrity_cache()
         try:
-            with self._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                if replace_snapshot:
-                    connection.execute("DELETE FROM tstn_catalog_products")
-                    self._insert_snapshot(connection, records)
-                elif not self.search_index_ready:
-                    connection.execute("DELETE FROM tstn_search_terms")
-                    self._insert_search_terms(connection, records)
-                self._set_meta(connection, "catalog_revision", revision)
-                self._set_meta(connection, "search_index_revision", index_revision)
-                self._set_meta(connection, "item_count", len(records))
-                self._set_meta(connection, "last_synced_at", synced_at)
-                if not self._check_integrity_connection(connection):
-                    raise ValueError("new snapshot failed local integrity validation")
+            publish_context = (
+                publication_guard()
+                if publication_guard is not None
+                else nullcontext()
+            )
+            with publish_context:
+                # Keep the optional credential-generation guard held from this
+                # final check through SQLite commit. A rotation can therefore
+                # happen before or after publication, never between them.
+                changed = revision != self.revision
+                replace_snapshot = changed or not self.check_integrity()
+                synced_at = _utc_marker(now)
+                self._invalidate_integrity_cache()
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if replace_snapshot:
+                        connection.execute("DELETE FROM tstn_catalog_products")
+                        self._insert_snapshot(connection, records)
+                    elif not self.search_index_ready:
+                        connection.execute("DELETE FROM tstn_search_terms")
+                        self._insert_search_terms(connection, records)
+                    self._set_meta(connection, "catalog_revision", revision)
+                    self._set_meta(connection, "search_index_revision", index_revision)
+                    self._set_meta(connection, "item_count", len(records))
+                    self._set_meta(connection, "last_synced_at", synced_at)
+                    if not self._check_integrity_connection(connection):
+                        raise ValueError("new snapshot failed local integrity validation")
+        except TstnMirrorSyncGuardRejected:
+            self._invalidate_integrity_cache()
+            raise
         except Exception:
+            self._invalidate_integrity_cache()
             raise _safe_error(
                 "Локальный каталог ТСТН не обновлён; предыдущая ревизия сохранена",
                 code="TSTN_MIRROR_UPDATE_FAILED",
