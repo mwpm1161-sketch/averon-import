@@ -70,6 +70,7 @@ const context = {{
   authState: 'authenticated',
   status: {{available: true}},
   api: () => Promise.resolve(context.status),
+  renderSharedProviderSelectionPanel: () => {{}},
   renderSourcingHistoryControls: () => {{}},
   SOURCING_MODE_LABELS: {{one_c_only: 'Только история 1С', one_c_then_provider: 'История 1С → поставщик', provider_only: 'Только поставщик'}},
   createSourcingState: () => ({{sourceMode: 'provider_only', historyStatus:null, historyStatusLoaded:false,
@@ -240,7 +241,10 @@ def test_sourcing_modal_phase_owns_excel_launch_visibility_and_review_back_navig
     assert 'setSourcingModalPhase("project_result")' in result
     assert 'setSourcingModalPhase(job.status, "excel_tender")' in excel_poll
     assert 'setSourcingModalPhase("failed", "excel_tender")' in excel_start
-    assert 'addEventListener("close",() => setSourcingModalPhase("closed", "none"))' in app
+    close_handler = app.split('addEventListener("close",() => {', 1)[1].split('});', 1)[0]
+    assert 'setSourcingModalPhase("closed", "none")' in close_handler
+    assert 'state.sourcing.pendingSourcing = null' in close_handler
+    assert 'state.sourcing.providerSelectionProviders = new Set()' in close_handler
     assert 'tender-sourcing-submit").hidden =' not in app
 
 

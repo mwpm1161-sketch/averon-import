@@ -32,6 +32,33 @@ class SourcingNotice(SourcingModel):
     user_visible: bool = True
 
 
+class SourcingProviderOutcome(SourcingModel):
+    """Safe public summary of one outcome-native provider result.
+
+    This intentionally excludes runtime affinity, configuration revisions,
+    credentials, and supplier response payloads.
+    """
+
+    provider_key: str
+    state: Literal["not_attempted", "suppressed", "success", "empty", "partial_success", "failure"]
+    offers_returned_count: int = Field(ge=0, le=100)
+    retained_offer_count: int = Field(ge=0, le=100)
+    failure_category: Literal[
+        "authentication", "invalid_response", "misconfigured", "rate_limited",
+        "timeout", "transport", "unavailable", "unknown",
+    ] | None = None
+
+
+class SourcingCommercialEvidence(SourcingModel):
+    """Allowlisted commercial state for a provider offer."""
+
+    provider_key: str
+    offer_id: str
+    state: Literal["COMPLETE", "INCOMPLETE", "INVALID"]
+    issue_codes: list[str] = Field(default_factory=list, max_length=10)
+    vat_basis: Literal["GROSS_INCLUDING_VAT", "NET_EXCLUDING_VAT", "UNKNOWN"]
+
+
 class SourcingSourceMode(str, Enum):
     PROVIDER_ONLY = "provider_only"
     ONE_C_ONLY = "one_c_only"
@@ -332,6 +359,10 @@ class SourcingResult(SourcingModel):
     route: SourcingRouteMetadata | None = None
     provider_error_category: str | None = None
     provider_call_suppressed: bool = False
+    provider_outcomes: list[SourcingProviderOutcome] = Field(default_factory=list, max_length=8)
+    commercial_evidence: list[SourcingCommercialEvidence] = Field(default_factory=list, max_length=400)
+    commercial_selection_state: Literal["SELECTED", "NO_SAFE_WINNER"] | None = None
+    commercial_selection_reasons: list[str] = Field(default_factory=list, max_length=5)
 
 
 class ProjectSourcingResult(SourcingModel):
@@ -374,6 +405,7 @@ class ProjectSourcingResult(SourcingModel):
     provider_key: str = ""
     provider_label: str = ""
     catalog_version: str = ""
+    provider_keys: list[str] = Field(default_factory=list, max_length=8)
 
 
 class SourcingProviderInfo(SourcingModel):

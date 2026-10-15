@@ -17,7 +17,7 @@ from averon_import.services.sourcing.providers.contracts import ProviderFailureC
 
 from .durable_read import DurableTenderSourcingRunV2
 
-PublicProvider = Literal["etm_ipro", "lemana_b2b", "vseinstrumenti"]
+PublicProvider = Literal["etm_ipro", "lemana_b2b", "vseinstrumenti", "tstn"]
 
 
 class _PublicModel(BaseModel):
@@ -82,7 +82,7 @@ class PublicCommercialSelection(_PublicModel):
 class PublicMultiProviderRow(_PublicModel):
     source_row_id: StrictStr = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
     excel_row: StrictInt = Field(ge=1, le=1_048_576)
-    provider_outcomes: tuple[PublicProviderOutcome, ...] = Field(min_length=2, max_length=3)
+    provider_outcomes: tuple[PublicProviderOutcome, ...] = Field(min_length=1, max_length=3)
     offers: tuple[PublicOffer, ...] = Field(max_length=400)
     matches: tuple[PublicMatch, ...] = Field(max_length=400)
     commercial_evidence: tuple[PublicCommercialEvidence, ...] = Field(max_length=400)
@@ -99,7 +99,7 @@ class PublicMultiProviderSummary(_PublicModel):
     tender_id: StrictStr = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
     status: Literal["running", "completed", "failed", "interrupted"]
     source_mode: Literal["provider_only"] = "provider_only"
-    providers: tuple[PublicProvider, ...] = Field(min_length=2, max_length=3)
+    providers: tuple[PublicProvider, ...] = Field(min_length=1, max_length=3)
     created_at: StrictStr = Field(max_length=40)
     started_at: StrictStr = Field(max_length=40)
     completed_at: StrictStr | None = Field(max_length=40)
@@ -119,8 +119,8 @@ def _reference(value) -> dict:
 
 
 def _check_public_selection(run: DurableTenderSourcingRunV2) -> None:
-    if (not 2 <= len(run.selection.provider_keys) <= 3
-            or not set(run.selection.provider_keys).issubset({"etm_ipro", "lemana_b2b", "vseinstrumenti"})):
+    if (not 1 <= len(run.selection.provider_keys) <= 3
+            or not set(run.selection.provider_keys).issubset({"etm_ipro", "lemana_b2b", "vseinstrumenti", "tstn"})):
         raise ValueError("run is outside the public tender provider contract")
 
 

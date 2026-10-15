@@ -139,7 +139,7 @@ def execute_multi_provider_tender_run(
                 or len(set(selected_source_row_ids)) != len(selected_source_row_ids)):
             raise MultiProviderOrchestrationError(code.INVALID_ROWS, run_id)
         if service.provider_runner is None or not set(selection.provider_keys).issubset(
-            {"etm_ipro", "lemana_b2b", "local_catalog", "vseinstrumenti"}
+            {"etm_ipro", "lemana_b2b", "local_catalog", "vseinstrumenti", "tstn"}
         ):
             raise MultiProviderOrchestrationError(code.PROVIDER_CONFIGURATION, run_id)
         started = _timestamp(clock)

@@ -82,6 +82,12 @@ def _offer(value):
         provenance = {"source": proof.get("source"), "source_item_id": proof.get("source_item_id", ""),
                       "price_field": proof.get("price_field", ""), "environment": proof.get("environment"),
                       "region_id": proof.get("region_id")}
+    elif value.provider == "tstn":
+        provenance = {key: proof.get(key) for key in (
+            "source", "identity_kind", "identity_value", "source_item_id",
+            "catalog_revision", "price_field", "availability_field", "city_filter",
+            "price_region_match", "availability_region_match",
+        )}
     else:
         provenance = {"source": "unproven"}
     return dict(offer_reference=_reference(ProviderOfferReference.from_offer(value)),

@@ -104,6 +104,7 @@ from averon_import.services.manual_tenders.multi_provider_orchestration import (
 )
 from averon_import.services.manual_tenders.multi_provider_public import project_multi_provider_summary
 from averon_import.services.sourcing.providers.contracts import ProviderSelection
+from averon_import.services.sourcing.providers.execution import ProviderExecutionScope, ProviderRunner
 from averon_import.services.manual_tenders.price_export import (
     XLSX_MIME,
     TenderPriceExportRepository,
@@ -186,6 +187,13 @@ from averon_import.services.workspace import WorkspaceService, validate_document
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
 logger = logging.getLogger(__name__)
+
+# This server-side switch is deliberately independent from credentials and the
+# persisted `tstn.enabled` setting. It remains closed unless an operator sets
+# the dedicated environment flag for a reviewed deployment.
+TSTN_PUBLIC_LIVE_EXECUTION_ENABLED = os.environ.get(
+    "AVERON_TSTN_PUBLIC_LIVE_EXECUTION_ENABLED", "",
+).strip().casefold() in {"1", "true", "yes"}
 
 
 def _static_asset_revision(filename: str) -> str:
@@ -2603,6 +2611,7 @@ class SourcingRowRequest(BaseModel):
 
     row: dict[str, Any]
     provider: str | None = None
+    providers: list[StrictStr] | None = Field(default=None, max_length=3)
     limit: int = 20
     source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
 
@@ -2621,6 +2630,7 @@ class SourcingProjectRequest(BaseModel):
 
     rows: list[dict[str, Any]]
     provider: str | None = None
+    providers: list[StrictStr] | None = Field(default=None, max_length=3)
     limit: int = 20
     source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY
 
@@ -2875,17 +2885,28 @@ def _submit_manual_tender_sourcing(
         raise
 
 
-_TENDER_MULTI_PROVIDER_LABELS = {
+_TENDER_PRIMARY_PROVIDER_LABELS = {
     "etm_ipro": "ЭТМ iPRO",
-    "lemana_b2b": "Лемана ПРО",
     "vseinstrumenti": "ВсеИнструменты.ru",
+    "tstn": "ТЕХНОНИКОЛЬ",
 }
-_TENDER_MULTI_PROVIDER_MIN = 2
+_TENDER_PRIMARY_PROVIDER_DESCRIPTIONS = {
+    "etm_ipro": "Каталог, цены и склады iPRO.",
+    "vseinstrumenti": "Поиск по каталогу ВсеИнструменты.ru.",
+    "tstn": "Локальный каталог; онлайн-поиск закрыт до отдельного разрешения.",
+}
+_TENDER_LEGACY_PROVIDER_LABELS = {"lemana_b2b": "Лемана ПРО"}
+_TENDER_MULTI_PROVIDER_LABELS = {**_TENDER_PRIMARY_PROVIDER_LABELS, **_TENDER_LEGACY_PROVIDER_LABELS}
+_TENDER_MULTI_PROVIDER_MIN = 1
 
 
 def _available_tender_multi_provider_keys(runtime) -> tuple[str, ...]:
     """Return configured public tender providers without probing suppliers."""
     registered = set(runtime.execution_provider_keys)
+    if TSTN_PUBLIC_LIVE_EXECUTION_ENABLED:
+        preparation = getattr(runtime, "_tstn_runtime", None)
+        if getattr(preparation, "adapter", None) is not None:
+            registered.add("tstn")
     providers = getattr(runtime, "providers", {})
     available = []
     for key in sorted(_TENDER_MULTI_PROVIDER_LABELS):
@@ -2915,10 +2936,96 @@ def _available_tender_multi_provider_keys(runtime) -> tuple[str, ...]:
                         continue
             except Exception:
                 continue
+        if key == "tstn":
+            if not TSTN_PUBLIC_LIVE_EXECUTION_ENABLED:
+                continue
+            preparation = getattr(runtime, "_tstn_runtime", None)
+            try:
+                readiness = preparation.readiness
+                if not readiness.configured or readiness.catalog_state not in {
+                    "ready", "integrity_unconfirmed",
+                }:
+                    continue
+            except Exception:
+                continue
         # VI's execution registration and the current marker are both
         # required; the token value itself is never read here.
         available.append(key)
     return tuple(available)
+
+
+def _primary_provider_options(runtime) -> list[dict[str, Any]]:
+    available = set(_available_tender_multi_provider_keys(runtime))
+    options = []
+    for key, label in _TENDER_PRIMARY_PROVIDER_LABELS.items():
+        if key in available:
+            options.append({"key": key, "label": label, "description": _TENDER_PRIMARY_PROVIDER_DESCRIPTIONS[key], "available": True, "reason": ""})
+            continue
+        reason = "Поставщик пока не настроен локально."
+        if key == "tstn":
+            if not TSTN_PUBLIC_LIVE_EXECUTION_ENABLED:
+                reason = "Онлайн-поиск ТСТН пока отключён администратором."
+            else:
+                preparation = getattr(runtime, "_tstn_runtime", None)
+                try:
+                    readiness = preparation.readiness
+                    if not readiness.configured:
+                        reason = "Не настроены локальные учётные данные ТСТН."
+                    elif readiness.catalog_state not in {"ready", "integrity_unconfirmed"}:
+                        reason = "Локальный каталог ТСТН ещё не готов."
+                except Exception:
+                    reason = "Состояние ТСТН сейчас недоступно."
+        options.append({"key": key, "label": label, "description": _TENDER_PRIMARY_PROVIDER_DESCRIPTIONS[key], "available": False, "reason": reason})
+    return options
+
+
+def _public_selection_runner(runtime, provider_keys: tuple[str, ...]) -> ProviderRunner:
+    runner = getattr(runtime, "provider_runner", None)
+    if runner is None:
+        runner = getattr(getattr(runtime, "service", None), "provider_runner", None)
+    if runner is None:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": "Один или несколько поставщиков недоступны.",
+        })
+    if "tstn" not in provider_keys:
+        return runner
+    if not TSTN_PUBLIC_LIVE_EXECUTION_ENABLED:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": "Онлайн-поиск ТЕХНОНИКОЛЬ пока отключён администратором.",
+        })
+    preparation = getattr(runtime, "_tstn_runtime", None)
+    try:
+        private_runner = preparation.create_private_provider_runner()
+        private_registry = private_runner._registry
+        registry = dict(runner._registry)
+        registry["tstn"] = private_registry["tstn"]
+        return ProviderRunner(registry)
+    except Exception:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": "Локальный каталог ТЕХНОНИКОЛЬ не готов к безопасному поиску.",
+        }) from None
+
+
+def _tstn_private_dedupe_revision(runtime) -> str | None:
+    """Opaque request fingerprint; never projected to public or durable data."""
+    if not TSTN_PUBLIC_LIVE_EXECUTION_ENABLED:
+        return None
+    preparation = getattr(runtime, "_tstn_runtime", None)
+    try:
+        adapter = preparation.adapter
+        readiness = preparation.readiness
+        if adapter is None or not readiness.configured:
+            return None
+        return stable_fingerprint({
+            "credential_generation": adapter.credential_generation,
+            "catalog_revision": adapter._catalog_revision(),
+            "adapter_revision": getattr(adapter, "adapter_revision", "m6p-tn4a-outcome-adapter-v1"),
+        })
+    except Exception:
+        return None
 
 
 def _manual_tender_vi_config_revision(runtime) -> str | None:
@@ -2949,25 +3056,117 @@ def _manual_tender_vi_config_revision(runtime) -> str | None:
         return None
 
 
+@app.get("/api/sourcing/provider-selection-capabilities", dependencies=[Depends(require_authenticated)])
 @app.get("/api/manual-tenders/sourcing/multi-provider-capabilities", dependencies=[Depends(require_authenticated)])
 def get_multi_provider_sourcing_capabilities(_user: CurrentUser = Depends(require_authenticated)):
     with _sourcing_runtime_lock:
         runtime = sourcing_runtime
-    available = _available_tender_multi_provider_keys(runtime)
+    available = set(_available_tender_multi_provider_keys(runtime))
     providers = [
-        {"key": key, "label": _TENDER_MULTI_PROVIDER_LABELS[key]}
-        for key in available
+        {"key": key, "label": label}
+        for key, label in _TENDER_PRIMARY_PROVIDER_LABELS.items()
+        if key in available
     ]
     return {
-        "enabled": len(providers) >= _TENDER_MULTI_PROVIDER_MIN,
+        "enabled": bool(providers),
         "source_mode": SourcingSourceMode.PROVIDER_ONLY.value,
         "providers": providers,
+        "options": _primary_provider_options(runtime),
         "min_providers": _TENDER_MULTI_PROVIDER_MIN,
-        "max_providers": len(_TENDER_MULTI_PROVIDER_LABELS),
+        "max_providers": len(_TENDER_PRIMARY_PROVIDER_LABELS),
         "max_rows": 100,
         "max_result_limit": 20,
-        "export_supported": False,
+        "export_supported": True,
     }
+
+
+@app.get("/api/sourcing/providers/tstn/readiness", dependencies=[Depends(require_admin)])
+def get_tstn_admin_readiness(_user: CurrentUser = Depends(require_admin)):
+    """Return local TN4B readiness facts without reading credential values."""
+    with _sourcing_runtime_lock:
+        runtime = sourcing_runtime
+    preparation = getattr(runtime, "_tstn_runtime", None)
+    if preparation is None:
+        return {
+            "configuration_enabled": False,
+            "credentials_configured": False,
+            "catalog_present": False,
+            "catalog_state": "not_prepared",
+            "last_synced_at": None,
+            "item_count": 0,
+            "search_index_ready": False,
+            "live_gate_enabled": TSTN_PUBLIC_LIVE_EXECUTION_ENABLED,
+            "live_verified": False,
+        }
+    readiness = preparation.readiness
+    mirror = getattr(preparation, "_mirror", None)
+    stats = {}
+    if mirror is not None:
+        try:
+            stats = mirror.stats()
+        except Exception:
+            stats = {}
+    try:
+        configuration_enabled = app_settings_service.settings.sourcing.tstn.enabled is True
+    except Exception:
+        configuration_enabled = False
+    return {
+        "configuration_enabled": configuration_enabled,
+        "credentials_configured": readiness.configured is True,
+        "catalog_present": mirror is not None,
+        "catalog_state": readiness.catalog_state,
+        "last_synced_at": stats.get("last_synced_at") or None,
+        "item_count": int(stats.get("item_count") or 0),
+        "search_index_ready": stats.get("search_index_ready") is True,
+        "live_gate_enabled": TSTN_PUBLIC_LIVE_EXECUTION_ENABLED,
+        "live_verified": readiness.live_verified is True,
+    }
+
+
+def _admit_public_provider_selection(
+    provider_keys: list[str],
+    *,
+    legacy_provider: str | None,
+    source_mode: SourcingSourceMode,
+    runtime=None,
+    service=None,
+) -> tuple[ProviderSelection, Any, ProviderRunner]:
+    if source_mode != SourcingSourceMode.PROVIDER_ONLY or legacy_provider is not None:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_MODE_UNSUPPORTED",
+            "message": "Выбор нескольких источников доступен только для поиска у поставщиков.",
+        })
+    if not isinstance(provider_keys, list) or not 1 <= len(provider_keys) <= len(_TENDER_PRIMARY_PROVIDER_LABELS):
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_SELECTION_INVALID",
+            "message": "Нужно выбрать от одного до трёх разных поставщиков.",
+        })
+    try:
+        selection = ProviderSelection(provider_keys=tuple(provider_keys))
+    except Exception:
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_SELECTION_INVALID",
+            "message": "Список поставщиков не прошёл проверку.",
+        }) from None
+    if not set(selection.provider_keys).issubset(_TENDER_PRIMARY_PROVIDER_LABELS):
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": "Один или несколько выбранных поставщиков недоступны.",
+        })
+    if runtime is None or service is None:
+        with _sourcing_runtime_lock:
+            runtime = sourcing_runtime
+            service = runtime.service
+    available = set(_available_tender_multi_provider_keys(runtime))
+    if not set(selection.provider_keys).issubset(available):
+        options = {item["key"]: item for item in _primary_provider_options(runtime)}
+        selected_reason = next((options[key]["reason"] for key in selection.provider_keys
+                                if key in options and not options[key]["available"]), "")
+        raise HTTPException(400, detail={
+            "code": "MULTI_PROVIDER_UNAVAILABLE",
+            "message": selected_reason or "Один или несколько выбранных поставщиков недоступны.",
+        })
+    return selection, service, _public_selection_runner(runtime, selection.provider_keys)
 
 
 def _submit_manual_tender_multi_provider(
@@ -2978,7 +3177,7 @@ def _submit_manual_tender_multi_provider(
     if request.providers is None:
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_SELECTION_REQUIRED",
-            "message": "Выберите не менее двух поставщиков для сравнения.",
+            "message": "Выберите от одного до трёх поставщиков.",
         })
     if request.source_mode != SourcingSourceMode.PROVIDER_ONLY:
         raise HTTPException(400, detail={
@@ -2991,11 +3190,11 @@ def _submit_manual_tender_multi_provider(
             "message": "Для сравнения используйте список поставщиков.",
         })
     if (len(request.providers) < _TENDER_MULTI_PROVIDER_MIN
-            or len(request.providers) > len(_TENDER_MULTI_PROVIDER_LABELS)
+            or len(request.providers) > len(_TENDER_PRIMARY_PROVIDER_LABELS)
             or len(set(request.providers)) != len(request.providers)):
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_SELECTION_INVALID",
-            "message": "Нужно выбрать от двух до трёх разных доступных поставщиков.",
+            "message": "Нужно выбрать от одного до трёх разных поставщиков.",
         })
     if any(key not in _TENDER_MULTI_PROVIDER_LABELS for key in request.providers):
         raise HTTPException(400, detail={
@@ -3027,8 +3226,15 @@ def _submit_manual_tender_multi_provider(
     except Exception:
         raise HTTPException(400, detail={
             "code": "MULTI_PROVIDER_SELECTION_INVALID",
-            "message": "Нужно выбрать двух разных доступных поставщиков.",
+            "message": "Нужно выбрать доступных поставщиков.",
         }) from None
+    execution_runner = _public_selection_runner(runtime, selection.provider_keys)
+    if service.provider_runner is not execution_runner:
+        # TSTN remains private in the ordinary runtime. Add only its validated
+        # adapter to this explicitly admitted request-local execution copy.
+        from copy import copy
+        service = copy(service)
+        service.provider_runner = execution_runner
 
     repository = tender_repository
     run_store = tender_sourcing_runs
@@ -3079,6 +3285,17 @@ def _submit_manual_tender_multi_provider(
         # dedupe fingerprint. It is not part of any public or durable model.
         dedupe_payload["provider_config_revisions"] = {
             "vseinstrumenti": vi_config_revision,
+        }
+    if "tstn" in selection.provider_keys:
+        tstn_revision = _tstn_private_dedupe_revision(runtime)
+        if tstn_revision is None:
+            raise HTTPException(400, detail={
+                "code": "MULTI_PROVIDER_UNAVAILABLE",
+                "message": "Локальный каталог ТЕХНОНИКОЛЬ не готов к безопасному поиску.",
+            })
+        dedupe_payload["provider_config_revisions"] = {
+            **dedupe_payload.get("provider_config_revisions", {}),
+            "tstn": tstn_revision,
         }
     dedupe_key = stable_fingerprint(dedupe_payload)
 
@@ -3400,6 +3617,35 @@ def _price_export_confirmation_error(code: str, message: str, summary: dict[str,
     return HTTPException(409, detail={"code": code, "message": message, "summary": summary})
 
 
+def _resolve_manual_tender_export_run(
+    workspace_path,
+    workspace: dict[str, Any],
+    tender_id: str,
+    run_id: str,
+    *,
+    include_historical_prices: bool,
+):
+    internal = tender_sourcing_runs.get_internal_mixed(workspace_path, tender_id, run_id)
+    if isinstance(internal, dict):
+        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
+        snapshot = tender_history_decisions.get_snapshot(workspace_path, workspace, run, tender_id, run_id)
+        decisions = tender_price_resolver.resolve_run(
+            workspace, run, tender_id=tender_id, run_id=run_id,
+            include_historical_prices=include_historical_prices,
+            human_history_decisions=snapshot["effective"],
+        )
+        return run, snapshot, decisions
+
+    # V2 is immutable provider evidence without history decisions. It is mapped
+    # through the same price/unit/provenance resolver as the established export.
+    run = tender_sourcing_runs.get_public_mixed(workspace_path, tender_id, run_id)
+    snapshot = {"effective": {}, "decision_revision": 0, "decision_digest": ""}
+    decisions = tender_price_resolver.resolve_multi_provider_run(
+        workspace, internal, tender_id=tender_id, run_id=run_id,
+    )
+    return run, snapshot, decisions
+
+
 def _submit_manual_tender_price_export(
     tender_id: str,
     run_id: str,
@@ -3410,16 +3656,10 @@ def _submit_manual_tender_price_export(
     owner_id = _tender_owner_key(user)
     try:
         workspace_path, workspace, lease = tender_repository.acquire_sourcing_workspace(tender_id, owner_id)
-        run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
-        decision_snapshot = tender_history_decisions.get_snapshot(
-            workspace_path, workspace, run, tender_id, run_id,
-        )
         # Resolve history once with consent to identify whether explicit consent
         # is needed, then resolve using only the submitted policy options.
-        with_history = tender_price_resolver.resolve_run(
-            workspace, run, tender_id=tender_id, run_id=run_id,
-            include_historical_prices=True,
-            human_history_decisions=decision_snapshot["effective"],
+        run, decision_snapshot, with_history = _resolve_manual_tender_export_run(
+            workspace_path, workspace, tender_id, run_id, include_historical_prices=True,
         )
         history_summary = summarize_decisions(with_history)
         if (
@@ -3432,11 +3672,10 @@ def _submit_manual_tender_price_export(
                 "В выбранном запуске есть исторические цены 1С. Выберите, включать их или продолжить без них.",
                 history_summary,
             )
-        decisions = tender_price_resolver.resolve_run(
-            workspace, run, tender_id=tender_id, run_id=run_id,
+        decisions = _resolve_manual_tender_export_run(
+            workspace_path, workspace, tender_id, run_id,
             include_historical_prices=request.include_historical_prices,
-            human_history_decisions=decision_snapshot["effective"],
-        )
+        )[2]
         summary = summarize_decisions(decisions)
         if summary["priced_count"] == 0:
             raise _price_export_confirmation_error(
@@ -3461,9 +3700,9 @@ def _submit_manual_tender_price_export(
                 workspace_path, tender_id, owner_id,
                 source_sha256=source_sha, revision=revision,
             )
-            current_run = tender_sourcing_runs.get_public(workspace_path, tender_id, run_id)
-            current_history_decisions = tender_history_decisions.get_snapshot(
-                workspace_path, current_workspace, current_run, tender_id, run_id,
+            current_run, current_history_decisions, current_decisions = _resolve_manual_tender_export_run(
+                workspace_path, current_workspace, tender_id, run_id,
+                include_historical_prices=request.include_historical_prices,
             )
             if (
                 current_history_decisions["decision_revision"] != decision_snapshot["decision_revision"]
@@ -3473,11 +3712,6 @@ def _submit_manual_tender_price_export(
                     "Подтверждения истории изменились после проверки экспорта. Повторите экспорт.",
                     409, "TENDER_HISTORY_DECISIONS_CHANGED",
                 )
-            current_decisions = tender_price_resolver.resolve_run(
-                current_workspace, current_run, tender_id=tender_id, run_id=run_id,
-                include_historical_prices=request.include_historical_prices,
-                human_history_decisions=current_history_decisions["effective"],
-            )
             current_summary = summarize_decisions(current_decisions)
             if current_summary["priced_count"] == 0 or (
                 current_summary["blank_count"] and not request.allow_partial
@@ -3852,6 +4086,22 @@ def sourcing_understand(request: SourcingRowRequest):
 def sourcing_search(request: SourcingRowRequest):
     lease = None
     try:
+        if getattr(request, "providers", None) is not None:
+            selection, service, runner = _admit_public_provider_selection(
+                request.providers,
+                legacy_provider=request.provider,
+                source_mode=request.source_mode,
+            )
+            understanding = service.understand_row_result(request.row)
+            result = service.search_intent_provider_selection(
+                understanding.resolved_intent,
+                selection=selection,
+                limit=max(1, min(request.limit, 20)),
+                execution_scope=ProviderExecutionScope(execution_scope_id=uuid4().hex),
+                provider_runner=runner,
+                understanding=understanding,
+            )
+            return _sourcing_payload(result)
         if request.source_mode != SourcingSourceMode.PROVIDER_ONLY:
             lease = one_c_history_activity.acquire_sourcing()
         result = sourcing_service.search_row_routed(
@@ -3894,6 +4144,7 @@ def _submit_sourcing_project_job(
     provider_key: str | None,
     limit: int,
     source_mode: SourcingSourceMode = SourcingSourceMode.PROVIDER_ONLY,
+    provider_keys: tuple[str, ...] | None = None,
     document_id: str | None = None,
     owner_id: str = "__internal__",
 ):
@@ -3907,11 +4158,23 @@ def _submit_sourcing_project_job(
             if sourcing_service is not runtime.service
             else runtime.service
         )
-    provider = (
-        service.provider(provider_key)
-        if source_mode == SourcingSourceMode.PROVIDER_ONLY
-        else None
-    )
+    selection = None
+    execution_runner = None
+    if provider_keys is not None:
+        selection, service, execution_runner = _admit_public_provider_selection(
+            list(provider_keys),
+            legacy_provider=provider_key,
+            source_mode=source_mode,
+            runtime=runtime,
+            service=service,
+        )
+        provider = None
+    else:
+        provider = (
+            service.provider(provider_key)
+            if source_mode == SourcingSourceMode.PROVIDER_ONLY
+            else None
+        )
     history = None
     run_id = None
     created_at = datetime.now(timezone.utc).isoformat()
@@ -3950,6 +4213,8 @@ def _submit_sourcing_project_job(
                     progress=tracked_progress,
                     telemetry=telemetry.append,
                     ai_rerank=False,
+                    provider_selection=selection,
+                    provider_runner=execution_runner,
                 )
                 catalog_version = result.catalog_version or "unknown"
             else:
@@ -4013,9 +4278,26 @@ def _submit_sourcing_project_job(
             "document_revision": document_revision,
             "source_mode": source_mode.value,
             "provider": provider_key,
+            "provider_keys": selection.provider_keys if selection is not None else None,
             "limit": max(1, min(limit, 100)),
             "rows": rows,
         })
+        if selection is not None and "vseinstrumenti" in selection.provider_keys:
+            revision = _manual_tender_vi_config_revision(runtime)
+            if revision is None:
+                raise HTTPException(400, detail={
+                    "code": "MULTI_PROVIDER_UNAVAILABLE",
+                    "message": "Один или несколько выбранных поставщиков недоступны.",
+                })
+            dedupe_key = stable_fingerprint({"base": dedupe_key, "vi_config_revision": revision})
+        if selection is not None and "tstn" in selection.provider_keys:
+            revision = _tstn_private_dedupe_revision(runtime)
+            if revision is None:
+                raise HTTPException(400, detail={
+                    "code": "MULTI_PROVIDER_UNAVAILABLE",
+                    "message": "Локальный каталог ТЕХНОНИКОЛЬ не готов к безопасному поиску.",
+                })
+            dedupe_key = stable_fingerprint({"base": dedupe_key, "tstn_config_revision": revision})
         releases = [history_lease.release] if history_lease is not None else []
         if document_id is not None:
             job = _submit_document_job(
@@ -4079,6 +4361,7 @@ def sourcing_search_all(
         provider_key=provider_key,
         limit=limit,
         source_mode=request.source_mode,
+        provider_keys=tuple(request.providers) if request.providers is not None else None,
         owner_id=_job_owner_id(user),
     )
 
@@ -4224,6 +4507,7 @@ def document_sourcing_search_all(
         provider_key=request.provider,
         limit=max(1, min(request.limit, 100)),
         source_mode=request.source_mode,
+        provider_keys=tuple(request.providers) if request.providers is not None else None,
         document_id=document_id,
         owner_id=_job_owner_id(user),
     )

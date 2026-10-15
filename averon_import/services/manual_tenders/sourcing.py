@@ -442,6 +442,11 @@ class TenderSourcingRunStore:
             except (TypeError, ValueError):
                 raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT") from None
 
+    def get_internal_mixed(self, workspace_path: Path, tender_id: str, run_id: str):
+        """Read the validated internal V1/V2 representation for trusted server policies."""
+        with self._lock, self.repository._lock:
+            return self._read_any_path(self._path(workspace_path, run_id), tender_id=tender_id)
+
 
 def _safe_match(match: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(match, dict):

@@ -17,6 +17,11 @@ function createSourcingState(overrides = {}) {
     fuzzyConfirmation: null,
     manualHistorySearch: null,
     manualHistoryConfirmation: null,
+    pendingSourcing: null,
+    providerSelectionEnabled: false,
+    providerSelectionProviders: new Set(),
+    providerSelectionCapabilities: null,
+    providerSelectionCapabilitiesPromise: null,
     ...overrides,
   };
 }
@@ -1142,6 +1147,31 @@ async function loadSourcingHistoryStatus() {
   }
 }
 
+async function loadTstnReadinessStatus() {
+  const node = $("#settings-tstn-readiness");
+  if (!node || state.authState !== "authenticated" || state.currentUser?.capabilities?.settings !== true) return;
+  node.textContent = "Проверяем локальную конфигурацию и каталог…";
+  node.className = "mode-status";
+  try {
+    const readiness = await api("/api/sourcing/providers/tstn/readiness");
+    const config = readiness.configuration_enabled ? "конфигурация включена" : "конфигурация выключена";
+    const credentials = readiness.credentials_configured ? "учётные данные настроены" : "учётные данные не настроены";
+    const catalog = readiness.catalog_present
+      ? `${readiness.catalog_state || "состояние неизвестно"} · товаров ${Number(readiness.item_count || 0)}`
+      : "каталог отсутствует";
+    const index = readiness.search_index_ready ? "индекс готов" : "индекс не готов";
+    const synced = readiness.last_synced_at ? ` · синхронизация ${formatRecentTimestamp(readiness.last_synced_at)}` : "";
+    const live = readiness.live_gate_enabled
+      ? (readiness.live_verified ? "live-проверка выполнена" : "live-проверка не выполнена")
+      : "live-поиск закрыт серверным разрешением";
+    node.textContent = `${config} · ${credentials} · ${catalog} · ${index}${synced} · ${live}. Значения секретов не читаются.`;
+    node.className = readiness.catalog_present && readiness.search_index_ready ? "mode-status ok" : "mode-status warning";
+  } catch (error) {
+    node.textContent = `Не удалось прочитать локальный статус ТСТН: ${error.message || "повторите попытку"}`;
+    node.className = "mode-status warning";
+  }
+}
+
 function resetExcelMultiProviderChoice() {
   const tender = state.excelTender;
   if (!tender) return;
@@ -1185,17 +1215,98 @@ function renderExcelMultiProviderPanel() {
   options.replaceChildren();
   const capabilities = state.excelTender.multiProviderCapabilities;
   if (!enabled || !capabilities) return;
-  const available = Array.isArray(capabilities.providers) ? capabilities.providers : [];
-  const allowed = available.filter((item) => ["etm_ipro", "lemana_b2b", "vseinstrumenti"].includes(item?.key));
-  const minProviders = Number(capabilities.min_providers || 2);
-  if (capabilities.enabled !== true || allowed.length < minProviders) {
+  const available = Array.isArray(capabilities.options) ? capabilities.options : (capabilities.providers || []);
+  const allowed = available.filter((item) => ["etm_ipro", "vseinstrumenti", "tstn"].includes(item?.key));
+  const minProviders = Number(capabilities.min_providers || 1);
+  if (allowed.length < minProviders) {
     if (admission) {
       admission.hidden = false;
-      admission.textContent = "Сравнение нескольких поставщиков сейчас недоступно.";
+      admission.textContent = "Поставщики пока не готовы к поиску.";
     }
+  }
+  options.innerHTML = allowed.map((provider) => `<label class="multi-provider-option"><input type="checkbox" data-multi-provider-key="${escapeHtml(provider.key)}" ${state.excelTender.multiProviderProviders.has(provider.key) ? "checked" : ""} ${state.excelTender.sourcingActive || provider.available === false ? "disabled" : ""}><span><b>${escapeHtml(provider.label)}</b><small>${escapeHtml(provider.available === false ? (provider.reason || "Не готов к поиску") : provider.description || "" )}</small></span></label>`).join("");
+}
+
+function renderSharedProviderSelectionPanel() {
+  const panel = $("#shared-provider-selection");
+  const start = $("#shared-sourcing-start");
+  if (!panel || !start) return;
+  const sourcing = state.sourcing;
+  const sharedBeforeRun = sourcing?.modalContext === "shared" && ["before_run", "failed"].includes(sourcing.modalPhase);
+  const visible = sharedBeforeRun && sourcing.sourceMode === "provider_only";
+  panel.hidden = !visible;
+  start.hidden = !sharedBeforeRun;
+  start.disabled = !start.hidden && sourcing.providerSelectionEnabled
+    && sourcing.providerSelectionProviders.size === 0;
+  start.textContent = sourcing?.modalPhase === "failed" ? "Повторить подбор" : "Запустить подбор";
+  const toggle = $("#shared-provider-selection-toggle");
+  const options = $("#shared-provider-selection-options");
+  const status = $("#shared-provider-selection-status");
+  if (!visible || !toggle || !options) return;
+  toggle.textContent = sourcing.providerSelectionEnabled ? "Поставщики выбраны" : "Выбрать поставщиков";
+  toggle.disabled = sourcing.providerSelectionEnabled;
+  options.hidden = !sourcing.providerSelectionEnabled;
+  options.replaceChildren();
+  const capabilities = sourcing.providerSelectionCapabilities;
+  if (!sourcing.providerSelectionEnabled || !capabilities) return;
+  const entries = (capabilities.options || capabilities.providers || [])
+    .filter((item) => ["etm_ipro", "vseinstrumenti", "tstn"].includes(item?.key));
+  options.innerHTML = entries.map((provider) => `<label class="multi-provider-option"><input type="checkbox" data-shared-provider-key="${escapeHtml(provider.key)}" ${sourcing.providerSelectionProviders.has(provider.key) ? "checked" : ""} ${provider.available === false ? "disabled" : ""}><span><b>${escapeHtml(provider.label)}</b><small>${escapeHtml(provider.available === false ? (provider.reason || "Не готов к поиску") : provider.description || "" )}</small></span></label>`).join("");
+  if (status) {
+    status.hidden = false;
+    status.textContent = sourcing.providerSelectionProviders.size
+      ? `Выбрано поставщиков: ${sourcing.providerSelectionProviders.size}. Поиск начнётся после нажатия «Запустить подбор».`
+      : "Выберите от одного до трёх доступных поставщиков.";
+  }
+  start.disabled = sourcing.providerSelectionProviders.size === 0;
+}
+
+async function handleSharedProviderSelectionToggle() {
+  const sourcing = state.sourcing;
+  if (!sourcing || sourcing.sourceMode !== "provider_only" || sourcing.modalPhase !== "before_run") return;
+  if (sourcing.providerSelectionCapabilities) {
+    sourcing.providerSelectionEnabled = true;
+    renderSharedProviderSelectionPanel();
     return;
   }
-  options.innerHTML = allowed.map((provider) => `<label class="multi-provider-option"><input type="checkbox" data-multi-provider-key="${escapeHtml(provider.key)}" ${state.excelTender.multiProviderProviders.has(provider.key) ? "checked" : ""} ${state.excelTender.sourcingActive ? "disabled" : ""}>${escapeHtml(provider.label)}</label>`).join("");
+  const status = $("#shared-provider-selection-status");
+  if (status) { status.hidden = false; status.textContent = "Проверяем локальную готовность…"; }
+  try {
+    const capabilities = await api("/api/sourcing/provider-selection-capabilities");
+    if (state.sourcing !== sourcing || sourcing.modalPhase !== "before_run") return;
+    sourcing.providerSelectionCapabilities = capabilities;
+    sourcing.providerSelectionEnabled = true;
+    renderSharedProviderSelectionPanel();
+  } catch (error) {
+    if (state.sourcing !== sourcing) return;
+    if (status) { status.hidden = false; status.textContent = error.message || "Не удалось проверить локальную готовность."; }
+  }
+}
+
+async function startSharedSourcing() {
+  const sourcing = state.sourcing;
+  const pending = sourcing?.pendingSourcing;
+  if (!pending || sourcing.modalContext !== "shared" || !["before_run", "failed"].includes(sourcing.modalPhase)) return;
+  const providers = sourcing.providerSelectionEnabled
+    ? [...sourcing.providerSelectionProviders]
+    : null;
+  if (sourcing.sourceMode === "provider_only" && sourcing.providerSelectionEnabled && !providers?.length) {
+    renderSharedProviderSelectionPanel();
+    return;
+  }
+  if (pending.kind === "row") {
+    await executeSourcingForRow(pending.row, providers);
+  } else if (pending.kind === "project") {
+    await executeProjectSourcing(pending.rows, pending.documentId, pending.submitButton, providers);
+  }
+}
+
+function handleSharedProviderSelection(event) {
+  const key = String(event?.target?.dataset?.sharedProviderKey || "");
+  if (!["etm_ipro", "vseinstrumenti", "tstn"].includes(key)) return;
+  if (event.target.checked) state.sourcing.providerSelectionProviders.add(key);
+  else state.sourcing.providerSelectionProviders.delete(key);
+  renderSharedProviderSelectionPanel();
 }
 
 async function loadExcelMultiProviderCapabilities(tenderId) {
@@ -1242,9 +1353,9 @@ async function handleExcelMultiProviderToggle(event) {
   try {
     const capabilities = await loadExcelMultiProviderCapabilities(tenderId);
     if (state.excelTender.workspace?.tender_id !== tenderId || !state.excelTender.multiProviderEnabled) return;
-    if (!capabilities || capabilities.enabled !== true || !Array.isArray(capabilities.providers)
-        || capabilities.providers.length < Number(capabilities.min_providers || 2)) {
-      if (admission) { admission.hidden = false; admission.textContent = "Сравнение нескольких поставщиков сейчас недоступно."; }
+    if (!capabilities || !Array.isArray(capabilities.options || capabilities.providers)
+        || !(capabilities.options || capabilities.providers).some((item) => item.available !== false)) {
+      if (admission) { admission.hidden = false; admission.textContent = "Поставщики пока не готовы к поиску."; }
     } else if (admission) admission.hidden = true;
     renderExcelMultiProviderPanel();
   } catch (error) {
@@ -1255,7 +1366,7 @@ async function handleExcelMultiProviderToggle(event) {
 
 function handleExcelMultiProviderSelection(event) {
   const key = String(event?.target?.dataset?.multiProviderKey || "");
-  if (!["etm_ipro", "lemana_b2b", "vseinstrumenti"].includes(key)) return;
+  if (!["etm_ipro", "vseinstrumenti", "tstn"].includes(key)) return;
   if (event.target.checked) state.excelTender.multiProviderProviders.add(key);
   else state.excelTender.multiProviderProviders.delete(key);
   const admission = $("#multi-provider-admission");
@@ -1265,6 +1376,7 @@ function handleExcelMultiProviderSelection(event) {
 function openSourcingModal() {
   renderSourcingHistoryControls();
   if (state.excelTender && typeof renderExcelMultiProviderPanel === "function") renderExcelMultiProviderPanel();
+  renderSharedProviderSelectionPanel();
   $("#sourcing-modal").showModal();
   if (!state.sourcing.historyStatusLoaded) void loadSourcingHistoryStatus();
 }
@@ -1280,6 +1392,12 @@ function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || 
     state.sourcing.manualHistoryConfirmation = null;
   }
   const submit = $("#tender-sourcing-submit");
+  const sharedStart = $("#shared-sourcing-start");
+  if (sharedStart) {
+    sharedStart.hidden = context !== "shared" || !["before_run", "failed"].includes(phase);
+    sharedStart.disabled = false;
+    sharedStart.textContent = phase === "failed" ? "Повторить подбор" : "Запустить подбор";
+  }
   if (!submit) return;
   const canLaunch = context === "excel_tender" && ["before_run", "failed"].includes(phase);
   submit.hidden = !canLaunch;
@@ -1292,6 +1410,7 @@ function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || 
     submit.disabled = true;
     submit.textContent = phase === "queued" ? "В очереди…" : "Подбираем…";
   }
+  renderSharedProviderSelectionPanel();
 }
 
 function sourcingModeLoadingCopy(mode) {
@@ -1323,12 +1442,17 @@ function handleSourcingModeChange(event) {
   }
   state.sourcing.sourceMode = nextMode;
   if (nextMode !== "provider_only" && state.excelTender) resetExcelMultiProviderChoice();
+  if (nextMode !== "provider_only") {
+    state.sourcing.providerSelectionEnabled = false;
+    state.sourcing.providerSelectionProviders = new Set();
+  }
   state.sourcing.sourceModeTouched = true;
   state.sourcing.modeChangedAfterResult = Boolean(
     state.sourcing.result && sourcingResultMode(state.sourcing.result) !== nextMode,
   );
   renderSourcingHistoryControls();
   if (state.excelTender && typeof renderExcelMultiProviderPanel === "function") renderExcelMultiProviderPanel();
+  renderSharedProviderSelectionPanel();
 }
 
 async function loadOneCHistoryStatus() {
@@ -2274,7 +2398,7 @@ function applyTenderHistoryDecisionSnapshot(result, snapshot) {
 function renderMultiProviderPublicRun(run) {
   if ($("#sourcing-modal")?.open) setSourcingModalPhase("project_result", "excel_tender");
   const content = $("#sourcing-content");
-  const providerLabels = {etm_ipro:"ЭТМ iPRO", lemana_b2b:"Лемана ПРО", vseinstrumenti:"ВсеИнструменты.ru"};
+  const providerLabels = {etm_ipro:"ЭТМ iPRO", lemana_b2b:"Лемана ПРО", vseinstrumenti:"ВсеИнструменты.ru", tstn:"ТЕХНОНИКОЛЬ"};
   const outcomeLabels = {
     success:"Поиск завершён", empty:"Предложения не найдены", partial_success:"Поиск завершён частично",
     failure:"Ошибка поставщика", suppressed:"Запрос не выполнен", not_attempted:"Запрос не выполнялся",
@@ -2293,9 +2417,9 @@ function renderMultiProviderPublicRun(run) {
   const detailOffer = (offer, match, evidence, selected) => {
     const price = offer.price === null ? "Цена не указана" : `${escapeHtml(offer.price)} ${escapeHtml(offer.currency || "")} / ${escapeHtml(offer.price_unit || "ед.")}`;
     const identity = [offer.article && `Артикул: ${offer.article}`, offer.manufacturer && `Производитель: ${offer.manufacturer}`, offer.brand && `Бренд: ${offer.brand}`].filter(Boolean).map(escapeHtml).join(" · ");
-    const commercialNote = offer.provider_key === "lemana_b2b" && evidence?.state !== "COMPLETE"
-      ? '<p class="multi-provider-commercial-note">Коммерческая проверка нужна: основание цены или НДС не подтверждены.</p>'
-      : evidence ? `<p>Коммерческие сведения: ${escapeHtml(stateLabels[evidence.state] || "требуют проверки")}; НДС: ${escapeHtml(evidence.vat_basis || "не подтверждён")}.</p>` : "";
+    const commercialNote = evidence?.state !== "COMPLETE"
+      ? '<p class="multi-provider-commercial-note">Предварительная цена: НДС и единица цены не подтверждены.</p>'
+      : evidence ? `<p>Коммерческие сведения: ${escapeHtml(stateLabels[evidence.state] || "требуют проверки")}; НДС: ${escapeHtml(evidence.vat_basis || "не подтверждён")}.</p>` : "<p>Коммерческие условия требуют проверки.</p>";
     return `<article class="multi-provider-offer ${selected ? "is-selected" : ""}"><h4>${escapeHtml(providerLabels[offer.provider_key] || "Поставщик")}: ${escapeHtml(offer.title)}</h4><p class="multi-provider-price">${price}</p>${identity ? `<p>${identity}</p>` : ""}<p>${match ? `Сопоставление: ${escapeHtml(decisionLabels[match.decision] || "Нужна проверка")}.` : ""}${offer.availability_text ? ` ${escapeHtml(offer.availability_text)}` : ""}${offer.availability === true ? " · В наличии" : offer.availability === false ? " · Нет в наличии" : ""}</p>${commercialNote}${offer.url ? `<a href="${escapeHtml(offer.url)}" target="_blank" rel="noopener noreferrer">Открыть предложение</a>` : ""}</article>`;
   };
   const rows = (run.rows || []).map((row) => {
@@ -2435,14 +2559,16 @@ function renderExcelTenderExportControls() {
   const button = $("#tender-export-button");
   const download = $("#tender-export-download");
   if (!runSelect || !artifactSelect || !button || !download) return;
-  const completed = (state.excelTender.latestRuns || []).filter((run) => run.status === "completed" && run.run_kind !== "multi_provider" && run.schema_version !== 2 && /^[a-f0-9]{32}$/.test(run.run_id || ""));
+  const completed = (state.excelTender.latestRuns || []).filter((run) => run.status === "completed" && /^[a-f0-9]{32}$/.test(run.run_id || ""));
   const modes = {one_c_only:"История 1С", one_c_then_provider:"История 1С → поставщик", provider_only:"Поставщик"};
   const selectedRun = completed.some((run) => run.run_id === state.excelTender.selectedExportRunId)
     ? state.excelTender.selectedExportRunId : completed[0]?.run_id || "";
   state.excelTender.selectedExportRunId = selectedRun || null;
   runSelect.innerHTML = completed.map((run) => {
     const when = run.completed_at ? new Date(run.completed_at).toLocaleString("ru-RU") : "";
-    return `<option value="${escapeHtml(run.run_id)}">${escapeHtml(modes[run.source_mode] || "Подбор")} · ${escapeHtml(when)} · запуск ${escapeHtml(String(run.run_id).slice(0,8))}</option>`;
+    const multiProvider = run.run_kind === "multi_provider" || run.schema_version === 2;
+    const label = multiProvider ? `Поставщики: ${(run.providers || []).map((key) => sourcingProviderLabel({provider:key})).join(", ")}` : modes[run.source_mode] || "Подбор";
+    return `<option value="${escapeHtml(run.run_id)}">${escapeHtml(label)} · ${escapeHtml(when)} · запуск ${escapeHtml(String(run.run_id).slice(0,8))}</option>`;
   }).join("");
   runSelect.value = selectedRun;
   runSelect.disabled = !completed.length || state.excelTender.exportActive || state.excelTender.sourcingActive;
@@ -2761,11 +2887,11 @@ async function startExcelTenderSourcing() {
   }
   const providers = [...state.excelTender.multiProviderProviders].sort();
   const capabilities = state.excelTender.multiProviderCapabilities;
-  const minProviders = Number(capabilities?.min_providers || 2);
+  const minProviders = Number(capabilities?.min_providers || 1);
   const maxProviders = Number(capabilities?.max_providers || 3);
   if (multiProvider && (providers.length < minProviders || providers.length > maxProviders || !capabilities?.enabled)) {
     const admission = $("#multi-provider-admission");
-    if (admission) { admission.hidden = false; admission.textContent = "Проверьте доступность и выберите не менее двух поставщиков."; }
+    if (admission) { admission.hidden = false; admission.textContent = "Проверьте доступность и выберите от одного до трёх поставщиков."; }
     return;
   }
   const tenderId = workspace.tender_id;
@@ -4377,6 +4503,9 @@ function sourcingProviderLabel(offer) {
     demo_store_http: "Averon Demo Store",
     local_catalog: "Локальный каталог",
     etm_ipro: "ЭТМ iPRO",
+    vseinstrumenti: "ВсеИнструменты.ru",
+    tstn: "ТЕХНОНИКОЛЬ",
+    lemana_b2b: "Лемана ПРО",
   }[source] || "Поставщик";
 }
 
@@ -4577,7 +4706,9 @@ function renderProductUnderstanding(understanding) {
 
 function projectRecommendedMatch(item) {
   const offer = item.recommended_offer;
-  return offer ? (item.match_results || []).find((match) => match.offer?.offer_id === offer.offer_id) || null : null;
+  return offer ? (item.match_results || []).find((match) =>
+    match.offer?.offer_id === offer.offer_id && match.offer?.provider === offer.provider
+  ) || null : null;
 }
 
 function projectMatch(item) {
@@ -4596,6 +4727,48 @@ function projectDecision(item) {
   const match = projectMatch(item);
   if (match?.decision) return match.decision;
   return item.offers?.length ? "REVIEW" : "WITHOUT_OFFERS";
+}
+
+function providerOutcomeStateLabel(state) {
+  return ({
+    success:"поиск завершён",
+    empty:"предложения не найдены",
+    partial_success:"частичный результат",
+    failure:"ошибка поставщика",
+    suppressed:"запрос заблокирован",
+    not_attempted:"запрос не выполнялся",
+  })[state] || "статус неизвестен";
+}
+
+function commercialEvidenceNote(offer, evidence) {
+  if (!evidence) return "Коммерческие условия требуют проверки.";
+  if (evidence.state !== "COMPLETE") return "Предварительная цена: НДС и единица цены не подтверждены.";
+  const vat = ({gross_including_vat:"цена с НДС", net_excluding_vat:"цена без НДС", not_applicable:"НДС не применяется"})[evidence.vat_basis] || "основание НДС требует проверки";
+  return `Коммерческие сведения проверены: ${vat}.`;
+}
+
+function renderOutcomeNativeSummary(result) {
+  const outcomes = Array.isArray(result.provider_outcomes) ? result.provider_outcomes : [];
+  const labels = outcomes.map((outcome) => `<li><b>${escapeHtml(sourcingProviderLabel({provider:outcome.provider_key}))}</b>: ${escapeHtml(providerOutcomeStateLabel(outcome.state))}${outcome.offers_returned_count ? ` · предложений: ${Number(outcome.offers_returned_count)}` : ""}</li>`).join("");
+  const evidence = new Map((result.commercial_evidence || []).map((item) => [JSON.stringify([item.provider_key, item.offer_id]), item]));
+  const matches = new Map((result.match_results || []).map((item) => [JSON.stringify([item.offer?.provider, item.offer?.offer_id]), item]));
+  const offers = [];
+  const seen = new Set();
+  for (const offer of result.offers || []) {
+    const ref = JSON.stringify([offer?.provider, offer?.offer_id]);
+    if (!offer?.offer_id || seen.has(ref)) continue;
+    seen.add(ref);
+    const match = matches.get(ref);
+    if (!match || match.decision === "REJECT") continue;
+    offers.push({offer, match, evidence:evidence.get(ref)});
+  }
+  const safeWinnerRef = result.recommended_offer
+    ? JSON.stringify([result.recommended_offer.provider, result.recommended_offer.offer_id])
+    : "";
+  const selected = offers.find((item) => JSON.stringify([item.offer.provider, item.offer.offer_id]) === safeWinnerRef);
+  const candidates = offers.filter((item) => !selected || item !== selected).slice(0, 8);
+  const offerCard = ({offer, match, evidence:proof}, recommended) => `<div class="outcome-native-candidate">${renderOfferCard({...match, offer}, !recommended, result.intent)}<p class="multi-provider-commercial-note">${escapeHtml(commercialEvidenceNote(offer, proof))}</p></div>`;
+  return `<section class="outcome-native-summary"><h3>Результаты по поставщикам</h3><ul class="multi-provider-outcomes">${labels || "<li>Статус поставщика не получен.</li>"}</ul>${selected ? `<h3>Безопасно выбранное предложение</h3>${offerCard(selected, true)}` : ""}${candidates.length ? `<h3>${selected ? "Другие варианты" : "Предложения для проверки"}</h3><div class="offer-grid">${candidates.map((item) => offerCard(item, false)).join("")}</div>` : ""}${!selected && !candidates.length ? `<p class="sourcing-warning">Подтверждённого коммерческого предложения нет.</p>` : ""}</section>`;
 }
 
 function projectReason(item) {
@@ -4696,12 +4869,14 @@ function projectReviewCandidates(item) {
     }
   }
   const candidates = [];
-  const seenOfferIds = new Set();
+  const seenOfferReferences = new Set();
   const add = (candidate) => {
     if (!candidate || candidate.decision === "REJECT" || !candidate.offer) return;
     const offerId = String(candidate.offer.offer_id || "").trim();
-    if (offerId && seenOfferIds.has(offerId)) return;
-    if (offerId) seenOfferIds.add(offerId);
+    const provider = String(candidate.offer.provider || "").trim();
+    const identity = JSON.stringify([provider, offerId]);
+    if (offerId && seenOfferReferences.has(identity)) return;
+    if (offerId) seenOfferReferences.add(identity);
     candidates.push(candidate);
   };
   add(item.review_candidate);
@@ -4785,19 +4960,33 @@ function renderProjectPriceCell(offer, historical) {
 
 function renderProjectResultRow(view, itemIndex) {
   const {item, offer, decision, total, reason, route, historical} = view;
+  const providerOutcomes = Array.isArray(item.provider_outcomes) ? item.provider_outcomes : [];
+  const providerSummary = providerOutcomes.map((outcome) => {
+    const label = sourcingProviderLabel({provider:outcome.provider_key});
+    const stateLabel = ({success:"поиск завершён", empty:"без предложений", partial_success:"частичный результат", failure:"ошибка", suppressed:"не запущен", not_attempted:"не запущен"})[outcome.state] || "статус неизвестен";
+    return `${label}: ${stateLabel}`;
+  }).join(" · ");
   const alternative = item.review_candidate
     && item.recommended_offer
-    && item.recommended_offer.offer_id !== offer?.offer_id
+    && (item.recommended_offer.offer_id !== offer?.offer_id || item.recommended_offer.provider !== offer?.provider)
     ? `<small class="project-result-secondary">Альтернатива: ${offerTitleHtml(item.recommended_offer)}</small>`
+    : "";
+  const selectedEvidence = offer ? (item.commercial_evidence || []).find((proof) =>
+    proof.provider_key === offer.provider && proof.offer_id === offer.offer_id
+  ) : null;
+  const commercialNote = selectedEvidence
+    ? `<small class="project-result-secondary">${escapeHtml(commercialEvidenceNote(offer, selectedEvidence))}</small>`
     : "";
   const inspectCandidates = projectHasReviewCandidates(item)
     ? `<button type="button" class="button text project-review-candidates" data-project-source-row-id="${escapeHtml(item.intent?.source_row_id || "")}">Посмотреть варианты</button>`
     : "";
   const historicalReview = route?.final_source_kind === "history_review";
-  const offerCell = !offer ? "Нет подтверждённого предложения"
+  const offerCell = !offer ? (item.offers?.length ? "Предложения требуют проверки" : "Нет предложения")
     : historicalReview ? `Вариант истории 1С для проверки: ${offerTitleHtml(offer)}`
     : offerTitleHtml(offer);
-  const sourceCell = route?.final_source_kind === "historical_purchase" || historicalReview
+  const sourceCell = providerSummary
+    ? `<span>${escapeHtml(providerSummary)}</span>`
+    : route?.final_source_kind === "historical_purchase" || historicalReview
     ? `<span>История 1С${historicalReview ? " · требуется проверка" : ""}</span><small class="project-result-secondary">Дата закупки: ${escapeHtml(historicalOfferDate(offer, route))}</small><small class="project-result-secondary">Поставщик в истории: ${escapeHtml(historicalOfferCounterparty(offer))}</small><small class="project-result-secondary">Склад: ${escapeHtml(historicalOfferWarehouse(offer))}</small>`
     : offer ? `<span>${escapeHtml(sourcingProviderLabel(offer))}</span>${route?.fallback_called ? `<small class="project-result-secondary">После проверки истории 1С</small>` : ""}`
     : "—";
@@ -4807,7 +4996,7 @@ function renderProjectResultRow(view, itemIndex) {
   return `<div class="project-result-row" role="row">
     <span class="project-result-position">${escapeHtml(item.intent.normalized_name || item.intent.source_text)}</span>
     <span class="project-result-quantity">${escapeHtml(item.intent.quantity || "—")}</span>
-    <span class="project-result-offer">${offerCell}${alternative}${inspectCandidates}${renderSourcingRouteExplanation(route)}</span>
+    <span class="project-result-offer">${offerCell}${commercialNote}${alternative}${providerSummary && inspectCandidates ? `<small class="project-result-secondary">${item.offers.length} предложений · ${escapeHtml(providerSummary)}</small>` : ""}${inspectCandidates}${renderSourcingRouteExplanation(route)}</span>
     <span class="project-result-price">${priceCell}</span>
     <span class="project-result-total">${totalCell}</span>
     <span class="project-result-status">${renderSourcingDecision(decision, reason)}</span>
@@ -4857,6 +5046,7 @@ function renderProjectItemDetails(projectResult, item) {
   const title = route?.source_mode === "one_c_only" && route?.final_source_kind === "history_review"
     ? historyPresentation.title
     : "Варианты для проверки";
+  const evidenceByReference = new Map((item.commercial_evidence || []).map((proof) => [JSON.stringify([proof.provider_key, proof.offer_id]), proof]));
   content.innerHTML = `<button type="button" class="button text project-results-back">← К результатам подбора</button>
     <h3>Проверка позиции</h3>
     <p class="project-item-source">${escapeHtml(sourceLabel)}</p>
@@ -4865,9 +5055,13 @@ function renderProjectItemDetails(projectResult, item) {
     <h3>${escapeHtml(title)}</h3>
     ${route?.final_source_kind === "history_review" ? `<p class="history-review-explanation" role="status">${escapeHtml(historyPresentation.explanation)}</p>` : ""}
     ${excelTenderProject ? renderProjectReviewNavigation(projectResult, sourceRowId) : ""}
-    <div class="offer-grid">${candidates.map((candidate) => historical
-      ? `<div class="history-candidate-wrapper">${renderHistoricalOfferCard(candidate, {compact:true, route})}${renderHumanHistoryDecisionAction(item, candidate)}</div>`
-      : renderOfferCard(candidate, true, intent)).join("")}</div>
+    <div class="offer-grid">${candidates.map((candidate) => {
+      if (historical) return `<div class="history-candidate-wrapper">${renderHistoricalOfferCard(candidate, {compact:true, route})}${renderHumanHistoryDecisionAction(item, candidate)}</div>`;
+      const reference = JSON.stringify([candidate.offer?.provider, candidate.offer?.offer_id]);
+      const proof = evidenceByReference.get(reference);
+      const note = proof ? `<p class="multi-provider-commercial-note">${escapeHtml(commercialEvidenceNote(candidate.offer, proof))}</p>` : "";
+      return `<div class="outcome-native-candidate">${renderOfferCard(candidate, true, intent)}${note}</div>`;
+    }).join("")}</div>
     ${manualHistorySearchAllowed(item) ? renderManualHistorySearch(item) : ""}`;
   for (const button of $$("#sourcing-content .project-results-back")) {
     button.addEventListener("click", () => {
@@ -5389,6 +5583,13 @@ function renderSourcingResult(result, row = null) {
     bindProjectCandidateActions(result);
     return;
   }
+  if (Array.isArray(result.provider_outcomes) && result.provider_outcomes.length) {
+    const intent = result.intent || {};
+    const quantity = intent.quantity ? `${escapeHtml(intent.quantity)} ${escapeHtml(intent.unit || "")}` : "Количество требует проверки";
+    $("#sourcing-subtitle").textContent = "Поиск по выбранным поставщикам завершён";
+    content.innerHTML = `${renderSourcingNotices(result.notices)}${renderProductUnderstanding(result.understanding)}<div class="intent-summary"><div><small>Позиция</small><b>${escapeHtml(intent.normalized_name || intent.source_text || "Не определено")}</b></div><div><small>Количество</small><b>${quantity}</b></div></div>${renderOutcomeNativeSummary(result)}`;
+    return;
+  }
   const route = result.route || null;
   const intent = result.intent || {};
   const historyUsed = route?.final_source_kind === "historical_purchase";
@@ -5421,34 +5622,60 @@ function renderSourcingResult(result, row = null) {
 }
 
 async function openSourcingForRow(row) {
-  setSourcingModalPhase("running", "single_row");
   const sourcing = state.sourcing;
-  const generation = ++sourcing.requestGeneration;
-  const sourceMode = sourcing.sourceMode;
   sourcing.row = row;
+  sourcing.pendingSourcing = {kind:"row", row};
   sourcing.result = null;
   sourcing.modeChangedAfterResult = false;
   renderSourcingHistoryControls();
+  setSourcingModalPhase("before_run", "shared");
+  $("#sourcing-subtitle").textContent = "Выберите поставщиков и запустите подбор";
+  $("#sourcing-content").innerHTML = `<div class="intent-summary"><div><small>Позиция</small><b>${escapeHtml(row.name || row.source_text || row.article || "Без названия")}</b></div><div><small>Количество</small><b>${escapeHtml(String(row.quantity || "—"))} ${escapeHtml(row.unit || "")}</b></div></div><p class="hint">Поставщики не вызываются, пока вы не нажмёте «Запустить подбор».</p>`;
+  openSourcingModal();
+  renderSharedProviderSelectionPanel();
+}
+
+async function executeSourcingForRow(row, providers = null) {
+  const sourcing = state.sourcing;
+  setSourcingModalPhase("running", "shared");
+  const generation = ++sourcing.requestGeneration;
+  const sourceMode = sourcing.sourceMode;
   const loading = sourcingModeLoadingCopy(sourceMode);
   $("#sourcing-subtitle").textContent = loading.title;
   $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${escapeHtml(loading.title)}</b><small>${escapeHtml(loading.detail)}</small></div>`;
-  openSourcingModal();
   try {
-    const result = await api("/api/sourcing/search", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({row, limit:20, source_mode:sourceMode})});
+    const payload = {row, limit:20, source_mode:sourceMode};
+    if (providers?.length) payload.providers = providers;
+    const result = await api("/api/sourcing/search", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
+    sourcing.pendingSourcing = null;
     sourcing.result = result;
     $("#sourcing-subtitle").textContent = result.ai_mode === "qwen" ? "Интеллектуальный подбор завершён" : "Подбор по каталогу завершён";
     renderSourcingResult(result, row);
   } catch (error) {
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     $("#sourcing-subtitle").textContent = "Поиск не выполнен";
-    setSourcingModalPhase("failed", "single_row");
-    $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}<br><small>Можно продолжить с локальным каталогом после его наполнения.</small></div>`;
+    setSourcingModalPhase("failed", "shared");
+    $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}<br><small>Проверьте доступность выбранных источников и повторите запуск.</small></div>`;
   }
 }
 
 async function runProjectSourcing(rows, documentId = null, submitButton = null) {
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
+  const sourcing = state.sourcing;
+  sourcing.pendingSourcing = {kind:"project", rows, documentId, submitButton};
+  sourcing.result = null;
+  sourcing.modeChangedAfterResult = false;
+  sourcing.projectFilter = "all";
+  renderSourcingHistoryControls();
+  setSourcingModalPhase("before_run", "shared");
+  $("#sourcing-subtitle").textContent = "Выберите поставщиков и запустите подбор";
+  $("#sourcing-content").innerHTML = `<p class="hint">Поставщики не вызываются, пока вы не нажмёте «Запустить подбор».</p><p class="hint">Выбрано позиций: ${rows.length}.</p>`;
+  openSourcingModal();
+  renderSharedProviderSelectionPanel();
+}
+
+async function executeProjectSourcing(rows, documentId = null, submitButton = null, providers = null) {
   const previousButtonLabel = submitButton?.textContent;
   const previousButtonDisabled = submitButton?.disabled;
   if (submitButton) {
@@ -5456,20 +5683,18 @@ async function runProjectSourcing(rows, documentId = null, submitButton = null) 
     submitButton.textContent = "Запускаем подбор…";
   }
   const sourcing = state.sourcing;
-  setSourcingModalPhase("running", "project");
+  setSourcingModalPhase("running", "shared");
   const generation = ++sourcing.requestGeneration;
   const sourceMode = sourcing.sourceMode;
-  sourcing.projectFilter = "all";
-  sourcing.result = null;
-  sourcing.modeChangedAfterResult = false;
-  renderSourcingHistoryControls();
   const loading = sourcingModeLoadingCopy(sourceMode);
   $("#sourcing-subtitle").textContent = loading.title;
   $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${escapeHtml(loading.title)}</b><small>${escapeHtml(loading.detail)}</small></div>`;
   openSourcingModal();
   try {
     const url = documentId ? `/api/documents/${documentId}/sourcing/search-all` : "/api/sourcing/search-all";
-    const job = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({rows, limit:20, source_mode:sourceMode})});
+    const payload = {rows, limit:20, source_mode:sourceMode};
+    if (providers?.length) payload.providers = providers;
+    const job = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     await pollSourcingJob(
       job.id,
@@ -5480,10 +5705,11 @@ async function runProjectSourcing(rows, documentId = null, submitButton = null) 
         submitButton.textContent = status === "queued" ? "В очереди…" : "Подбираем…";
       },
     );
+    sourcing.pendingSourcing = null;
   } catch (error) {
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     $("#sourcing-subtitle").textContent = "Подбор не выполнен";
-    if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "project");
+    if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "shared");
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
   } finally {
     if (submitButton) {
@@ -6598,6 +6824,9 @@ function setupEvents() {
   $("#tender-sourcing-submit").addEventListener("click", () => { void startExcelTenderSourcing(); });
   $("#multi-provider-toggle").addEventListener("change", (event) => { void handleExcelMultiProviderToggle(event); });
   $("#multi-provider-options").addEventListener("change", handleExcelMultiProviderSelection);
+  $("#shared-provider-selection-toggle").addEventListener("click", () => { void handleSharedProviderSelectionToggle(); });
+  $("#shared-provider-selection-options").addEventListener("change", handleSharedProviderSelection);
+  $("#shared-sourcing-start").addEventListener("click", () => { void startSharedSourcing(); });
   $("#tender-export-run").addEventListener("change", (event) => {
     clearTenderExportFailure();
     state.excelTender.selectedExportRunId = event.target.value || null;
@@ -6686,8 +6915,9 @@ function setupEvents() {
     $(".settings-user-header").hidden = isAdmin;
     if (isAdmin) initializeSettings(state.settings || {});
     $("#settings-modal").showModal();
-    void Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()]);
+    void Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus(), ...(isAdmin ? [loadTstnReadinessStatus()] : [])]);
   });
+  $("#settings-tstn-refresh").addEventListener("click", () => { void loadTstnReadinessStatus(); });
   $("#one-c-history-refresh").addEventListener("click",() => { void Promise.all([loadOneCHistoryStatus(), loadSourcingHistoryStatus()]); });
   $("#one-c-history-preview").addEventListener("click",startOneCHistoryPreview);
   $("#one-c-history-analyze").addEventListener("click",analyzeOneCHistoryMapping);
@@ -6769,7 +6999,13 @@ function setupEvents() {
   $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
   $("#sourcing-source-mode").addEventListener("change",handleSourcingModeChange);
   $("#sourcing-history-refresh").addEventListener("click",() => { void loadSourcingHistoryStatus(); });
-  $("#sourcing-modal").addEventListener("close",() => setSourcingModalPhase("closed", "none"));
+  $("#sourcing-modal").addEventListener("close",() => {
+    state.sourcing.pendingSourcing = null;
+    state.sourcing.providerSelectionEnabled = false;
+    state.sourcing.providerSelectionProviders = new Set();
+    state.sourcing.providerSelectionCapabilities = null;
+    setSourcingModalPhase("closed", "none");
+  });
   $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());
   $("#zoom-in").addEventListener("click",()=>setZoom(Math.min(1.8,state.zoom+.1))); $("#zoom-out").addEventListener("click",()=>setZoom(Math.max(.5,state.zoom-.1)));

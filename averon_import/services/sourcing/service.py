@@ -5,6 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 import hashlib
 import json
+import uuid
 from typing import Any, Callable
 
 from averon_import.core.unit_normalization import normalize_sourcing_unit_family
@@ -35,6 +36,8 @@ from averon_import.services.sourcing.models import (
     SourcingResult,
     SourcingRouteMetadata,
     SourcingSourceMode,
+    SourcingProviderOutcome,
+    SourcingCommercialEvidence,
     dedupe_sourcing_notices,
 )
 from averon_import.services.sourcing.providers.one_c_history import (
@@ -198,6 +201,7 @@ class SourcingService:
         selection: ProviderSelection,
         limit: int,
         execution_scope: ProviderExecutionScope,
+        provider_runner: ProviderRunner | None = None,
     ) -> ProviderExecutionResult:
         """Retrieve offers through the explicitly selected outcome-native providers.
 
@@ -206,11 +210,12 @@ class SourcingService:
         their existing caller-owned flows.
         """
 
-        if self.provider_runner is None:
+        runner = provider_runner or self.provider_runner
+        if runner is None:
             raise ProviderRunnerConfigurationError(
                 "outcome-native provider runner is not configured",
             )
-        return self.provider_runner.run(
+        return runner.run(
             selection=selection,
             intent=intent,
             limit=limit,
@@ -241,6 +246,94 @@ class SourcingService:
         """Select locally within the strongest returned identity cohort."""
 
         return select_provider_commercial_winner(commercial_evaluation)
+
+    def search_intent_provider_selection(
+        self,
+        intent: ProductIntent,
+        *,
+        selection: ProviderSelection,
+        limit: int,
+        execution_scope: ProviderExecutionScope,
+        provider_runner: ProviderRunner | None = None,
+        understanding: ProductUnderstandingResult | None = None,
+    ) -> SourcingResult:
+        """Run the approved outcome-native chain for an explicit provider set."""
+        started = time.perf_counter()
+        execution = self.execute_provider_selection(
+            intent,
+            selection=selection,
+            limit=limit,
+            execution_scope=execution_scope,
+            provider_runner=provider_runner,
+        )
+        matching = self.evaluate_provider_execution(intent, execution)
+        commercial = self.evaluate_provider_commercial_evidence(matching)
+        winner = self.select_provider_commercial_winner(commercial)
+        offers_by_reference = {
+            (offer.provider, offer.offer_id): offer for offer in execution.offers
+        }
+        selected_reference = winner.selected_reference
+        recommended = (
+            offers_by_reference.get((selected_reference.provider_key, selected_reference.offer_id))
+            if selected_reference is not None else None
+        )
+        review_reference = matching.review_candidate_reference
+        review = next((
+            match for match in matching.matches
+            if review_reference is not None
+            and match.offer.provider == review_reference.provider_key
+            and match.offer.offer_id == review_reference.offer_id
+        ), None)
+        outcomes = [SourcingProviderOutcome(
+            provider_key=item.provider_key,
+            state=item.state.value,
+            offers_returned_count=len(item.offers),
+            retained_offer_count=len(item.offers),
+            failure_category=item.failure_category.value if item.failure_category else None,
+        ) for item in execution.outcomes]
+        evidence = [SourcingCommercialEvidence(
+            provider_key=item.offer_reference.provider_key,
+            offer_id=item.offer_reference.offer_id,
+            state=item.evidence_state.value,
+            issue_codes=[code.value for code in item.issue_codes],
+            vat_basis=item.vat_basis.value,
+        ) for item in commercial.evidence]
+        warnings = list(understanding.warnings) if understanding is not None else []
+        notices = list(understanding.notices) if understanding is not None else []
+        if winner.selected_reference is None and winner.candidate_references:
+            notices.append(SourcingNotice(
+                code="COMMERCIAL_SELECTION_REQUIRES_REVIEW",
+                message="Совпадение найдено, но цена или коммерческие условия требуют проверки.",
+            ))
+        return SourcingResult(
+            intent=intent,
+            understanding=understanding,
+            recommended_offer=recommended,
+            review_candidate=review,
+            offers=list(execution.offers),
+            match_results=list(matching.matches),
+            warnings=warnings,
+            notices=dedupe_sourcing_notices(notices),
+            timings={
+                "total_s": round(time.perf_counter() - started, 6),
+                "retrieval_s": sum(
+                    timing.milliseconds / 1000
+                    for outcome in execution.outcomes for timing in outcome.timings
+                    if timing.stage in {"search", "catalog", "commercial"}
+                ),
+                "ai_rank_s": 0.0,
+                "provider_request_count": float(execution.total_request_count),
+            },
+            ai_mode=understanding.mode if understanding is not None else "fallback",
+            route=SourcingRouteMetadata(
+                source_mode=SourcingSourceMode.PROVIDER_ONLY,
+                final_source_kind="provider",
+            ),
+            provider_outcomes=outcomes,
+            commercial_evidence=evidence,
+            commercial_selection_state=winner.state.value,
+            commercial_selection_reasons=[reason.value for reason in winner.reason_codes],
+        )
 
     def set_ai(self, ai: SourcingAIService) -> None:
         self.ai = ai
@@ -1157,7 +1250,20 @@ class SourcingService:
         telemetry: Callable[[dict[str, Any]], None] | None = None,
         catalog_version: str | None = None,
         ai_rerank: bool = False,
+        provider_selection: ProviderSelection | None = None,
+        provider_runner: ProviderRunner | None = None,
+        execution_scope: ProviderExecutionScope | None = None,
     ) -> ProjectSourcingResult:
+        if provider_selection is not None:
+            return self.search_project_provider_selection(
+                rows,
+                selection=provider_selection,
+                limit=limit,
+                progress=progress,
+                telemetry=telemetry,
+                provider_runner=provider_runner,
+                execution_scope=execution_scope,
+            )
         eligible = [
             dict(row) for row in rows
             if row.get("selected", True) is not False
@@ -1359,6 +1465,183 @@ class SourcingService:
             provider_key=provider.key,
             provider_label=provider.label,
             catalog_version=catalog_version,
+        )
+
+    def search_project_provider_selection(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        selection: ProviderSelection,
+        limit: int = 20,
+        progress: Callable[[int, int, str], None] | None = None,
+        telemetry: Callable[[dict[str, Any]], None] | None = None,
+        provider_runner: ProviderRunner | None = None,
+        execution_scope: ProviderExecutionScope | None = None,
+    ) -> ProjectSourcingResult:
+        """Evaluate a selected set through outcome-native execution and M6A/B."""
+        eligible = [
+            dict(row) for row in rows
+            if row.get("selected", True) is not False
+            and row.get("row_type") in {"item", "component", "item_candidate"}
+        ]
+        total = len(eligible)
+        scope = execution_scope or ProviderExecutionScope(execution_scope_id=uuid.uuid4().hex)
+        started_project = time.perf_counter()
+        if progress:
+            progress(0, total, "Готовим выбранных поставщиков")
+        results: list[SourcingResult] = []
+        warnings: list[str] = []
+        notices: list[SourcingNotice] = []
+        confirmed_totals: dict[str, Decimal] = {}
+        alternative_totals: dict[str, Decimal] = {}
+        matched = alternatives = review = without = 0
+        matched_unpriced = alternative_unpriced = unit_confirmation = unresolved = 0
+        understanding_time = retrieval_time = matching_time = 0.0
+
+        for index, row in enumerate(eligible):
+            if progress:
+                progress(index, total, f"Анализируем позицию {index + 1} из {total}: {_project_row_label(row)}")
+            understanding_started = time.perf_counter()
+            understanding, _cache_hit = self._understand_row_result_with_cache(row)
+            understanding_time += time.perf_counter() - understanding_started
+            evaluation_started = time.perf_counter()
+            try:
+                result = self.search_intent_provider_selection(
+                    understanding.resolved_intent,
+                    selection=selection,
+                    limit=limit,
+                    execution_scope=scope,
+                    provider_runner=provider_runner,
+                    understanding=understanding,
+                )
+            except Exception:
+                # Keep a provider or matching fault local to this row. Do not
+                # let one provider's error discard other completed positions.
+                result = SourcingResult(
+                    intent=understanding.resolved_intent,
+                    understanding=understanding,
+                    warnings=list(understanding.warnings),
+                    notices=list(understanding.notices),
+                    ai_mode=understanding.mode,
+                    route=SourcingRouteMetadata(
+                        source_mode=SourcingSourceMode.PROVIDER_ONLY,
+                        final_source_kind="none",
+                        fallback_status="error",
+                    ),
+                )
+                notices.append(SourcingNotice(
+                    code="PROVIDER_SELECTION_ROW_FAILED",
+                    message="Не удалось безопасно завершить подбор одной из позиций.",
+                ))
+            evaluation_time = time.perf_counter() - evaluation_started
+            retrieval_time += result.timings.get("retrieval_s", 0.0)
+            matching_time += max(0.0, evaluation_time - result.timings.get("retrieval_s", 0.0))
+            results.append(result)
+            warnings.extend(result.warnings)
+            notices.extend(result.notices)
+
+            best = result.recommended_offer
+            selected_match = next((
+                item for item in result.match_results
+                if best is not None and item.offer.provider == best.provider and item.offer.offer_id == best.offer_id
+            ), None)
+            if not result.offers:
+                without += 1
+                unresolved += 1
+            elif best is None or selected_match is None:
+                review += 1
+                unresolved += 1
+            elif selected_match.decision == MatchDecision.ALTERNATIVE:
+                alternatives += 1
+            elif selected_match.decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                matched += 1
+            else:
+                review += 1
+                unresolved += 1
+
+            if best is not None and selected_match is not None:
+                quantity = _trusted_quantity(row)
+                if quantity is None:
+                    warnings.append(f"{result.intent.source_row_id}: quantity requires confirmation")
+                    notices.append(SourcingNotice(
+                        code="QUANTITY_REQUIRES_CONFIRMATION",
+                        message="Для одной или нескольких позиций требуется подтвердить количество.",
+                    ))
+                elif selected_match.decision in {MatchDecision.MATCH, MatchDecision.LIKELY_MATCH}:
+                    # The recommendation is produced only by the commercial
+                    # selector, which requires complete evidence for its cohort.
+                    if best.price is None or not best.currency:
+                        matched_unpriced += 1
+                    elif _units_compatible(row.get("unit"), best.price_unit):
+                        confirmed_totals[best.currency] = confirmed_totals.get(best.currency, Decimal("0")) + best.price * quantity
+                    else:
+                        unit_confirmation += 1
+                        notices.append(SourcingNotice(
+                            code="PRICE_UNIT_REQUIRES_CONFIRMATION",
+                            message="Для одной или нескольких позиций требуется проверить единицу цены поставщика.",
+                        ))
+                elif selected_match.decision == MatchDecision.ALTERNATIVE:
+                    if best.price is None or not best.currency:
+                        alternative_unpriced += 1
+                    elif _units_compatible(row.get("unit"), best.price_unit):
+                        alternative_totals[best.currency] = alternative_totals.get(best.currency, Decimal("0")) + best.price * quantity
+
+            if telemetry:
+                telemetry(_row_telemetry(
+                    row, understanding, False, result,
+                    selected_match.decision.value if selected_match else ("REVIEW" if result.offers else "WITHOUT_OFFERS"),
+                    selected_match.decision if selected_match else None,
+                    current_ai_mode=str(self.ai.cache_identity().get("mode") or "fallback"),
+                ))
+            if progress:
+                progress(index + 1, total, f"Готово {index + 1} из {total}: {_project_row_label(row)}")
+
+        confirmed_currencies = sorted(confirmed_totals)
+        alternative_currencies = sorted(alternative_totals)
+        if len(confirmed_currencies) > 1 or len(alternative_currencies) > 1:
+            notices.append(SourcingNotice(
+                code="MULTIPLE_CURRENCIES",
+                message="В проекте несколько валют; итоговые суммы показаны раздельно и не суммируются.",
+            ))
+        confirmed_total = confirmed_totals[confirmed_currencies[0]] if len(confirmed_currencies) == 1 else None
+        alternative_total = alternative_totals[alternative_currencies[0]] if len(alternative_currencies) == 1 else None
+        labels = {
+            "etm_ipro": "ЭТМ iPRO", "vseinstrumenti": "ВсеИнструменты.ru",
+            "tstn": "ТЕХНОНИКОЛЬ", "lemana_b2b": "Лемана ПРО",
+        }
+        return ProjectSourcingResult(
+            positions_total=total,
+            positions_processed=len(results),
+            positions_matched=matched,
+            positions_alternatives=alternatives,
+            positions_review=review,
+            positions_without_offers=without,
+            positions_provider_matched=matched,
+            confirmed_total=confirmed_total,
+            confirmed_totals=confirmed_totals,
+            confirmed_currency=confirmed_currencies[0] if len(confirmed_currencies) == 1 else None,
+            alternative_total=alternative_total,
+            alternative_totals=alternative_totals,
+            alternative_currency=alternative_currencies[0] if len(alternative_currencies) == 1 else None,
+            matched_unpriced_count=matched_unpriced,
+            alternative_unpriced_count=alternative_unpriced,
+            unit_confirmation_count=unit_confirmation,
+            unresolved_count=unresolved,
+            estimated_total=confirmed_total,
+            currency=confirmed_currencies[0] if len(confirmed_currencies) == 1 else None,
+            estimated_totals=confirmed_totals,
+            warnings=list(dict.fromkeys(warnings)),
+            notices=dedupe_sourcing_notices(notices),
+            results=results,
+            timings={
+                "total_s": round(time.perf_counter() - started_project, 6),
+                "understanding_s": round(understanding_time, 6),
+                "retrieval_s": round(retrieval_time, 6),
+                "matching_s": round(matching_time, 6),
+                "ai_rank_s": 0.0,
+            },
+            provider_label=" · ".join(labels.get(key, key) for key in selection.provider_keys),
+            provider_keys=list(selection.provider_keys),
         )
 
     def _project_catalog_version(self, provider: SourcingProvider) -> str:

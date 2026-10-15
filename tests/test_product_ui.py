@@ -413,7 +413,7 @@ def test_sourcing_notices_are_typed_and_do_not_render_raw_diagnostics():
     assert "notice.user_visible === false" in app_js
     assert "sourcing-notice-${severity}" in app_js
     assert "escapeHtml(message)" in app_js
-    assert app_js.count("renderSourcingNotices(result.notices)") == 2
+    assert app_js.count("renderSourcingNotices(result.notices)") == 3
     assert "(result.warnings || []).length" not in app_js
     assert "Qwen returned unsupported attribute keys; they were ignored" not in app_js
 

@@ -241,12 +241,26 @@ class DurableVseinstrumentiProvenance(DurableContract):
     ]
 
 
+class DurableTstnProvenance(DurableContract):
+    source: Literal["tstn"]
+    identity_kind: Literal["id", "article"]
+    identity_value: ItemId
+    source_item_id: ItemId
+    catalog_revision: Revision
+    price_field: Annotated[StrictStr, Field(max_length=40)]
+    availability_field: Annotated[StrictStr, Field(max_length=40)]
+    city_filter: Annotated[StrictStr, Field(max_length=80)]
+    price_region_match: Literal["not_requested", "unreported", "exact_value_match", "unconfirmed"]
+    availability_region_match: Literal["not_requested", "unreported", "exact_value_match", "unconfirmed"]
+
+
 class DurableUnprovenProvenance(DurableContract):
     source: Literal["unproven"]
 
 
 DurableProvenance = Annotated[
-    DurableEtmProvenance | DurableLemanaProvenance | DurableVseinstrumentiProvenance | DurableUnprovenProvenance,
+    DurableEtmProvenance | DurableLemanaProvenance | DurableVseinstrumentiProvenance
+    | DurableTstnProvenance | DurableUnprovenProvenance,
     Field(discriminator="source"),
 ]
 
@@ -473,6 +487,21 @@ class DurableTenderSourcingRowV2(DurableContract):
                     or bool(proof.price_field) != (offer.price is not None)
                 ):
                     raise ValueError("VseInstrumenti evidence contradicts its source identity")
+            elif provider == "tstn":
+                if not isinstance(proof, DurableTstnProvenance) or evidence.vat_basis != VatBasis.UNKNOWN:
+                    raise ValueError("TSTN commercial basis remains unproved")
+                if (evidence.evidence_state == CommercialEvidenceState.COMPLETE
+                        or not {CommercialIssueCode.PROVIDER_PRICE_BASIS_UNPROVEN,
+                                CommercialIssueCode.PRICE_UNIT_UNTRUSTED}.issubset(evidence.issue_codes)):
+                    raise ValueError("TSTN requires its stored unproved-basis issue facts")
+                outcome = outcomes[provider]
+                if evidence.evidence_state != CommercialEvidenceState.INVALID and (
+                    proof.source_item_id != offer.source_item_id or not offer.source_item_id.strip()
+                    or proof.identity_value != offer.source_item_id
+                    or proof.catalog_revision != outcome.catalog_version
+                    or bool(proof.price_field) != (offer.price is not None)
+                ):
+                    raise ValueError("TSTN evidence contradicts its source identity")
             elif not isinstance(proof, DurableUnprovenProvenance) or evidence.vat_basis != VatBasis.UNKNOWN:
                 raise ValueError("other provider commercial basis remains unproved")
             elif not {CommercialIssueCode.PROVIDER_PRICE_BASIS_UNPROVEN,

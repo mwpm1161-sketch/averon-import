@@ -37,6 +37,7 @@ const context = vm.createContext({
   manualHistorySearchAllowed: () => false,
   renderManualHistorySearch: () => "",
   bindHumanHistoryDecisionActions: () => {},
+  renderSharedProviderSelectionPanel: () => {},
   renderSourcingResult: (result) => {
     context.backTarget = result;
     context.setSourcingModalPhase("project_result");

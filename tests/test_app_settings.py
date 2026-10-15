@@ -790,7 +790,10 @@ def test_tstn_passive_status_and_runtime_rebuild_do_not_read_credentials_or_make
     assert settings["sourcing"]["tstn"]["credentials_configured"] is True
     assert settings["sourcing"]["tstn"]["x_sp_secret_configured"] is True
     assert "credential_generation" not in json.dumps(config, ensure_ascii=False)
-    assert "tstn" not in str(capabilities).casefold()
+    tstn_option = next(item for item in capabilities["options"] if item["key"] == "tstn")
+    assert tstn_option["available"] is False
+    assert "онлайн-поиск" in tstn_option["reason"].casefold()
+    assert "credential_generation" not in str(capabilities)
     assert all(provider["key"] != "tstn" for provider in providers["providers"])
     assert TSTN_SERVICE_IDENTIFIER not in store.read_keys
     assert TSTN_CLIENT_KEY not in store.read_keys
@@ -1145,7 +1148,7 @@ def test_vseinstrumenti_is_publicly_available_only_with_current_local_configurat
 
     assert "vseinstrumenti" in app_module.sourcing_runtime.execution_providers
     assert [item["key"] for item in capabilities["providers"]] == ["vseinstrumenti"]
-    assert capabilities["enabled"] is False  # One configured provider cannot start a comparison.
+    assert capabilities["enabled"] is True  # The public flow supports one explicitly selected provider.
     assert "vi.public-test-token" not in str(capabilities)
     assert "credential_generation" not in str(capabilities)
 

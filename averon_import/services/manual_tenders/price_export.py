@@ -597,6 +597,93 @@ class TenderPriceResolver:
             for row_id in run["selected_source_row_ids"]
         ]
 
+    def resolve_multi_provider_run(
+        self,
+        workspace: dict[str, Any],
+        run: Any,
+        *,
+        tender_id: str,
+        run_id: str,
+    ) -> list[TenderPriceDecision]:
+        """Resolve V2 rows through the existing export policy and strict provenance checks."""
+        from .durable_read import DurableTenderSourcingRunV2
+
+        if (type(run) is not DurableTenderSourcingRunV2 or run.run_id != run_id
+                or run.tender_id != tender_id or workspace.get("tender_id") != tender_id
+                or run.status != "completed"):
+            raise TenderWorkspaceError("Данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT")
+        try:
+            revisions_match = (int(run.workspace_revision) == int(workspace.get("revision", -1))
+                               and run.source_sha256 == workspace.get("source_sha256"))
+        except (TypeError, ValueError):
+            revisions_match = False
+        if not revisions_match:
+            raise TenderWorkspaceError("Запуск не соответствует текущей версии тендера.", 409, "TENDER_RUN_WORKSPACE_MISMATCH")
+        source_rows = workspace.get("rows")
+        if not isinstance(source_rows, list):
+            raise TenderWorkspaceError("Строки тендера повреждены.", 409, "TENDER_WORKSPACE_CORRUPT")
+        source_by_id: dict[str, dict[str, Any]] = {}
+        for source in source_rows:
+            if not isinstance(source, dict):
+                raise TenderWorkspaceError("Строки тендера повреждены.", 409, "TENDER_WORKSPACE_CORRUPT")
+            row_id = str(source.get("source_row_id") or "")
+            if not row_id or row_id in source_by_id:
+                raise TenderWorkspaceError("Строки тендера повреждены.", 409, "TENDER_WORKSPACE_CORRUPT")
+            source_by_id[row_id] = source
+        if (len(run.selected_source_row_ids) != len(run.rows)
+                or {row.source_row_id for row in run.rows} != set(run.selected_source_row_ids)):
+            raise TenderWorkspaceError("Строки подбора не прошли проверку соответствия.", 409, "TENDER_RESULT_CORRELATION_FAILED")
+
+        projected_run = {
+            "run_id": run.run_id,
+            "tender_id": run.tender_id,
+            "status": run.status,
+            "source_mode": "provider_only",
+            "source_sha256": run.source_sha256,
+            "workspace_revision": run.workspace_revision,
+            "completed_at": run.completed_at,
+        }
+        decisions: list[TenderPriceDecision] = []
+        for row in run.rows:
+            source = source_by_id.get(row.source_row_id)
+            if source is None or source.get("row_type") != "item":
+                raise TenderWorkspaceError("Строка подбора отсутствует в тендере.", 409, "TENDER_RESULT_CORRELATION_FAILED")
+            try:
+                same_physical_row = int(row.physical_excel_row) == int(source.get("excel_row", -1))
+            except (TypeError, ValueError):
+                same_physical_row = False
+            if not same_physical_row:
+                raise TenderWorkspaceError("Физическая строка подбора не совпадает с источником.", 409, "TENDER_RESULT_CORRELATION_FAILED")
+
+            canonical: dict[str, Any] = {"physical_excel_row": row.physical_excel_row, "route": {"final_source_kind": "provider"}}
+            selected = row.commercial_selection.selected_reference
+            if row.commercial_selection.state.value == "SELECTED" and selected is not None:
+                offer = next((item for item in row.offers if item.offer_reference == selected), None)
+                match = next((item for item in row.matches if item.offer_reference == selected), None)
+                evidence = next((item for item in row.commercial_evidence if item.offer_reference == selected), None)
+                if offer is None or match is None or evidence is None or evidence.evidence_state.value != "COMPLETE":
+                    raise TenderWorkspaceError("Коммерческие данные подбора повреждены.", 409, "TENDER_RUN_CORRUPT")
+                proof = offer.provenance.model_dump(mode="python", warnings=False)
+                provider = offer.offer_reference.provider_key
+                canonical.update({
+                    "recommended_offer": {
+                        "provider": provider,
+                        "offer_id": offer.offer_reference.offer_id,
+                        "source_item_id": offer.source_item_id,
+                        "price": offer.price,
+                        "currency": getattr(offer.currency, "value", offer.currency),
+                        "price_unit": offer.price_unit,
+                    },
+                    "recommended_match": {
+                        "decision": match.decision.value,
+                        "offer_id": offer.offer_reference.offer_id,
+                    },
+                    "price_provenance": proof,
+                    "provider_source": {"provider": provider, "source_item_id": offer.source_item_id},
+                })
+            decisions.append(self.resolve(source, canonical, projected_run, include_historical_prices=False))
+        return decisions
+
 
 def summarize_decisions(decisions: list[TenderPriceDecision]) -> dict[str, Any]:
     reason_counts: dict[str, int] = {}

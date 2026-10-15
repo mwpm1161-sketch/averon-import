@@ -54,9 +54,14 @@ async function testLazyCapabilitiesAndProtectedChoice() {
     api: async () => {
       context.capabilityRequests += 1;
       return {enabled: true, source_mode: "provider_only", providers: [
-        {key: "etm_ipro", label: "ЭТМ iPRO"}, {key: "lemana_b2b", label: "Лемана ПРО"},
+        {key: "etm_ipro", label: "ЭТМ iPRO"},
         {key: "vseinstrumenti", label: "ВсеИнструменты.ru"},
-      ], min_providers: 2, max_providers: 3};
+        {key: "tstn", label: "ТЕХНОНИКОЛЬ"},
+      ], options: [
+        {key:"etm_ipro",label:"ЭТМ iPRO",description:"Каталог iPRO.",available:true},
+        {key:"vseinstrumenti",label:"ВсеИнструменты.ru",description:"Каталог VI.",available:true},
+        {key:"tstn",label:"ТЕХНОНИКОЛЬ",description:"Онлайн-поиск закрыт.",reason:"Онлайн-поиск закрыт",available:false},
+      ], min_providers: 1, max_providers: 3};
     },
     renderSourcingHistoryControls() {}, renderStaleSourcingHistoryWarning() {},
     sourcingResultMode: () => "provider_only", renderExcelMultiProviderPanel() {},
@@ -68,12 +73,12 @@ async function testLazyCapabilitiesAndProtectedChoice() {
     if (nodes["#multi-provider-panel"].hidden || nodes["#multi-provider-toggle"].checked) throw new Error("Comparison must start visible and off in provider-only tender context");
     await handleExcelMultiProviderToggle({target:{checked:true}});
     if (capabilityRequests !== 1) throw new Error("Explicit opt-in should issue exactly one capabilities request");
-    if (!nodes["#multi-provider-options"].innerHTML.includes("lemana_b2b")) throw new Error("Provider choices must come from capabilities");
+    if (nodes["#multi-provider-options"].innerHTML.includes("lemana_b2b")) throw new Error("Lemana must remain outside the new primary selection");
     if (!nodes["#multi-provider-options"].innerHTML.includes("vseinstrumenti")) throw new Error("Configured VI must appear in the public selection");
+    if (!nodes["#multi-provider-options"].innerHTML.includes("ТЕХНОНИКОЛЬ") || !nodes["#multi-provider-options"].innerHTML.includes("disabled")) throw new Error("TSTN should be visible with its disabled readiness reason");
     handleExcelMultiProviderSelection({target:{dataset:{multiProviderKey:"etm_ipro"},checked:true}});
-    handleExcelMultiProviderSelection({target:{dataset:{multiProviderKey:"lemana_b2b"},checked:true}});
     handleExcelMultiProviderSelection({target:{dataset:{multiProviderKey:"vseinstrumenti"},checked:true}});
-    if (state.excelTender.multiProviderProviders.size !== 3) throw new Error("All explicit provider choices should be retained");
+    if (state.excelTender.multiProviderProviders.size !== 2) throw new Error("All explicit primary provider choices should be retained");
     state.sourcing.historyStatus = {available:true};
     handleSourcingModeChange({target:{value:"one_c_only"}});
     if (state.excelTender.multiProviderEnabled || state.excelTender.multiProviderProviders.size) throw new Error("Switching to history must clear comparison choice");
@@ -87,7 +92,7 @@ async function testLazyCapabilitiesAndProtectedChoice() {
 
 async function testSelectionCapAndExplicitRequestHandshake() {
   const functionSource = sliceBetween("async function startExcelTenderSourcing() {", "function parseManualPaste(text)");
-  async function submitWithCount(count, enabled = true, selectedProviders = ["lemana_b2b", "etm_ipro"]) {
+  async function submitWithCount(count, enabled = true, selectedProviders = ["etm_ipro"]) {
     const calls = [];
     const admission = {hidden: true, textContent: ""};
     const modeSelect = {disabled: false};
@@ -101,7 +106,7 @@ async function testSelectionCapAndExplicitRequestHandshake() {
     const state = {excelTender: {
       workspace:{tender_id:"tender"}, sourcingActive:false, exportActive:false, selectedIds:new Set(Array.from({length:count}, (_, i) => `row-${i}`)), pollGeneration:1,
       multiProviderEnabled:enabled, multiProviderProviders:new Set(selectedProviders),
-      multiProviderCapabilities:{enabled:true,min_providers:2,max_providers:3},
+      multiProviderCapabilities:{enabled:true,min_providers:1,max_providers:3},
     }, sourcing:{sourceMode:"provider_only"}};
     const context = {
       state, $: selector => nodes[selector],
@@ -119,13 +124,54 @@ async function testSelectionCapAndExplicitRequestHandshake() {
   const max = await submitWithCount(100);
   assert(max.calls.length === 1, "Exactly 100 selected rows should be admitted");
   assert(max.calls[0].source_row_ids.length === 100, "The 100-row request must not discard rows");
-  assert(max.calls[0].providers.join(",") === "etm_ipro,lemana_b2b", "The explicit provider handshake should be canonical");
+  assert(max.calls[0].providers.join(",") === "etm_ipro", "One-provider selection should use the explicit provider handshake");
   assert(max.calls[0].limit === 20 && !("provider" in max.calls[0]), "M4A request should cap at 20 and omit the scalar legacy provider");
-  const generalized = await submitWithCount(2, true, ["vseinstrumenti", "etm_ipro", "lemana_b2b"]);
+  const two = await submitWithCount(2, true, ["vseinstrumenti", "etm_ipro"]);
+  assert(two.calls.length === 1 && two.calls[0].providers.join(",") === "etm_ipro,vseinstrumenti", "Two-provider selection should use canonical keys");
+  const generalized = await submitWithCount(2, true, ["vseinstrumenti", "etm_ipro", "tstn"]);
   assert(generalized.calls.length === 1, "Generalized three-provider selection should be admitted");
-  assert(generalized.calls[0].providers.join(",") === "etm_ipro,lemana_b2b,vseinstrumenti", "M5D should send the canonical explicit provider set");
+  assert(generalized.calls[0].providers.join(",") === "etm_ipro,tstn,vseinstrumenti", "Three-provider selection should send the canonical primary set");
   const legacy = await submitWithCount(1, false);
   assert(legacy.calls.length === 1 && !("providers" in legacy.calls[0]), "The legacy request must omit the multi-provider handshake when opt-in is off");
+}
+
+async function testSharedPreflightDoesNotSearchBeforeStart() {
+  const opener = sliceBetween("async function openSourcingForRow(row) {", "async function executeSourcingForRow(row, providers = null)");
+  const selection = sliceBetween("function renderSharedProviderSelectionPanel() {", "async function loadExcelMultiProviderCapabilities(");
+  const calls = [];
+  const nodes = {
+    "#shared-provider-selection": {hidden:true},
+    "#shared-sourcing-start": {hidden:true,disabled:false,textContent:""},
+    "#shared-provider-selection-toggle": {textContent:"",disabled:false},
+    "#shared-provider-selection-options": {hidden:true,innerHTML:"",replaceChildren(){this.innerHTML="";}},
+    "#shared-provider-selection-status": {hidden:true,textContent:""},
+    "#sourcing-subtitle": {textContent:""},
+    "#sourcing-content": {innerHTML:""},
+  };
+  const state = {authState:"authenticated",sourcing:{modalContext:"none",modalPhase:"closed",sourceMode:"provider_only",requestGeneration:0,
+    historyStatusLoaded:true,historyStatus:{available:false},sourceModeTouched:true,result:null,
+    providerSelectionEnabled:false,providerSelectionProviders:new Set(),providerSelectionCapabilities:null,
+    providerSelectionCapabilitiesPromise:null,pendingSourcing:null}};
+  const context = {state,calls,$:selector=>nodes[selector],escapeHtml:value=>String(value),
+    renderSourcingHistoryControls(){},openSourcingModal(){calls.push("open-modal");},
+    setSourcingModalPhase(phase,contextName){state.sourcing.modalPhase=phase;state.sourcing.modalContext=contextName;},
+    api:async url=>{calls.push(url);return {options:[
+      {key:"etm_ipro",label:"ЭТМ iPRO",available:true},
+      {key:"vseinstrumenti",label:"ВсеИнструменты.ru",available:true},
+      {key:"tstn",label:"ТЕХНОНИКОЛЬ",available:false,reason:"Онлайн-поиск закрыт"},
+    ],min_providers:1,max_providers:3};},
+    executeSourcingForRow:async(row,providers)=>calls.push({search:row.name,providers}),
+    executeProjectSourcing:async()=>{throw new Error("unexpected project path");},
+  };
+  await vm.runInNewContext(`(async()=>{ ${opener} ${selection}
+    await openSourcingForRow({name:"Клапан",quantity:"2",unit:"шт"});
+    if(calls.some(item=>typeof item==="string"&&item.includes("search"))) throw new Error("Opening the result dialog must not search suppliers");
+    await handleSharedProviderSelectionToggle();
+    handleSharedProviderSelection({target:{dataset:{sharedProviderKey:"etm_ipro"},checked:true}});
+    await startSharedSourcing();
+  })()`,context);
+  assert(calls.some(item => item === "/api/sourcing/provider-selection-capabilities"), "Shared selection should read local capabilities on opt-in");
+  assert(calls.some(item => typeof item === "object" && item.search === "Клапан" && item.providers.join(",") === "etm_ipro"), "Only the explicit start action should execute the chosen supplier search");
 }
 
 function testCompositeIdentityAndFailedRendering() {
@@ -150,7 +196,7 @@ function testCompositeIdentityAndFailedRendering() {
   assert(rendered.html.includes("Поиск завершён частично") && rendered.html.includes("Поиск завершён"), "Lowercase public provider states should render localized labels");
   assert(rendered.html.includes("Один из поставщиков завершил поиск с частичной ошибкой."), "Partial provider failure should remain explicit");
   assert(rendered.html.includes("Поставщик вернул 7 предложений. Показаны варианты, участвовавшие в решении."), "Returned and retained counts should be distinguished");
-  assert(rendered.html.includes("Коммерческая проверка нужна"), "Lemana evidence should explain the verification requirement");
+  assert(rendered.html.includes("Предварительная цена: НДС и единица цены не подтверждены."), "Unproven commercial evidence must be marked as preliminary");
   assert(rendered.html.includes("0.123456789012345678901"), "Exact decimal text should be rendered without numeric coercion");
   assert(rendered.html.includes('<article class="multi-provider-offer is-selected"><h4>ЭТМ iPRO: ETM winner'), "Winner identity must include provider key when offer IDs collide");
   assert(rendered.html.includes('<article class="multi-provider-offer "><h4>Лемана ПРО: Lemana candidate'), "Same-ID other-provider offer must remain a separate candidate");
@@ -211,12 +257,14 @@ async function testSavedV2RunDoesNotRequestHistoryDecisions() {
   assert(calls.length === 1 && !calls[0].includes("history-decisions"), "Opening saved v2 must request detail only");
   assert(rendered === 1, "Saved v2 detail should use the dedicated renderer");
   const source = sliceBetween("function renderExcelTenderExportControls() {", "async function refreshExcelTenderExports(");
-  assert(source.includes('run.run_kind !== "multi_provider" && run.schema_version !== 2'), "V2 runs must stay outside XLSX run options");
+  assert(!source.includes('run.run_kind !== "multi_provider" && run.schema_version !== 2'), "V2 runs should be available to the existing XLSX export");
+  assert(source.includes('run.run_kind === "multi_provider" || run.schema_version === 2'), "V2 runs should be identified in provider export options");
 }
 
 Promise.all([
   testLazyCapabilitiesAndProtectedChoice(),
   testSelectionCapAndExplicitRequestHandshake(),
+  testSharedPreflightDoesNotSearchBeforeStart(),
   testSavedV2RunDoesNotRequestHistoryDecisions(),
 ]).then(() => {
   testCompositeIdentityAndFailedRendering();
