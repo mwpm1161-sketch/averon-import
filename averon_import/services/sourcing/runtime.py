@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from threading import RLock
@@ -43,13 +43,216 @@ from averon_import.services.sourcing.product_understanding import SourcingAIServ
 from averon_import.services.sourcing.service import SourcingService
 from averon_import.services.one_c_history.repository import OneCHistoryRepository
 from averon_import.services.secrets import (
+    TSTN_CREDENTIALS_CONFIGURED,
     VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
     YANDEX_AI_API_KEY,
     resolve_secret,
 )
+from averon_import.services.sourcing.providers.tstn.adapter import (
+    TstnCommercialExecutionAdapter,
+)
+from averon_import.services.sourcing.providers.tstn.authorization import (
+    TSTN_CREDENTIAL_LOCK,
+)
+from averon_import.services.sourcing.providers.tstn.mirror import TstnCatalogMirror
 
 
 VI_CREDENTIAL_LOCK = RLock()
+
+
+@dataclass(frozen=True)
+class TstnReadiness:
+    """Safe local readiness categories; never implies remote API reachability."""
+
+    credential_state: str
+    catalog_state: str
+    configured: bool
+    catalog_ready: bool
+    live_verified: bool = False
+
+
+@dataclass(frozen=True)
+class TstnRuntimePreparation:
+    """Private TN4B composition, intentionally outside all provider registries."""
+
+    adapter: TstnCommercialExecutionAdapter | None = field(repr=False, compare=False)
+    _settings_service: Any = field(repr=False, compare=False)
+    _secret_store: Any = field(repr=False, compare=False)
+    _mirror: TstnCatalogMirror | None = field(repr=False, compare=False)
+    _prepared_enabled: bool = field(repr=False)
+    _prepared_generation: str = field(repr=False)
+    _catalog_path: Path | None = field(default=None, repr=False, compare=False)
+    _storage_error: bool = field(default=False, repr=False)
+    _preparation_error: bool = field(default=False, repr=False)
+
+    def __repr__(self) -> str:
+        return "TstnRuntimePreparation(<private>)"
+
+    @property
+    def readiness(self) -> TstnReadiness:
+        """Read only settings and the non-secret marker; never scans the catalog."""
+
+        try:
+            # Credential updates take this same lock before changing either
+            # SecretStore markers or the server-owned generation.
+            with TSTN_CREDENTIAL_LOCK:
+                try:
+                    current = self._settings_service.settings.sourcing.tstn
+                    enabled = current.enabled is True
+                    generation = current.credential_generation
+                except Exception:
+                    return TstnReadiness(
+                        credential_state="configuration_error",
+                        catalog_state="not_checked",
+                        configured=False,
+                        catalog_ready=False,
+                    )
+                if not enabled:
+                    credential_state = "disabled"
+                elif self._preparation_error:
+                    credential_state = "runtime_preparation_error"
+                elif not self._prepared_enabled or generation != self._prepared_generation:
+                    credential_state = "runtime_generation_stale"
+                else:
+                    try:
+                        marker = self._secret_store.get(TSTN_CREDENTIALS_CONFIGURED)
+                    except Exception:
+                        credential_state = "credential_store_error"
+                    else:
+                        if not marker:
+                            credential_state = "authorization_pair_missing"
+                        elif marker != generation:
+                            credential_state = "credentials_marker_stale"
+                        elif self.adapter is None:
+                            credential_state = "runtime_preparation_error"
+                        else:
+                            credential_state = "configured"
+        except Exception:
+            return TstnReadiness(
+                credential_state="configuration_error",
+                catalog_state="not_checked",
+                configured=False,
+                catalog_ready=False,
+            )
+
+        if not enabled:
+            return TstnReadiness(
+                credential_state=credential_state,
+                catalog_state="not_checked",
+                configured=False,
+                catalog_ready=False,
+            )
+
+        catalog_state = self._catalog_readiness(enabled=enabled)
+        return TstnReadiness(
+            credential_state=credential_state,
+            catalog_state=catalog_state,
+            configured=credential_state == "configured",
+            catalog_ready=catalog_state == "ready",
+        )
+
+    def _catalog_readiness(self, *, enabled: bool) -> str:
+        if not enabled:
+            return "not_checked"
+        if self._storage_error:
+            return "storage_error"
+        if self._mirror is None:
+            return "catalog_missing"
+        try:
+            revision = self._mirror.revision
+            stats = self._mirror.stats()
+            if not isinstance(stats, dict) or stats.get("catalog_revision") != revision:
+                return "storage_error"
+        except Exception:
+            return "storage_error"
+        if stats.get("integrity_ok") is False:
+            return "integrity_error"
+        if revision == "unknown":
+            return "catalog_unsynchronized"
+        if stats.get("search_index_ready") is True:
+            return "ready"
+        return "integrity_unconfirmed"
+
+
+def _prepare_tstn_runtime(
+    data_root: Path,
+    settings_service: Any,
+    secret_store: Any,
+) -> TstnRuntimePreparation:
+    """Prepare TSTN privately, without probing credentials or contacting TSTN."""
+
+    try:
+        with TSTN_CREDENTIAL_LOCK:
+            configured = settings_service.settings.sourcing.tstn
+            enabled = configured.enabled is True
+            generation = configured.credential_generation
+    except Exception:
+        return TstnRuntimePreparation(
+            adapter=None,
+            _settings_service=settings_service,
+            _secret_store=secret_store,
+            _mirror=None,
+            _prepared_enabled=False,
+            _prepared_generation="",
+            _preparation_error=True,
+        )
+
+    if not enabled:
+        return TstnRuntimePreparation(
+            adapter=None,
+            _settings_service=settings_service,
+            _secret_store=secret_store,
+            _mirror=None,
+            _prepared_enabled=False,
+            _prepared_generation=generation,
+        )
+
+    catalog_path = data_root / "sourcing" / "providers" / "tstn" / "catalog.sqlite3"
+    mirror: TstnCatalogMirror | None = None
+    storage_error = False
+    try:
+        # TstnCatalogMirror creates its parent/schema; instantiate only when a
+        # persisted mirror already exists so runtime prep cannot create one.
+        catalog_path.stat()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        storage_error = True
+    else:
+        try:
+            mirror = TstnCatalogMirror(catalog_path, initialize=False)
+        except Exception:
+            storage_error = True
+
+    def current_configuration() -> tuple[bool, str]:
+        current = settings_service.settings.sourcing.tstn
+        return current.enabled, current.credential_generation
+
+    adapter: TstnCommercialExecutionAdapter | None = None
+    preparation_error = False
+    try:
+        adapter = TstnCommercialExecutionAdapter(
+            mirror,
+            secret_store,
+            enabled=enabled,
+            credential_generation=generation,
+            request_timeout_s=configured.request_timeout_s,
+            current_configuration=current_configuration,
+        )
+    except Exception:
+        preparation_error = True
+
+    return TstnRuntimePreparation(
+        adapter=adapter,
+        _settings_service=settings_service,
+        _secret_store=secret_store,
+        _mirror=mirror,
+        _prepared_enabled=enabled,
+        _prepared_generation=generation,
+        _catalog_path=catalog_path,
+        _storage_error=storage_error,
+        _preparation_error=preparation_error,
+    )
 
 
 def _v1_base_url(value: str) -> str:
@@ -112,6 +315,7 @@ class SourcingRuntime:
     execution_providers: Mapping[str, OutcomeNativeProviderAdapter]
     provider_runner: ProviderRunner
     one_c_history_provider: OneCHistoryProvider | None = None
+    _tstn_runtime: TstnRuntimePreparation | None = field(default=None, repr=False, compare=False)
 
     @property
     def execution_provider_keys(self) -> tuple[str, ...]:
@@ -130,6 +334,7 @@ def create_sourcing_runtime(
     """Build the current sourcing providers and service from owned dependencies."""
 
     data_root = Path(data_dir)
+    tstn_runtime = _prepare_tstn_runtime(data_root, settings_service, secret_store)
     repository = CatalogRepository(data_root / "sourcing" / "catalog.sqlite3")
     local_provider = LocalCatalogProvider(repository)
     demo_store_provider = DemoStoreHttpProvider(
@@ -211,4 +416,5 @@ def create_sourcing_runtime(
         execution_providers=MappingProxyType(execution_providers),
         provider_runner=provider_runner,
         one_c_history_provider=sourcing_service.one_c_history_provider,
+        _tstn_runtime=tstn_runtime,
     )

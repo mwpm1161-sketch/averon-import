@@ -274,19 +274,37 @@ def _snapshot_revision(records: Iterable[TstnCatalogRecord]) -> str:
 class TstnCatalogMirror:
     """Offline SQLite mirror; only ``sync`` accepts a client, reads never do."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, initialize: bool = True):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = not initialize
+        if initialize:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         # A persisted index is not trusted after process restart until one
         # complete integrity pass has validated its source rows and terms.
         # The validated revisions are only an in-process fast-path afterwards.
         self._integrity_validated: bool | None = None
         self._validated_catalog_revision: str | None = None
         self._validated_index_revision: str | None = None
-        self._initialize()
+        if initialize:
+            self._initialize()
+        elif not self.path.is_file():
+            raise _safe_error(
+                "Локальный каталог ТСТН недоступен",
+                code="TSTN_CATALOG_STORAGE_ERROR",
+                category="storage_error",
+            )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10.0)
+        if self._read_only:
+            # Runtime preparation and passive readiness must not create or
+            # repair a missing persisted catalog as a side effect of reading.
+            connection = sqlite3.connect(
+                self.path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=10.0,
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=10.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=10000")
