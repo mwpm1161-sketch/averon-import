@@ -343,11 +343,20 @@ class ProviderRunner:
 
         request_counter = ProviderRequestCounter()
         try:
-            raw_outcome = adapter.execute_search(
-                intent,
-                limit=limit,
-                request_counter=request_counter,
-            )
+            identity_executor = getattr(adapter, "execute_search_with_identity", None)
+            if callable(identity_executor):
+                raw_outcome = identity_executor(
+                    identity,
+                    intent,
+                    limit=limit,
+                    request_counter=request_counter,
+                )
+            else:
+                raw_outcome = adapter.execute_search(
+                    intent,
+                    limit=limit,
+                    request_counter=request_counter,
+                )
         except Exception:
             outcome = self._failure(
                 provider_key,

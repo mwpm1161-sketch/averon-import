@@ -49,6 +49,10 @@ _GENERATION_RE = re.compile(r"^[a-f0-9]{32}$")
 _REVISION_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
+class _CatalogRevisionChanged(RuntimeError):
+    """Local catalog changed while a result was being assembled."""
+
+
 class TstnCurrentConfiguration(Protocol):
     def __call__(self) -> tuple[bool, str]: ...
 
@@ -213,6 +217,21 @@ class TstnCommercialExecutionAdapter:
         """Create a deterministic local-only dedupe identity."""
 
         revision = self._catalog_revision()
+        return self._identity_for_revision(
+            intent,
+            limit=limit,
+            execution_scope_id=execution_scope_id,
+            revision=revision,
+        )
+
+    def _identity_for_revision(
+        self,
+        intent: ProductIntent,
+        *,
+        limit: int,
+        execution_scope_id: str,
+        revision: str,
+    ) -> ProviderSearchRequestIdentity:
         affinity = self._affinity(revision)
         fingerprint = _digest({
             "provider_key": self.key,
@@ -231,6 +250,64 @@ class TstnCommercialExecutionAdapter:
             affinity=affinity,
             limit=limit,
         )
+
+    def execute_search_with_identity(
+        self,
+        identity: ProviderSearchRequestIdentity,
+        intent: ProductIntent,
+        *,
+        limit: int,
+        request_counter: ProviderRequestCounter,
+    ) -> ProviderSearchOutcome:
+        """Bind execution to the exact local revision used by ProviderRunner."""
+
+        if (
+            not isinstance(identity, ProviderSearchRequestIdentity)
+            or not isinstance(intent, ProductIntent)
+            or type(limit) is not int
+            or not isinstance(request_counter, ProviderRequestCounter)
+        ):
+            counter = request_counter if isinstance(request_counter, ProviderRequestCounter) else ProviderRequestCounter()
+            revision = self._catalog_revision()
+            return self._failure(
+                counter,
+                self._affinity(revision),
+                ProviderFailureCategory.MISCONFIGURED,
+                catalog_revision=None,
+            )
+
+        revision = self._catalog_revision()
+        try:
+            current_identity = self._identity_for_revision(
+                intent,
+                limit=limit,
+                execution_scope_id=identity.execution_scope_id,
+                revision=revision,
+            )
+        except Exception:
+            current_identity = None
+        if (
+            current_identity is None
+            or identity.provider_key != self.key
+            or identity.limit != limit
+            or identity != current_identity
+        ):
+            return self._failure(
+                request_counter,
+                identity.affinity,
+                ProviderFailureCategory.UNAVAILABLE,
+                catalog_revision=None,
+            )
+        return self._execute_search(
+            intent,
+            limit=limit,
+            request_counter=request_counter,
+            expected_catalog_revision=revision,
+            expected_affinity=identity.affinity,
+        )
+
+    def _catalog_revision_matches(self, expected_revision: str) -> bool:
+        return self._catalog_revision() == expected_revision
 
     def _configuration_matches(self) -> bool:
         try:
@@ -252,7 +329,7 @@ class TstnCommercialExecutionAdapter:
         affinity: ProviderAffinity,
         category: ProviderFailureCategory,
         *,
-        catalog_revision: str,
+        catalog_revision: str | None,
     ) -> ProviderSearchOutcome:
         return ProviderSearchOutcome(
             provider_key=self.key,
@@ -263,6 +340,18 @@ class TstnCommercialExecutionAdapter:
             catalog_version=catalog_revision,
         )
 
+    def _revision_failure(
+        self,
+        counter: ProviderRequestCounter,
+        affinity: ProviderAffinity,
+    ) -> ProviderSearchOutcome:
+        return self._failure(
+            counter,
+            affinity,
+            ProviderFailureCategory.UNAVAILABLE,
+            catalog_revision=None,
+        )
+
     def _execute_call(
         self,
         method: Callable[..., Any],
@@ -271,8 +360,11 @@ class TstnCommercialExecutionAdapter:
         access_token: SecretStr,
         filter_value: str,
         filter_kind: str,
+        expected_catalog_revision: str,
     ) -> tuple[Any | None, ProviderFailureCategory | None]:
         with TSTN_CREDENTIAL_LOCK:
+            if not self._catalog_revision_matches(expected_catalog_revision):
+                raise _CatalogRevisionChanged
             if not self._configuration_matches():
                 return None, ProviderFailureCategory.MISCONFIGURED
             if request_counter.request_count >= self.max_http_attempts:
@@ -282,15 +374,19 @@ class TstnCommercialExecutionAdapter:
                 "city": self.verified_city_code or None,
                 filter_kind: filter_value,
             }
+            failure: ProviderFailureCategory | None = None
+            response: Any | None = None
             try:
                 response = method(**query)
             except TstnApiError as exc:
-                return None, _failure_category(exc)
+                failure = _failure_category(exc)
             except ProviderRequestLimitExceeded:
-                return None, ProviderFailureCategory.RATE_LIMITED
+                failure = ProviderFailureCategory.RATE_LIMITED
             except Exception:
-                return None, ProviderFailureCategory.UNKNOWN
-            return response, None
+                failure = ProviderFailureCategory.UNKNOWN
+            if not self._catalog_revision_matches(expected_catalog_revision):
+                raise _CatalogRevisionChanged
+            return (None, failure) if failure is not None else (response, None)
 
     @staticmethod
     def _matching_price(
@@ -328,13 +424,30 @@ class TstnCommercialExecutionAdapter:
             return "", True
         statuses = {row.status for row in rows}
         if len(statuses) != 1:
-            return "Статусы доступности неоднозначны", True
+            return "", True
         status = next(iter(statuses))
         return (status if isinstance(status, str) else ""), False
+
+    @staticmethod
+    def _response_region_match(
+        response_city: str | None,
+        requested_city: str,
+    ) -> tuple[bool, str]:
+        """Compare only literal values; a city code is not a city-name alias."""
+
+        if not requested_city:
+            return True, "not_requested"
+        if response_city is None or not response_city:
+            return True, "unreported"
+        if response_city == requested_city:
+            return True, "exact_value_match"
+        return False, "unconfirmed"
 
     def _ambiguous_catalog_articles(
         self,
         candidates: tuple[TstnCatalogRecord, ...] | list[TstnCatalogRecord],
+        *,
+        expected_catalog_revision: str,
     ) -> set[str]:
         """Detect duplicate articles across the local catalog, beyond top hits.
 
@@ -348,10 +461,14 @@ class TstnCommercialExecutionAdapter:
             raise ValueError("catalog mirror is unavailable")
         ambiguous: set[str] = set()
         for record in candidates:
+            if not self._catalog_revision_matches(expected_catalog_revision):
+                raise _CatalogRevisionChanged
             article = record.article
             if not article:
                 continue
             matches = self.mirror.search(article=article, limit=2)
+            if not self._catalog_revision_matches(expected_catalog_revision):
+                raise _CatalogRevisionChanged
             if (
                 not isinstance(matches, (list, tuple))
                 or len(matches) > 2
@@ -377,6 +494,8 @@ class TstnCommercialExecutionAdapter:
         availability_text: str,
         price_observed: bool,
         availability_observed: bool,
+        price_region_match: str,
+        availability_region_match: str,
         catalog_revision: str,
         affinity: ProviderAffinity,
     ) -> Offer:
@@ -404,7 +523,9 @@ class TstnCommercialExecutionAdapter:
             "catalog_revision": catalog_revision,
             "price_field": "results[].price" if price_observed else "",
             "availability_field": "results[].status" if availability_observed else "",
-            "city_code": self.verified_city_code,
+            "city_filter": self.verified_city_code,
+            "price_region_match": price_region_match,
+            "availability_region_match": availability_region_match,
             "config_revision": affinity.config_revision,
         }
         return Offer(
@@ -435,6 +556,25 @@ class TstnCommercialExecutionAdapter:
     ) -> ProviderSearchOutcome:
         """Execute one bounded search after retrieving candidates locally."""
 
+        revision = self._catalog_revision()
+        return self._execute_search(
+            intent,
+            limit=limit,
+            request_counter=request_counter,
+            expected_catalog_revision=revision,
+            expected_affinity=self._affinity(revision),
+        )
+
+    def _execute_search(
+        self,
+        intent: ProductIntent,
+        *,
+        limit: int,
+        request_counter: ProviderRequestCounter,
+        expected_catalog_revision: str,
+        expected_affinity: ProviderAffinity,
+    ) -> ProviderSearchOutcome:
+
         if (
             not isinstance(intent, ProductIntent)
             or type(limit) is not int
@@ -442,16 +582,15 @@ class TstnCommercialExecutionAdapter:
             or not isinstance(request_counter, ProviderRequestCounter)
         ):
             empty_counter = request_counter if isinstance(request_counter, ProviderRequestCounter) else ProviderRequestCounter()
-            revision = self._catalog_revision()
             return self._failure(
                 empty_counter,
-                self._affinity(revision),
+                expected_affinity,
                 ProviderFailureCategory.MISCONFIGURED,
-                catalog_revision=revision,
+                catalog_revision=None,
             )
 
-        catalog_revision = self._catalog_revision()
-        affinity = self._affinity(catalog_revision)
+        catalog_revision = expected_catalog_revision
+        affinity = expected_affinity
         if self.mirror is None:
             return self._failure(
                 request_counter,
@@ -459,18 +598,24 @@ class TstnCommercialExecutionAdapter:
                 ProviderFailureCategory.MISCONFIGURED,
                 catalog_revision=catalog_revision,
             )
+        if not self._catalog_revision_matches(catalog_revision):
+            return self._revision_failure(request_counter, affinity)
         try:
             candidates = self.mirror.search(
                 intent,
                 limit=min(limit, self.max_candidates),
             )
         except Exception:
+            if not self._catalog_revision_matches(catalog_revision):
+                return self._revision_failure(request_counter, affinity)
             return self._failure(
                 request_counter,
                 affinity,
                 ProviderFailureCategory.UNAVAILABLE,
                 catalog_revision=catalog_revision,
             )
+        if not self._catalog_revision_matches(catalog_revision):
+            return self._revision_failure(request_counter, affinity)
         if (
             not isinstance(candidates, (list, tuple))
             or len(candidates) > min(limit, self.max_candidates)
@@ -483,6 +628,8 @@ class TstnCommercialExecutionAdapter:
                 catalog_revision=catalog_revision,
             )
         if not candidates:
+            if not self._catalog_revision_matches(catalog_revision):
+                return self._revision_failure(request_counter, affinity)
             return ProviderSearchOutcome(
                 provider_key=self.key,
                 state=ProviderSearchState.EMPTY,
@@ -492,7 +639,12 @@ class TstnCommercialExecutionAdapter:
             )
 
         try:
-            ambiguous_catalog_articles = self._ambiguous_catalog_articles(candidates)
+            ambiguous_catalog_articles = self._ambiguous_catalog_articles(
+                candidates,
+                expected_catalog_revision=catalog_revision,
+            )
+        except _CatalogRevisionChanged:
+            return self._revision_failure(request_counter, affinity)
         except Exception:
             return self._failure(
                 request_counter,
@@ -501,6 +653,9 @@ class TstnCommercialExecutionAdapter:
                 catalog_revision=catalog_revision,
             )
 
+        if not self._catalog_revision_matches(catalog_revision):
+            return self._revision_failure(request_counter, affinity)
+
         try:
             client = self.client_factory(
                 self.request_timeout_s,
@@ -508,6 +663,8 @@ class TstnCommercialExecutionAdapter:
                 outbound_attempt_observer=request_counter.record_outbound_attempt,
             )
         except Exception:
+            if not self._catalog_revision_matches(catalog_revision):
+                return self._revision_failure(request_counter, affinity)
             return self._failure(
                 request_counter,
                 affinity,
@@ -522,6 +679,9 @@ class TstnCommercialExecutionAdapter:
                 catalog_revision=catalog_revision,
             )
 
+        if not self._catalog_revision_matches(catalog_revision):
+            return self._revision_failure(request_counter, affinity)
+
         authorizer = SecretStoreTstnAuthorizer(
             self.secret_store,
             client,
@@ -533,6 +693,8 @@ class TstnCommercialExecutionAdapter:
         try:
             access_token = authorizer.authorize()
         except TstnApiError as exc:
+            if not self._catalog_revision_matches(catalog_revision):
+                return self._revision_failure(request_counter, affinity)
             return self._failure(
                 request_counter,
                 affinity,
@@ -540,12 +702,17 @@ class TstnCommercialExecutionAdapter:
                 catalog_revision=catalog_revision,
             )
         except Exception:
+            if not self._catalog_revision_matches(catalog_revision):
+                return self._revision_failure(request_counter, affinity)
             return self._failure(
                 request_counter,
                 affinity,
                 ProviderFailureCategory.UNKNOWN,
                 catalog_revision=catalog_revision,
             )
+
+        if not self._catalog_revision_matches(catalog_revision):
+            return self._revision_failure(request_counter, affinity)
 
         offers: list[Offer] = []
         failures: list[ProviderFailureCategory] = []
@@ -566,15 +733,21 @@ class TstnCommercialExecutionAdapter:
             status_text = ""
             price_observed = False
             availability_observed = False
+            price_region_match = "not_requested" if not self.verified_city_code else "unreported"
+            availability_region_match = price_region_match
             duplicate_article = record.article in ambiguous_catalog_articles
 
-            price_response, price_failure = self._execute_call(
-                client.get_prices,
-                request_counter=request_counter,
-                access_token=access_token,
-                filter_value=filter_value,
-                filter_kind=filter_kind,
-            )
+            try:
+                price_response, price_failure = self._execute_call(
+                    client.get_prices,
+                    request_counter=request_counter,
+                    access_token=access_token,
+                    filter_value=filter_value,
+                    filter_kind=filter_kind,
+                    expected_catalog_revision=catalog_revision,
+                )
+            except _CatalogRevisionChanged:
+                return self._revision_failure(request_counter, affinity)
             if price_failure is not None:
                 if price_failure in {
                     ProviderFailureCategory.AUTHENTICATION,
@@ -592,20 +765,29 @@ class TstnCommercialExecutionAdapter:
             elif not isinstance(price_response, TstnPricesResponse):
                 failures.append(ProviderFailureCategory.INVALID_RESPONSE)
             else:
-                price_rows = price_response.results or ()
-                if price_rows and any(
-                    not record.article or row.article != record.article
-                    for row in price_rows
-                ):
-                    failures.append(ProviderFailureCategory.INVALID_RESPONSE)
-                price, ambiguous_price = self._matching_price(
-                    price_response,
-                    article=record.article,
-                    duplicate_article=duplicate_article,
+                region_ok, price_region_match = self._response_region_match(
+                    price_response.city,
+                    self.verified_city_code,
                 )
-                price_observed = price is not None
-                if ambiguous_price:
+                if not region_ok:
                     failures.append(ProviderFailureCategory.INVALID_RESPONSE)
+                else:
+                    price_rows = price_response.results or ()
+                    mixed_price_rows = bool(price_rows) and any(
+                        not record.article or row.article != record.article
+                        for row in price_rows
+                    )
+                    if mixed_price_rows:
+                        failures.append(ProviderFailureCategory.INVALID_RESPONSE)
+                    else:
+                        price, ambiguous_price = self._matching_price(
+                            price_response,
+                            article=record.article,
+                            duplicate_article=duplicate_article,
+                        )
+                        price_observed = price is not None
+                        if ambiguous_price:
+                            failures.append(ProviderFailureCategory.INVALID_RESPONSE)
 
             if request_limit_reached:
                 offers.append(self._offer(
@@ -614,18 +796,24 @@ class TstnCommercialExecutionAdapter:
                     availability_text=status_text,
                     price_observed=price_observed,
                     availability_observed=availability_observed,
+                    price_region_match=price_region_match,
+                    availability_region_match=availability_region_match,
                     catalog_revision=catalog_revision,
                     affinity=affinity,
                 ))
                 break
 
-            available_response, available_failure = self._execute_call(
-                client.get_available,
-                request_counter=request_counter,
-                access_token=access_token,
-                filter_value=filter_value,
-                filter_kind=filter_kind,
-            )
+            try:
+                available_response, available_failure = self._execute_call(
+                    client.get_available,
+                    request_counter=request_counter,
+                    access_token=access_token,
+                    filter_value=filter_value,
+                    filter_kind=filter_kind,
+                    expected_catalog_revision=catalog_revision,
+                )
+            except _CatalogRevisionChanged:
+                return self._revision_failure(request_counter, affinity)
             if available_failure is not None:
                 if available_failure in {
                     ProviderFailureCategory.AUTHENTICATION,
@@ -643,20 +831,29 @@ class TstnCommercialExecutionAdapter:
             elif not isinstance(available_response, TstnAvailableItemsResponse):
                 failures.append(ProviderFailureCategory.INVALID_RESPONSE)
             else:
-                availability_rows = available_response.results or ()
-                if availability_rows and any(
-                    not record.article or row.article != record.article
-                    for row in availability_rows
-                ):
-                    failures.append(ProviderFailureCategory.INVALID_RESPONSE)
-                status_text, ambiguous_status = self._matching_status(
-                    available_response,
-                    article=record.article,
-                    duplicate_article=duplicate_article,
+                region_ok, availability_region_match = self._response_region_match(
+                    available_response.city,
+                    self.verified_city_code,
                 )
-                availability_observed = bool(status_text) and not ambiguous_status
-                if ambiguous_status:
+                if not region_ok:
                     failures.append(ProviderFailureCategory.INVALID_RESPONSE)
+                else:
+                    availability_rows = available_response.results or ()
+                    mixed_availability_rows = bool(availability_rows) and any(
+                        not record.article or row.article != record.article
+                        for row in availability_rows
+                    )
+                    if mixed_availability_rows:
+                        failures.append(ProviderFailureCategory.INVALID_RESPONSE)
+                    else:
+                        status_text, ambiguous_status = self._matching_status(
+                            available_response,
+                            article=record.article,
+                            duplicate_article=duplicate_article,
+                        )
+                        availability_observed = bool(status_text) and not ambiguous_status
+                        if ambiguous_status:
+                            failures.append(ProviderFailureCategory.INVALID_RESPONSE)
 
             offers.append(self._offer(
                 record,
@@ -664,11 +861,16 @@ class TstnCommercialExecutionAdapter:
                 availability_text=status_text,
                 price_observed=price_observed,
                 availability_observed=availability_observed,
+                price_region_match=price_region_match,
+                availability_region_match=availability_region_match,
                 catalog_revision=catalog_revision,
                 affinity=affinity,
             ))
             if request_limit_reached:
                 break
+
+        if not self._catalog_revision_matches(catalog_revision):
+            return self._revision_failure(request_counter, affinity)
 
         if not offers:
             category = failures[0] if failures else ProviderFailureCategory.INVALID_RESPONSE

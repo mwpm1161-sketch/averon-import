@@ -121,16 +121,34 @@ def _auth_response():
     return _response({"access_token": ACCESS_TOKEN, "access_date": "2026-10-15"})
 
 
-def _price_response(article: str | None = None, price: str | None = None, *, rows=None):
+def _price_response(
+    article: str | None = None,
+    price: str | None = None,
+    *,
+    rows=None,
+    city: str | None = None,
+):
     if rows is None:
         rows = [] if article is None else [{"article": article, "price": price}]
-    return _response({"count": len(rows), "results": rows})
+    payload = {"count": len(rows), "results": rows}
+    if city is not None:
+        payload["city"] = city
+    return _response(payload)
 
 
-def _availability_response(article: str | None = None, status: str | None = None, *, rows=None):
+def _availability_response(
+    article: str | None = None,
+    status: str | None = None,
+    *,
+    rows=None,
+    city: str | None = None,
+):
     if rows is None:
         rows = [] if article is None else [{"article": article, "status": status}]
-    return _response({"count": len(rows), "results": rows})
+    payload = {"count": len(rows), "results": rows}
+    if city is not None:
+        payload["city"] = city
+    return _response(payload)
 
 
 def _record(
@@ -322,6 +340,72 @@ def test_filtered_id_queries_normalize_one_offer_and_count_real_attempts():
     assert store.read_keys.count(TSTN_CREDENTIALS_CONFIGURED) >= 2
 
 
+@pytest.mark.parametrize("response_city", ["city-code-78", "Region name, unmapped"])
+def test_unconfirmed_response_city_withholds_commercial_values(response_city):
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response("000101", "99.50", city=response_city),
+            _availability_response("000101", "В наличии", city=response_city),
+        ],
+        city_code="city-code-77",
+    )
+
+    outcome = adapter.execute_search(_intent(), limit=1, request_counter=ProviderRequestCounter())
+    offer = outcome.offers[0]
+
+    assert outcome.state == ProviderSearchState.PARTIAL_SUCCESS
+    assert outcome.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert offer.price is None
+    assert offer.availability_text == ""
+    assert offer.data_provenance["city_filter"] == "city-code-77"
+    assert offer.data_provenance["price_region_match"] == "unconfirmed"
+    assert offer.data_provenance["availability_region_match"] == "unconfirmed"
+
+
+def test_missing_response_city_keeps_region_attribution_unconfirmed():
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response("000101", "99.50"),
+            _availability_response("000101", "В наличии"),
+        ],
+        city_code="city-code-77",
+    )
+
+    outcome = adapter.execute_search(_intent(), limit=1, request_counter=ProviderRequestCounter())
+    offer = outcome.offers[0]
+
+    assert outcome.state == ProviderSearchState.SUCCESS
+    assert offer.price == Decimal("99.50")
+    assert offer.availability_text == "В наличии"
+    assert offer.data_provenance["price_region_match"] == "unreported"
+    assert offer.data_provenance["availability_region_match"] == "unreported"
+
+
+def test_exact_response_city_value_is_kept_without_name_aliasing():
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response("000101", "99.50", city="city-code-77"),
+            _availability_response("000101", "В наличии", city="city-code-77"),
+        ],
+        city_code="city-code-77",
+    )
+
+    outcome = adapter.execute_search(_intent(), limit=1, request_counter=ProviderRequestCounter())
+    offer = outcome.offers[0]
+
+    assert outcome.state == ProviderSearchState.SUCCESS
+    assert offer.price == Decimal("99.50")
+    assert offer.availability_text == "В наличии"
+    assert offer.data_provenance["price_region_match"] == "exact_value_match"
+    assert offer.data_provenance["availability_region_match"] == "exact_value_match"
+
+
 def test_article_fallback_preserves_leading_zeroes_and_distinguishes_same_text_as_id():
     records = [
         _record(identity_kind="article", identity_value="00017", item_id=None, article="00017"),
@@ -449,6 +533,83 @@ def test_mismatched_extra_rows_are_not_assigned_to_candidate():
     assert outcome.offers[0].data_provenance["price_field"] == ""
 
 
+def test_mixed_price_rows_discard_matching_price_and_keep_other_clean_fields():
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response(rows=[
+                {"article": "000101", "price": "10.00"},
+                {"article": "000999", "price": "90.00"},
+            ]),
+            _availability_response("000101", "В наличии"),
+        ],
+    )
+
+    outcome = adapter.execute_search(_intent(), limit=1, request_counter=ProviderRequestCounter())
+
+    assert outcome.state == ProviderSearchState.PARTIAL_SUCCESS
+    assert outcome.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert outcome.offers[0].price is None
+    assert outcome.offers[0].availability_text == "В наличии"
+
+
+def test_mixed_availability_rows_discard_matching_status_and_keep_clean_price():
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response("000101", "10.00"),
+            _availability_response(rows=[
+                {"article": "000101", "status": "В наличии"},
+                {"article": "000999", "status": "Под заказ"},
+            ]),
+        ],
+    )
+
+    outcome = adapter.execute_search(_intent(), limit=1, request_counter=ProviderRequestCounter())
+
+    assert outcome.state == ProviderSearchState.PARTIAL_SUCCESS
+    assert outcome.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert outcome.offers[0].price == Decimal("10.00")
+    assert outcome.offers[0].availability_text == ""
+
+
+def test_consistent_duplicate_rows_remain_usable_and_empty_responses_are_successful():
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response(rows=[
+                {"article": "000101", "price": "10.00"},
+                {"article": "000101", "price": "10.00"},
+            ]),
+            _availability_response(rows=[
+                {"article": "000101", "status": "В наличии"},
+                {"article": "000101", "status": "В наличии"},
+            ]),
+        ],
+    )
+
+    duplicate_outcome = adapter.execute_search(
+        _intent(), limit=1, request_counter=ProviderRequestCounter(),
+    )
+    assert duplicate_outcome.state == ProviderSearchState.SUCCESS
+    assert duplicate_outcome.offers[0].price == Decimal("10.00")
+    assert duplicate_outcome.offers[0].availability_text == "В наличии"
+
+    empty_adapter, *_ = _setup(
+        [_record()],
+        [_auth_response(), _price_response(), _availability_response()],
+    )
+    empty_outcome = empty_adapter.execute_search(
+        _intent(), limit=1, request_counter=ProviderRequestCounter(),
+    )
+    assert empty_outcome.state == ProviderSearchState.SUCCESS
+    assert empty_outcome.offers[0].price is None
+    assert empty_outcome.offers[0].availability_text == ""
+
+
 def test_invalid_decimal_is_sanitized_and_yields_partial_unpriced_offer():
     adapter, _mirror, _store, _transport, _config = _setup(
         [_record()],
@@ -502,6 +663,26 @@ def test_status_text_is_preserved_without_inventing_boolean_availability(status)
     assert outcome.state == ProviderSearchState.SUCCESS
     assert outcome.offers[0].availability is None
     assert outcome.offers[0].availability_text == status
+
+
+def test_response_city_is_unbound_when_no_city_filter_was_requested():
+    adapter, _mirror, _store, _transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            _price_response("000101", "5.00", city="Supplier default city"),
+            _availability_response("000101", "В наличии", city="Supplier default city"),
+        ],
+    )
+
+    outcome = adapter.execute_search(_intent(), limit=1, request_counter=ProviderRequestCounter())
+
+    assert outcome.state == ProviderSearchState.SUCCESS
+    assert outcome.offers[0].price == Decimal("5.00")
+    assert outcome.offers[0].availability_text == "В наличии"
+    assert outcome.offers[0].data_provenance["city_filter"] == ""
+    assert outcome.offers[0].data_provenance["price_region_match"] == "not_requested"
+    assert outcome.offers[0].data_provenance["availability_region_match"] == "not_requested"
 
 
 def test_unknown_price_basis_stays_unproven_and_cannot_select_a_commercial_winner():
@@ -671,6 +852,92 @@ def test_runner_dedupe_binds_intent_limit_catalog_generation_city_and_policy():
         intent, limit=1, execution_scope_id="dedupe",
     ).request_fingerprint != first_identity.request_fingerprint
     assert transport.requests and all(ACCESS_TOKEN not in repr(item.data_provenance) for item in first.offers)
+
+
+def test_provider_runner_rejects_catalog_revision_changed_after_request_identity():
+    adapter, mirror, store, transport, _config = _setup(
+        [_record()],
+        [_auth_response(), _price_response("000101", "1.00"), _availability_response("000101", "В наличии")],
+    )
+    original_identity = adapter.request_identity
+
+    def identity_then_switch(intent, *, limit, execution_scope_id):
+        identity = original_identity(
+            intent,
+            limit=limit,
+            execution_scope_id=execution_scope_id,
+        )
+        mirror.revision = "e" * 64
+        return identity
+
+    adapter.request_identity = identity_then_switch
+    outcome = _execution(adapter, limit=1).outcomes[0]
+
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.failure_category == ProviderFailureCategory.UNAVAILABLE
+    assert outcome.offers == ()
+    assert outcome.request_count == 0
+    assert outcome.catalog_version is None
+    assert mirror.search_calls == 0
+    assert store.read_keys == []
+    assert transport.requests == []
+
+
+def test_catalog_revision_change_during_commercial_request_discards_partial_offer():
+    holder = {}
+
+    def change_revision_after_price(_request):
+        holder["mirror"].revision = "e" * 64
+        return _price_response("000101", "1.00")
+
+    adapter, mirror, store, transport, _config = _setup(
+        [_record()],
+        [
+            _auth_response(),
+            change_revision_after_price,
+            _availability_response("000101", "В наличии"),
+        ],
+    )
+    holder["mirror"] = mirror
+
+    outcome = _execution(adapter, limit=1).outcomes[0]
+
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.failure_category == ProviderFailureCategory.UNAVAILABLE
+    assert outcome.offers == ()
+    assert outcome.request_count == 2
+    assert outcome.catalog_version is None
+    assert len(transport.requests) == 2
+    assert store.read_keys.count(TSTN_CREDENTIALS_CONFIGURED) >= 2
+
+
+def test_catalog_revision_change_during_duplicate_article_check_stops_before_auth():
+    record = _record()
+    mirror = FakeMirror([record])
+    original_search = mirror.search
+
+    def changing_article_search(intent=None, *, article=None, limit):
+        matches = original_search(intent, article=article, limit=limit)
+        if article is not None:
+            mirror.revision = "e" * 64
+        return matches
+
+    mirror.search = changing_article_search
+    adapter, _mirror, store, transport, _config = _setup(
+        [record],
+        [_auth_response(), _price_response("000101", "1.00"), _availability_response("000101", "В наличии")],
+        mirror=mirror,
+    )
+
+    outcome = _execution(adapter, limit=1).outcomes[0]
+
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.failure_category == ProviderFailureCategory.UNAVAILABLE
+    assert outcome.offers == ()
+    assert outcome.request_count == 0
+    assert outcome.catalog_version is None
+    assert store.read_keys == []
+    assert transport.requests == []
 
 
 def test_secret_material_never_enters_offer_provenance_or_outcome_errors():
