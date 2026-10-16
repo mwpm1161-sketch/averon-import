@@ -240,11 +240,20 @@ def test_sourcing_modal_phase_owns_excel_launch_visibility_and_review_back_navig
     assert "renderSourcingResult(projectResult)" in project_detail
     assert 'setSourcingModalPhase("project_result")' in result
     assert 'setSourcingModalPhase(job.status, "excel_tender")' in excel_poll
+    assert "isSourcingUiCurrent()" in excel_poll
     assert 'setSourcingModalPhase("failed", "excel_tender")' in excel_start
-    close_handler = app.split('addEventListener("close",() => {', 1)[1].split('});', 1)[0]
+    assert "const sourcingContext = state.sourcing;" in excel_start
+    assert "state.sourcing.requestGeneration === sourcingUiGeneration" in excel_start
+    assert "selectedIds.length);" in excel_start
+    assert "!isCurrent() || !isSourcingUiCurrent()" in excel_start
+    excel_preflight = app.split("function openExcelTenderSourcing()", 1)[1].split("async function deleteExcelTenderWorkspace", 1)[0]
+    assert "invalidateSourcingOperation(state.sourcing)" in excel_preflight
+    close_handler = app.split("function handleSourcingModalClose() {", 1)[1].split("function setSourcingModalPhase(", 1)[0]
+    assert 'addEventListener("close",handleSourcingModalClose)' in app
+    assert "invalidateSourcingOperation(sourcing)" in close_handler
     assert 'setSourcingModalPhase("closed", "none")' in close_handler
-    assert 'state.sourcing.pendingSourcing = null' in close_handler
-    assert 'state.sourcing.providerSelectionProviders = new Set()' in close_handler
+    assert 'sourcing.pendingSourcing = null' in close_handler
+    assert 'sourcing.providerSelectionProviders = new Set()' in close_handler
     assert 'tender-sourcing-submit").hidden =' not in app
 
 

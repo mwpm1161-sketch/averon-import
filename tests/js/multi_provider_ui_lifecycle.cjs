@@ -136,6 +136,7 @@ async function testSelectionCapAndExplicitRequestHandshake() {
 }
 
 async function testSharedPreflightDoesNotSearchBeforeStart() {
+  const invalidation = sliceBetween("function restoreSourcingSubmitButton(", "function handleSourcingModalClose(");
   const opener = sliceBetween("async function openSourcingForRow(row) {", "async function executeSourcingForRow(row, providers = null)");
   const selection = sliceBetween("function renderSharedProviderSelectionPanel() {", "async function loadExcelMultiProviderCapabilities(");
   const calls = [];
@@ -163,7 +164,7 @@ async function testSharedPreflightDoesNotSearchBeforeStart() {
     executeSourcingForRow:async(row,providers)=>calls.push({search:row.name,providers}),
     executeProjectSourcing:async()=>{throw new Error("unexpected project path");},
   };
-  await vm.runInNewContext(`(async()=>{ ${opener} ${selection}
+  await vm.runInNewContext(`(async()=>{ ${invalidation} ${opener} ${selection}
     await openSourcingForRow({name:"Клапан",quantity:"2",unit:"шт"});
     if(calls.some(item=>typeof item==="string"&&item.includes("search"))) throw new Error("Opening the result dialog must not search suppliers");
     await handleSharedProviderSelectionToggle();

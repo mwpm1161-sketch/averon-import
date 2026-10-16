@@ -50,6 +50,16 @@ class SecretBackedVseinstrumentiClient:
             "bearer_token=<deferred>)"
         )
 
+    def is_cached_configuration_current(self) -> bool:
+        """Check cache eligibility without resolving the Bearer token or doing I/O."""
+        with self._credential_lock:
+            try:
+                current_generation = self._current_generation()
+                configured_generation = self._secret_store.get(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+                return current_generation == self._credential_generation and configured_generation == self._credential_generation
+            except Exception:
+                return False
+
     def search_products(
         self,
         search: str,

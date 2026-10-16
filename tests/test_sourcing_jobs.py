@@ -251,4 +251,6 @@ def test_sourcing_job_poller_checks_generation_before_and_after_job_get():
 
     submitter = app_js.split("async function runProjectSourcing(", 1)[1].split("\nasync function openProjectSourcing", 1)[0]
     assert submitter.index("submitButton.disabled = true;") < submitter.index("const job = await api(url")
-    assert "submitButton.disabled = previousButtonDisabled;" in submitter
+    assert "sourcing.activeSubmission = submission;" in submitter
+    assert "sourcing.activeSubmission === submission) restoreSourcingSubmitButton(sourcing, submission);" in submitter
+    assert "state.sourcing === sourcing && sourcing.requestGeneration === generation" in submitter

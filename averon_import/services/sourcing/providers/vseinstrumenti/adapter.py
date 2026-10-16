@@ -294,6 +294,16 @@ class VseinstrumentiExecutionAdapter:
             limit=limit,
         )
 
+    def is_cached_identity_current(self, identity: ProviderSearchRequestIdentity) -> bool:
+        """Revalidate VI runtime credentials before the runner serves a cache hit."""
+        try:
+            if identity.provider_key != self.key or identity.affinity != self._affinity():
+                return False
+            validator = getattr(self.client, "is_cached_configuration_current", None)
+            return validator() is True if callable(validator) else True
+        except Exception:
+            return False
+
     def execute_search(
         self,
         intent: ProductIntent,

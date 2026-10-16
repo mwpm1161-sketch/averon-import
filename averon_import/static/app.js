@@ -18,6 +18,7 @@ function createSourcingState(overrides = {}) {
     manualHistorySearch: null,
     manualHistoryConfirmation: null,
     pendingSourcing: null,
+    activeSubmission: null,
     providerSelectionEnabled: false,
     providerSelectionProviders: new Set(),
     providerSelectionCapabilities: null,
@@ -1264,6 +1265,7 @@ function renderSharedProviderSelectionPanel() {
 async function handleSharedProviderSelectionToggle() {
   const sourcing = state.sourcing;
   if (!sourcing || sourcing.sourceMode !== "provider_only" || sourcing.modalPhase !== "before_run") return;
+  const generation = sourcing.requestGeneration;
   if (sourcing.providerSelectionCapabilities) {
     sourcing.providerSelectionEnabled = true;
     renderSharedProviderSelectionPanel();
@@ -1273,12 +1275,12 @@ async function handleSharedProviderSelectionToggle() {
   if (status) { status.hidden = false; status.textContent = "Проверяем локальную готовность…"; }
   try {
     const capabilities = await api("/api/sourcing/provider-selection-capabilities");
-    if (state.sourcing !== sourcing || sourcing.modalPhase !== "before_run") return;
+    if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation || sourcing.modalPhase !== "before_run") return;
     sourcing.providerSelectionCapabilities = capabilities;
     sourcing.providerSelectionEnabled = true;
     renderSharedProviderSelectionPanel();
   } catch (error) {
-    if (state.sourcing !== sourcing) return;
+    if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation || sourcing.modalPhase !== "before_run") return;
     if (status) { status.hidden = false; status.textContent = error.message || "Не удалось проверить локальную готовность."; }
   }
 }
@@ -1379,6 +1381,32 @@ function openSourcingModal() {
   renderSharedProviderSelectionPanel();
   $("#sourcing-modal").showModal();
   if (!state.sourcing.historyStatusLoaded) void loadSourcingHistoryStatus();
+}
+
+function restoreSourcingSubmitButton(sourcing, submission = sourcing?.activeSubmission) {
+  if (!submission?.button) return;
+  submission.button.disabled = submission.previousDisabled;
+  submission.button.textContent = submission.previousLabel;
+  if (sourcing.activeSubmission === submission) sourcing.activeSubmission = null;
+}
+
+function invalidateSourcingOperation(sourcing = state.sourcing) {
+  if (!sourcing) return;
+  sourcing.requestGeneration = (Number(sourcing.requestGeneration) || 0) + 1;
+  restoreSourcingSubmitButton(sourcing);
+}
+
+function handleSourcingModalClose() {
+  const modal = $("#sourcing-modal");
+  if (modal?.open) return;
+  const sourcing = state.sourcing;
+  if (!sourcing) return;
+  invalidateSourcingOperation(sourcing);
+  sourcing.pendingSourcing = null;
+  sourcing.providerSelectionEnabled = false;
+  sourcing.providerSelectionProviders = new Set();
+  sourcing.providerSelectionCapabilities = null;
+  setSourcingModalPhase("closed", "none");
 }
 
 function setSourcingModalPhase(phase, context = state.sourcing?.modalContext || "shared") {
@@ -2793,6 +2821,8 @@ function renderExcelTenderRows() {
 function openExcelTenderSourcing() {
   if (!state.excelTender.workspace || state.excelTender.sourcingActive) return;
   if (!state.excelTender.selectedIds.size) { toast("Выберите хотя бы одну позицию для подбора", "error"); return; }
+  invalidateSourcingOperation(state.sourcing);
+  state.sourcing.pendingSourcing = null;
   setSourcingModalPhase("before_run", "excel_tender");
   $("#sourcing-subtitle").textContent = "Будут отправлены только выбранные строки Excel";
   $("#sourcing-content").innerHTML = '<p class="hint">Проверьте выбранный источник подбора и запустите задание.</p>';
@@ -2813,6 +2843,15 @@ async function deleteExcelTenderWorkspace() {
 }
 
 async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
+  const sourcingContext = state.sourcing;
+  const sourcingUiGeneration = sourcingContext?.requestGeneration;
+  const hasSourcingModalContext = typeof sourcingContext?.modalContext === "string";
+  const isSourcingUiCurrent = () => !hasSourcingModalContext || (
+    state.sourcing === sourcingContext
+    && state.sourcing.requestGeneration === sourcingUiGeneration
+    && state.sourcing.modalContext === "excel_tender"
+    && $("#sourcing-modal").open
+  );
   let queuedPoll = 0;
   const current = () => state.excelTender.workspace?.tender_id === tenderId
     && state.excelTender.pollGeneration === generation
@@ -2831,16 +2870,26 @@ async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
     const total = job.total || expectedTotal;
     const completed = Math.min(Number(job.current || 0), total || Number(job.current || 0));
     if (job.status === "queued" || job.status === "running") {
-      if ($("#sourcing-modal").open) setSourcingModalPhase(job.status, "excel_tender");
-      $("#sourcing-subtitle").textContent = job.status === "queued" ? "Задание в очереди" : "Подбираем предложения";
-      $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${job.status === "queued" ? "В очереди" : "Выполняется"}</b><strong>${completed} из ${total}</strong><small>${job.status === "queued" ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
+      if (isSourcingUiCurrent()) {
+        if ($("#sourcing-modal").open) setSourcingModalPhase(job.status, "excel_tender");
+        $("#sourcing-subtitle").textContent = job.status === "queued" ? "Задание в очереди" : "Подбираем предложения";
+        $("#sourcing-content").innerHTML = `<div class="sourcing-loading"><span class="spinner"></span><b>${job.status === "queued" ? "В очереди" : "Выполняется"}</b><strong>${completed} из ${total}</strong><small>${job.status === "queued" ? "Задание начнётся, когда освободится очередь." : "Product Understanding → поиск → deterministic matching"}</small></div>`;
+      }
     } else if (job.status === "completed") {
+      if (!isSourcingUiCurrent()) {
+        void refreshExcelTenderRuns(tenderId);
+        return;
+      }
       const result = job.result;
       const multiProvider = result?.run_kind === "multi_provider" || result?.schema_version === 2;
       if (multiProvider && result?.run_id) {
         const endpoint = `/api/manual-tenders/${encodeURIComponent(tenderId)}/runs/${encodeURIComponent(result.run_id)}`;
         const run = await api(endpoint);
         if (!current()) return;
+        if (!isSourcingUiCurrent()) {
+          void refreshExcelTenderRuns(tenderId);
+          return;
+        }
         renderMultiProviderPublicRun(run);
         void refreshExcelTenderRuns(tenderId);
         return;
@@ -2896,6 +2945,12 @@ async function startExcelTenderSourcing() {
   }
   const tenderId = workspace.tender_id;
   const generation = ++state.excelTender.pollGeneration;
+  const sourcingContext = state.sourcing;
+  const sourcingUiGeneration = sourcingContext.requestGeneration;
+  const isSourcingUiCurrent = () => state.sourcing === sourcingContext
+    && state.sourcing.requestGeneration === sourcingUiGeneration
+    && state.sourcing.modalContext === "excel_tender"
+    && $("#sourcing-modal").open;
   const mode = state.sourcing.sourceMode;
   state.excelTender.sourcingActive = true;
   if (typeof renderExcelMultiProviderPanel === "function") renderExcelMultiProviderPanel();
@@ -2919,7 +2974,7 @@ async function startExcelTenderSourcing() {
     state.excelTender.jobId = job.id;
     await pollExcelTenderJob(job.id, tenderId, generation, selectedIds.length);
   } catch (error) {
-    if (!isCurrent()) return;
+    if (!isCurrent() || !isSourcingUiCurrent()) return;
     $("#sourcing-subtitle").textContent = "Подбор не выполнен";
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message || "Подбор не выполнен")}</div>`;
     if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "excel_tender");
@@ -4743,7 +4798,11 @@ function providerOutcomeStateLabel(state) {
 function commercialEvidenceNote(offer, evidence) {
   if (!evidence) return "Коммерческие условия требуют проверки.";
   if (evidence.state !== "COMPLETE") return "Предварительная цена: НДС и единица цены не подтверждены.";
-  const vat = ({gross_including_vat:"цена с НДС", net_excluding_vat:"цена без НДС", not_applicable:"НДС не применяется"})[evidence.vat_basis] || "основание НДС требует проверки";
+  const vat = ({
+    GROSS_INCLUDING_VAT:"цена с НДС",
+    NET_EXCLUDING_VAT:"цена без НДС",
+    UNKNOWN:"основание НДС требует проверки",
+  })[evidence.vat_basis] || "основание НДС требует проверки";
   return `Коммерческие сведения проверены: ${vat}.`;
 }
 
@@ -5623,6 +5682,7 @@ function renderSourcingResult(result, row = null) {
 
 async function openSourcingForRow(row) {
   const sourcing = state.sourcing;
+  invalidateSourcingOperation(sourcing);
   sourcing.row = row;
   sourcing.pendingSourcing = {kind:"row", row};
   sourcing.result = null;
@@ -5663,6 +5723,7 @@ async function executeSourcingForRow(row, providers = null) {
 async function runProjectSourcing(rows, documentId = null, submitButton = null) {
   if (!rows.length) { toast("Нет выбранных позиций для подбора", "error"); return; }
   const sourcing = state.sourcing;
+  invalidateSourcingOperation(sourcing);
   sourcing.pendingSourcing = {kind:"project", rows, documentId, submitButton};
   sourcing.result = null;
   sourcing.modeChangedAfterResult = false;
@@ -5676,15 +5737,20 @@ async function runProjectSourcing(rows, documentId = null, submitButton = null) 
 }
 
 async function executeProjectSourcing(rows, documentId = null, submitButton = null, providers = null) {
-  const previousButtonLabel = submitButton?.textContent;
-  const previousButtonDisabled = submitButton?.disabled;
+  const sourcing = state.sourcing;
+  const generation = ++sourcing.requestGeneration;
+  const submission = submitButton ? {
+    generation,
+    button: submitButton,
+    previousLabel: submitButton.textContent,
+    previousDisabled: submitButton.disabled,
+  } : null;
   if (submitButton) {
+    sourcing.activeSubmission = submission;
     submitButton.disabled = true;
     submitButton.textContent = "Запускаем подбор…";
   }
-  const sourcing = state.sourcing;
   setSourcingModalPhase("running", "shared");
-  const generation = ++sourcing.requestGeneration;
   const sourceMode = sourcing.sourceMode;
   const loading = sourcingModeLoadingCopy(sourceMode);
   $("#sourcing-subtitle").textContent = loading.title;
@@ -5705,6 +5771,7 @@ async function executeProjectSourcing(rows, documentId = null, submitButton = nu
         submitButton.textContent = status === "queued" ? "В очереди…" : "Подбираем…";
       },
     );
+    if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
     sourcing.pendingSourcing = null;
   } catch (error) {
     if (state.sourcing !== sourcing || sourcing.requestGeneration !== generation) return;
@@ -5712,10 +5779,8 @@ async function executeProjectSourcing(rows, documentId = null, submitButton = nu
     if ($("#sourcing-modal").open) setSourcingModalPhase("failed", "shared");
     $("#sourcing-content").innerHTML = `<div class="sourcing-warning">${escapeHtml(error.message)}</div>`;
   } finally {
-    if (submitButton) {
-      submitButton.disabled = previousButtonDisabled;
-      submitButton.textContent = previousButtonLabel;
-    }
+    if (state.sourcing === sourcing && sourcing.requestGeneration === generation
+        && sourcing.activeSubmission === submission) restoreSourcingSubmitButton(sourcing, submission);
   }
 }
 
@@ -6999,13 +7064,7 @@ function setupEvents() {
   $("#project-sourcing-button").addEventListener("click",openProjectSourcing);
   $("#sourcing-source-mode").addEventListener("change",handleSourcingModeChange);
   $("#sourcing-history-refresh").addEventListener("click",() => { void loadSourcingHistoryStatus(); });
-  $("#sourcing-modal").addEventListener("close",() => {
-    state.sourcing.pendingSourcing = null;
-    state.sourcing.providerSelectionEnabled = false;
-    state.sourcing.providerSelectionProviders = new Set();
-    state.sourcing.providerSelectionCapabilities = null;
-    setSourcingModalPhase("closed", "none");
-  });
+  $("#sourcing-modal").addEventListener("close",handleSourcingModalClose);
   $("#close-sourcing").addEventListener("click",()=>$("#sourcing-modal").close());
   $("#help-button").addEventListener("click",()=>$("#help-modal").showModal()); $("#close-help").addEventListener("click",()=>$("#help-modal").close());
   $("#zoom-in").addEventListener("click",()=>setZoom(Math.min(1.8,state.zoom+.1))); $("#zoom-out").addEventListener("click",()=>setZoom(Math.max(.5,state.zoom-.1)));

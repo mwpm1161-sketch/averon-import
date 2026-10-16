@@ -4,6 +4,7 @@ from decimal import Decimal
 import hashlib
 import json
 import socket
+from threading import RLock
 import urllib.request
 from urllib.parse import parse_qs, urlsplit
 
@@ -48,6 +49,15 @@ from averon_import.services.sourcing.providers.vseinstrumenti.client import (
     VseinstrumentiClient,
     VseinstrumentiErrorCategory,
     VseinstrumentiRateLimiter,
+)
+from averon_import.services.sourcing.providers.vseinstrumenti import client as vi_client_module
+from averon_import.services.sourcing.providers.vseinstrumenti.runtime_client import (
+    SecretBackedVseinstrumentiClient,
+)
+from averon_import.services.secrets import (
+    MemorySecretStore,
+    VSEINSTRUMENTI_BEARER_TOKEN,
+    VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
 )
 
 
@@ -242,6 +252,99 @@ def test_runner_executes_vi_outcome_and_request_local_dedup_does_not_double_coun
     assert second.outcomes[0].request_count == 0
     assert second.reused_provider_keys == ("vseinstrumenti",)
     assert len(transport.requests) == 1
+
+
+def _secret_backed_adapter(monkeypatch, *, generation_value, store, transport):
+    monkeypatch.setattr(vi_client_module, "_default_transport", transport)
+    limiter = VseinstrumentiRateLimiter(clock=lambda: 0.0, sleeper=lambda _delay: None)
+    client = SecretBackedVseinstrumentiClient(
+        store,
+        environment="prod",
+        timeout_seconds=10.0,
+        credential_generation="a" * 32,
+        current_generation=lambda: generation_value[0],
+        credential_lock=RLock(),
+        rate_limiter=limiter,
+    )
+    return VseinstrumentiExecutionAdapter(
+        client,
+        region_id=REGION,
+        credential_generation="a" * 32,
+    )
+
+
+class _ReadTrackingMemorySecretStore(MemorySecretStore):
+    def __init__(self):
+        super().__init__()
+        self.reads = []
+
+    def get(self, key):
+        self.reads.append(key)
+        return super().get(key)
+
+
+def test_runtime_vi_cache_hit_rechecks_marker_without_reading_token(monkeypatch):
+    store = _ReadTrackingMemorySecretStore()
+    generation = "a" * 32
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN, TOKEN)
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, generation)
+    transport = FakeTransport(_response(_payload(_product())))
+    adapter = _secret_backed_adapter(
+        monkeypatch,
+        generation_value=[generation],
+        store=store,
+        transport=transport,
+    )
+    runner = ProviderRunner({"vseinstrumenti": adapter})
+    scope = ProviderExecutionScope(execution_scope_id="vi-runtime-cache-current")
+    selection = ProviderSelection(provider_keys=("vseinstrumenti",))
+
+    first = runner.run(selection=selection, intent=_intent(), limit=5, scope=scope)
+    store.reads.clear()
+    cached = runner.run(selection=selection, intent=_intent(), limit=5, scope=scope)
+
+    assert first.outcomes[0].state == ProviderSearchState.SUCCESS
+    assert cached.outcomes[0].state == ProviderSearchState.SUCCESS
+    assert cached.outcomes[0].request_count == 0
+    assert cached.reused_provider_keys == ("vseinstrumenti",)
+    assert store.reads == [VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED]
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("change", ["generation", "marker"])
+def test_runtime_vi_stale_cache_fails_closed_without_token_read_or_http(monkeypatch, change):
+    store = _ReadTrackingMemorySecretStore()
+    initial_generation = "a" * 32
+    current_generation = [initial_generation]
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN, TOKEN)
+    store.set(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED, initial_generation)
+    transport = FakeTransport(_response(_payload(_product())))
+    adapter = _secret_backed_adapter(
+        monkeypatch,
+        generation_value=current_generation,
+        store=store,
+        transport=transport,
+    )
+    runner = ProviderRunner({"vseinstrumenti": adapter})
+    scope = ProviderExecutionScope(execution_scope_id=f"vi-runtime-cache-stale-{change}")
+    selection = ProviderSelection(provider_keys=("vseinstrumenti",))
+    first = runner.run(selection=selection, intent=_intent(), limit=5, scope=scope)
+    store.reads.clear()
+
+    if change == "generation":
+        current_generation[0] = "b" * 32
+    else:
+        store.delete(VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED)
+    stale = runner.run(selection=selection, intent=_intent(), limit=5, scope=scope)
+
+    assert first.outcomes[0].state == ProviderSearchState.SUCCESS
+    assert stale.outcomes[0].state == ProviderSearchState.FAILURE
+    assert stale.outcomes[0].offers == ()
+    assert stale.outcomes[0].request_count == 0
+    assert stale.reused_provider_keys == ()
+    assert store.reads == [VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED]
+    assert len(transport.requests) == 1
+    assert TOKEN not in stale.model_dump_json()
 
 
 def test_credential_generation_prevents_reuse_across_rotated_vi_credentials():
