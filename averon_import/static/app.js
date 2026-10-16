@@ -2894,14 +2894,24 @@ async function pollExcelTenderJob(jobId, tenderId, generation, expectedTotal) {
         void refreshExcelTenderRuns(tenderId);
         return;
       }
-      $("#sourcing-subtitle").textContent = "Подбор тендера завершён";
       if (result?.source_mode === "one_c_only" && result.run_id && state.excelTender.workspace?.tender_id === tenderId) {
         try {
           const endpoint = `/api/manual-tenders/${encodeURIComponent(tenderId)}/runs/${encodeURIComponent(result.run_id)}/history-decisions`;
-          applyTenderHistoryDecisionSnapshot(result, await api(endpoint));
+          const snapshot = await api(endpoint);
+          if (!current()) return;
+          if (!isSourcingUiCurrent()) {
+            void refreshExcelTenderRuns(tenderId);
+            return;
+          }
+          applyTenderHistoryDecisionSnapshot(result, snapshot);
         } catch (_) {}
       }
       if (!current()) return;
+      if (!isSourcingUiCurrent()) {
+        void refreshExcelTenderRuns(tenderId);
+        return;
+      }
+      $("#sourcing-subtitle").textContent = "Подбор тендера завершён";
       if (result?.run_id) {
         state.excelTender.selectedExportRunId = result.run_id;
         state.excelTender.selectedExportId = null;

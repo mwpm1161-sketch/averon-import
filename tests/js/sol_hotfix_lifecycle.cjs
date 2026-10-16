@@ -237,6 +237,122 @@ async function testLateExcelPollingCannotReplaceSharedContext() {
   assert.equal(context.lastRenderedResult, undefined);
 }
 
+async function testLateLegacyExcelHistoryCannotReplaceSharedContext() {
+  const {context, state, node, apiCalls} = makeHarness();
+  const history = deferred();
+  let appliedSnapshots = 0;
+  state.excelTender = {
+    workspace:{tender_id:"tender-a"}, pollGeneration:1, sourcingActive:true, jobId:"job-a",
+    selectedExportRunId:"previous-run", selectedExportId:"previous-export",
+    historyDecisionRevision:"previous-revision", historyDecisionDigest:"previous-digest",
+  };
+  state.sourcing.modalContext = "excel_tender";
+  state.sourcing.modalPhase = "running";
+  state.sourcing.requestGeneration = 7;
+  node("#sourcing-modal").open = true;
+  node("#sourcing-subtitle").textContent = "Excel A is running";
+  node("#sourcing-content").innerHTML = "Excel A pending";
+  context.getJobForPolling = async () => ({
+    status:"completed", result:{run_id:"run-a", source_mode:"one_c_only", label:"Excel A result"},
+  });
+  context.api = url => {
+    apiCalls.push({url});
+    return history.promise;
+  };
+  context.applyTenderHistoryDecisionSnapshot = () => { appliedSnapshots += 1; };
+  const oldPoll = context.pollExcelTenderJob("job-a", "tender-a", 1, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(apiCalls.length, 1);
+  assert.match(apiCalls[0].url, /history-decisions$/);
+
+  node("#sourcing-modal").close();
+  context.handleSourcingModalClose();
+  await context.openSourcingForRow({name:"Shared row B"});
+  const pendingB = state.sourcing.pendingSourcing;
+  const generationB = state.sourcing.requestGeneration;
+  const phaseB = state.sourcing.modalPhase;
+  const subtitleB = node("#sourcing-subtitle").textContent;
+  const contentB = node("#sourcing-content").innerHTML;
+  const selectedRunB = state.excelTender.selectedExportRunId;
+  const selectedExportB = state.excelTender.selectedExportId;
+
+  history.resolve({rows:[], effective:{}, decision_revision:"late-a", decision_digest:"late-a"});
+  await oldPoll;
+
+  assert.equal(state.sourcing.row.name, "Shared row B");
+  assert.equal(state.sourcing.pendingSourcing, pendingB);
+  assert.equal(state.sourcing.requestGeneration, generationB);
+  assert.equal(state.sourcing.modalPhase, phaseB);
+  assert.equal(node("#sourcing-subtitle").textContent, subtitleB);
+  assert.equal(node("#sourcing-content").innerHTML, contentB);
+  assert.equal(state.excelTender.selectedExportRunId, selectedRunB);
+  assert.equal(state.excelTender.selectedExportId, selectedExportB);
+  assert.equal(state.excelTender.historyDecisionRevision, "previous-revision");
+  assert.equal(state.excelTender.historyDecisionDigest, "previous-digest");
+  assert.equal(appliedSnapshots, 0);
+  assert.equal(context.lastRenderedResult, undefined);
+  assert.equal(context.excelRunRefreshes, 1);
+}
+
+async function testNormalLegacyExcelCompletionStillRenders() {
+  const {context, state, node} = makeHarness();
+  const result = {run_id:"legacy-run", source_mode:"one_c_only", label:"Legacy result"};
+  let appliedSnapshots = 0;
+  state.excelTender = {
+    workspace:{tender_id:"tender-a"}, pollGeneration:1, sourcingActive:true, jobId:"job-a",
+  };
+  state.sourcing.modalContext = "excel_tender";
+  state.sourcing.modalPhase = "running";
+  state.sourcing.requestGeneration = 3;
+  node("#sourcing-modal").open = true;
+  context.getJobForPolling = async () => ({status:"completed", result});
+  context.api = async url => {
+    assert.match(url, /history-decisions$/);
+    return {rows:[], effective:{}, decision_revision:"revision", decision_digest:"digest"};
+  };
+  context.applyTenderHistoryDecisionSnapshot = (target, snapshot) => {
+    assert.equal(target, result);
+    assert.equal(snapshot.decision_revision, "revision");
+    appliedSnapshots += 1;
+  };
+
+  await context.pollExcelTenderJob("job-a", "tender-a", 1, 1);
+
+  assert.equal(appliedSnapshots, 1);
+  assert.equal(state.excelTender.selectedExportRunId, "legacy-run");
+  assert.equal(state.excelTender.selectedExportId, null);
+  assert.equal(context.lastRenderedResult, result);
+  assert.equal(context.excelRunRefreshes, 1);
+}
+
+async function testNormalV2ExcelCompletionStillRenders() {
+  const {context, state, node} = makeHarness();
+  const run = {run_id:"v2-run", schema_version:2};
+  let historyRequests = 0;
+  state.excelTender = {
+    workspace:{tender_id:"tender-a"}, pollGeneration:1, sourcingActive:true, jobId:"job-a",
+  };
+  state.sourcing.modalContext = "excel_tender";
+  state.sourcing.modalPhase = "running";
+  state.sourcing.requestGeneration = 4;
+  node("#sourcing-modal").open = true;
+  context.getJobForPolling = async () => ({
+    status:"completed", result:{run_id:"v2-run", run_kind:"multi_provider", schema_version:2},
+  });
+  context.api = async url => {
+    historyRequests += Number(url.endsWith("history-decisions"));
+    assert.match(url, /\/runs\/v2-run$/);
+    return run;
+  };
+  context.renderMultiProviderPublicRun = received => { context.renderedV2Run = received; };
+
+  await context.pollExcelTenderJob("job-a", "tender-a", 1, 1);
+
+  assert.equal(historyRequests, 0);
+  assert.equal(context.renderedV2Run, run);
+  assert.equal(context.excelRunRefreshes, 1);
+}
+
 function testSerializedVatBasisLabels() {
   const {context} = makeHarness();
   const note = evidence => context.commercialEvidenceNote({}, evidence);
@@ -255,6 +371,9 @@ function testSerializedVatBasisLabels() {
   await testProjectPollingAndOldCleanupCannotTouchNewRun();
   await testNormalSearchAndImmediateRetryStillWork();
   await testLateExcelPollingCannotReplaceSharedContext();
+  await testLateLegacyExcelHistoryCannotReplaceSharedContext();
+  await testNormalLegacyExcelCompletionStillRenders();
+  await testNormalV2ExcelCompletionStillRenders();
   testSerializedVatBasisLabels();
   console.log("PASS: SOL F1/F2/F3 lifecycle regressions");
 })().catch(error => {
