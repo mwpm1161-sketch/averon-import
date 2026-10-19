@@ -3,7 +3,6 @@ from __future__ import annotations
 from decimal import Decimal
 import io
 import json
-import logging
 import socket
 import traceback
 import urllib.error
@@ -36,6 +35,13 @@ from averon_import.services.sourcing.providers import safe_diagnostics as diagno
 REGION = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
 TOKEN = "VI_SECRET_SENTINEL_123"
 SEARCH = "Аккумуляторная дрель Durofix 60V RK60132-PM"
+
+
+@pytest.fixture
+def diagnostic_output(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "stream", output)
+    return output
 
 
 class FakeResponse:
@@ -143,21 +149,19 @@ def test_search_builds_documented_one_page_request_with_bearer_header_only():
     assert len(result.products) == 1
 
 
-def test_safe_diagnostics_are_disabled_by_default(monkeypatch, caplog):
+def test_safe_diagnostics_are_disabled_by_default(monkeypatch, diagnostic_output):
     monkeypatch.delenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", raising=False)
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     transport = FakeTransport(FakeResponse(b"<html>safe fixture</html>", headers={"Content-Type": "text/html"}))
 
     with pytest.raises(VseinstrumentiApiError):
         _client(transport).search_products(SEARCH, region_id=REGION)
 
-    assert caplog.text == ""
+    assert diagnostic_output.getvalue() == ""
     assert len(transport.requests) == 1
 
 
-def test_safe_diagnostics_for_successful_json_do_not_change_request_count(monkeypatch, caplog):
+def test_safe_diagnostics_for_successful_json_do_not_change_request_count(monkeypatch, diagnostic_output):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     transport = FakeTransport(FakeResponse(
         _response(_payload(_product())).body,
         headers={"Content-Type": "application/json; charset=utf-8"},
@@ -169,16 +173,15 @@ def test_safe_diagnostics_for_successful_json_do_not_change_request_count(monkey
     assert len(result.products) == 1
     assert counter.request_count == 1
     assert len(transport.requests) == 1
-    assert caplog.text == ""
+    assert diagnostic_output.getvalue() == ""
 
 
 @pytest.mark.parametrize("diagnostics_enabled", [False, True])
 def test_response_header_failure_never_changes_client_result_or_attempt_count(
-    monkeypatch, diagnostics_enabled, caplog,
+    monkeypatch, diagnostics_enabled, diagnostic_output,
 ):
     if diagnostics_enabled:
         monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-        caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     else:
         monkeypatch.delenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", raising=False)
     response = HeadersRaisingResponse(b"{invalid-json")
@@ -193,10 +196,10 @@ def test_response_header_failure_never_changes_client_result_or_attempt_count(
     assert counter.request_count == len(transport.requests) == 1
     assert response.header_reads == (1 if diagnostics_enabled else 0)
     if diagnostics_enabled:
-        assert "content_type=MISSING" in caplog.text
+        assert "content_type=MISSING" in diagnostic_output.getvalue()
     else:
-        assert caplog.text == ""
-    assert "SYNTHETIC_HEADER_ACCESS_SECRET" not in caplog.text
+        assert diagnostic_output.getvalue() == ""
+    assert "SYNTHETIC_HEADER_ACCESS_SECRET" not in diagnostic_output.getvalue()
 
 
 def test_diagnostic_event_construction_failure_is_swallowed_once(monkeypatch):
@@ -228,10 +231,9 @@ def test_diagnostic_event_construction_failure_is_swallowed_once(monkeypatch):
     ],
 )
 def test_http_200_error_envelope_keeps_http_and_envelope_codes_separate(
-    monkeypatch, caplog, envelope_code, expected_category,
+    monkeypatch, diagnostic_output, envelope_code, expected_category,
 ):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     body = _response({"code": envelope_code, "message": "SAFE_ENVELOPE_FIXTURE"})
     transport = FakeTransport(body)
     counter = ProviderRequestCounter()
@@ -245,10 +247,11 @@ def test_http_200_error_envelope_keeps_http_and_envelope_codes_separate(
     assert caught.value.status_code == envelope_code
     assert caught.value.diagnostic_status_code == 200
     assert caught.value.envelope_status_code == envelope_code
-    assert f"error_type={VseinstrumentiDiagnosticErrorType.ERROR_ENVELOPE.value}" in caplog.text
-    assert "status_code=200" in caplog.text
-    assert f"envelope_status_code={envelope_code}" in caplog.text
-    assert "SAFE_ENVELOPE_FIXTURE" not in caplog.text
+    output = diagnostic_output.getvalue()
+    assert f"error_type={VseinstrumentiDiagnosticErrorType.ERROR_ENVELOPE.value}" in output
+    assert "status_code=200" in output
+    assert f"envelope_status_code={envelope_code}" in output
+    assert "SAFE_ENVELOPE_FIXTURE" not in output
     assert counter.request_count == len(transport.requests) == 1
 
 
@@ -262,10 +265,9 @@ def test_http_200_error_envelope_keeps_http_and_envelope_codes_separate(
     ],
 )
 def test_safe_diagnostics_classify_json_decode_failure_without_sensitive_values(
-    monkeypatch, caplog, body, headers, error_type, reason_code, content_type,
+    monkeypatch, diagnostic_output, body, headers, error_type, reason_code, content_type,
 ):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     transport = FakeTransport(FakeResponse(body, headers=headers))
     counter = ProviderRequestCounter()
 
@@ -277,22 +279,22 @@ def test_safe_diagnostics_classify_json_decode_failure_without_sensitive_values(
     assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
     assert counter.request_count == 1
     assert len(transport.requests) == 1
-    assert f"error_type={error_type}" in caplog.text
-    assert f"reason_code={reason_code}" in caplog.text
-    assert "status_code=200" in caplog.text
-    assert f"content_type={content_type}" in caplog.text
-    assert f"response_bytes={len(body)}" in caplog.text
+    output = diagnostic_output.getvalue()
+    assert f"error_type={error_type}" in output
+    assert f"reason_code={reason_code}" in output
+    assert "status_code=200" in output
+    assert f"content_type={content_type}" in output
+    assert f"response_bytes={len(body)}" in output
     for secret in (TOKEN, SEARCH, REGION, "BODY_SECRET_SENTINEL"):
-        assert secret not in caplog.text
+        assert secret not in output
 
 
-def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplog):
+def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagnostic_output):
     from averon_import.services.sourcing.providers.safe_diagnostics import (
         VseinstrumentiDiagnosticReasonCode,
     )
 
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     invalid_cases = [
         ({"unexpected": "ENVELOPE_SECRET"}, VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE),
         (_payload(_product(), search="OTHER_QUERY_SECRET"), VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH),
@@ -307,7 +309,8 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplo
     ]
 
     for payload, expected_reason in invalid_cases:
-        caplog.clear()
+        diagnostic_output.seek(0)
+        diagnostic_output.truncate(0)
         transport = FakeTransport(FakeResponse(_response(payload).body, headers={"Content-Type": "application/json"}))
         with pytest.raises(VseinstrumentiApiError) as caught:
             _client(transport).search_products(SEARCH, region_id=REGION)
@@ -317,13 +320,14 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplo
             VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
             VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
         } else "RESPONSE_VALIDATION"
-        assert f"error_type={expected_error_type}" in caplog.text
-        assert f"reason_code={expected_reason.value}" in caplog.text
-        assert "status_code=200" in caplog.text
-        assert "ENVELOPE_SECRET" not in caplog.text
-        assert "OTHER_QUERY_SECRET" not in caplog.text
-        assert "PRODUCTS_SECRET" not in caplog.text
-        assert "CONFLICT_SECRET" not in caplog.text
+        output = diagnostic_output.getvalue()
+        assert f"error_type={expected_error_type}" in output
+        assert f"reason_code={expected_reason.value}" in output
+        assert "status_code=200" in output
+        assert "ENVELOPE_SECRET" not in output
+        assert "OTHER_QUERY_SECRET" not in output
+        assert "PRODUCTS_SECRET" not in output
+        assert "CONFLICT_SECRET" not in output
         assert len(transport.requests) == 1
 
 
@@ -338,10 +342,9 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplo
     ],
 )
 def test_http_diagnostics_keep_existing_categories_and_single_attempt(
-    monkeypatch, caplog, status, category, content_type,
+    monkeypatch, diagnostic_output, status, category, content_type,
 ):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     body = b"HTTP_BODY_SECRET_SENTINEL"
     headers = {
         "JSON": {"Content-Type": "application/json"},
@@ -358,22 +361,22 @@ def test_http_diagnostics_keep_existing_categories_and_single_attempt(
     assert caught.value.category == category
     assert caught.value.status_code == status
     assert caught.value.diagnostic_status_code == status
-    assert f"error_type={VseinstrumentiDiagnosticErrorType.HTTP.value}" in caplog.text
-    assert f"status_code={status}" in caplog.text
-    assert "envelope_status_code=MISSING" in caplog.text
-    assert f"content_type={content_type}" in caplog.text
-    assert f"response_bytes={len(body)}" in caplog.text
-    assert "HTTP_BODY_SECRET_SENTINEL" not in caplog.text
-    assert TOKEN not in caplog.text
-    assert SEARCH not in caplog.text
-    assert REGION not in caplog.text
+    output = diagnostic_output.getvalue()
+    assert f"error_type={VseinstrumentiDiagnosticErrorType.HTTP.value}" in output
+    assert f"status_code={status}" in output
+    assert "envelope_status_code=MISSING" in output
+    assert f"content_type={content_type}" in output
+    assert f"response_bytes={len(body)}" in output
+    assert "HTTP_BODY_SECRET_SENTINEL" not in output
+    assert TOKEN not in output
+    assert SEARCH not in output
+    assert REGION not in output
     assert counter.request_count == 1
     assert len(transport.requests) == 1
 
 
-def test_transport_diagnostic_does_not_retain_exception_text(monkeypatch, caplog):
+def test_transport_diagnostic_does_not_retain_exception_text(monkeypatch, diagnostic_output):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     transport = FakeTransport(RuntimeError(f"{TOKEN} {SEARCH} {REGION}"))
     counter = ProviderRequestCounter()
 
@@ -381,12 +384,13 @@ def test_transport_diagnostic_does_not_retain_exception_text(monkeypatch, caplog
         _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
 
     assert caught.value.category == VseinstrumentiErrorCategory.TRANSPORT
-    assert "error_type=TRANSPORT" in caplog.text
-    assert "status_code=MISSING" in caplog.text
-    assert "response_bytes=MISSING" in caplog.text
-    assert TOKEN not in caplog.text
-    assert SEARCH not in caplog.text
-    assert REGION not in caplog.text
+    output = diagnostic_output.getvalue()
+    assert "error_type=TRANSPORT" in output
+    assert "status_code=MISSING" in output
+    assert "response_bytes=MISSING" in output
+    assert TOKEN not in output
+    assert SEARCH not in output
+    assert REGION not in output
     assert counter.request_count == 1
     assert len(transport.requests) == 1
 

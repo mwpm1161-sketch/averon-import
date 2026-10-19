@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 import hashlib
+import io
 import json
 import logging
 import socket
+import sys
 from threading import RLock
 import urllib.request
 from urllib.parse import parse_qs, urlsplit
@@ -61,6 +63,13 @@ from averon_import.services.secrets import (
     VSEINSTRUMENTI_BEARER_TOKEN,
     VSEINSTRUMENTI_BEARER_TOKEN_CONFIGURED,
 )
+
+
+@pytest.fixture
+def diagnostic_output(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "stream", output)
+    return output
 
 
 REGION = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
@@ -267,9 +276,8 @@ def test_runner_executes_vi_outcome_and_request_local_dedup_does_not_double_coun
     assert len(transport.requests) == 1
 
 
-def test_offer_conversion_failure_emits_only_fixed_diagnostic(monkeypatch, caplog):
+def test_offer_conversion_failure_emits_only_fixed_diagnostic(monkeypatch, diagnostic_output):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     adapter, transport = _adapter(_response(_payload(_product())))
 
     def fail_conversion(_product, _affinity):
@@ -282,11 +290,12 @@ def test_offer_conversion_failure_emits_only_fixed_diagnostic(monkeypatch, caplo
     assert result.failure_category == ProviderFailureCategory.INVALID_RESPONSE
     assert result.offers == ()
     assert result.request_count == 1
-    assert "error_type=OFFER_CONVERSION" in caplog.text
-    assert "reason_code=OFFER_CONVERSION" in caplog.text
-    assert TOKEN not in caplog.text
-    assert "ARTICLE_SECRET_SENTINEL" not in caplog.text
-    assert REGION not in caplog.text
+    output = diagnostic_output.getvalue()
+    assert "error_type=OFFER_CONVERSION" in output
+    assert "reason_code=OFFER_CONVERSION" in output
+    assert TOKEN not in output
+    assert "ARTICLE_SECRET_SENTINEL" not in output
+    assert REGION not in output
     assert len(transport.requests) == 1
 
 
@@ -310,35 +319,35 @@ class _RaisingDiagnosticFormatter(logging.Formatter):
         raise RuntimeError("SYNTHETIC_LOG_FORMATTER_SECRET")
 
 
-class _RaisingDiagnosticHandler(logging.Handler):
-    def __init__(self, calls, *, formatter=None):
-        super().__init__(logging.WARNING)
-        self.calls = calls
-        if formatter is not None:
-            self.setFormatter(formatter)
-
-    def emit(self, record):
-        self.calls.append("handler")
-        if self.formatter is not None:
-            self.format(record)
-        raise RuntimeError("SYNTHETIC_LOG_HANDLER_SECRET")
-
-
 def _inject_diagnostic_failure(monkeypatch, failure_kind):
     logger = diagnostics_module._LOGGER
-    monkeypatch.setattr(logger, "handlers", [])
     monkeypatch.setattr(logger, "filters", [])
-    monkeypatch.setattr(logger, "propagate", False)
-    monkeypatch.setattr(logger, "disabled", False)
-    monkeypatch.setattr(logger, "level", logging.WARNING)
     calls = []
     if failure_kind == "handler":
-        logger.addHandler(_RaisingDiagnosticHandler(calls))
+        def fail_handler(_record):
+            calls.append("handler")
+            raise RuntimeError("SYNTHETIC_LOG_HANDLER_SECRET")
+
+        monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "emit", fail_handler)
     elif failure_kind == "filter":
-        logger.addFilter(_RaisingDiagnosticFilter(calls))
+        diagnostic_filter = _RaisingDiagnosticFilter(calls)
+        monkeypatch.setattr(logger, "filter", diagnostic_filter.filter)
+    elif failure_kind == "handler_filter":
+        diagnostic_filter = _RaisingDiagnosticFilter(calls)
+        monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "filter", diagnostic_filter.filter)
     elif failure_kind == "formatter":
         formatter = _RaisingDiagnosticFormatter(calls)
-        logger.addHandler(_RaisingDiagnosticHandler(calls, formatter=formatter))
+        monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "format", formatter.format)
+    elif failure_kind == "stream":
+        class RaisingStream:
+            def write(self, _message):
+                calls.append("stream")
+                raise RuntimeError("SYNTHETIC_LOG_STREAM_SECRET")
+
+            def flush(self):
+                return None
+
+        monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "stream", RaisingStream())
     elif failure_kind == "construction":
         def fail_construction(**_kwargs):
             calls.append("construction")
@@ -350,17 +359,21 @@ def _inject_diagnostic_failure(monkeypatch, failure_kind):
     return calls
 
 
-@pytest.mark.parametrize("failure_kind", ["handler", "filter", "formatter", "construction"])
+@pytest.mark.parametrize(
+    "failure_kind", ["handler", "filter", "handler_filter", "formatter", "stream", "construction"],
+)
 def test_diagnostic_failures_do_not_change_provider_outcome_or_retry_request(
-    monkeypatch, caplog, failure_kind,
+    monkeypatch, capsys, failure_kind,
 ):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "stream", sys.stderr)
 
     baseline_adapter, baseline_transport = _adapter(_response(b"{INVALID_RESPONSE_BODY_SECRET"))
     baseline = baseline_adapter.execute_search(
         _intent(), limit=5, request_counter=ProviderRequestCounter(),
     )
+    capsys.readouterr()  # discard the expected baseline diagnostic record
 
     calls = _inject_diagnostic_failure(monkeypatch, failure_kind)
     faulted_adapter, faulted_transport = _adapter(_response(b"{INVALID_RESPONSE_BODY_SECRET"))
@@ -373,23 +386,102 @@ def test_diagnostic_failures_do_not_change_provider_outcome_or_retry_request(
     assert baseline.failure_category == faulted.failure_category == ProviderFailureCategory.INVALID_RESPONSE
     assert baseline.request_count == faulted.request_count == 1
     assert len(baseline_transport.requests) == len(faulted_transport.requests) == 1
-    assert calls.count("handler") == (1 if failure_kind in {"handler", "formatter"} else 0)
-    assert calls.count("filter") == (1 if failure_kind == "filter" else 0)
+    assert calls.count("handler") == (1 if failure_kind == "handler" else 0)
+    assert calls.count("filter") == (1 if failure_kind in {"filter", "handler_filter"} else 0)
     assert calls.count("formatter") == (1 if failure_kind == "formatter" else 0)
+    assert calls.count("stream") == (1 if failure_kind == "stream" else 0)
     assert calls.count("construction") == (1 if failure_kind == "construction" else 0)
+    stderr = capsys.readouterr().err
+    assert "--- Logging error ---" not in stderr
+    assert "Traceback" not in stderr
     for secret in (
         TOKEN,
         "INVALID_RESPONSE_BODY_SECRET",
         "SYNTHETIC_LOG_HANDLER_SECRET",
         "SYNTHETIC_LOG_FILTER_SECRET",
         "SYNTHETIC_LOG_FORMATTER_SECRET",
+        "SYNTHETIC_LOG_STREAM_SECRET",
         "SYNTHETIC_EVENT_CONSTRUCTION_SECRET",
     ):
-        assert secret not in caplog.text
+        assert secret not in stderr
+    assert stderr == ""
 
 
-def test_header_metadata_failure_preserves_provider_outcome_off_and_on(monkeypatch, caplog):
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+@pytest.mark.parametrize("flag_value", [None, "0"])
+def test_diagnostics_off_preserves_baseline_outcome_and_emits_nothing(monkeypatch, diagnostic_output, flag_value):
+    if flag_value is None:
+        monkeypatch.delenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", raising=False)
+    else:
+        monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", flag_value)
+
+    baseline_adapter, baseline_transport = _adapter(_response(b"{INVALID_RESPONSE_BODY_SECRET"))
+    baseline = baseline_adapter.execute_search(
+        _intent(), limit=5, request_counter=ProviderRequestCounter(),
+    )
+    current_adapter, current_transport = _adapter(_response(b"{INVALID_RESPONSE_BODY_SECRET"))
+    current = current_adapter.execute_search(
+        _intent(), limit=5, request_counter=ProviderRequestCounter(),
+    )
+
+    assert baseline.model_dump(mode="json") == current.model_dump(mode="json")
+    assert baseline.request_count == current.request_count == 1
+    assert len(baseline_transport.requests) == len(current_transport.requests) == 1
+    assert diagnostic_output.getvalue() == ""
+
+
+def test_enabled_diagnostic_emits_one_allowlisted_record_without_extra_request(
+    monkeypatch, diagnostic_output,
+):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    adapter, transport = _adapter(_response(b"{INVALID_RESPONSE_BODY_SECRET"))
+
+    outcome = adapter.execute_search(
+        _intent(), limit=5, request_counter=ProviderRequestCounter(),
+    )
+
+    lines = diagnostic_output.getvalue().splitlines()
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert outcome.request_count == 1
+    assert len(transport.requests) == 1
+    assert len(lines) == 1
+    assert lines[0].startswith("vseinstrumenti_safe_diagnostic ")
+    assert set(lines[0].split()[1:]) == {
+        "error_type=JSON_DECODING",
+        "status_code=200",
+        "envelope_status_code=MISSING",
+        "content_type=MISSING",
+        f"response_bytes={len(b'{INVALID_RESPONSE_BODY_SECRET')}",
+        "reason_code=UNKNOWN",
+    }
+
+
+def test_safe_sink_does_not_propagate_to_root_handler(monkeypatch, capsys):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "stream", sys.stderr)
+    logger = diagnostics_module._LOGGER
+    root = logging.getLogger()
+    root_output = io.StringIO()
+    root_handler = logging.StreamHandler(root_output)
+    original_root_handlers = tuple(root.handlers)
+    original_propagate = logger.propagate
+    try:
+        root.addHandler(root_handler)
+        logger.propagate = True
+        diagnostics_module.log_vseinstrumenti_diagnostic(
+            error_type=diagnostics_module.VseinstrumentiDiagnosticErrorType.TRANSPORT,
+        )
+    finally:
+        root.removeHandler(root_handler)
+        logger.propagate = original_propagate
+
+    assert tuple(root.handlers) == original_root_handlers
+    assert root_output.getvalue() == ""
+    stderr = capsys.readouterr().err
+    assert stderr.count("vseinstrumenti_safe_diagnostic ") == 1
+
+
+def test_header_metadata_failure_preserves_provider_outcome_off_and_on(monkeypatch, diagnostic_output):
     monkeypatch.delenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", raising=False)
     off_response = HeadersRaisingResponse(b"{INVALID_RESPONSE_BODY_SECRET")
     off_adapter, off_transport = _adapter(off_response)
@@ -397,7 +489,7 @@ def test_header_metadata_failure_preserves_provider_outcome_off_and_on(monkeypat
         _intent(), limit=5, request_counter=ProviderRequestCounter(),
     )
     assert off_response.header_reads == 0
-    assert caplog.text == ""
+    assert diagnostic_output.getvalue() == ""
 
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
     on_response = HeadersRaisingResponse(b"{INVALID_RESPONSE_BODY_SECRET")
@@ -408,8 +500,8 @@ def test_header_metadata_failure_preserves_provider_outcome_off_and_on(monkeypat
 
     assert off_outcome.model_dump(mode="json") == on_outcome.model_dump(mode="json")
     assert on_response.header_reads == 1
-    assert "content_type=MISSING" in caplog.text
-    assert "SYNTHETIC_HEADER_ACCESS_SECRET" not in caplog.text
+    assert "content_type=MISSING" in diagnostic_output.getvalue()
+    assert "SYNTHETIC_HEADER_ACCESS_SECRET" not in diagnostic_output.getvalue()
     for outcome in (off_outcome, on_outcome):
         assert outcome.state == ProviderSearchState.FAILURE
         assert outcome.failure_category == ProviderFailureCategory.INVALID_RESPONSE
@@ -418,9 +510,8 @@ def test_header_metadata_failure_preserves_provider_outcome_off_and_on(monkeypat
     assert len(off_transport.requests) == len(on_transport.requests) == 1
 
 
-def test_runner_outcome_contract_failure_is_safely_diagnosed(monkeypatch, caplog):
+def test_runner_outcome_contract_failure_is_safely_diagnosed(monkeypatch, diagnostic_output):
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
-    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
     adapter, transport = _adapter()
     identity = adapter.request_identity(_intent(), limit=5, execution_scope_id="diagnostic-scope")
 
@@ -444,9 +535,64 @@ def test_runner_outcome_contract_failure_is_safely_diagnosed(monkeypatch, caplog
     assert result.outcomes[0].failure_category == ProviderFailureCategory.INVALID_RESPONSE
     assert result.outcomes[0].offers == ()
     assert result.outcomes[0].request_count == 0
-    assert "error_type=OUTCOME_CONTRACT" in caplog.text
-    assert "reason_code=OUTCOME_CONTRACT" in caplog.text
+    assert "error_type=OUTCOME_CONTRACT" in diagnostic_output.getvalue()
+    assert "reason_code=OUTCOME_CONTRACT" in diagnostic_output.getvalue()
     assert len(transport.requests) == 0
+
+
+@pytest.mark.parametrize(
+    "failure_kind", ["handler", "filter", "handler_filter", "formatter", "stream", "construction"],
+)
+def test_runner_outcome_is_preserved_when_diagnostic_sink_fails(monkeypatch, capsys, failure_kind):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    monkeypatch.setattr(diagnostics_module._SAFE_HANDLER, "stream", sys.stderr)
+    adapter, transport = _adapter()
+    identity = adapter.request_identity(_intent(), limit=5, execution_scope_id="sink-fault-runner-baseline")
+
+    def invalid_outcome(_intent, *, limit, request_counter):
+        return ProviderSearchOutcome(
+            provider_key="other-provider",
+            state=ProviderSearchState.EMPTY,
+            request_count=request_counter.request_count,
+            affinity=identity.affinity,
+        )
+
+    adapter.execute_search = invalid_outcome
+    selection = ProviderSelection(provider_keys=("vseinstrumenti",))
+    baseline = ProviderRunner({"vseinstrumenti": adapter}).run(
+        selection=selection,
+        intent=_intent(),
+        limit=5,
+        scope=ProviderExecutionScope(execution_scope_id="sink-fault-runner-baseline"),
+    )
+    capsys.readouterr()
+
+    calls = _inject_diagnostic_failure(monkeypatch, failure_kind)
+    faulted = ProviderRunner({"vseinstrumenti": adapter}).run(
+        selection=selection,
+        intent=_intent(),
+        limit=5,
+        scope=ProviderExecutionScope(execution_scope_id="sink-fault-runner-faulted"),
+    )
+
+    assert baseline.outcomes[0].model_dump(mode="json") == faulted.outcomes[0].model_dump(mode="json")
+    assert faulted.outcomes[0].state == ProviderSearchState.FAILURE
+    assert faulted.outcomes[0].failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert faulted.outcomes[0].request_count == 0
+    assert faulted.outcomes[0].offers == ()
+    assert transport.requests == []
+    assert calls
+    stderr = capsys.readouterr().err
+    assert stderr == ""
+    for secret in (
+        "SYNTHETIC_LOG_HANDLER_SECRET",
+        "SYNTHETIC_LOG_FILTER_SECRET",
+        "SYNTHETIC_LOG_FORMATTER_SECRET",
+        "SYNTHETIC_LOG_STREAM_SECRET",
+        "SYNTHETIC_EVENT_CONSTRUCTION_SECRET",
+    ):
+        assert secret not in stderr
 
 
 def test_runner_outcome_contract_is_preserved_when_diagnostic_emission_fails(monkeypatch):

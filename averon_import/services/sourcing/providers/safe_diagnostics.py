@@ -10,6 +10,8 @@ from __future__ import annotations
 from enum import Enum
 import logging
 import os
+import sys
+import threading
 
 
 class VseinstrumentiDiagnosticErrorType(str, Enum):
@@ -45,6 +47,46 @@ class VseinstrumentiContentTypeCategory(str, Enum):
 
 
 _LOGGER = logging.getLogger("averon.sourcing.vseinstrumenti.diagnostics")
+_SINK_LOCK = threading.RLock()
+
+
+class _SafeDiagnosticStreamHandler(logging.StreamHandler):
+    """A normal stderr sink whose internal logging failures stay silent."""
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        # StreamHandler.emit() normally calls logging.Handler.handleError(),
+        # which writes a traceback and the record to stderr when
+        # logging.raiseExceptions is true. Diagnostic records contain only
+        # allowlisted values, but even that fallback can leak formatter or
+        # stream exception text. Diagnostics are best-effort, so drop them.
+        return None
+
+
+_SAFE_HANDLER = _SafeDiagnosticStreamHandler(stream=sys.stderr)
+_SAFE_HANDLER.setLevel(logging.WARNING)
+_SAFE_FORMATTER = logging.Formatter("%(message)s")
+_SAFE_HANDLER.setFormatter(_SAFE_FORMATTER)
+
+
+def _ensure_safe_diagnostic_sink() -> None:
+    """Keep this dedicated logger isolated from root and custom handlers."""
+
+    with _SINK_LOCK:
+        _LOGGER.propagate = False
+        _LOGGER.setLevel(logging.WARNING)
+        _LOGGER.disabled = False
+        # This logger carries only the fixed event below. Do not let an
+        # application filter mutate it or route it through another sink.
+        _LOGGER.filters.clear()
+        _SAFE_HANDLER.filters.clear()
+        _SAFE_HANDLER.setFormatter(_SAFE_FORMATTER)
+        # Logging configuration may be applied after this module is imported.
+        # Detach every other handler from this VI-only logger before emitting.
+        for handler in tuple(_LOGGER.handlers):
+            if handler is not _SAFE_HANDLER:
+                _LOGGER.removeHandler(handler)
+        if _SAFE_HANDLER not in _LOGGER.handlers:
+            _LOGGER.addHandler(_SAFE_HANDLER)
 
 
 def safe_diagnostics_enabled() -> bool:
@@ -101,6 +143,7 @@ def _emit_allowlisted_diagnostic(
         else None
     )
     safe_size = response_bytes if type(response_bytes) is int and 0 <= response_bytes <= 2_097_153 else None
+    _ensure_safe_diagnostic_sink()
     _LOGGER.warning(
         "vseinstrumenti_safe_diagnostic error_type=%s status_code=%s envelope_status_code=%s content_type=%s "
         "response_bytes=%s reason_code=%s",
