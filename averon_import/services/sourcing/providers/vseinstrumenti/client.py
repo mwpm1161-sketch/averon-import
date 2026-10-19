@@ -30,6 +30,7 @@ from ..safe_diagnostics import (
     VseinstrumentiDiagnosticReasonCode,
     content_type_category,
     log_vseinstrumenti_diagnostic,
+    safe_diagnostics_enabled,
 )
 
 
@@ -98,6 +99,8 @@ class VseinstrumentiApiError(RuntimeError):
         category: VseinstrumentiErrorCategory,
         *,
         status_code: int | None = None,
+        diagnostic_status_code: int | None = None,
+        envelope_status_code: int | None = None,
         diagnostic_error_type: VseinstrumentiDiagnosticErrorType | None = None,
         reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.UNKNOWN,
         content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
@@ -105,6 +108,8 @@ class VseinstrumentiApiError(RuntimeError):
     ) -> None:
         self.category = category
         self.status_code = status_code
+        self.diagnostic_status_code = diagnostic_status_code
+        self.envelope_status_code = envelope_status_code
         self.diagnostic_error_type = diagnostic_error_type
         self.reason_code = reason_code
         self.content_type = content_type
@@ -272,6 +277,10 @@ def _status_error(
     status: int,
     raw: bytes | None,
     content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
+    *,
+    diagnostic_status_code: int | None = None,
+    envelope_status_code: int | None = None,
+    diagnostic_error_type: VseinstrumentiDiagnosticErrorType = VseinstrumentiDiagnosticErrorType.HTTP,
 ) -> VseinstrumentiApiError:
     envelope: object = None
     try:
@@ -293,7 +302,9 @@ def _status_error(
     return VseinstrumentiApiError(
         category,
         status_code=status,
-        diagnostic_error_type=VseinstrumentiDiagnosticErrorType.HTTP,
+        diagnostic_status_code=status if diagnostic_status_code is None else diagnostic_status_code,
+        envelope_status_code=envelope_status_code,
+        diagnostic_error_type=diagnostic_error_type,
         content_type=content_type,
         response_bytes=len(raw) if raw is not None else None,
     )
@@ -302,7 +313,11 @@ def _status_error(
 def _read_bounded(
     response: Any,
 ) -> tuple[int, bytes, VseinstrumentiContentTypeCategory]:
-    content_type = content_type_category(response)
+    content_type = (
+        content_type_category(response)
+        if safe_diagnostics_enabled()
+        else VseinstrumentiContentTypeCategory.MISSING
+    )
     status = getattr(response, "status", None)
     if status is None:
         status = getattr(response, "code", None)
@@ -317,6 +332,7 @@ def _read_bounded(
         raise VseinstrumentiApiError(
             VseinstrumentiErrorCategory.INVALID_RESPONSE,
             status_code=status,
+            diagnostic_status_code=status,
             diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
             content_type=content_type,
         )
@@ -326,6 +342,7 @@ def _read_bounded(
         raise VseinstrumentiApiError(
             VseinstrumentiErrorCategory.TIMEOUT,
             status_code=status,
+            diagnostic_status_code=status,
             diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
             content_type=content_type,
         ) from None
@@ -333,6 +350,7 @@ def _read_bounded(
         raise VseinstrumentiApiError(
             VseinstrumentiErrorCategory.TRANSPORT,
             status_code=status,
+            diagnostic_status_code=status,
             diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
             content_type=content_type,
         ) from None
@@ -343,6 +361,7 @@ def _read_bounded(
         raise VseinstrumentiApiError(
             VseinstrumentiErrorCategory.INVALID_RESPONSE,
             status_code=status,
+            diagnostic_status_code=status,
             diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
             content_type=content_type,
             response_bytes=observed_size,
@@ -419,7 +438,8 @@ class VseinstrumentiClient:
                 log_vseinstrumenti_diagnostic(
                     error_type=exc.diagnostic_error_type,
                     reason_code=exc.reason_code,
-                    status_code=exc.status_code,
+                    status_code=exc.diagnostic_status_code,
+                    envelope_status_code=exc.envelope_status_code,
                     content_type=exc.content_type,
                     response_bytes=exc.response_bytes,
                 )
@@ -519,6 +539,7 @@ class VseinstrumentiClient:
                 raise VseinstrumentiApiError(
                     VseinstrumentiErrorCategory.INVALID_RESPONSE,
                     status_code=status,
+                    diagnostic_status_code=status,
                     diagnostic_error_type=VseinstrumentiDiagnosticErrorType.JSON_DECODING,
                     content_type=response_content_type,
                     response_bytes=len(raw),
@@ -529,11 +550,20 @@ class VseinstrumentiClient:
                     raise VseinstrumentiApiError(
                         VseinstrumentiErrorCategory.AUTHENTICATION,
                         status_code=api_status,
-                        diagnostic_error_type=VseinstrumentiDiagnosticErrorType.HTTP,
+                        diagnostic_status_code=status,
+                        envelope_status_code=api_status,
+                        diagnostic_error_type=VseinstrumentiDiagnosticErrorType.ERROR_ENVELOPE,
                         content_type=response_content_type,
                         response_bytes=len(raw),
                     )
-                raise _status_error(api_status, raw, response_content_type)
+                raise _status_error(
+                    api_status,
+                    raw,
+                    response_content_type,
+                    diagnostic_status_code=status,
+                    envelope_status_code=api_status,
+                    diagnostic_error_type=VseinstrumentiDiagnosticErrorType.ERROR_ENVELOPE,
+                )
             return parse_product_search_result(
                 payload,
                 expected_search=search,
@@ -556,6 +586,7 @@ class VseinstrumentiClient:
             raise VseinstrumentiApiError(
                 VseinstrumentiErrorCategory.INVALID_RESPONSE,
                 status_code=status,
+                diagnostic_status_code=status,
                 diagnostic_error_type=error_type,
                 reason_code=exc.reason_code,
                 content_type=response_content_type,
@@ -565,6 +596,7 @@ class VseinstrumentiClient:
             raise VseinstrumentiApiError(
                 VseinstrumentiErrorCategory.INVALID_RESPONSE,
                 status_code=status,
+                diagnostic_status_code=status,
                 diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
                 content_type=response_content_type,
                 response_bytes=len(raw),

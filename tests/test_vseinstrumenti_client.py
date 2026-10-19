@@ -30,6 +30,7 @@ from averon_import.services.sourcing.providers.execution import ProviderRequestC
 from averon_import.services.sourcing.providers.safe_diagnostics import (
     VseinstrumentiDiagnosticErrorType,
 )
+from averon_import.services.sourcing.providers import safe_diagnostics as diagnostics_module
 
 
 REGION = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
@@ -51,6 +52,20 @@ class FakeResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+class HeadersRaisingResponse(FakeResponse):
+    def __init__(self, body: bytes, status: int = 200):
+        self.body = body
+        self.status = status
+        self.read_limit = None
+        self.closed = False
+        self.header_reads = 0
+
+    @property
+    def headers(self):
+        self.header_reads += 1
+        raise RuntimeError("SYNTHETIC_HEADER_ACCESS_SECRET")
 
 
 class FakeTransport:
@@ -157,6 +172,86 @@ def test_safe_diagnostics_for_successful_json_do_not_change_request_count(monkey
     assert caplog.text == ""
 
 
+@pytest.mark.parametrize("diagnostics_enabled", [False, True])
+def test_response_header_failure_never_changes_client_result_or_attempt_count(
+    monkeypatch, diagnostics_enabled, caplog,
+):
+    if diagnostics_enabled:
+        monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+        caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    else:
+        monkeypatch.delenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", raising=False)
+    response = HeadersRaisingResponse(b"{invalid-json")
+    transport = FakeTransport(response)
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert caught.value.status_code == 200
+    assert counter.request_count == len(transport.requests) == 1
+    assert response.header_reads == (1 if diagnostics_enabled else 0)
+    if diagnostics_enabled:
+        assert "content_type=MISSING" in caplog.text
+    else:
+        assert caplog.text == ""
+    assert "SYNTHETIC_HEADER_ACCESS_SECRET" not in caplog.text
+
+
+def test_diagnostic_event_construction_failure_is_swallowed_once(monkeypatch):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    calls = []
+
+    def fail_construction(**_kwargs):
+        calls.append(1)
+        raise RuntimeError(f"{TOKEN} SYNTHETIC_EVENT_SECRET")
+
+    monkeypatch.setattr(diagnostics_module, "_emit_allowlisted_diagnostic", fail_construction)
+    transport = FakeTransport(FakeResponse(b"{invalid-json"))
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert counter.request_count == len(transport.requests) == 1
+    assert calls == [1]
+    assert TOKEN not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "envelope_code,expected_category",
+    [
+        (500, VseinstrumentiErrorCategory.UNAVAILABLE),
+        (401, VseinstrumentiErrorCategory.AUTHENTICATION),
+    ],
+)
+def test_http_200_error_envelope_keeps_http_and_envelope_codes_separate(
+    monkeypatch, caplog, envelope_code, expected_category,
+):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    body = _response({"code": envelope_code, "message": "SAFE_ENVELOPE_FIXTURE"})
+    transport = FakeTransport(body)
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category == expected_category
+    # Keep the pre-existing API-error status semantics while reporting the
+    # actual transport status separately to diagnostics.
+    assert caught.value.status_code == envelope_code
+    assert caught.value.diagnostic_status_code == 200
+    assert caught.value.envelope_status_code == envelope_code
+    assert f"error_type={VseinstrumentiDiagnosticErrorType.ERROR_ENVELOPE.value}" in caplog.text
+    assert "status_code=200" in caplog.text
+    assert f"envelope_status_code={envelope_code}" in caplog.text
+    assert "SAFE_ENVELOPE_FIXTURE" not in caplog.text
+    assert counter.request_count == len(transport.requests) == 1
+
+
 @pytest.mark.parametrize(
     "body,headers,error_type,reason_code,content_type",
     [
@@ -184,6 +279,7 @@ def test_safe_diagnostics_classify_json_decode_failure_without_sensitive_values(
     assert len(transport.requests) == 1
     assert f"error_type={error_type}" in caplog.text
     assert f"reason_code={reason_code}" in caplog.text
+    assert "status_code=200" in caplog.text
     assert f"content_type={content_type}" in caplog.text
     assert f"response_bytes={len(body)}" in caplog.text
     for secret in (TOKEN, SEARCH, REGION, "BODY_SECRET_SENTINEL"):
@@ -223,6 +319,7 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplo
         } else "RESPONSE_VALIDATION"
         assert f"error_type={expected_error_type}" in caplog.text
         assert f"reason_code={expected_reason.value}" in caplog.text
+        assert "status_code=200" in caplog.text
         assert "ENVELOPE_SECRET" not in caplog.text
         assert "OTHER_QUERY_SECRET" not in caplog.text
         assert "PRODUCTS_SECRET" not in caplog.text
@@ -237,6 +334,7 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplo
         (403, VseinstrumentiErrorCategory.AUTHENTICATION, "OTHER"),
         (429, VseinstrumentiErrorCategory.RATE_LIMITED, "MISSING"),
         (500, VseinstrumentiErrorCategory.UNAVAILABLE, "HTML"),
+        (503, VseinstrumentiErrorCategory.UNAVAILABLE, "OTHER"),
     ],
 )
 def test_http_diagnostics_keep_existing_categories_and_single_attempt(
@@ -259,8 +357,10 @@ def test_http_diagnostics_keep_existing_categories_and_single_attempt(
 
     assert caught.value.category == category
     assert caught.value.status_code == status
+    assert caught.value.diagnostic_status_code == status
     assert f"error_type={VseinstrumentiDiagnosticErrorType.HTTP.value}" in caplog.text
     assert f"status_code={status}" in caplog.text
+    assert "envelope_status_code=MISSING" in caplog.text
     assert f"content_type={content_type}" in caplog.text
     assert f"response_bytes={len(body)}" in caplog.text
     assert "HTTP_BODY_SECRET_SENTINEL" not in caplog.text
