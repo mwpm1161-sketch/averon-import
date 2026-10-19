@@ -28,6 +28,11 @@ from .client import (
     is_valid_region_id,
 )
 from .models import VseinstrumentiProduct, VseinstrumentiTechnicalSpecification
+from ..safe_diagnostics import (
+    VseinstrumentiDiagnosticErrorType,
+    VseinstrumentiDiagnosticReasonCode,
+    log_vseinstrumenti_diagnostic,
+)
 
 
 _ADAPTER_REVISION = "vseinstrumenti_openapi_execution_v1"
@@ -348,6 +353,10 @@ class VseinstrumentiExecutionAdapter:
         try:
             offers = [self._offer(product, affinity) for product in result.products]
         except Exception:
+            log_vseinstrumenti_diagnostic(
+                error_type=VseinstrumentiDiagnosticErrorType.OFFER_CONVERSION,
+                reason_code=VseinstrumentiDiagnosticReasonCode.OFFER_CONVERSION,
+            )
             return self._failure(
                 request_counter,
                 affinity,

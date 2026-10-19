@@ -8,6 +8,8 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..safe_diagnostics import VseinstrumentiDiagnosticReasonCode
+
 
 MAX_SKU_LENGTH = 180
 MAX_NAME_LENGTH = 320
@@ -23,15 +25,31 @@ _DECIMAL_TEXT = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 class VseinstrumentiResponseError(ValueError):
     """Response JSON is outside the bounded, documented VI search shape."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.UNKNOWN,
+    ) -> None:
+        self.reason_code = reason_code
+        super().__init__(message)
 
-def _text(value: object, *, field: str, maximum: int, required: bool = False) -> str:
+
+def _text(
+    value: object,
+    *,
+    field: str,
+    maximum: int,
+    required: bool = False,
+    reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE,
+) -> str:
     if not isinstance(value, str):
-        raise VseinstrumentiResponseError(f"{field} must be a string")
+        raise VseinstrumentiResponseError(f"{field} must be a string", reason_code=reason_code)
     normalized = value.strip()
     if len(normalized) > maximum or (required and not normalized):
-        raise VseinstrumentiResponseError(f"{field} is outside its allowed bounds")
+        raise VseinstrumentiResponseError(f"{field} is outside its allowed bounds", reason_code=reason_code)
     if any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in normalized):
-        raise VseinstrumentiResponseError(f"{field} contains control characters")
+        raise VseinstrumentiResponseError(f"{field} contains control characters", reason_code=reason_code)
     return normalized
 
 
@@ -39,24 +57,29 @@ def _optional_text(value: object, *, field: str, maximum: int) -> str:
     return "" if value is None else _text(value, field=field, maximum=maximum)
 
 
-def _decimal(value: object, *, field: str) -> Decimal:
+def _decimal(
+    value: object,
+    *,
+    field: str,
+    reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE,
+) -> Decimal:
     """Accept JSON integer/Decimal or its documented string representation."""
 
     if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
-        raise VseinstrumentiResponseError(f"{field} must be a decimal string or number")
+        raise VseinstrumentiResponseError(f"{field} must be a decimal string or number", reason_code=reason_code)
     if isinstance(value, str):
         value = value.strip()
         if len(value) > 120 or not _DECIMAL_TEXT.fullmatch(value):
-            raise VseinstrumentiResponseError(f"{field} is not a bounded decimal")
+            raise VseinstrumentiResponseError(f"{field} is not a bounded decimal", reason_code=reason_code)
     try:
         result = Decimal(value)
     except (InvalidOperation, ValueError, TypeError):
-        raise VseinstrumentiResponseError(f"{field} is not a decimal") from None
+        raise VseinstrumentiResponseError(f"{field} is not a decimal", reason_code=reason_code) from None
     if not result.is_finite() or result < 0:
-        raise VseinstrumentiResponseError(f"{field} must be finite and non-negative")
+        raise VseinstrumentiResponseError(f"{field} must be finite and non-negative", reason_code=reason_code)
     parts = result.as_tuple()
     if len(parts.digits) > 80 or abs(parts.exponent) > 100:
-        raise VseinstrumentiResponseError(f"{field} exceeds its numeric bounds")
+        raise VseinstrumentiResponseError(f"{field} exceeds its numeric bounds", reason_code=reason_code)
     return result
 
 
@@ -95,11 +118,18 @@ def _optional_price_object(value: object, *, field: str) -> tuple[Decimal | None
     if value is None:
         return None, None
     if not isinstance(value, dict):
-        raise VseinstrumentiResponseError(f"{field} must be an object")
-    price = None if value.get("price") is None else _decimal(value["price"], field=f"{field}.price")
+        raise VseinstrumentiResponseError(
+            f"{field} must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.PRICE_SHAPE,
+        )
+    price = None if value.get("price") is None else _decimal(
+        value["price"], field=f"{field}.price", reason_code=VseinstrumentiDiagnosticReasonCode.PRICE_SHAPE,
+    )
     base_price = (
         None if value.get("basePrice") is None
-        else _decimal(value["basePrice"], field=f"{field}.basePrice")
+        else _decimal(
+            value["basePrice"], field=f"{field}.basePrice",
+            reason_code=VseinstrumentiDiagnosticReasonCode.PRICE_SHAPE,
+        )
     )
     return price, base_price
 
@@ -108,7 +138,9 @@ def _optional_stock(value: object) -> Decimal | None:
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise VseinstrumentiResponseError("stock must be an object")
+        raise VseinstrumentiResponseError(
+            "stock must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE,
+        )
     quantity = value.get("atWarehouse")
     return None if quantity is None else _decimal(quantity, field="stock.atWarehouse")
 
@@ -117,14 +149,26 @@ def _specifications(value: object) -> tuple[VseinstrumentiTechnicalSpecification
     if value is None or value == {}:
         return ()
     if not isinstance(value, dict):
-        raise VseinstrumentiResponseError("technicalSpecifications must be an object")
+        raise VseinstrumentiResponseError(
+            "technicalSpecifications must be an object",
+            reason_code=VseinstrumentiDiagnosticReasonCode.SPECS_SHAPE,
+        )
     allowed = {"name", "value", "unit", "description"}
     if not set(value).issubset(allowed):
-        raise VseinstrumentiResponseError("technicalSpecifications has an undocumented shape")
-    fields = {
-        key: _optional_text(value.get(key, ""), field=f"technicalSpecifications.{key}", maximum=MAX_SPEC_TEXT_LENGTH)
-        for key in allowed
-    }
+        raise VseinstrumentiResponseError(
+            "technicalSpecifications has an undocumented shape",
+            reason_code=VseinstrumentiDiagnosticReasonCode.SPECS_SHAPE,
+        )
+    try:
+        fields = {
+            key: _optional_text(value.get(key, ""), field=f"technicalSpecifications.{key}", maximum=MAX_SPEC_TEXT_LENGTH)
+            for key in allowed
+        }
+    except VseinstrumentiResponseError:
+        raise VseinstrumentiResponseError(
+            "technicalSpecifications has an invalid field",
+            reason_code=VseinstrumentiDiagnosticReasonCode.SPECS_SHAPE,
+        ) from None
     if not any(fields.values()):
         return ()
     return (VseinstrumentiTechnicalSpecification(**fields),)
@@ -152,8 +196,13 @@ def _site_url(value: object) -> str:
 
 def _product(value: object) -> VseinstrumentiProduct:
     if not isinstance(value, dict):
-        raise VseinstrumentiResponseError("each product must be an object")
-    sku = _text(value.get("sku"), field="sku", maximum=MAX_SKU_LENGTH, required=True)
+        raise VseinstrumentiResponseError(
+            "each product must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE,
+        )
+    sku = _text(
+        value.get("sku"), field="sku", maximum=MAX_SKU_LENGTH, required=True,
+        reason_code=VseinstrumentiDiagnosticReasonCode.SKU_TYPE,
+    )
     name = _text(value.get("name"), field="name", maximum=MAX_NAME_LENGTH, required=True)
     product_code = _optional_text(value.get("productCode", ""), field="productCode", maximum=MAX_ARTICLE_LENGTH)
     brand_name = _optional_text(value.get("brandName", ""), field="brandName", maximum=MAX_BRAND_LENGTH)
@@ -163,7 +212,10 @@ def _product(value: object) -> VseinstrumentiProduct:
     raw_dates = value.get("deliveryDates")
     if raw_dates is not None:
         if not isinstance(raw_dates, dict):
-            raise VseinstrumentiResponseError("deliveryDates must be an object")
+            raise VseinstrumentiResponseError(
+                "deliveryDates must be an object",
+                reason_code=VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE,
+            )
         pickup_date = _optional_text(raw_dates.get("pickup", ""), field="deliveryDates.pickup", maximum=80)
         courier_date = _optional_text(raw_dates.get("courier", ""), field="deliveryDates.courier", maximum=80)
     price, base_price = _optional_price_object(value.get("prices"), field="prices")
@@ -200,23 +252,50 @@ def parse_product_search_result(
     if type(requested_limit) is not int or not 1 <= requested_limit <= MAX_PRODUCTS_PER_PAGE:
         raise VseinstrumentiResponseError("requested product limit is outside its allowed bounds")
     if not isinstance(payload, dict):
-        raise VseinstrumentiResponseError("response must be an object")
+        raise VseinstrumentiResponseError(
+            "response must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+        )
     result = payload.get("result")
     if not isinstance(result, dict):
-        raise VseinstrumentiResponseError("response result must be an object")
-    search = _text(result.get("search"), field="result.search", maximum=500, required=True)
-    region_id = _text(result.get("regionId"), field="result.regionId", maximum=80, required=True)
+        raise VseinstrumentiResponseError(
+            "response result must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+        )
+    context_reason = VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH
+    try:
+        search = _text(
+            result.get("search"), field="result.search", maximum=500, required=True,
+            reason_code=context_reason,
+        )
+        region_id = _text(
+            result.get("regionId"), field="result.regionId", maximum=80, required=True,
+            reason_code=context_reason,
+        )
+    except VseinstrumentiResponseError:
+        raise VseinstrumentiResponseError(
+            "response context is invalid", reason_code=context_reason,
+        ) from None
     if search != expected_search or region_id != expected_region_id:
-        raise VseinstrumentiResponseError("response context does not match the request")
+        raise VseinstrumentiResponseError(
+            "response context does not match the request", reason_code=context_reason,
+        )
     raw_products = result.get("products")
     if isinstance(raw_products, dict):
         if raw_products:
-            raise VseinstrumentiResponseError("non-empty products object has an undocumented shape")
+            raise VseinstrumentiResponseError(
+                "non-empty products object has an undocumented shape",
+                reason_code=VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
+            )
         raw_products = []
     if not isinstance(raw_products, list):
-        raise VseinstrumentiResponseError("result.products must be an array or empty object")
+        raise VseinstrumentiResponseError(
+            "result.products must be an array or empty object",
+            reason_code=VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
+        )
     if len(raw_products) > requested_limit:
-        raise VseinstrumentiResponseError("response contains more products than the requested page limit")
+        raise VseinstrumentiResponseError(
+            "response contains more products than the requested page limit",
+            reason_code=VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
+        )
 
     products: list[VseinstrumentiProduct] = []
     seen: dict[str, tuple[VseinstrumentiProduct, dict[str, Any]]] = {}
@@ -225,7 +304,10 @@ def parse_product_search_result(
         previous = seen.get(product.sku)
         if previous is not None:
             if previous[1] != raw:
-                raise VseinstrumentiResponseError("response contains conflicting duplicate SKUs")
+                raise VseinstrumentiResponseError(
+                    "response contains conflicting duplicate SKUs",
+                    reason_code=VseinstrumentiDiagnosticReasonCode.DUPLICATE_CONFLICT,
+                )
             continue
         seen[product.sku] = (product, raw)
         products.append(product)

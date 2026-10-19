@@ -30,6 +30,11 @@ from averon_import.services.sourcing.providers.contracts import (
     ProviderSelection,
     index_offers_by_provider_identity,
 )
+from .safe_diagnostics import (
+    VseinstrumentiDiagnosticErrorType,
+    VseinstrumentiDiagnosticReasonCode,
+    log_vseinstrumenti_diagnostic,
+)
 
 
 # Request-local safety cap: a five-provider run may not materialize 500 offers
@@ -387,6 +392,11 @@ class ProviderRunner:
                 raw_outcome.model_dump(mode="python"),
             )
         except Exception:
+            if provider_key == "vseinstrumenti":
+                log_vseinstrumenti_diagnostic(
+                    error_type=VseinstrumentiDiagnosticErrorType.OUTCOME_CONTRACT,
+                    reason_code=VseinstrumentiDiagnosticReasonCode.OUTCOME_CONTRACT,
+                )
             outcome = self._failure(
                 provider_key,
                 ProviderFailureCategory.INVALID_RESPONSE,
@@ -402,6 +412,11 @@ class ProviderRunner:
             or outcome.affinity != identity.affinity
             or len(outcome.offers) > limit
         ):
+            if provider_key == "vseinstrumenti":
+                log_vseinstrumenti_diagnostic(
+                    error_type=VseinstrumentiDiagnosticErrorType.OUTCOME_CONTRACT,
+                    reason_code=VseinstrumentiDiagnosticReasonCode.OUTCOME_CONTRACT,
+                )
             outcome = self._failure(
                 provider_key,
                 ProviderFailureCategory.INVALID_RESPONSE,
@@ -414,6 +429,11 @@ class ProviderRunner:
         try:
             index_offers_by_provider_identity(outcome.offers)
         except ValueError:
+            if provider_key == "vseinstrumenti":
+                log_vseinstrumenti_diagnostic(
+                    error_type=VseinstrumentiDiagnosticErrorType.OUTCOME_CONTRACT,
+                    reason_code=VseinstrumentiDiagnosticReasonCode.OUTCOME_CONTRACT,
+                )
             outcome = self._failure(
                 provider_key,
                 ProviderFailureCategory.INVALID_RESPONSE,

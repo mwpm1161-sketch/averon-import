@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 import io
 import json
+import logging
 import socket
 import traceback
 import urllib.error
@@ -26,6 +27,9 @@ from averon_import.services.sourcing.providers.vseinstrumenti.models import (
     parse_product_search_result,
 )
 from averon_import.services.sourcing.providers.execution import ProviderRequestCounter
+from averon_import.services.sourcing.providers.safe_diagnostics import (
+    VseinstrumentiDiagnosticErrorType,
+)
 
 
 REGION = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
@@ -34,9 +38,10 @@ SEARCH = "Аккумуляторная дрель Durofix 60V RK60132-PM"
 
 
 class FakeResponse:
-    def __init__(self, body: bytes, status: int = 200):
+    def __init__(self, body: bytes, status: int = 200, headers=None):
         self.body = body
         self.status = status
+        self.headers = headers or {}
         self.read_limit = None
         self.closed = False
 
@@ -121,6 +126,169 @@ def test_search_builds_documented_one_page_request_with_bearer_header_only():
     assert response.closed
     assert result.region_id == REGION
     assert len(result.products) == 1
+
+
+def test_safe_diagnostics_are_disabled_by_default(monkeypatch, caplog):
+    monkeypatch.delenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", raising=False)
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    transport = FakeTransport(FakeResponse(b"<html>safe fixture</html>", headers={"Content-Type": "text/html"}))
+
+    with pytest.raises(VseinstrumentiApiError):
+        _client(transport).search_products(SEARCH, region_id=REGION)
+
+    assert caplog.text == ""
+    assert len(transport.requests) == 1
+
+
+def test_safe_diagnostics_for_successful_json_do_not_change_request_count(monkeypatch, caplog):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    transport = FakeTransport(FakeResponse(
+        _response(_payload(_product())).body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    ))
+    counter = ProviderRequestCounter()
+
+    result = _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert len(result.products) == 1
+    assert counter.request_count == 1
+    assert len(transport.requests) == 1
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize(
+    "body,headers,error_type,reason_code,content_type",
+    [
+        (b"{not-json", {"Content-Type": "application/json"}, "JSON_DECODING", "UNKNOWN", "JSON"),
+        (b"<html>BODY_SECRET_SENTINEL</html>", {"Content-Type": "text/html; charset=utf-8"}, "JSON_DECODING", "UNKNOWN", "HTML"),
+        (b"not-json", {"Content-Type": "application/octet-stream"}, "JSON_DECODING", "UNKNOWN", "OTHER"),
+        (b"not-json", {}, "JSON_DECODING", "UNKNOWN", "MISSING"),
+    ],
+)
+def test_safe_diagnostics_classify_json_decode_failure_without_sensitive_values(
+    monkeypatch, caplog, body, headers, error_type, reason_code, content_type,
+):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    transport = FakeTransport(FakeResponse(body, headers=headers))
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(
+            SEARCH, region_id=REGION, outbound_attempt_observer=counter,
+        )
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert counter.request_count == 1
+    assert len(transport.requests) == 1
+    assert f"error_type={error_type}" in caplog.text
+    assert f"reason_code={reason_code}" in caplog.text
+    assert f"content_type={content_type}" in caplog.text
+    assert f"response_bytes={len(body)}" in caplog.text
+    for secret in (TOKEN, SEARCH, REGION, "BODY_SECRET_SENTINEL"):
+        assert secret not in caplog.text
+
+
+def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, caplog):
+    from averon_import.services.sourcing.providers.safe_diagnostics import (
+        VseinstrumentiDiagnosticReasonCode,
+    )
+
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    invalid_cases = [
+        ({"unexpected": "ENVELOPE_SECRET"}, VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE),
+        (_payload(_product(), search="OTHER_QUERY_SECRET"), VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH),
+        ({"result": {"search": SEARCH, "regionId": REGION, "products": "PRODUCTS_SECRET"}},
+         VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE),
+        (_payload(_product(sku=123)), VseinstrumentiDiagnosticReasonCode.SKU_TYPE),
+        (_payload(_product(technicalSpecifications=[])), VseinstrumentiDiagnosticReasonCode.SPECS_SHAPE),
+        (_payload(_product(prices=[])), VseinstrumentiDiagnosticReasonCode.PRICE_SHAPE),
+        (_payload(_product(name=17)), VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE),
+        (_payload(_product(), _product(sku="0015555760", name="CONFLICT_SECRET")),
+         VseinstrumentiDiagnosticReasonCode.DUPLICATE_CONFLICT),
+    ]
+
+    for payload, expected_reason in invalid_cases:
+        caplog.clear()
+        transport = FakeTransport(FakeResponse(_response(payload).body, headers={"Content-Type": "application/json"}))
+        with pytest.raises(VseinstrumentiApiError) as caught:
+            _client(transport).search_products(SEARCH, region_id=REGION)
+        assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+        expected_error_type = "ENVELOPE_VALIDATION" if expected_reason in {
+            VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+            VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
+            VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
+        } else "RESPONSE_VALIDATION"
+        assert f"error_type={expected_error_type}" in caplog.text
+        assert f"reason_code={expected_reason.value}" in caplog.text
+        assert "ENVELOPE_SECRET" not in caplog.text
+        assert "OTHER_QUERY_SECRET" not in caplog.text
+        assert "PRODUCTS_SECRET" not in caplog.text
+        assert "CONFLICT_SECRET" not in caplog.text
+        assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "status,category,content_type",
+    [
+        (401, VseinstrumentiErrorCategory.AUTHENTICATION, "JSON"),
+        (403, VseinstrumentiErrorCategory.AUTHENTICATION, "OTHER"),
+        (429, VseinstrumentiErrorCategory.RATE_LIMITED, "MISSING"),
+        (500, VseinstrumentiErrorCategory.UNAVAILABLE, "HTML"),
+    ],
+)
+def test_http_diagnostics_keep_existing_categories_and_single_attempt(
+    monkeypatch, caplog, status, category, content_type,
+):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    body = b"HTTP_BODY_SECRET_SENTINEL"
+    headers = {
+        "JSON": {"Content-Type": "application/json"},
+        "OTHER": {"Content-Type": "application/octet-stream"},
+        "HTML": {"Content-Type": "text/html"},
+        "MISSING": {},
+    }[content_type]
+    transport = FakeTransport(FakeResponse(body, status=status, headers=headers))
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category == category
+    assert caught.value.status_code == status
+    assert f"error_type={VseinstrumentiDiagnosticErrorType.HTTP.value}" in caplog.text
+    assert f"status_code={status}" in caplog.text
+    assert f"content_type={content_type}" in caplog.text
+    assert f"response_bytes={len(body)}" in caplog.text
+    assert "HTTP_BODY_SECRET_SENTINEL" not in caplog.text
+    assert TOKEN not in caplog.text
+    assert SEARCH not in caplog.text
+    assert REGION not in caplog.text
+    assert counter.request_count == 1
+    assert len(transport.requests) == 1
+
+
+def test_transport_diagnostic_does_not_retain_exception_text(monkeypatch, caplog):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    transport = FakeTransport(RuntimeError(f"{TOKEN} {SEARCH} {REGION}"))
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.TRANSPORT
+    assert "error_type=TRANSPORT" in caplog.text
+    assert "status_code=MISSING" in caplog.text
+    assert "response_bytes=MISSING" in caplog.text
+    assert TOKEN not in caplog.text
+    assert SEARCH not in caplog.text
+    assert REGION not in caplog.text
+    assert counter.request_count == 1
+    assert len(transport.requests) == 1
 
 
 def test_outbound_observer_runs_once_immediately_before_transport():

@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 import hashlib
 import json
+import logging
 import socket
 from threading import RLock
 import urllib.request
@@ -252,6 +253,60 @@ def test_runner_executes_vi_outcome_and_request_local_dedup_does_not_double_coun
     assert second.outcomes[0].request_count == 0
     assert second.reused_provider_keys == ("vseinstrumenti",)
     assert len(transport.requests) == 1
+
+
+def test_offer_conversion_failure_emits_only_fixed_diagnostic(monkeypatch, caplog):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    adapter, transport = _adapter(_response(_payload(_product())))
+
+    def fail_conversion(_product, _affinity):
+        raise ValueError(f"{TOKEN} ARTICLE_SECRET_SENTINEL {REGION}")
+
+    monkeypatch.setattr(adapter, "_offer", fail_conversion)
+    result = adapter.execute_search(_intent(), limit=5, request_counter=ProviderRequestCounter())
+
+    assert result.state == ProviderSearchState.FAILURE
+    assert result.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert result.offers == ()
+    assert result.request_count == 1
+    assert "error_type=OFFER_CONVERSION" in caplog.text
+    assert "reason_code=OFFER_CONVERSION" in caplog.text
+    assert TOKEN not in caplog.text
+    assert "ARTICLE_SECRET_SENTINEL" not in caplog.text
+    assert REGION not in caplog.text
+    assert len(transport.requests) == 1
+
+
+def test_runner_outcome_contract_failure_is_safely_diagnosed(monkeypatch, caplog):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    caplog.set_level(logging.WARNING, logger="averon.sourcing.vseinstrumenti.diagnostics")
+    adapter, transport = _adapter()
+    identity = adapter.request_identity(_intent(), limit=5, execution_scope_id="diagnostic-scope")
+
+    def invalid_outcome(_intent, *, limit, request_counter):
+        return ProviderSearchOutcome(
+            provider_key="other-provider",
+            state=ProviderSearchState.EMPTY,
+            request_count=request_counter.request_count,
+            affinity=identity.affinity,
+        )
+
+    adapter.execute_search = invalid_outcome
+    result = ProviderRunner({"vseinstrumenti": adapter}).run(
+        selection=ProviderSelection(provider_keys=("vseinstrumenti",)),
+        intent=_intent(),
+        limit=5,
+        scope=ProviderExecutionScope(execution_scope_id="diagnostic-scope"),
+    )
+
+    assert result.outcomes[0].state == ProviderSearchState.FAILURE
+    assert result.outcomes[0].failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert result.outcomes[0].offers == ()
+    assert result.outcomes[0].request_count == 0
+    assert "error_type=OUTCOME_CONTRACT" in caplog.text
+    assert "reason_code=OUTCOME_CONTRACT" in caplog.text
+    assert len(transport.requests) == 0
 
 
 def _secret_backed_adapter(monkeypatch, *, generation_value, store, transport):

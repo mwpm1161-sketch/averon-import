@@ -24,6 +24,13 @@ from .models import (
     parse_product_search_result,
 )
 from ..outbound import OutboundAttemptObserver
+from ..safe_diagnostics import (
+    VseinstrumentiContentTypeCategory,
+    VseinstrumentiDiagnosticErrorType,
+    VseinstrumentiDiagnosticReasonCode,
+    content_type_category,
+    log_vseinstrumenti_diagnostic,
+)
 
 
 VSEINSTRUMENTI_API_BASE_URLS = {
@@ -91,9 +98,17 @@ class VseinstrumentiApiError(RuntimeError):
         category: VseinstrumentiErrorCategory,
         *,
         status_code: int | None = None,
+        diagnostic_error_type: VseinstrumentiDiagnosticErrorType | None = None,
+        reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.UNKNOWN,
+        content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
+        response_bytes: int | None = None,
     ) -> None:
         self.category = category
         self.status_code = status_code
+        self.diagnostic_error_type = diagnostic_error_type
+        self.reason_code = reason_code
+        self.content_type = content_type
+        self.response_bytes = response_bytes
         super().__init__(_SAFE_MESSAGES[category])
 
 
@@ -253,7 +268,11 @@ def _envelope_status(payload: object) -> int | None:
     return None
 
 
-def _status_error(status: int, raw: bytes) -> VseinstrumentiApiError:
+def _status_error(
+    status: int,
+    raw: bytes | None,
+    content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
+) -> VseinstrumentiApiError:
     envelope: object = None
     try:
         envelope = _json_loads_exact(raw) if raw else None
@@ -271,29 +290,64 @@ def _status_error(status: int, raw: bytes) -> VseinstrumentiApiError:
         category = VseinstrumentiErrorCategory.UNAVAILABLE
     else:
         category = VseinstrumentiErrorCategory.INVALID_RESPONSE
-    return VseinstrumentiApiError(category, status_code=status)
+    return VseinstrumentiApiError(
+        category,
+        status_code=status,
+        diagnostic_error_type=VseinstrumentiDiagnosticErrorType.HTTP,
+        content_type=content_type,
+        response_bytes=len(raw) if raw is not None else None,
+    )
 
 
-def _read_bounded(response: Any) -> tuple[int, bytes]:
+def _read_bounded(
+    response: Any,
+) -> tuple[int, bytes, VseinstrumentiContentTypeCategory]:
+    content_type = content_type_category(response)
     status = getattr(response, "status", None)
     if status is None:
         status = getattr(response, "code", None)
     if type(status) is not int:
-        raise VseinstrumentiApiError(VseinstrumentiErrorCategory.INVALID_RESPONSE)
+        raise VseinstrumentiApiError(
+            VseinstrumentiErrorCategory.INVALID_RESPONSE,
+            diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
+            content_type=content_type,
+        )
     reader = getattr(response, "read", None)
     if not callable(reader):
-        raise VseinstrumentiApiError(VseinstrumentiErrorCategory.INVALID_RESPONSE)
+        raise VseinstrumentiApiError(
+            VseinstrumentiErrorCategory.INVALID_RESPONSE,
+            status_code=status,
+            diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
+            content_type=content_type,
+        )
     try:
         raw = reader(VSEINSTRUMENTI_MAX_RESPONSE_BYTES + 1)
     except (TimeoutError, socket.timeout):
-        raise VseinstrumentiApiError(VseinstrumentiErrorCategory.TIMEOUT, status_code=status) from None
+        raise VseinstrumentiApiError(
+            VseinstrumentiErrorCategory.TIMEOUT,
+            status_code=status,
+            diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
+            content_type=content_type,
+        ) from None
     except Exception:
-        raise VseinstrumentiApiError(VseinstrumentiErrorCategory.TRANSPORT, status_code=status) from None
+        raise VseinstrumentiApiError(
+            VseinstrumentiErrorCategory.TRANSPORT,
+            status_code=status,
+            diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
+            content_type=content_type,
+        ) from None
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
     if not isinstance(raw, bytes) or len(raw) > VSEINSTRUMENTI_MAX_RESPONSE_BYTES:
-        raise VseinstrumentiApiError(VseinstrumentiErrorCategory.INVALID_RESPONSE, status_code=status)
-    return status, raw
+        observed_size = len(raw) if isinstance(raw, bytes) else None
+        raise VseinstrumentiApiError(
+            VseinstrumentiErrorCategory.INVALID_RESPONSE,
+            status_code=status,
+            diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
+            content_type=content_type,
+            response_bytes=observed_size,
+        )
+    return status, raw, content_type
 
 
 class VseinstrumentiClient:
@@ -349,6 +403,38 @@ class VseinstrumentiClient:
         order_by: str = "price",
         outbound_attempt_observer: OutboundAttemptObserver | None = None,
     ) -> VseinstrumentiProductSearchResult:
+        """Perform a bounded search and optionally emit one allowlisted diagnostic."""
+
+        try:
+            return self._search_products(
+                search,
+                region_id=region_id,
+                limit=limit,
+                sort=sort,
+                order_by=order_by,
+                outbound_attempt_observer=outbound_attempt_observer,
+            )
+        except VseinstrumentiApiError as exc:
+            if exc.diagnostic_error_type is not None:
+                log_vseinstrumenti_diagnostic(
+                    error_type=exc.diagnostic_error_type,
+                    reason_code=exc.reason_code,
+                    status_code=exc.status_code,
+                    content_type=exc.content_type,
+                    response_bytes=exc.response_bytes,
+                )
+            raise
+
+    def _search_products(
+        self,
+        search: str,
+        *,
+        region_id: str,
+        limit: int = VSEINSTRUMENTI_MAX_PAGE_SIZE,
+        sort: str = "asc",
+        order_by: str = "price",
+        outbound_attempt_observer: OutboundAttemptObserver | None = None,
+    ) -> VseinstrumentiProductSearchResult:
         """Search one page at offset zero; no retries or follow-up requests."""
 
         if (outbound_attempt_observer is not None and not callable(
@@ -391,14 +477,15 @@ class VseinstrumentiClient:
                 except urllib.error.HTTPError as exc:
                     try:
                         try:
-                            status, raw = _read_bounded(exc)
-                        except VseinstrumentiApiError:
-                            status, raw = int(exc.code), b""
-                        raise _status_error(status, raw) from None
+                            status, raw, content_type = _read_bounded(exc)
+                        except VseinstrumentiApiError as read_error:
+                            status, raw = int(exc.code), None
+                            content_type = read_error.content_type
+                        raise _status_error(status, raw, content_type) from None
                     finally:
                         exc.close()
                 try:
-                    status, raw = _read_bounded(response)
+                    status, raw, response_content_type = _read_bounded(response)
                 finally:
                     close = getattr(response, "close", None)
                     if callable(close):
@@ -406,25 +493,47 @@ class VseinstrumentiClient:
         except VseinstrumentiApiError:
             raise
         except (TimeoutError, socket.timeout):
-            raise VseinstrumentiApiError(VseinstrumentiErrorCategory.TIMEOUT) from None
+            raise VseinstrumentiApiError(
+                VseinstrumentiErrorCategory.TIMEOUT,
+                diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
+            ) from None
         except urllib.error.URLError:
-            raise VseinstrumentiApiError(VseinstrumentiErrorCategory.TRANSPORT) from None
+            raise VseinstrumentiApiError(
+                VseinstrumentiErrorCategory.TRANSPORT,
+                diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
+            ) from None
         except Exception:
             # Transport exceptions can embed request headers or URLs. Never
             # retain their text, cause, repr, or traceback in the public error.
-            raise VseinstrumentiApiError(VseinstrumentiErrorCategory.TRANSPORT) from None
+            raise VseinstrumentiApiError(
+                VseinstrumentiErrorCategory.TRANSPORT,
+                diagnostic_error_type=VseinstrumentiDiagnosticErrorType.TRANSPORT,
+            ) from None
 
         if status != 200:
-            raise _status_error(status, raw) from None
+            raise _status_error(status, raw, response_content_type) from None
         try:
-            payload = _json_loads_exact(raw)
+            try:
+                payload = _json_loads_exact(raw)
+            except VseinstrumentiResponseError:
+                raise VseinstrumentiApiError(
+                    VseinstrumentiErrorCategory.INVALID_RESPONSE,
+                    status_code=status,
+                    diagnostic_error_type=VseinstrumentiDiagnosticErrorType.JSON_DECODING,
+                    content_type=response_content_type,
+                    response_bytes=len(raw),
+                ) from None
             api_status = _envelope_status(payload)
             if api_status is not None:
                 if api_status == 500 and _authentication_error_envelope(payload):
                     raise VseinstrumentiApiError(
-                        VseinstrumentiErrorCategory.AUTHENTICATION, status_code=api_status,
+                        VseinstrumentiErrorCategory.AUTHENTICATION,
+                        status_code=api_status,
+                        diagnostic_error_type=VseinstrumentiDiagnosticErrorType.HTTP,
+                        content_type=response_content_type,
+                        response_bytes=len(raw),
                     )
-                raise _status_error(api_status, raw)
+                raise _status_error(api_status, raw, response_content_type)
             return parse_product_search_result(
                 payload,
                 expected_search=search,
@@ -433,7 +542,30 @@ class VseinstrumentiClient:
             )
         except VseinstrumentiApiError:
             raise
-        except VseinstrumentiResponseError:
-            raise VseinstrumentiApiError(VseinstrumentiErrorCategory.INVALID_RESPONSE) from None
+        except VseinstrumentiResponseError as exc:
+            envelope_reasons = {
+                VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+                VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
+                VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
+            }
+            error_type = (
+                VseinstrumentiDiagnosticErrorType.ENVELOPE_VALIDATION
+                if exc.reason_code in envelope_reasons
+                else VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION
+            )
+            raise VseinstrumentiApiError(
+                VseinstrumentiErrorCategory.INVALID_RESPONSE,
+                status_code=status,
+                diagnostic_error_type=error_type,
+                reason_code=exc.reason_code,
+                content_type=response_content_type,
+                response_bytes=len(raw),
+            ) from None
         except Exception:
-            raise VseinstrumentiApiError(VseinstrumentiErrorCategory.INVALID_RESPONSE) from None
+            raise VseinstrumentiApiError(
+                VseinstrumentiErrorCategory.INVALID_RESPONSE,
+                status_code=status,
+                diagnostic_error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
+                content_type=response_content_type,
+                response_bytes=len(raw),
+            ) from None
