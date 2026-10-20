@@ -25,6 +25,7 @@ from averon_import.services.sourcing.providers.vseinstrumenti.models import (
     VseinstrumentiResponseError,
     parse_product_search_result,
 )
+from averon_import.services.sourcing.providers.vseinstrumenti import models as models_module
 from averon_import.services.sourcing.providers.execution import ProviderRequestCounter
 from averon_import.services.sourcing.providers.safe_diagnostics import (
     VseinstrumentiDiagnosticErrorType,
@@ -108,6 +109,10 @@ def _product(**updates):
 
 def _payload(*products, search=SEARCH, region_id=REGION):
     return {"result": {"search": search, "regionId": region_id, "products": list(products)}}
+
+
+def _root_payload(*products):
+    return {"products": list(products)}
 
 
 def _response(payload, status=200):
@@ -348,6 +353,194 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagn
         assert len(transport.requests) == 1
 
 
+@pytest.mark.parametrize("response_variant", ["RESULT_PRODUCTS", "ROOT_PRODUCTS"])
+@pytest.mark.parametrize(
+    "case_name,sku_value,remove_sku,expected_shape,product_code,expected_product_code_type",
+    [
+        ("missing", None, True, "SKU_MISSING", "ARTICLE_SECRET_MISSING", "STRING"),
+        ("null", None, False, "SKU_NULL", "ARTICLE_SECRET_NULL", "STRING"),
+        ("number", 917364, False, "SKU_NUMBER", 782341, "NUMBER"),
+        ("empty", " \t ", False, "SKU_STRING_EMPTY", "ARTICLE_SECRET_EMPTY", "STRING"),
+        ("overlong", "SKU_OVERLONG_SENTINEL_" + "x" * 181, False, "SKU_STRING_OVERLONG", "ARTICLE_SECRET_LONG", "STRING"),
+        ("control", "SKU_CONTROL_SENTINEL_\x01", False, "SKU_STRING_CONTROL", "ARTICLE_SECRET_CONTROL", "STRING"),
+        ("array", ["SKU_ARRAY_SENTINEL"], False, "SKU_ARRAY", "ARTICLE_SECRET_ARRAY", "STRING"),
+        ("object", {"value": "SKU_OBJECT_SENTINEL"}, False, "SKU_OBJECT", "ARTICLE_SECRET_OBJECT", "STRING"),
+        ("boolean", True, False, "SKU_BOOLEAN", "ARTICLE_SECRET_BOOLEAN", "STRING"),
+    ],
+)
+def test_sku_shape_diagnostic_is_allowlisted_and_outcome_neutral(
+    monkeypatch,
+    diagnostic_output,
+    response_variant,
+    case_name,
+    sku_value,
+    remove_sku,
+    expected_shape,
+    product_code,
+    expected_product_code_type,
+):
+    payload_product = _product(productCode=product_code)
+    if remove_sku:
+        payload_product.pop("sku")
+    else:
+        payload_product["sku"] = sku_value
+    payload = (
+        _root_payload(payload_product)
+        if response_variant == "ROOT_PRODUCTS"
+        else _payload(payload_product)
+    )
+    body = _response(payload).body
+    outcomes = []
+    request_counts = []
+    outputs = []
+
+    for enabled in (False, True):
+        if enabled:
+            monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+        else:
+            monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "0")
+        diagnostic_output.seek(0)
+        diagnostic_output.truncate(0)
+        transport = FakeTransport(FakeResponse(body, headers={"Content-Type": "application/json"}))
+        counter = ProviderRequestCounter()
+        with pytest.raises(VseinstrumentiApiError) as caught:
+            _client(transport).search_products(
+                SEARCH, region_id=REGION, outbound_attempt_observer=counter,
+            )
+        outcomes.append((caught.value.category, caught.value.reason_code, caught.value.diagnostic_error_type))
+        request_counts.append((counter.request_count, len(transport.requests)))
+        outputs.append(diagnostic_output.getvalue())
+
+    assert outcomes == [
+        (VseinstrumentiErrorCategory.INVALID_RESPONSE,
+         diagnostics_module.VseinstrumentiDiagnosticReasonCode.SKU_TYPE,
+         VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION),
+    ] * 2, case_name
+    assert request_counts == [(1, 1), (1, 1)]
+    assert outputs[0] == ""
+    expected_line = (
+        f"sku_shape={expected_shape} response_variant={response_variant} "
+        f"product_code_type={expected_product_code_type}"
+    )
+    assert expected_line in outputs[1], case_name
+    assert len(outputs[1]) < 2048
+    for secret in (
+        TOKEN, SEARCH, REGION, "SKU_OVERLONG_SENTINEL", "SKU_CONTROL_SENTINEL",
+        "SKU_ARRAY_SENTINEL", "SKU_OBJECT_SENTINEL", "ARTICLE_SECRET",
+        str(product_code), "917364", "782341",
+    ):
+        assert secret not in outputs[1], (case_name, secret)
+
+
+def test_sku_shape_other_bucket_handles_non_json_python_values_without_retaining_them():
+    from averon_import.services.sourcing.providers.safe_diagnostics import (
+        VseinstrumentiResponseVariant,
+        VseinstrumentiSkuShapeCode,
+        classify_vseinstrumenti_sku_shape,
+    )
+
+    classified = classify_vseinstrumenti_sku_shape(
+        {"sku": object(), "productCode": "ARTICLE_SENTINEL"},
+        response_variant=VseinstrumentiResponseVariant.RESULT_PRODUCTS,
+    )
+
+    assert classified is not None
+    assert classified.sku_shape is VseinstrumentiSkuShapeCode.SKU_OTHER
+    assert "ARTICLE_SENTINEL" not in repr(classified)
+
+
+def test_sku_other_and_missing_product_code_diagnostic_uses_only_fixed_enums(
+    monkeypatch, diagnostic_output,
+):
+    from averon_import.services.sourcing.providers.safe_diagnostics import (
+        VseinstrumentiDiagnosticReasonCode,
+        VseinstrumentiResponseVariant,
+        VseinstrumentiSkuShapeCode,
+        classify_vseinstrumenti_sku_shape,
+    )
+
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    classified = classify_vseinstrumenti_sku_shape(
+        {"sku": object(), "unlisted_field": "UNLISTED_SENTINEL"},
+        response_variant=VseinstrumentiResponseVariant.ROOT_PRODUCTS,
+    )
+    assert classified is not None
+    assert classified.sku_shape is VseinstrumentiSkuShapeCode.SKU_OTHER
+
+    diagnostics_module.log_vseinstrumenti_diagnostic(
+        error_type=VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION,
+        reason_code=VseinstrumentiDiagnosticReasonCode.SKU_TYPE,
+        sku_shape=classified,
+    )
+
+    output = diagnostic_output.getvalue()
+    assert "sku_shape=SKU_OTHER response_variant=ROOT_PRODUCTS product_code_type=MISSING" in output
+    assert "UNLISTED_SENTINEL" not in output
+    assert "<object" not in output
+    assert len(output) < 2048
+
+
+def test_sku_diagnostic_probe_is_not_run_when_flag_is_off(monkeypatch, diagnostic_output):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "0")
+    calls = []
+
+    def forbidden_probe(*_args, **_kwargs):
+        calls.append(1)
+        raise RuntimeError("DIAGNOSTIC_SENTINEL")
+
+    monkeypatch.setattr(models_module, "classify_vseinstrumenti_sku_shape", forbidden_probe)
+    transport = FakeTransport(_response(_payload(_product(sku=17))))
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category is VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert caught.value.reason_code.value == "SKU_TYPE"
+    assert calls == []
+    assert counter.request_count == len(transport.requests) == 1
+    assert diagnostic_output.getvalue() == ""
+
+
+def test_sku_diagnostic_probe_failure_and_sink_failure_do_not_change_provider_error(
+    monkeypatch, diagnostic_output,
+):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+
+    def fail_probe(*_args, **_kwargs):
+        raise RuntimeError(f"PROBE_SECRET {TOKEN} {SEARCH}")
+
+    monkeypatch.setattr(models_module, "classify_vseinstrumenti_sku_shape", fail_probe)
+    transport = FakeTransport(_response(_root_payload(_product(sku=17))))
+    counter = ProviderRequestCounter()
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert caught.value.category is VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert caught.value.reason_code.value == "SKU_TYPE"
+    assert caught.value.diagnostic_sku_shape is None
+    assert counter.request_count == len(transport.requests) == 1
+    assert "PROBE_SECRET" not in diagnostic_output.getvalue()
+
+    diagnostic_output.seek(0)
+    diagnostic_output.truncate(0)
+
+    def fail_sink(**_kwargs):
+        raise RuntimeError(f"SINK_SECRET {TOKEN} {SEARCH}")
+
+    monkeypatch.setattr(diagnostics_module, "_emit_allowlisted_diagnostic", fail_sink)
+    monkeypatch.setattr(models_module, "classify_vseinstrumenti_sku_shape", diagnostics_module.classify_vseinstrumenti_sku_shape)
+    transport = FakeTransport(_response(_payload(_product(sku=True))))
+    counter = ProviderRequestCounter()
+    with pytest.raises(VseinstrumentiApiError) as sink_caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, outbound_attempt_observer=counter)
+
+    assert sink_caught.value.category is caught.value.category
+    assert sink_caught.value.reason_code is caught.value.reason_code
+    assert counter.request_count == len(transport.requests) == 1
+    assert diagnostic_output.getvalue() == ""
+
+
 @pytest.mark.parametrize(
     "case_name,payload,expected_outcome,expected_shape_fragments,secret_values",
     [
@@ -491,21 +684,33 @@ def test_response_shape_probe_diagnostic_sink_failure_does_not_change_failure(mo
 
 
 def test_maximum_response_shape_event_stays_bounded(monkeypatch, diagnostic_output):
+    from averon_import.services.sourcing.providers.safe_diagnostics import (
+        VseinstrumentiResponseVariant,
+        classify_vseinstrumenti_sku_shape,
+    )
+
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
     nested_fields = ("products", "items", "search", "regionId", "error", "errors", "message")
     containers = ("result", "data", "products", "items", "response", "payload", "error", "errors", "details")
     payload = {container: {field: None for field in nested_fields} for container in containers}
     shape = diagnostics_module.classify_vseinstrumenti_response_shape(payload)
+    sku_shape = classify_vseinstrumenti_sku_shape(
+        {"sku": "", "productCode": "ARTICLE_NOT_LOGGED"},
+        response_variant=VseinstrumentiResponseVariant.ROOT_PRODUCTS,
+    )
 
     assert shape is not None
+    assert sku_shape is not None
     diagnostics_module.log_vseinstrumenti_diagnostic(
         error_type=VseinstrumentiDiagnosticErrorType.ENVELOPE_VALIDATION,
         response_shape=shape,
+        sku_shape=sku_shape,
     )
 
     event = diagnostic_output.getvalue().rstrip("\n")
     assert len(event) < 2048
     assert "response_shape=" in event
+    assert "sku_shape=SKU_STRING_EMPTY" in event
 
 
 @pytest.mark.parametrize(

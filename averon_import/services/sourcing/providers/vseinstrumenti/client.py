@@ -29,6 +29,7 @@ from ..safe_diagnostics import (
     VseinstrumentiDiagnosticErrorType,
     VseinstrumentiDiagnosticReasonCode,
     VseinstrumentiResponseShape,
+    VseinstrumentiSkuShapeDiagnostic,
     classify_vseinstrumenti_response_shape,
     content_type_category,
     log_vseinstrumenti_diagnostic,
@@ -108,6 +109,7 @@ class VseinstrumentiApiError(RuntimeError):
         content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
         response_bytes: int | None = None,
         diagnostic_response_shape: VseinstrumentiResponseShape | None = None,
+        diagnostic_sku_shape: VseinstrumentiSkuShapeDiagnostic | None = None,
     ) -> None:
         self.category = category
         self.status_code = status_code
@@ -118,6 +120,7 @@ class VseinstrumentiApiError(RuntimeError):
         self.content_type = content_type
         self.response_bytes = response_bytes
         self.diagnostic_response_shape = diagnostic_response_shape
+        self.diagnostic_sku_shape = diagnostic_sku_shape
         super().__init__(_SAFE_MESSAGES[category])
 
 
@@ -447,6 +450,7 @@ class VseinstrumentiClient:
                     content_type=exc.content_type,
                     response_bytes=exc.response_bytes,
                     response_shape=exc.diagnostic_response_shape,
+                    sku_shape=exc.diagnostic_sku_shape,
                 )
             raise
 
@@ -608,6 +612,12 @@ class VseinstrumentiClient:
                 content_type=response_content_type,
                 response_bytes=len(raw),
                 diagnostic_response_shape=diagnostic_response_shape,
+                diagnostic_sku_shape=(
+                    exc.diagnostic_sku_shape
+                    if exc.reason_code is VseinstrumentiDiagnosticReasonCode.SKU_TYPE
+                    and safe_diagnostics_enabled()
+                    else None
+                ),
             ) from None
         except Exception:
             raise VseinstrumentiApiError(

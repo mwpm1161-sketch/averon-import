@@ -64,6 +64,38 @@ class VseinstrumentiJsonValueType(str, Enum):
     MISSING = "MISSING"
 
 
+class VseinstrumentiSkuShapeCode(str, Enum):
+    """Fixed diagnostic categories for a rejected product SKU, never its value."""
+
+    SKU_MISSING = "SKU_MISSING"
+    SKU_NULL = "SKU_NULL"
+    SKU_NUMBER = "SKU_NUMBER"
+    SKU_STRING_EMPTY = "SKU_STRING_EMPTY"
+    SKU_STRING_OVERLONG = "SKU_STRING_OVERLONG"
+    SKU_STRING_CONTROL = "SKU_STRING_CONTROL"
+    SKU_ARRAY = "SKU_ARRAY"
+    SKU_OBJECT = "SKU_OBJECT"
+    SKU_BOOLEAN = "SKU_BOOLEAN"
+    SKU_OTHER = "SKU_OTHER"
+
+
+class VseinstrumentiResponseVariant(str, Enum):
+    ROOT_PRODUCTS = "ROOT_PRODUCTS"
+    RESULT_PRODUCTS = "RESULT_PRODUCTS"
+
+
+VSEINSTRUMENTI_MAX_SKU_LENGTH = 180
+
+
+@dataclass(frozen=True, slots=True)
+class VseinstrumentiSkuShapeDiagnostic:
+    """Type-only facts about one rejected product; contains no upstream values."""
+
+    sku_shape: VseinstrumentiSkuShapeCode
+    response_variant: VseinstrumentiResponseVariant
+    product_code_type: VseinstrumentiJsonValueType
+
+
 @dataclass(frozen=True, slots=True)
 class VseinstrumentiResponseShape:
     """A type-only signature over fixed JSON field allowlists."""
@@ -153,6 +185,76 @@ def classify_vseinstrumenti_response_shape(payload: object) -> VseinstrumentiRes
 
 
 _RESPONSE_SHAPE_MISSING = object()
+
+
+def classify_vseinstrumenti_sku_shape(
+    product: object,
+    *,
+    response_variant: VseinstrumentiResponseVariant,
+) -> VseinstrumentiSkuShapeDiagnostic | None:
+    """Classify only the fixed SKU/productCode fields of a rejected product."""
+    if type(product) is not dict or type(response_variant) is not VseinstrumentiResponseVariant:
+        return None
+    try:
+        if "sku" not in product:
+            sku_shape = VseinstrumentiSkuShapeCode.SKU_MISSING
+        else:
+            sku = product["sku"]
+            if sku is None:
+                sku_shape = VseinstrumentiSkuShapeCode.SKU_NULL
+            elif type(sku) is bool:
+                sku_shape = VseinstrumentiSkuShapeCode.SKU_BOOLEAN
+            elif type(sku) in {int, float, Decimal}:
+                sku_shape = VseinstrumentiSkuShapeCode.SKU_NUMBER
+            elif type(sku) is str:
+                normalized = sku.strip()
+                if not normalized:
+                    sku_shape = VseinstrumentiSkuShapeCode.SKU_STRING_EMPTY
+                elif len(normalized) > VSEINSTRUMENTI_MAX_SKU_LENGTH:
+                    sku_shape = VseinstrumentiSkuShapeCode.SKU_STRING_OVERLONG
+                elif any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in normalized):
+                    sku_shape = VseinstrumentiSkuShapeCode.SKU_STRING_CONTROL
+                else:
+                    # A normal string cannot fail the strict SKU validator;
+                    # retain a conservative fixed bucket if the probe is called
+                    # independently or the validation rules later diverge.
+                    sku_shape = VseinstrumentiSkuShapeCode.SKU_OTHER
+            elif type(sku) is list:
+                sku_shape = VseinstrumentiSkuShapeCode.SKU_ARRAY
+            elif type(sku) is dict:
+                sku_shape = VseinstrumentiSkuShapeCode.SKU_OBJECT
+            else:
+                sku_shape = VseinstrumentiSkuShapeCode.SKU_OTHER
+
+        product_code = product.get("productCode", _RESPONSE_SHAPE_MISSING)
+        product_code_type = (
+            VseinstrumentiJsonValueType.MISSING
+            if product_code is _RESPONSE_SHAPE_MISSING
+            else _json_value_type(product_code)
+        )
+        if product_code_type is None:
+            return None
+        return VseinstrumentiSkuShapeDiagnostic(
+            sku_shape=sku_shape,
+            response_variant=response_variant,
+            product_code_type=product_code_type,
+        )
+    except Exception:
+        # A diagnostic-only probe must never affect the parser's outcome.
+        return None
+
+
+def _format_vseinstrumenti_sku_shape(shape: object) -> str | None:
+    if type(shape) is not VseinstrumentiSkuShapeDiagnostic:
+        return None
+    if (type(shape.sku_shape) is not VseinstrumentiSkuShapeCode
+            or type(shape.response_variant) is not VseinstrumentiResponseVariant
+            or type(shape.product_code_type) is not VseinstrumentiJsonValueType):
+        return None
+    return (
+        f"sku_shape={shape.sku_shape.value} response_variant={shape.response_variant.value} "
+        f"product_code_type={shape.product_code_type.value}"
+    )
 
 
 def _format_vseinstrumenti_response_shape(shape: object) -> str | None:
@@ -264,6 +366,7 @@ def _emit_allowlisted_diagnostic(
     content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
     response_bytes: int | None = None,
     response_shape: VseinstrumentiResponseShape | None = None,
+    sku_shape: VseinstrumentiSkuShapeDiagnostic | None = None,
 ) -> None:
     """Construct and emit one allowlisted event; callers must isolate failures."""
     if not isinstance(error_type, VseinstrumentiDiagnosticErrorType):
@@ -280,6 +383,7 @@ def _emit_allowlisted_diagnostic(
     )
     safe_size = response_bytes if type(response_bytes) is int and 0 <= response_bytes <= 2_097_153 else None
     safe_shape = _format_vseinstrumenti_response_shape(response_shape)
+    safe_sku_shape = _format_vseinstrumenti_sku_shape(sku_shape)
     _ensure_safe_diagnostic_sink()
     message = (
         "vseinstrumenti_safe_diagnostic error_type=%s status_code=%s envelope_status_code=%s content_type=%s "
@@ -287,6 +391,8 @@ def _emit_allowlisted_diagnostic(
     )
     if safe_shape is not None:
         message += " response_shape=%s"
+    if safe_sku_shape is not None:
+        message += " %s"
     arguments: tuple[object, ...] = (
         error_type.value,
         safe_status if safe_status is not None else "MISSING",
@@ -297,6 +403,8 @@ def _emit_allowlisted_diagnostic(
     )
     if safe_shape is not None:
         arguments += (safe_shape,)
+    if safe_sku_shape is not None:
+        arguments += (safe_sku_shape,)
     _LOGGER.warning(message, *arguments)
 
 
@@ -309,6 +417,7 @@ def log_vseinstrumenti_diagnostic(
     content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
     response_bytes: int | None = None,
     response_shape: VseinstrumentiResponseShape | None = None,
+    sku_shape: VseinstrumentiSkuShapeDiagnostic | None = None,
 ) -> None:
     """Best-effort bounded diagnostic; its failures never affect sourcing."""
 
@@ -323,6 +432,7 @@ def log_vseinstrumenti_diagnostic(
             content_type=content_type,
             response_bytes=response_bytes,
             response_shape=response_shape,
+            sku_shape=sku_shape,
         )
     except Exception:
         # Diagnostics are deliberately lossy. Never retry or fallback-log here.

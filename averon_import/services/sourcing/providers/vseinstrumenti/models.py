@@ -8,10 +8,16 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..safe_diagnostics import VseinstrumentiDiagnosticReasonCode
+from ..safe_diagnostics import (
+    VSEINSTRUMENTI_MAX_SKU_LENGTH,
+    VseinstrumentiDiagnosticReasonCode,
+    VseinstrumentiResponseVariant,
+    classify_vseinstrumenti_sku_shape,
+    safe_diagnostics_enabled,
+)
 
 
-MAX_SKU_LENGTH = 180
+MAX_SKU_LENGTH = VSEINSTRUMENTI_MAX_SKU_LENGTH
 MAX_NAME_LENGTH = 320
 MAX_ARTICLE_LENGTH = 100
 MAX_BRAND_LENGTH = 100
@@ -33,6 +39,7 @@ class VseinstrumentiResponseError(ValueError):
         reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.UNKNOWN,
     ) -> None:
         self.reason_code = reason_code
+        self.diagnostic_sku_shape = None
         super().__init__(message)
 
 
@@ -196,15 +203,30 @@ def _site_url(value: object) -> str:
     return url
 
 
-def _product(value: object) -> VseinstrumentiProduct:
+def _product(
+    value: object,
+    *,
+    response_variant: VseinstrumentiResponseVariant,
+) -> VseinstrumentiProduct:
     if not isinstance(value, dict):
         raise VseinstrumentiResponseError(
             "each product must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.OTHER_FIELD_SHAPE,
         )
-    sku = _text(
-        value.get("sku"), field="sku", maximum=MAX_SKU_LENGTH, required=True,
-        reason_code=VseinstrumentiDiagnosticReasonCode.SKU_TYPE,
-    )
+    try:
+        sku = _text(
+            value.get("sku"), field="sku", maximum=MAX_SKU_LENGTH, required=True,
+            reason_code=VseinstrumentiDiagnosticReasonCode.SKU_TYPE,
+        )
+    except VseinstrumentiResponseError as exc:
+        if exc.reason_code is VseinstrumentiDiagnosticReasonCode.SKU_TYPE and safe_diagnostics_enabled():
+            try:
+                exc.diagnostic_sku_shape = classify_vseinstrumenti_sku_shape(
+                    value, response_variant=response_variant,
+                )
+            except Exception:
+                # Preserve strict validation even if diagnostic classification fails.
+                exc.diagnostic_sku_shape = None
+        raise
     name = _text(value.get("name"), field="name", maximum=MAX_NAME_LENGTH, required=True)
     product_code = _optional_text(value.get("productCode", ""), field="productCode", maximum=MAX_ARTICLE_LENGTH)
     brand_name = _optional_text(value.get("brandName", ""), field="brandName", maximum=MAX_BRAND_LENGTH)
@@ -285,6 +307,7 @@ def parse_product_search_result(
             "response must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT,
         )
     if "result" in payload:
+        response_variant = VseinstrumentiResponseVariant.RESULT_PRODUCTS
         # The documented envelope remains unchanged. Reject mixed envelopes,
         # since choosing either product collection would be ambiguous.
         if "products" in payload:
@@ -318,6 +341,7 @@ def parse_product_search_result(
             )
         raw_products = result.get("products")
     else:
+        response_variant = VseinstrumentiResponseVariant.ROOT_PRODUCTS
         if "products" not in payload:
             raise VseinstrumentiResponseError(
                 "response result is missing", reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_MISSING,
@@ -363,7 +387,7 @@ def parse_product_search_result(
     products: list[VseinstrumentiProduct] = []
     seen: dict[str, tuple[VseinstrumentiProduct, dict[str, Any]]] = {}
     for raw in raw_products:
-        product = _product(raw)
+        product = _product(raw, response_variant=response_variant)
         previous = seen.get(product.sku)
         if previous is not None:
             if previous[1] != raw:
