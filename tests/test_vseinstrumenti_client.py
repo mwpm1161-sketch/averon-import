@@ -349,6 +349,166 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagn
 
 
 @pytest.mark.parametrize(
+    "case_name,payload,expected_outcome,expected_shape_fragments,secret_values",
+    [
+        (
+            "documented_success",
+            _payload(_product()),
+            ("success", 1),
+            (),
+            ("SYNTHETIC_SUCCESS_SECRET",),
+        ),
+        (
+            "data_products",
+            {"data": {"products": [{"sku": "DATA_SKU_SECRET", "price": 17}]}},
+            ("invalid_response", 200, "RESULT_MISSING"),
+            ("data=OBJECT", "data[products=ARRAY"),
+            ("DATA_SKU_SECRET", "17"),
+        ),
+        (
+            "root_products",
+            {"products": [{"sku": "ROOT_SKU_SECRET", "name": "ROOT_NAME_SECRET"}]},
+            ("invalid_response", 200, "RESULT_MISSING"),
+            ("products=ARRAY",),
+            ("ROOT_SKU_SECRET", "ROOT_NAME_SECRET"),
+        ),
+        (
+            "response_wrapper",
+            {"response": {"items": [{"sku": "WRAPPED_SKU_SECRET"}]}},
+            ("invalid_response", 200, "RESULT_MISSING"),
+            ("response=OBJECT", "response[products=MISSING,items=ARRAY"),
+            ("WRAPPED_SKU_SECRET",),
+        ),
+        (
+            "recognized_error_envelope",
+            {"error": 400, "code": 400, "message": "ERROR_MESSAGE_SECRET"},
+            ("invalid_request", 400, "UNKNOWN"),
+            (),
+            ("ERROR_MESSAGE_SECRET",),
+        ),
+        (
+            "unknown_error_envelope",
+            {"error": {"message": "UNKNOWN_ERROR_SECRET"}, "details": {"message": "DETAIL_SECRET"}},
+            ("invalid_response", 200, "RESULT_MISSING"),
+            ("error=OBJECT", "details=OBJECT", "error[products=MISSING", "message=STRING"),
+            ("UNKNOWN_ERROR_SECRET", "DETAIL_SECRET"),
+        ),
+        (
+            "no_recognized_keys",
+            {"unlisted_dynamic_key": {"secret": "DYNAMIC_SECRET"}},
+            ("invalid_response", 200, "RESULT_MISSING"),
+            ("root[result=MISSING,data=MISSING,products=MISSING",),
+            ("unlisted_dynamic_key", "DYNAMIC_SECRET"),
+        ),
+        (
+            "synthetic_secrets",
+            {
+                "data": {"products": [{
+                    "sku": "SECRET_SKU_ABC", "name": "SECRET_PRODUCT_ABC", "price": 123.45,
+                    "url": "https://example.invalid/?token=SECRET_URL_TOKEN",
+                }]},
+                "message": "SECRET_MESSAGE_ABC",
+            },
+            ("invalid_response", 200, "RESULT_MISSING"),
+            ("data=OBJECT", "message=STRING", "data[products=ARRAY"),
+            (
+                "SECRET_SKU_ABC", "SECRET_PRODUCT_ABC", "123.45", "SECRET_URL_TOKEN",
+                "SECRET_MESSAGE_ABC", SEARCH, TOKEN, REGION,
+            ),
+        ),
+    ],
+)
+def test_response_shape_probe_is_allowlisted_and_outcome_neutral(
+    monkeypatch,
+    diagnostic_output,
+    case_name,
+    payload,
+    expected_outcome,
+    expected_shape_fragments,
+    secret_values,
+):
+    outcomes = []
+    outputs = []
+    request_counts = []
+    for enabled in (False, True):
+        if enabled:
+            monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+        else:
+            monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "0")
+        diagnostic_output.seek(0)
+        diagnostic_output.truncate(0)
+        transport = FakeTransport(_response(payload))
+        counter = ProviderRequestCounter()
+        try:
+            result = _client(transport).search_products(
+                SEARCH, region_id=REGION, outbound_attempt_observer=counter,
+            )
+            outcome = ("success", len(result.products))
+        except VseinstrumentiApiError as exc:
+            outcome = (exc.category.value, exc.status_code, exc.reason_code.value)
+        outcomes.append(outcome)
+        outputs.append(diagnostic_output.getvalue())
+        request_counts.append((counter.request_count, len(transport.requests)))
+
+    assert outcomes == [expected_outcome, expected_outcome], case_name
+    assert request_counts == [(1, 1), (1, 1)], case_name
+    assert outputs[0] == ""
+    if expected_shape_fragments:
+        assert "response_shape=" in outputs[1], case_name
+        for fragment in expected_shape_fragments:
+            assert fragment in outputs[1], (case_name, fragment)
+    else:
+        assert "response_shape=" not in outputs[1], case_name
+    assert len(outputs[1]) < 2048
+    for secret in secret_values:
+        assert secret not in outputs[1], (case_name, secret)
+
+
+def test_response_shape_probe_diagnostic_sink_failure_does_not_change_failure(monkeypatch, diagnostic_output):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    calls = []
+
+    def refuse_sink(**_kwargs):
+        calls.append(1)
+        raise RuntimeError(f"SINK_SECRET_SENTINEL {TOKEN} {SEARCH}")
+
+    monkeypatch.setattr(diagnostics_module, "_emit_allowlisted_diagnostic", refuse_sink)
+    transport = FakeTransport(_response({"data": {"products": [{"sku": "PRODUCT_SECRET"}]}}))
+    counter = ProviderRequestCounter()
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(
+            SEARCH, region_id=REGION, outbound_attempt_observer=counter,
+        )
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert caught.value.reason_code.value == "RESULT_MISSING"
+    assert counter.request_count == len(transport.requests) == 1
+    assert calls == [1]
+    assert diagnostic_output.getvalue() == ""
+    assert TOKEN not in str(caught.value)
+    assert SEARCH not in str(caught.value)
+
+
+def test_maximum_response_shape_event_stays_bounded(monkeypatch, diagnostic_output):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    nested_fields = ("products", "items", "search", "regionId", "error", "errors", "message")
+    containers = ("result", "data", "products", "items", "response", "payload", "error", "errors", "details")
+    payload = {container: {field: None for field in nested_fields} for container in containers}
+    shape = diagnostics_module.classify_vseinstrumenti_response_shape(payload)
+
+    assert shape is not None
+    diagnostics_module.log_vseinstrumenti_diagnostic(
+        error_type=VseinstrumentiDiagnosticErrorType.ENVELOPE_VALIDATION,
+        response_shape=shape,
+    )
+
+    event = diagnostic_output.getvalue().rstrip("\n")
+    assert len(event) < 2048
+    assert "response_shape=" in event
+
+
+@pytest.mark.parametrize(
     "status,category,content_type",
     [
         (401, VseinstrumentiErrorCategory.AUTHENTICATION, "JSON"),

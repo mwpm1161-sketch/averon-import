@@ -299,6 +299,39 @@ def test_offer_conversion_failure_emits_only_fixed_diagnostic(monkeypatch, diagn
     assert len(transport.requests) == 1
 
 
+@pytest.mark.parametrize("diagnostic_mode", ["off", "on", "sink_failure"])
+def test_missing_result_shape_probe_preserves_provider_outcome(monkeypatch, diagnostic_output, diagnostic_mode):
+    if diagnostic_mode == "off":
+        monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "0")
+    else:
+        monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    if diagnostic_mode == "sink_failure":
+        def refuse_sink(**_kwargs):
+            raise RuntimeError(f"SINK_SECRET_SENTINEL {TOKEN}")
+
+        monkeypatch.setattr(diagnostics_module, "_emit_allowlisted_diagnostic", refuse_sink)
+
+    adapter, transport = _adapter(_response({
+        "data": {"products": [{"sku": "SKU_SECRET_SENTINEL", "price": "PRICE_SECRET_SENTINEL"}]},
+    }))
+    result = adapter.execute_search(_intent(), limit=5, request_counter=ProviderRequestCounter())
+
+    assert result.state == ProviderSearchState.FAILURE
+    assert result.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert result.offers == ()
+    assert result.request_count == 1
+    assert len(transport.requests) == 1
+    output = diagnostic_output.getvalue()
+    if diagnostic_mode == "on":
+        assert "response_shape=" in output
+        assert "data=OBJECT" in output
+        assert "data[products=ARRAY" in output
+    else:
+        assert output == ""
+    for secret in (TOKEN, "SKU_SECRET_SENTINEL", "PRICE_SECRET_SENTINEL", "SINK_SECRET_SENTINEL"):
+        assert secret not in output
+
+
 class _RaisingDiagnosticFilter(logging.Filter):
     def __init__(self, calls):
         super().__init__()

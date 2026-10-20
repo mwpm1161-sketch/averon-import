@@ -28,6 +28,8 @@ from ..safe_diagnostics import (
     VseinstrumentiContentTypeCategory,
     VseinstrumentiDiagnosticErrorType,
     VseinstrumentiDiagnosticReasonCode,
+    VseinstrumentiResponseShape,
+    classify_vseinstrumenti_response_shape,
     content_type_category,
     log_vseinstrumenti_diagnostic,
     safe_diagnostics_enabled,
@@ -105,6 +107,7 @@ class VseinstrumentiApiError(RuntimeError):
         reason_code: VseinstrumentiDiagnosticReasonCode = VseinstrumentiDiagnosticReasonCode.UNKNOWN,
         content_type: VseinstrumentiContentTypeCategory = VseinstrumentiContentTypeCategory.MISSING,
         response_bytes: int | None = None,
+        diagnostic_response_shape: VseinstrumentiResponseShape | None = None,
     ) -> None:
         self.category = category
         self.status_code = status_code
@@ -114,6 +117,7 @@ class VseinstrumentiApiError(RuntimeError):
         self.reason_code = reason_code
         self.content_type = content_type
         self.response_bytes = response_bytes
+        self.diagnostic_response_shape = diagnostic_response_shape
         super().__init__(_SAFE_MESSAGES[category])
 
 
@@ -442,6 +446,7 @@ class VseinstrumentiClient:
                     envelope_status_code=exc.envelope_status_code,
                     content_type=exc.content_type,
                     response_bytes=exc.response_bytes,
+                    response_shape=exc.diagnostic_response_shape,
                 )
             raise
 
@@ -586,6 +591,14 @@ class VseinstrumentiClient:
                 if exc.reason_code in envelope_reasons
                 else VseinstrumentiDiagnosticErrorType.RESPONSE_VALIDATION
             )
+            diagnostic_response_shape = None
+            if (exc.reason_code is VseinstrumentiDiagnosticReasonCode.RESULT_MISSING
+                    and safe_diagnostics_enabled()):
+                try:
+                    diagnostic_response_shape = classify_vseinstrumenti_response_shape(payload)
+                except Exception:
+                    # A failed diagnostic probe cannot change parsing behavior.
+                    diagnostic_response_shape = None
             raise VseinstrumentiApiError(
                 VseinstrumentiErrorCategory.INVALID_RESPONSE,
                 status_code=status,
@@ -594,6 +607,7 @@ class VseinstrumentiClient:
                 reason_code=exc.reason_code,
                 content_type=response_content_type,
                 response_bytes=len(raw),
+                diagnostic_response_shape=diagnostic_response_shape,
             ) from None
         except Exception:
             raise VseinstrumentiApiError(
