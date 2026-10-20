@@ -368,8 +368,8 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagn
         (
             "root_products",
             {"products": [{"sku": "ROOT_SKU_SECRET", "name": "ROOT_NAME_SECRET"}]},
-            ("invalid_response", 200, "RESULT_MISSING"),
-            ("products=ARRAY",),
+            ("success", 1),
+            (),
             ("ROOT_SKU_SECRET", "ROOT_NAME_SECRET"),
         ),
         (
@@ -770,6 +770,140 @@ def test_response_parser_rejects_more_than_global_maximum_raw_product_entries():
             expected_region_id=REGION,
             requested_limit=40,
         )
+
+
+def test_root_products_response_reuses_strict_product_parser_without_fabricating_echoes():
+    transport = FakeTransport(_response({"products": [_product()]}))
+
+    result = _client(transport).search_products(SEARCH, region_id=REGION)
+
+    assert result.search is None
+    assert result.region_id is None
+    assert len(result.products) == 1
+    assert result.products[0].sku == "0015555760"
+    assert result.products[0].price == Decimal("3800.1250")
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("echo", [
+    {"search": SEARCH, "regionId": REGION},
+    {"search": SEARCH},
+    {"regionId": REGION},
+])
+def test_root_products_response_validates_present_context_echoes(echo):
+    result = _client(FakeTransport(_response({"products": [_product()], **echo}))).search_products(
+        SEARCH, region_id=REGION,
+    )
+
+    assert result.search == echo.get("search")
+    assert result.region_id == echo.get("regionId")
+
+
+@pytest.mark.parametrize("echo", [
+    {"search": "different search"},
+    {"regionId": "different-region"},
+    {"search": None},
+    {"regionId": 42},
+])
+def test_root_products_response_rejects_invalid_or_mismatched_context(echo):
+    transport = FakeTransport(_response({"products": [_product()], **echo}))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("product", [
+    {"sku": 42, "name": "Tool"},
+    {"sku": "42"},
+    {"sku": "42", "name": 7},
+    {"sku": "42", "name": "Tool", "prices": "unknown"},
+    {"sku": "42", "name": "Tool", "prices": {"price": True}},
+    {"sku": "42", "name": "Tool", "technicalSpecifications": []},
+    {"sku": "42", "name": "Tool", "siteUrl": "javascript:alert(1)"},
+])
+def test_root_products_response_rejects_products_outside_existing_model(product):
+    transport = FakeTransport(_response({"products": [product]}))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert len(transport.requests) == 1
+
+
+def test_root_products_response_collapses_exact_duplicate_and_rejects_conflicting_sku():
+    product = _product()
+    exact = _client(FakeTransport(_response({"products": [product, dict(product)]}))).search_products(
+        SEARCH, region_id=REGION,
+    )
+    assert len(exact.products) == 1
+
+    conflicting = dict(product, prices={"price": "1.00"})
+    transport = FakeTransport(_response({"products": [product, conflicting]}))
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION)
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert len(transport.requests) == 1
+
+
+def test_root_products_response_enforces_requested_page_limit():
+    transport = FakeTransport(_response({"products": [_product(), dict(_product(), sku="second")]}))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION, limit=1)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("payload", [
+    {"products": []},
+    {"products": {}},
+    {"products": "unknown"},
+    {"products": [_product()], "result": {"products": [_product()]}},
+    {"products": [_product()], "error": {"message": "failure"}},
+    {"products": [_product()], "errors": []},
+    {"products": [_product()], "success": False},
+    {"products": [_product()], "message": "unknown envelope"},
+    {"products": [_product()], "unknown_metadata": "ignored?"},
+])
+def test_root_products_response_rejects_empty_or_ambiguous_envelopes(payload):
+    transport = FakeTransport(_response(payload))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert len(transport.requests) == 1
+
+
+def test_root_products_response_error_markers_never_become_empty_or_success():
+    for payload, expected in (
+        ({"products": [_product()], "error": 400}, VseinstrumentiErrorCategory.INVALID_REQUEST),
+        ({"products": [_product()], "code": 500}, VseinstrumentiErrorCategory.UNAVAILABLE),
+    ):
+        transport = FakeTransport(_response(payload))
+        with pytest.raises(VseinstrumentiApiError) as caught:
+            _client(transport).search_products(SEARCH, region_id=REGION)
+        assert caught.value.category == expected
+        assert len(transport.requests) == 1
+
+
+def test_root_products_validation_diagnostics_do_not_emit_synthetic_secrets(monkeypatch, diagnostic_output):
+    monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
+    payload = {"products": [{"sku": 42, "name": TOKEN}]}
+    transport = FakeTransport(_response(payload))
+
+    with pytest.raises(VseinstrumentiApiError) as caught:
+        _client(transport).search_products(SEARCH, region_id=REGION)
+
+    assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
+    assert len(transport.requests) == 1
+    assert TOKEN not in diagnostic_output.getvalue()
+    assert SEARCH not in diagnostic_output.getvalue()
 
 
 @pytest.mark.parametrize("status,category", [

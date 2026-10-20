@@ -883,6 +883,39 @@ def test_empty_product_list_is_empty_with_one_attempt_and_no_partial_success():
     assert len(transport.requests) == 1
 
 
+def test_empty_root_products_fails_closed_instead_of_becoming_empty():
+    adapter, transport = _adapter(_response({"products": []}))
+
+    outcome = adapter.execute_search(_intent(), limit=5, request_counter=ProviderRequestCounter())
+
+    assert outcome.state == ProviderSearchState.FAILURE
+    assert outcome.failure_category == ProviderFailureCategory.INVALID_RESPONSE
+    assert outcome.offers == ()
+    assert outcome.request_count == 1
+    assert len(transport.requests) == 1
+
+
+def test_root_products_offer_flows_through_provider_runner_with_one_outbound_request():
+    adapter, transport = _adapter(_response({"products": [_product()]}))
+
+    result = ProviderRunner({"vseinstrumenti": adapter}).run(
+        selection=ProviderSelection(provider_keys=("vseinstrumenti",)),
+        intent=_intent(),
+        limit=5,
+        scope=ProviderExecutionScope(execution_scope_id="scope-root-products"),
+    )
+
+    outcome = result.outcomes[0]
+    assert outcome.state == ProviderSearchState.SUCCESS
+    assert outcome.request_count == 1
+    assert len(outcome.offers) == 1
+    assert outcome.offers[0].price == Decimal("12.3400")
+    assert outcome.offers[0].currency == ""
+    assert outcome.offers[0].availability is None
+    assert outcome.offers[0].data_provenance["region_id"] == REGION
+    assert len(transport.requests) == 1
+
+
 @pytest.mark.parametrize(
     "response,expected_category",
     [
@@ -974,7 +1007,8 @@ class StaticEtmAdapter:
         )
 
 
-def test_cheaper_vi_offer_cannot_win_against_proven_etm_through_m1d_m2a_m2b():
+@pytest.mark.parametrize("root_products", [False, True])
+def test_cheaper_vi_offer_cannot_win_against_proven_etm_through_m1d_m2a_m2b(root_products):
     intent = _intent(
         normalized_name="",
         model="",
@@ -998,9 +1032,11 @@ def test_cheaper_vi_offer_cannot_win_against_proven_etm_through_m1d_m2a_m2b():
             "catalog_version": "fixture-catalog",
         },
     )
-    vi_adapter, vi_transport = _adapter(_response(_payload(
-        _product(prices={"price": "1.00"}),
-    )))
+    vi_product = _product(prices={"price": "1.00"})
+    vi_response = (
+        {"products": [vi_product]} if root_products else _payload(vi_product)
+    )
+    vi_adapter, vi_transport = _adapter(_response(vi_response))
     runner = ProviderRunner({
         "etm_ipro": StaticEtmAdapter(etm_offer),
         "vseinstrumenti": vi_adapter,

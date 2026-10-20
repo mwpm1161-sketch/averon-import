@@ -19,6 +19,7 @@ MAX_UNIT_LENGTH = 80
 MAX_URL_LENGTH = 500
 MAX_SPEC_TEXT_LENGTH = 500
 MAX_PRODUCTS_PER_PAGE = 40
+_ROOT_PRODUCTS_FIELDS = frozenset({"products", "search", "regionId"})
 _DECIMAL_TEXT = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
@@ -109,8 +110,9 @@ class VseinstrumentiProduct:
 
 @dataclass(frozen=True, slots=True)
 class VseinstrumentiProductSearchResult:
-    search: str
-    region_id: str
+    # Echo fields remain absent when the response form does not provide them.
+    search: str | None
+    region_id: str | None
     products: tuple[VseinstrumentiProduct, ...]
 
 
@@ -235,6 +237,33 @@ def _product(value: object) -> VseinstrumentiProduct:
     )
 
 
+def _optional_context_echo(
+    payload: dict[str, Any],
+    *,
+    key: str,
+    field: str,
+    maximum: int,
+    expected: str,
+) -> str | None:
+    if key not in payload:
+        return None
+    try:
+        value = _text(
+            payload[key], field=field, maximum=maximum, required=True,
+            reason_code=VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
+        )
+    except VseinstrumentiResponseError:
+        raise VseinstrumentiResponseError(
+            "response context is invalid", reason_code=VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
+        ) from None
+    if value != expected:
+        raise VseinstrumentiResponseError(
+            "response context does not match the request",
+            reason_code=VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
+        )
+    return value
+
+
 def parse_product_search_result(
     payload: object,
     *,
@@ -242,11 +271,11 @@ def parse_product_search_result(
     expected_region_id: str,
     requested_limit: int = MAX_PRODUCTS_PER_PAGE,
 ) -> VseinstrumentiProductSearchResult:
-    """Strictly parse the documented search envelope without inferring facts.
+    """Parse the documented envelope and the constrained observed root form.
 
-    The PDF calls ``products`` an object but its response example is an array.
-    This parser accepts the demonstrated array and an empty object (the only
-    unambiguous empty-object representation); non-empty objects are rejected.
+    The documented ``result.products`` path retains its established array or
+    empty-object handling. The observed root ``products`` path requires a
+    non-empty array because an empty result has no confirmed semantics.
     """
 
     if type(requested_limit) is not int or not 1 <= requested_limit <= MAX_PRODUCTS_PER_PAGE:
@@ -255,35 +284,64 @@ def parse_product_search_result(
         raise VseinstrumentiResponseError(
             "response must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT,
         )
-    if "result" not in payload:
-        raise VseinstrumentiResponseError(
-            "response result is missing", reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_MISSING,
+    if "result" in payload:
+        # The documented envelope remains unchanged. Reject mixed envelopes,
+        # since choosing either product collection would be ambiguous.
+        if "products" in payload:
+            raise VseinstrumentiResponseError(
+                "response contains conflicting product envelopes",
+                reason_code=VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+            )
+        result = payload["result"]
+        if not isinstance(result, dict):
+            raise VseinstrumentiResponseError(
+                "response result must be an object",
+                reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT,
+            )
+        context_reason = VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH
+        try:
+            search = _text(
+                result.get("search"), field="result.search", maximum=500, required=True,
+                reason_code=context_reason,
+            )
+            region_id = _text(
+                result.get("regionId"), field="result.regionId", maximum=80, required=True,
+                reason_code=context_reason,
+            )
+        except VseinstrumentiResponseError:
+            raise VseinstrumentiResponseError(
+                "response context is invalid", reason_code=context_reason,
+            ) from None
+        if search != expected_search or region_id != expected_region_id:
+            raise VseinstrumentiResponseError(
+                "response context does not match the request", reason_code=context_reason,
+            )
+        raw_products = result.get("products")
+    else:
+        if "products" not in payload:
+            raise VseinstrumentiResponseError(
+                "response result is missing", reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_MISSING,
+            )
+        # This observed root form has no confirmed metadata/error contract.
+        # Its only accepted fields are the product array and optional echoes.
+        if not set(payload).issubset(_ROOT_PRODUCTS_FIELDS):
+            raise VseinstrumentiResponseError(
+                "root products response has an ambiguous envelope",
+                reason_code=VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+            )
+        search = _optional_context_echo(
+            payload, key="search", field="search", maximum=500, expected=expected_search,
         )
-    result = payload["result"]
-    if not isinstance(result, dict):
-        raise VseinstrumentiResponseError(
-            "response result must be an object",
-            reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT,
+        region_id = _optional_context_echo(
+            payload, key="regionId", field="regionId", maximum=80, expected=expected_region_id,
         )
-    context_reason = VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH
-    try:
-        search = _text(
-            result.get("search"), field="result.search", maximum=500, required=True,
-            reason_code=context_reason,
-        )
-        region_id = _text(
-            result.get("regionId"), field="result.regionId", maximum=80, required=True,
-            reason_code=context_reason,
-        )
-    except VseinstrumentiResponseError:
-        raise VseinstrumentiResponseError(
-            "response context is invalid", reason_code=context_reason,
-        ) from None
-    if search != expected_search or region_id != expected_region_id:
-        raise VseinstrumentiResponseError(
-            "response context does not match the request", reason_code=context_reason,
-        )
-    raw_products = result.get("products")
+        raw_products = payload["products"]
+        if not isinstance(raw_products, list) or not raw_products:
+            raise VseinstrumentiResponseError(
+                "root products response is empty or has an unconfirmed shape",
+                reason_code=VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
+            )
+
     if isinstance(raw_products, dict):
         if raw_products:
             raise VseinstrumentiResponseError(

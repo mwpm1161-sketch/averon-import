@@ -36,7 +36,7 @@ from ..safe_diagnostics import (
 
 
 _ADAPTER_REVISION = "vseinstrumenti_openapi_execution_v1"
-_CLIENT_REVISION = "vseinstrumenti_openapi_client_v1"
+_CLIENT_REVISION = "vseinstrumenti_openapi_client_v2"
 _MAX_QUERY_LENGTH = 500
 _NUMERIC_TEXT_RE = re.compile(r"^\+?\d+(?:[.,]\d+)?$")
 _DIMENSIONS_RE = re.compile(
@@ -405,6 +405,7 @@ class VseinstrumentiExecutionAdapter:
                 "source_item_id": product.sku,
                 "price_field": "prices.price" if product.price is not None else "",
                 "environment": affinity.environment,
+                # This is the configured request region, not a response echo.
                 "region_id": affinity.region_id,
                 "config_revision": affinity.config_revision,
             },
