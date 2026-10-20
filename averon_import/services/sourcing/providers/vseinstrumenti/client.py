@@ -575,6 +575,9 @@ class VseinstrumentiClient:
         except VseinstrumentiResponseError as exc:
             envelope_reasons = {
                 VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+                VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT,
+                VseinstrumentiDiagnosticReasonCode.RESULT_MISSING,
+                VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT,
                 VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
                 VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
             }

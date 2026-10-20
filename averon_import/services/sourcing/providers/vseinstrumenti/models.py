@@ -253,12 +253,17 @@ def parse_product_search_result(
         raise VseinstrumentiResponseError("requested product limit is outside its allowed bounds")
     if not isinstance(payload, dict):
         raise VseinstrumentiResponseError(
-            "response must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+            "response must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT,
         )
-    result = payload.get("result")
+    if "result" not in payload:
+        raise VseinstrumentiResponseError(
+            "response result is missing", reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_MISSING,
+        )
+    result = payload["result"]
     if not isinstance(result, dict):
         raise VseinstrumentiResponseError(
-            "response result must be an object", reason_code=VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+            "response result must be an object",
+            reason_code=VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT,
         )
     context_reason = VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH
     try:

@@ -296,7 +296,13 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagn
 
     monkeypatch.setenv("AVERON_VSEINSTRUMENTI_SAFE_DIAGNOSTICS", "1")
     invalid_cases = [
-        ({"unexpected": "ENVELOPE_SECRET"}, VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE),
+        (["ROOT_ARRAY_SECRET"], VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT),
+        ("ROOT_STRING_SECRET", VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT),
+        (None, VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT),
+        ({"unexpected": "RESULT_MISSING_SECRET"}, VseinstrumentiDiagnosticReasonCode.RESULT_MISSING),
+        ({"result": None}, VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT),
+        ({"result": []}, VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT),
+        ({"result": {}}, VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH),
         (_payload(_product(), search="OTHER_QUERY_SECRET"), VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH),
         ({"result": {"search": SEARCH, "regionId": REGION, "products": "PRODUCTS_SECRET"}},
          VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE),
@@ -317,6 +323,9 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagn
         assert caught.value.category == VseinstrumentiErrorCategory.INVALID_RESPONSE
         expected_error_type = "ENVELOPE_VALIDATION" if expected_reason in {
             VseinstrumentiDiagnosticReasonCode.ENVELOPE_SHAPE,
+            VseinstrumentiDiagnosticReasonCode.ROOT_NOT_OBJECT,
+            VseinstrumentiDiagnosticReasonCode.RESULT_MISSING,
+            VseinstrumentiDiagnosticReasonCode.RESULT_NOT_OBJECT,
             VseinstrumentiDiagnosticReasonCode.CONTEXT_MISMATCH,
             VseinstrumentiDiagnosticReasonCode.PRODUCTS_SHAPE,
         } else "RESPONSE_VALIDATION"
@@ -324,10 +333,18 @@ def test_parser_diagnostics_use_fixed_structured_reason_codes(monkeypatch, diagn
         assert f"error_type={expected_error_type}" in output
         assert f"reason_code={expected_reason.value}" in output
         assert "status_code=200" in output
-        assert "ENVELOPE_SECRET" not in output
-        assert "OTHER_QUERY_SECRET" not in output
-        assert "PRODUCTS_SECRET" not in output
-        assert "CONFLICT_SECRET" not in output
+        for secret in (
+            TOKEN,
+            SEARCH,
+            REGION,
+            "ROOT_ARRAY_SECRET",
+            "ROOT_STRING_SECRET",
+            "RESULT_MISSING_SECRET",
+            "OTHER_QUERY_SECRET",
+            "PRODUCTS_SECRET",
+            "CONFLICT_SECRET",
+        ):
+            assert secret not in output
         assert len(transport.requests) == 1
 
 

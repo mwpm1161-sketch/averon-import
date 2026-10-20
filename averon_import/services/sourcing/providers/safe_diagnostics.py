@@ -27,6 +27,9 @@ class VseinstrumentiDiagnosticErrorType(str, Enum):
 
 class VseinstrumentiDiagnosticReasonCode(str, Enum):
     ENVELOPE_SHAPE = "ENVELOPE_SHAPE"
+    ROOT_NOT_OBJECT = "ROOT_NOT_OBJECT"
+    RESULT_MISSING = "RESULT_MISSING"
+    RESULT_NOT_OBJECT = "RESULT_NOT_OBJECT"
     CONTEXT_MISMATCH = "CONTEXT_MISMATCH"
     PRODUCTS_SHAPE = "PRODUCTS_SHAPE"
     SKU_TYPE = "SKU_TYPE"
