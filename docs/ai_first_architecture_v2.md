@@ -1,0 +1,49 @@
+# AI-first extraction foundation (V2A)
+
+## Decision and boundary
+
+The experimental AI-first path treats a multimodal extraction as an untrusted, loss-preserving document draft. Qwen may interpret tables, rows, columns, page continuations and handwriting. Averon stores the observations, raises review issues, coordinates explicit human decisions, and can later produce deterministic exports from approved data.
+
+Local geometric reconstruction and `physical_row_refs` are not prerequisites in this path. Model candidate boxes may be retained as unverified hints, but the draft does not need them. Existing OCR, Human Review, Excel, sourcing, M6, API routes and provider registration remain unchanged. The package under `services/ai_first/` is not called by production code.
+
+An `extracted` page status means that a transcription payload was received and parsed. It does not mean the page or document is complete or correct. Neither a model role, an empty issue list, nor a set of candidate values can mark a row verified or authorize export.
+
+## Data contract
+
+```text
+source document
+└── AIDocumentDraft (source ID, revision ID, ordered pages, document issues)
+    └── AIPageExtraction (source page, status, raw model payload, fingerprint)
+        └── AITable (original headers/columns, raw table payload)
+            └── AIRow (model_kind, raw cells in source order, raw row payload)
+                ├── AICell (raw value, alternatives, handwriting/strike flags, optional box)
+                └── AIValueProposal (optional suggested value + source cell IDs)
+```
+
+Every page, table, row, column and cell is linked to an opaque source-document ID and page. IDs include the page payload fingerprint, so they are stable for the same page revision and change when that page changes. The entire parsed page payload and nested table/row/cell payloads are retained; unknown keys, columns, notes, flags and values are not discarded. The original cell array order is retained.
+
+Headers may have any names and tables may have any number of columns or multiple tables per page. Canonical column names are optional hints only. The raw header and all cells remain authoritative as source observations. The input transcription contract has no separate canonical-value proposals, so replay leaves that field empty instead of inventing normalized values.
+
+A row keeps the model's `kind` as `model_kind`; `server_role_candidate` is empty until a future, separately tested rule supplies a hypothesis. `role_verified` is fixed to false. Strike-through, handwriting, alternatives and unreadable signals remain attached at their reported scope. No value is selected as the effective quantity or unit by the conversion layer.
+
+## Document assembly
+
+`assemble_document_draft` orders pages, keeps each table and row distinct, represents missing requested pages as failed page records, and records candidate issues such as duplicate/gapped position numbers, unresolved continuation markers, unreadable text, and unlocalized handwriting/strike-through signals. It does not merge cross-page rows, fill gaps, fix duplicates, or infer that a page is complete. Candidate row-number checks run only when unique, recognized position and name headers are available; they are review prompts, not row identity or verification.
+
+The draft revision is derived from page fingerprints and statuses. Reprocessing the same page payload preserves that page's IDs. Changed page content gets new IDs; a review-state reconciliation deactivates decisions, page-completeness confirmations, and issue resolutions attached to changed pages while retaining the old decisions as inactive history. Unchanged pages may keep their decisions.
+
+## Human Review V2 service state
+
+`AIReviewState` records explicit reviewer decisions, manual rows, completeness confirmations, issue resolutions and a timestamped event sequence that preserves reviewer-entered values. Service functions support confirming/correcting/excluding a row; adding a row; splitting or merging rows; confirming a handwritten reading; confirming page completeness; resolving review issues; and reconciling a reprocessed page. There is no UI or persistent database adapter in V2A.
+
+The guard `assert_review_ready_for_export` fails unless every page has a human completeness confirmation, every retained or manually added row has an active human decision, and all review/blocking issues are resolved. The guard is only a boundary primitive: this package contains no Excel exporter, sourcing adapter, production route, or automatic admission path. A later exporter must consume reviewed decisions and write from those explicit values.
+
+## Offline replay
+
+`python -m averon_import.tools.ai_first_replay --input <saved-transcription.json> --output <protected-draft.json>` converts a saved V1 transcription without making an HTTP request. It prints only counts and status codes; it never prints cell values or model payloads. Output creation is exclusive and the caller must choose a directory protected for the source document.
+
+Offline replay confirmed that source rows and cells, including nonstandard fields and model misclassification, can be preserved without requiring geometric reconstruction. Such results do not receive automatic export authorization.
+
+## V2A exclusions
+
+No Qwen request, prompt change, production switch, user interface, database persistence, Human Review integration, Excel output, sourcing integration or M6 change is included. A later stage must decide retention/access controls for persisted drafts, reviewer identity/audit requirements, page completeness evidence, and how a reviewed draft is mapped into export-specific rows.
