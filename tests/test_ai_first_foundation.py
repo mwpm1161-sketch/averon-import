@@ -339,9 +339,85 @@ def test_latest_structure_change_can_be_undone_with_audit_and_invalidated_comple
     assert restored.confirmed_complete_pages == set()
     assert restored.history[-1].action == "undo_structure_change"
     assert restored.history[-1].payload["reverted_event_id"] == structure_event.event_id
+    assert any(event.event_id == structure_event.event_id for event in restored.history)
 
     restored = confirm_page_complete(draft, restored, 1, reviewer_id="reviewer")
     assert_review_ready_for_export(draft, restored)
+
+
+def test_merge_can_be_undone_in_the_same_extraction_revision():
+    draft = _draft(_payload(rows=[_row(0, "1", "Строка А"), _row(1, "2", "Строка Б")]))
+    rows = _all_rows(draft)
+    state = new_review_state(draft)
+    for row in rows:
+        state = record_row_decision(draft, state, row.id, disposition="confirmed", reviewer_id="reviewer")
+    state = record_structure_change(
+        draft, state, action="merge_rows", source_record_ids=[row.id for row in rows],
+        result_rows=[{"Наименование": "Объединённая строка"}], reviewer_id="reviewer",
+    )
+    merge_event = state.history[-1]
+    assert all(state.decisions[row.id].active for row in rows)
+    assert state.decisions[merge_event.result_record_ids[0]].active
+
+    restored = undo_structure_change(draft, state, merge_event.event_id, reviewer_id="reviewer")
+    assert all(restored.decisions[row.id].disposition == "confirmed" for row in rows)
+    assert all(restored.decisions[row.id].active for row in rows)
+    assert not restored.manual_rows[0].active
+    assert not restored.decisions[merge_event.result_record_ids[0]].active
+    assert restored.history[-1].payload["reverted_event_id"] == merge_event.event_id
+
+
+def test_reprocessing_blocks_undo_and_cannot_restore_stale_manual_rows_or_decisions():
+    old = _draft(_payload())
+    state = record_structure_change(
+        old, new_review_state(old), action="add_row", source_record_ids=[],
+        result_rows=[{"Наименование": "Ручная запись М"}], reviewer_id="reviewer", page_number=1,
+    )
+    manual_m = state.manual_rows[-1]
+    state = record_structure_change(
+        old, state, action="split_row", source_record_ids=[manual_m.id],
+        result_rows=[{"Наименование": "Ручная запись Н"}, {"Наименование": "Ручная запись О"}],
+        reviewer_id="reviewer",
+    )
+    split_event = state.history[-1]
+    assert manual_m.page_extraction_fingerprint == old.pages[0].extraction_fingerprint
+
+    new = _draft(_payload(rows=[_row(0, "1", "Изменённая исходная строка")]))
+    reconciled = reconcile_reprocessed_pages(old, new, state)
+    assert reconciled.history[-1].action == "page_reprocessed"
+    assert all(not row.active for row in reconciled.manual_rows)
+    assert all(not reconciled.decisions[row.id].active for row in reconciled.manual_rows)
+
+    before = reconciled.model_dump(mode="json")
+    with pytest.raises(AIReviewError, match="structure_change_stale_revision"):
+        undo_structure_change(new, reconciled, split_event.event_id, reviewer_id="reviewer")
+    assert reconciled.model_dump(mode="json") == before
+
+    # The fingerprint binding also protects old events if a persisted audit history is incomplete.
+    without_reprocess_event = reconciled.model_copy(deep=True)
+    without_reprocess_event.history = [
+        event for event in without_reprocess_event.history if event.action != "page_reprocessed"
+    ]
+    with pytest.raises(AIReviewError, match="structure_change_stale_revision"):
+        undo_structure_change(new, without_reprocess_event, split_event.event_id, reviewer_id="reviewer")
+
+    # Simulate corrupted persisted state that reactivates the stale row and its decision.
+    stale_manual_id = split_event.result_record_ids[0]
+    corrupted = reconciled.model_copy(deep=True)
+    corrupted.manual_rows = [
+        row.model_copy(update={"active": True}) if row.id == stale_manual_id else row
+        for row in corrupted.manual_rows
+    ]
+    corrupted.decisions[stale_manual_id] = corrupted.decisions[stale_manual_id].model_copy(
+        update={"active": True},
+    )
+    current_source_row = _all_rows(new)[0]
+    corrupted = record_row_decision(
+        new, corrupted, current_source_row.id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    corrupted = confirm_page_complete(new, corrupted, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="manual_row_page_revision_mismatch"):
+        assert_review_ready_for_export(new, corrupted)
 
 
 def test_structure_change_cannot_be_undone_after_dependent_row_review():

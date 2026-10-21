@@ -195,6 +195,7 @@ class AIManualRow(_StrictModel):
     id: str
     source_document_id: str
     page_number: int = Field(ge=1)
+    page_extraction_fingerprint: str | None = None
     reviewer_id: str
     values: dict[str, str]
     source_record_ids: list[str] = Field(default_factory=list)

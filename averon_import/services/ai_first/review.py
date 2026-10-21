@@ -140,6 +140,7 @@ def record_structure_change(
     page_numbers = {page.page_number for page in draft.pages}
     if page_number not in page_numbers:
         raise AIReviewError("unknown_page")
+    page = next(page for page in draft.pages if page.page_number == page_number)
     updated = state.model_copy(deep=True)
     prior_decisions = {
         record_id: (
@@ -173,7 +174,8 @@ def record_structure_change(
         manual_id = f"manual:{uuid4().hex}"
         manual = AIManualRow(
             id=manual_id, source_document_id=draft.source_document_id,
-            page_number=page_number, reviewer_id=reviewer_id, values=values,
+            page_number=page_number, page_extraction_fingerprint=page.extraction_fingerprint,
+            reviewer_id=reviewer_id, values=values,
             source_record_ids=source_ids,
         )
         updated.manual_rows.append(manual)
@@ -190,6 +192,9 @@ def record_structure_change(
             "result_count": len(result_ids),
             "prior_decisions": prior_decisions,
             "prior_manual_active": prior_manual_active,
+            "page_extraction_fingerprint": page.extraction_fingerprint,
+            "page_status": page.status,
+            "draft_revision_id": draft.revision_id,
         },
     ))
     updated.confirmed_complete_pages.discard(page_number)
@@ -210,6 +215,17 @@ def undo_structure_change(
     if event.action not in {"add_row", "split_row", "merge_rows"}:
         raise AIReviewError("not_a_structure_change")
     later = state.history[index + 1:]
+    if any(
+        later_event.action == "page_reprocessed" and later_event.page_number == event.page_number
+        for later_event in later
+    ):
+        raise AIReviewError("structure_change_stale_revision")
+    page = next((page for page in draft.pages if page.page_number == event.page_number), None)
+    recorded_fingerprint = event.payload.get("page_extraction_fingerprint")
+    recorded_status = event.payload.get("page_status")
+    if (page is None or not isinstance(recorded_fingerprint, str) or not recorded_fingerprint
+            or recorded_fingerprint != page.extraction_fingerprint or recorded_status != page.status):
+        raise AIReviewError("structure_change_stale_revision")
     if any(
         later_event.page_number == event.page_number
         and later_event.action in {"add_row", "split_row", "merge_rows"}
@@ -359,6 +375,16 @@ def assert_review_ready_for_export(draft: AIDocumentDraft, state: AIReviewState)
         raise AIReviewError("page_coverage_incomplete")
     if any(page.status in {"failed", "incomplete"} or page.error_code for page in draft.pages):
         raise AIReviewError("page_processing_incomplete")
+    pages_by_number = {page.page_number: page for page in draft.pages}
+    for row in state.manual_rows:
+        if not row.active:
+            continue
+        page = pages_by_number.get(row.page_number)
+        if row.source_document_id != draft.source_document_id or page is None:
+            raise AIReviewError("manual_row_provenance_mismatch")
+        if (not row.page_extraction_fingerprint
+                or row.page_extraction_fingerprint != page.extraction_fingerprint):
+            raise AIReviewError("manual_row_page_revision_mismatch")
     if state.confirmed_complete_pages != page_numbers:
         raise AIReviewError("page_completeness_not_human_confirmed")
     required = {row_id: page_number for row_id, (page_number, _) in _rows(draft).items()}
