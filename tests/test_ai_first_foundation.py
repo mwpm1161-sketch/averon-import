@@ -68,7 +68,7 @@ def _all_rows(draft):
 def test_arbitrary_headers_columns_tables_and_missing_geometry_are_preserved():
     payload = _payload(tables=[
         {"headers": ["Габарит", "Класс", "Неизвестный столбец", "Примечание поставщика"],
-         "rows": [{"kind": "component", "cells": [_cell(0, "80"), _cell(1, "К2"), _cell(2, "X-7"), _cell(3, "условие")], "vendor_extension": {"a": 7}}]},
+         "rows": [{"kind": "component", "cells": [_cell(0, '970008'), _cell(1, "К2"), _cell(2, "X-7"), _cell(3, "условие")], "vendor_extension": {"a": 7}}]},
         {"headers": ["Свободный заголовок"], "rows": [{"kind": "note", "cells": [_cell(0, "текст")]}]},
     ], future_page_field={"retained": True})
     page = page_from_payload(payload, source_document_id="doc-test")
@@ -97,17 +97,17 @@ def test_source_cell_order_unknown_values_and_model_role_are_not_rewritten():
 
 
 def test_struck_quantity_and_handwritten_replacement_are_preserved_as_uncertain():
-    quantity = _cell(1, "10", struck_through=True, handwritten_replacements=[{
-        "text": "12", "bbox_candidate": None, "source_note": "red ink",
+    quantity = _cell(1, '970006', struck_through=True, handwritten_replacements=[{
+        "text": '970007', "bbox_candidate": None, "source_note": "red ink",
     }])
     payload = _payload(headers=["Наименование", "Количество"], rows=[{
         "kind": "item", "cells": [_cell(0, "Клапан"), quantity],
         "struck_through": False, "handwritten": True, "handwritten_replacements": [],
     }])
     cell = _all_rows(_draft(payload))[0].raw_cells[1]
-    assert cell.raw_value == "10"
+    assert cell.raw_value == '970006'
     assert cell.struck_through is True
-    assert cell.handwritten_replacements[0].text == "12"
+    assert cell.handwritten_replacements[0].text == '970007'
     assert cell.handwritten_replacements[0].raw_model_payload["source_note"] == "red ink"
     assert cell.raw_value != cell.handwritten_replacements[0].text
     assert any(issue.code == "row_has_uncertain_visual_evidence" for issue in _draft(payload).issues)

@@ -61,13 +61,13 @@ def _table_summary(result):
     return result["summary"]["position_sequences"][0]
 
 
-def test_all_actual_positions_can_be_found_when_model_calls_them_headers():
-    result = _analysis(_position_rows(range(1, 16)))
-    assert result["summary"]["source_row_count"] == 15
-    assert result["summary"]["model_kind_counts"] == {"header": 15}
-    assert result["summary"]["potential_numbered_position_count"] == 15
+def test_numbered_rows_can_be_found_when_model_calls_them_headers():
+    result = _analysis(_position_rows(range(21, 26)))
+    assert result["summary"]["source_row_count"] == 5
+    assert result["summary"]["model_kind_counts"] == {"header": 5}
+    assert result["summary"]["potential_numbered_position_count"] == 5
     assert result["summary"]["model_kind_candidate_row_count"] == 0
-    assert result["summary"]["role_conflict_count"] == 15
+    assert result["summary"]["role_conflict_count"] == 5
     assert result["summary"]["confirmed_position_count"] == 0
     assert all(row["role_verified"] is False for row in result["rows"])
 
@@ -88,7 +88,7 @@ def test_column_numbering_1_through_9_is_not_a_specification_position():
 
 def test_section_title_with_nearby_handwritten_number_is_not_an_item():
     section = _row(
-        "", "Section A", "150", "",
+        "", "Section A", '970000', "",
         cell_changes={3: {"handwritten": True}},
     )
     result = _analysis([section, _row("1", "Test item", "2")])
@@ -98,10 +98,10 @@ def test_section_title_with_nearby_handwritten_number_is_not_an_item():
     assert result["rows"][0]["role_verified"] is False
 
 
-def test_positions_1_to_15_have_no_gap_or_duplicate():
-    result = _analysis(_position_rows(range(1, 16)))
+def test_consecutive_numbered_positions_have_no_gap_or_duplicate():
+    result = _analysis(_position_rows(range(21, 26)))
     sequence = _table_summary(result)
-    assert sequence["observed_position_numbers"] == list(range(1, 16))
+    assert sequence["observed_position_numbers"] == list(range(21, 26))
     assert sequence["missing_between_observed_positions"] == []
     assert sequence["duplicate_position_numbers"] == []
 
@@ -123,25 +123,25 @@ def test_duplicate_position_is_reported_and_rows_remain_distinct():
 
 def test_struck_quantity_and_possible_replacement_remain_separate():
     row = _row(
-        "1", "Test item", "10",
+        "1", "Test item", '970001',
         cell_changes={3: {
             "struck_through": True,
-            "handwritten_replacements": [{"text": "12", "bbox_candidate": None}],
+            "handwritten_replacements": [{"text": '970002', "bbox_candidate": None}],
         }},
     )
     record = _analysis([row])["rows"][0]
     quantity = next(cell for cell in record["cells"] if cell["column_index"] == 3)
-    assert quantity["raw_text"] == "10"
+    assert quantity["raw_text"] == '970001'
     assert quantity["struck_through"] is True
-    assert quantity["handwritten_replacements"][0]["text"] == "12"
+    assert quantity["handwritten_replacements"][0]["text"] == '970002'
     assert quantity["projection"]["status"] == "suppressed_uncertain"
-    assert record["values"]["quantity"] == "10"
+    assert record["values"]["quantity"] == '970001'
     assert "effective_quantity" not in record
 
 
 def test_handwritten_mass_is_not_attributed_to_struck_quantity():
     row = _row(
-        "1", "Test item", "80", "370",
+        "1", "Test item", '970004', '970003',
         cell_changes={
             3: {"struck_through": True},
             4: {"handwritten": True},
@@ -149,8 +149,8 @@ def test_handwritten_mass_is_not_attributed_to_struck_quantity():
     )
     record = _analysis([row])["rows"][0]
     quantity, mass = (next(c for c in record["cells"] if c["column_index"] == i) for i in (3, 4))
-    assert (quantity["raw_text"], quantity["struck_through"]) == ("80", True)
-    assert (mass["raw_text"], mass["handwritten"]) == ("370", True)
+    assert (quantity["raw_text"], quantity["struck_through"]) == ('970004', True)
+    assert (mass["raw_text"], mass["handwritten"]) == ('970003', True)
     assert quantity["projection"]["canonical_field"] == "quantity"
     assert mass["projection"]["canonical_field"] == "mass"
     assert quantity["projection"]["status"] == mass["projection"]["status"] == "suppressed_uncertain"
@@ -168,7 +168,7 @@ def test_fully_struck_position_is_retained_as_a_candidate():
 
 def test_unassignable_row_level_correction_does_not_pick_a_cell():
     row = _row(
-        "1", "Test item", "10",
+        "1", "Test item", '970005',
         row_changes={"handwritten_replacements": [{"text": "red mark", "bbox_candidate": None}]},
     )
     record = _analysis([row])["rows"][0]

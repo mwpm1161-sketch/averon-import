@@ -216,12 +216,12 @@ def test_provider_contract_real_pdf_rendering_individual_pages_no_disk_cache(pdf
 
 def test_five_columns_unknown_headers_multiline_and_technical_text(pdf):
     raw = page(tables=[table(["№", "Наименование", "Мой столбец", "Ед. изм.", "Количество"], [
-        row(["1", "Труба Ø57×3,5\nГОСТ 10704-91", "Ру16\nA-01", "м", "12,5"]),
+        row(["1", 'QZXW-0000\nRXWZ-0000', "Ру16\nA-01", "м", "12,5"]),
     ])])
     result, _ = recognize(pdf, raw)
     item = result.pages[0].rows[0]
     assert set(item.values) == {column["key"] for column in BASE_COLUMNS}
-    assert item.values["name"] == "Труба Ø57×3,5\nГОСТ 10704-91"
+    assert item.values["name"] == 'QZXW-0000\nRXWZ-0000'
     assert item.values["quantity"] == "12,5"
     assert item.metadata["vision_raw_page"] == raw
     assert item.metadata["vision_headers"][2] == "Мой столбец"
