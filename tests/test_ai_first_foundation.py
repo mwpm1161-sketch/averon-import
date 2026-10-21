@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 
+import fitz
 import pytest
 from pydantic import ValidationError
 
 from averon_import.services.ai_first.assembly import (
-    assemble_document_draft, failed_page, page_from_payload,
+    AIInputError, assemble_document_draft, failed_page, page_from_payload,
 )
 from averon_import.services.ai_first.contracts import AIRow
 from averon_import.services.ai_first.review import (
     AIReviewError, assert_review_ready_for_export, confirm_page_complete,
     new_review_state, record_handwriting_confirmation, record_row_decision,
     record_structure_change, reconcile_reprocessed_pages, resolve_review_issue,
+    undo_structure_change,
 )
 from averon_import.tools.ai_first_replay import main as replay_main
 
@@ -121,6 +123,17 @@ def test_empty_page_and_requested_missing_page_are_explicit_and_unverified():
     assert draft.pages[1].error_code == "page_result_missing"
     assert draft.extraction_is_verified is False
     assert draft.export_authorized is False
+    assert draft.expected_page_numbers == [1, 2]
+
+
+def test_page_payload_identity_must_match_server_page_argument():
+    with pytest.raises(AIInputError, match="page_identity_mismatch"):
+        page_from_payload(_payload(page=2), source_document_id="doc-test", page_number=1)
+    with pytest.raises(AIInputError, match="page_identity_mismatch"):
+        page_from_payload(_payload(page="1"), source_document_id="doc-test", page_number=1)
+    assert page_from_payload(
+        {"tables": []}, source_document_id="doc-test", page_number=1,
+    ).page_number == 1
 
 
 def test_incomplete_page_and_cross_page_continuation_remain_unmerged():
@@ -146,6 +159,14 @@ def test_duplicate_and_gap_positions_are_review_issues_only():
     gap = _draft(_payload(rows=[_row(0, "1", "Клапан A"), _row(1, "3", "Клапан C")]))
     assert any(issue.code == "position_gap_candidate" for issue in gap.issues)
     assert gap.export_authorized is False
+
+
+def test_extreme_position_gap_does_not_materialize_a_large_range():
+    draft = _draft(_payload(rows=[
+        _row(0, "1", "Первый элемент"),
+        _row(1, "1000000000", "Последний элемент"),
+    ]))
+    assert any(issue.code == "position_gap_candidate" for issue in draft.issues)
 
 
 def test_page_and_row_fingerprints_keep_ids_stable_only_for_same_revision():
@@ -174,6 +195,72 @@ def test_review_guard_requires_explicit_row_page_and_issue_decisions():
     assert draft.export_authorized is False
 
 
+def test_export_guard_rejects_empty_documents_and_missing_manifest():
+    empty = assemble_document_draft("doc-test", [], requested_pages=[])
+    with pytest.raises(AIReviewError, match="empty_document"):
+        assert_review_ready_for_export(empty, new_review_state(empty))
+
+    no_rows = _draft(_payload(tables=[]))
+    state = confirm_page_complete(no_rows, new_review_state(no_rows), 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="empty_document"):
+        assert_review_ready_for_export(no_rows, state)
+
+    all_excluded = _draft(_payload())
+    row_id = _all_rows(all_excluded)[0].id
+    state = record_row_decision(
+        all_excluded, new_review_state(all_excluded), row_id,
+        disposition="excluded", reviewer_id="reviewer",
+    )
+    state = confirm_page_complete(all_excluded, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="empty_document"):
+        assert_review_ready_for_export(all_excluded, state)
+
+    partial = _draft(_payload()).model_copy(update={"expected_page_numbers": [1, 2]})
+    state = record_row_decision(
+        partial, new_review_state(partial), _all_rows(partial)[0].id,
+        disposition="confirmed", reviewer_id="reviewer",
+    )
+    state = confirm_page_complete(partial, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="page_coverage_incomplete"):
+        assert_review_ready_for_export(partial, state)
+
+    no_manifest = assemble_document_draft(
+        "doc-test", [page_from_payload(_payload(), source_document_id="doc-test")],
+    )
+    state = record_row_decision(
+        no_manifest, new_review_state(no_manifest), _all_rows(no_manifest)[0].id,
+        disposition="confirmed", reviewer_id="reviewer",
+    )
+    state = confirm_page_complete(no_manifest, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="expected_page_manifest_required"):
+        assert_review_ready_for_export(no_manifest, state)
+
+
+@pytest.mark.parametrize("failed_status", ["failed", "incomplete"])
+def test_export_guard_rejects_failed_or_incomplete_page_even_after_resolution(failed_status):
+    page_one = page_from_payload(_payload(), source_document_id="doc-test")
+    page_two = (
+        failed_page("doc-test", 2, "transport_failed")
+        if failed_status == "failed"
+        else page_from_payload(
+            _payload(2, tables=[], unreadable_fragments=["[unreadable]"]),
+            source_document_id="doc-test",
+        )
+    )
+    draft = assemble_document_draft(
+        "doc-test", [page_one, page_two], requested_pages=[1, 2],
+    )
+    state = new_review_state(draft)
+    for row in _all_rows(draft):
+        state = record_row_decision(draft, state, row.id, disposition="confirmed", reviewer_id="reviewer")
+    for page in draft.pages:
+        state = confirm_page_complete(draft, state, page.page_number, reviewer_id="reviewer")
+    for issue in draft.issues:
+        state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Reviewed source.")
+    with pytest.raises(AIReviewError, match="page_processing_incomplete"):
+        assert_review_ready_for_export(draft, state)
+
+
 def test_human_can_correct_handwriting_add_split_merge_and_exclude():
     draft = _draft(_payload(rows=[_row(0, "1", "Слитая запись")]))
     row_id = _all_rows(draft)[0].id
@@ -186,24 +273,91 @@ def test_human_can_correct_handwriting_add_split_merge_and_exclude():
     assert state.history[0].event_id.startswith("review-event:")
     assert state.history[0].occurred_at.tzinfo is not None
     assert any(event.action == "confirm_handwriting" for event in state.history)
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
     state = record_structure_change(
         draft, state, action="split_row", source_record_ids=[row_id],
         result_rows=[{"Наименование": "Деталь А"}, {"Наименование": "Деталь Б"}], reviewer_id="reviewer",
     )
     assert state.decisions[row_id].disposition == "excluded"
+    assert state.confirmed_complete_pages == set()
     assert len(state.manual_rows) == 2
     new_id = state.manual_rows[0].id
+    assert all(row.active for row in state.manual_rows)
     state = record_structure_change(
         draft, state, action="merge_rows", source_record_ids=[new_id, state.manual_rows[1].id],
         result_rows=[{"Наименование": "Детали А и Б"}], reviewer_id="reviewer",
     )
     assert len(state.manual_rows) == 3
+    assert [row.active for row in state.manual_rows] == [False, False, True]
+    assert state.decisions[new_id].active is False
     state = record_structure_change(
         draft, state, action="add_row", source_record_ids=[],
         result_rows=[{"Наименование": "Добавленная позиция"}], reviewer_id="reviewer", page_number=1,
     )
     assert len(state.manual_rows) == 4
     assert state.history[-1].action == "add_row"
+
+
+def test_superseded_source_cannot_be_reactivated_and_guard_detects_conflicting_state():
+    draft = _draft(_payload())
+    source_id = _all_rows(draft)[0].id
+    state = record_structure_change(
+        draft, new_review_state(draft), action="split_row", source_record_ids=[source_id],
+        result_rows=[{"Наименование": "Часть А"}, {"Наименование": "Часть Б"}],
+        reviewer_id="reviewer",
+    )
+    with pytest.raises(AIReviewError, match="review_source_superseded"):
+        record_row_decision(draft, state, source_id, disposition="confirmed", reviewer_id="reviewer")
+
+    # Simulate malformed persisted state to prove the export boundary also fails closed.
+    state.decisions[source_id] = state.decisions[source_id].model_copy(
+        update={"disposition": "confirmed"},
+    )
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="conflicting_active_lineage"):
+        assert_review_ready_for_export(draft, state)
+
+
+def test_latest_structure_change_can_be_undone_with_audit_and_invalidated_completeness():
+    draft = _draft(_payload())
+    source_id = _all_rows(draft)[0].id
+    state = record_row_decision(
+        draft, new_review_state(draft), source_id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
+    state = record_structure_change(
+        draft, state, action="split_row", source_record_ids=[source_id],
+        result_rows=[{"Наименование": "Часть А"}, {"Наименование": "Часть Б"}],
+        reviewer_id="reviewer",
+    )
+    structure_event = state.history[-1]
+    restored = undo_structure_change(draft, state, structure_event.event_id, reviewer_id="reviewer")
+    assert restored.decisions[source_id].disposition == "confirmed"
+    assert restored.decisions[source_id].active is True
+    assert all(not row.active for row in restored.manual_rows)
+    assert all(not restored.decisions[row.id].active for row in restored.manual_rows)
+    assert restored.confirmed_complete_pages == set()
+    assert restored.history[-1].action == "undo_structure_change"
+    assert restored.history[-1].payload["reverted_event_id"] == structure_event.event_id
+
+    restored = confirm_page_complete(draft, restored, 1, reviewer_id="reviewer")
+    assert_review_ready_for_export(draft, restored)
+
+
+def test_structure_change_cannot_be_undone_after_dependent_row_review():
+    draft = _draft(_payload())
+    source_id = _all_rows(draft)[0].id
+    state = record_structure_change(
+        draft, new_review_state(draft), action="split_row", source_record_ids=[source_id],
+        result_rows=[{"Наименование": "Часть А"}, {"Наименование": "Часть Б"}],
+        reviewer_id="reviewer",
+    )
+    result_id = state.manual_rows[0].id
+    state = record_row_decision(
+        draft, state, result_id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    with pytest.raises(AIReviewError, match="structure_change_has_dependent_edits"):
+        undo_structure_change(draft, state, state.history[0].event_id, reviewer_id="reviewer")
 
 
 def test_reprocessing_invalidates_changed_page_decisions_and_confirmations():
@@ -238,13 +392,41 @@ def test_offline_replay_cli_preserves_payload_and_only_prints_metadata(tmp_path,
         _row(0, "1", "PRIVATE-CELL-CONTENT"),
     ]}], "unreadable_fragments": [], "handwritten_replacements": [], "unknown": {"keep": 1}}
     source = tmp_path / "input.json"
+    source_pdf = tmp_path / "source.pdf"
     output = tmp_path / "output.json"
+    with fitz.open() as document:
+        document.new_page()
+        document.save(source_pdf)
     source.write_text(json.dumps({"format": "test", "pages": [{"page": 1, "transcription": raw}]}), encoding="utf-8")
-    assert replay_main(["--input", str(source), "--output", str(output)]) == 0
+    assert replay_main(["--input", str(source), "--source-pdf", str(source_pdf), "--output", str(output)]) == 0
     out = capsys.readouterr()
     assert "PRIVATE-CELL-CONTENT" not in out.out
     assert "row_observation_count" in out.out
     saved = json.loads(output.read_text(encoding="utf-8"))
     assert saved["pages"][0]["raw_model_payload"]["unknown"] == {"keep": 1}
     assert saved["export_authorized"] is False
-    assert replay_main(["--input", str(source), "--output", str(output)]) == 2
+    assert replay_main(["--input", str(source), "--source-pdf", str(source_pdf), "--output", str(output)]) == 2
+
+
+def test_offline_replay_uses_source_pdf_page_count_not_model_pages(tmp_path, capsys):
+    raw = _payload()
+    source = tmp_path / "input.json"
+    source_pdf = tmp_path / "source.pdf"
+    output = tmp_path / "output.json"
+    with fitz.open() as document:
+        document.new_page()
+        document.new_page()
+        document.save(source_pdf)
+    source.write_text(json.dumps({
+        "pages": [{"page": 1, "transcription": raw}],
+    }), encoding="utf-8")
+
+    assert replay_main([
+        "--input", str(source), "--source-pdf", str(source_pdf), "--output", str(output),
+    ]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert summary["expected_page_count"] == 2
+    assert summary["page_status_counts"] == {"extracted": 1, "failed": 1}
+    assert saved["expected_page_numbers"] == [1, 2]
+    assert saved["pages"][1]["error_code"] == "page_result_missing"

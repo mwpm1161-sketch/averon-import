@@ -108,7 +108,13 @@ def page_from_payload(
     raw_model_payload; the original JSON value is also retained at page level.
     """
     raw_page = _mapping(payload)
-    number = raw_page.get("page") if page_number is None else page_number
+    payload_number = raw_page.get("page")
+    if page_number is None:
+        number = payload_number
+    else:
+        if "page" in raw_page and (type(payload_number) is not int or payload_number != page_number):
+            raise AIInputError("page_identity_mismatch")
+        number = page_number
     if type(number) is not int or number < 1 or not source_document_id:
         raise AIInputError("invalid_page_identity")
     tables_payload = _list(raw_page.get("tables"), default=[])
@@ -287,7 +293,10 @@ def _candidate_position(row: AIRow, position_column: int, name_column: int) -> i
         return None
     if not isinstance(name, str) or not name.strip() or _POSITIVE_INTEGER.fullmatch(name.strip()):
         return None
-    return int(position.strip())
+    try:
+        return int(position.strip())
+    except ValueError:
+        return None
 
 
 def _table_candidate_issues(table: AITable) -> list[AIReviewIssue]:
@@ -314,14 +323,12 @@ def _table_candidate_issues(table: AITable) -> list[AIReviewIssue]:
                 f"Position number {number} appears in multiple candidate rows; inspect source page.",
             ))
     numbers = sorted(occurrences)
-    if len(numbers) >= 2:
-        missing = sorted(set(range(numbers[0], numbers[-1] + 1)) - set(numbers))
-        if missing:
-            issues.append(_issue(
-                table.source_document_id, "position_gap_candidate", "review", table.page_number,
-                [row.id for row, _ in numbered],
-                "A gap in candidate position numbers may indicate a missing or split row; inspect source page.",
-            ))
+    if any(right - left > 1 for left, right in zip(numbers, numbers[1:])):
+        issues.append(_issue(
+            table.source_document_id, "position_gap_candidate", "review", table.page_number,
+            [row.id for row, _ in numbered],
+            "A gap in candidate position numbers may indicate a missing or split row; inspect source page.",
+        ))
     return issues
 
 
@@ -348,6 +355,7 @@ def assemble_document_draft(
             by_number[number] = failed_page(source_document_id, number, "page_result_missing")
         if set(by_number) - set(requested):
             raise AIInputError("unexpected_page_result")
+    expected_page_numbers = sorted(requested) if requested is not None else []
     ordered_pages = [by_number[number] for number in sorted(by_number)]
     issues = [issue for page in ordered_pages for issue in page.issues]
     for page in ordered_pages:
@@ -358,12 +366,14 @@ def assemble_document_draft(
             ))
     revision_fingerprint = _digest({
         "source_document_id": source_document_id,
+        "expected_page_numbers": expected_page_numbers,
         "pages": [[page.page_number, page.extraction_fingerprint, page.status] for page in ordered_pages],
     })
     return AIDocumentDraft(
         source_document_id=source_document_id,
         revision_id=f"rev:{revision_fingerprint[:24]}",
         pages=ordered_pages,
+        expected_page_numbers=expected_page_numbers,
         issues=issues,
         source_envelope=dict(source_envelope or {}),
         extraction_is_verified=False,

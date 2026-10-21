@@ -7,12 +7,25 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import fitz
+
 from averon_import.services.ai_first.assembly import (
     AIInputError, assemble_document_draft, page_from_payload,
 )
 
 
-def _load_draft(source: Path, document_id: str):
+def _expected_pages_from_pdf(source_pdf: Path) -> list[int]:
+    try:
+        with fitz.open(source_pdf.expanduser()) as document:
+            page_count = document.page_count
+    except Exception as exc:
+        raise AIInputError("source_pdf_unavailable_or_invalid") from exc
+    if type(page_count) is not int or page_count < 1:
+        raise AIInputError("source_pdf_has_no_pages")
+    return list(range(1, page_count + 1))
+
+
+def _load_draft(source: Path, document_id: str, expected_pages: list[int]):
     try:
         data = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -20,7 +33,6 @@ def _load_draft(source: Path, document_id: str):
     if not isinstance(data, dict) or not isinstance(data.get("pages"), list):
         raise AIInputError("unsupported_transcription_envelope")
     pages = []
-    page_numbers: list[int] = []
     try:
         for record in data["pages"]:
             if not isinstance(record, dict):
@@ -31,7 +43,6 @@ def _load_draft(source: Path, document_id: str):
                 raise AIInputError("invalid_transcription_structure")
             if payload.get("page", page_number) != page_number:
                 raise AIInputError("page_number_mismatch")
-            page_numbers.append(page_number)
             pages.append(page_from_payload(
                 payload, source_document_id=document_id, page_number=page_number,
             ))
@@ -41,7 +52,7 @@ def _load_draft(source: Path, document_id: str):
         raise AIInputError("transcription_schema_invalid") from exc
     envelope = {key: value for key, value in data.items() if key != "pages"}
     return assemble_document_draft(
-        document_id, pages, requested_pages=page_numbers, source_envelope=envelope,
+        document_id, pages, requested_pages=expected_pages, source_envelope=envelope,
     )
 
 
@@ -59,6 +70,7 @@ def _summary(draft: Any) -> dict[str, Any]:
     return {
         "status": "offline_draft_created",
         "page_count": len(draft.pages),
+        "expected_page_count": len(draft.expected_page_numbers),
         "page_status_counts": {
             status: sum(page.status == status for page in draft.pages)
             for status in ("extracted", "no_specification", "incomplete", "failed")
@@ -83,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", required=True, type=Path, help="Saved transcription JSON")
     parser.add_argument("--output", required=True, type=Path, help="New protected local JSON output path")
+    parser.add_argument(
+        "--source-pdf", required=True, type=Path,
+        help="Original PDF used to derive the authoritative page manifest",
+    )
     parser.add_argument("--document-id", default="offline-replay", help="Opaque local source identifier")
     return parser
 
@@ -92,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.output.exists():
             raise AIInputError("output_already_exists")
-        draft = _load_draft(args.input, args.document_id)
+        expected_pages = _expected_pages_from_pdf(args.source_pdf)
+        draft = _load_draft(args.input, args.document_id, expected_pages)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         # Exclusive creation prevents an accidental overwrite; the caller should
         # choose a directory whose ACL is appropriate for the source document.

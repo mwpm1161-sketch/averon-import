@@ -16,7 +16,7 @@ ReviewDisposition = Literal["confirmed", "corrected", "excluded"]
 ReviewAction = Literal[
     "confirm_row", "edit_value", "exclude_row", "add_row", "split_row",
     "merge_rows", "confirm_handwriting", "confirm_page_complete",
-    "resolve_issue", "page_reprocessed",
+    "resolve_issue", "page_reprocessed", "undo_structure_change",
 ]
 
 
@@ -147,6 +147,8 @@ class AIDocumentDraft(_StrictModel):
     source_document_id: str
     revision_id: str
     pages: list[AIPageExtraction]
+    # Supplied by the trusted caller from the source PDF, never inferred from OCR output.
+    expected_page_numbers: list[int] = Field(default_factory=list)
     issues: list[AIReviewIssue] = Field(default_factory=list)
     source_envelope: dict[str, Any] = Field(default_factory=dict)
     extraction_is_verified: Literal[False] = False
@@ -157,6 +159,10 @@ class AIDocumentDraft(_StrictModel):
         numbers = [page.page_number for page in self.pages]
         if numbers != sorted(set(numbers)):
             raise ValueError("document pages must be unique and ordered")
+        if any(type(number) is not int or number < 1 for number in self.expected_page_numbers):
+            raise ValueError("expected page numbers must be positive integers")
+        if self.expected_page_numbers != sorted(set(self.expected_page_numbers)):
+            raise ValueError("expected page numbers must be unique and ordered")
         if any(page.source_document_id != self.source_document_id for page in self.pages):
             raise ValueError("page source document mismatch")
         return self
