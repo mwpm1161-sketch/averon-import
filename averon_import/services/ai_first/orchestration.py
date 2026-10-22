@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,7 @@ import subprocess
 import tempfile
 import time
 from typing import Any, Awaitable, Callable, Literal, Protocol
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 import fitz
@@ -53,6 +55,61 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+_SENSITIVE_DESCRIPTOR_KEY_PARTS = (
+    "apikey", "apitoken", "secret", "credential", "authorization", "password",
+    "accesstoken", "refreshtoken", "idtoken", "bearertoken", "privatekey",
+)
+_SENSITIVE_DESCRIPTOR_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:api[_-]?(?:key|token)|(?:access|refresh|id|bearer)[_-]?token|"
+    r"secret|credential|authorization|password)\b\s*[:=]\s*\S+"
+)
+_BEARER_CREDENTIAL_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+_COMMON_OPAQUE_CREDENTIAL = re.compile(
+    r"(?i)\b(?:sk-[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9._-]{20,}|t1\.[A-Za-z0-9._-]{20,})"
+)
+_OPAQUE_DESCRIPTOR_TOKEN = re.compile(r"[A-Za-z0-9_.~+/-]{32,}={0,2}")
+
+
+def _sensitive_descriptor_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
+    return any(part in normalized for part in _SENSITIVE_DESCRIPTOR_KEY_PARTS)
+
+
+def _validate_public_descriptor_value(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if not isinstance(key, str) or _sensitive_descriptor_key(key):
+                raise ValueError("secret-like adapter parameter name")
+            _validate_public_descriptor_value(nested)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _validate_public_descriptor_value(nested)
+        return
+    if not isinstance(value, str):
+        return
+
+    if (
+        _SENSITIVE_DESCRIPTOR_ASSIGNMENT.search(value)
+        or _BEARER_CREDENTIAL_VALUE.search(value)
+        or _COMMON_OPAQUE_CREDENTIAL.search(value)
+        or _OPAQUE_DESCRIPTOR_TOKEN.fullmatch(value)
+    ):
+        raise ValueError("credential-like adapter parameter value")
+    for url in re.findall(r"(?i)https?://[^\s\"'<>]+", value):
+        try:
+            parsed = urlsplit(url.rstrip(".,;)]}"))
+            query_keys = (key for key, _ in parse_qsl(parsed.query, keep_blank_values=True))
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("credential-like adapter parameter URL")
+            if any(_sensitive_descriptor_key(key) for key in query_keys):
+                raise ValueError("credential-like adapter parameter URL")
+        except ValueError as exc:
+            if str(exc).startswith("credential-like"):
+                raise
+            raise ValueError("invalid adapter parameter URL") from None
+
+
 class AdapterDescriptor(_StrictModel):
     provider_id: str
     model_id: str
@@ -66,9 +123,9 @@ class AdapterDescriptor(_StrictModel):
         names = (self.provider_id, self.model_id, self.model_version, self.prompt_version, self.schema_version)
         if any(not value or len(value) > 160 for value in names):
             raise ValueError("invalid adapter descriptor")
-        forbidden = re.compile(r"(?:api[_-]?key|secret|credential|authorization|password|access[_-]?token|refresh[_-]?token)", re.I)
-        if any(forbidden.search(key) for key in self.parameters):
-            raise ValueError("secret-like adapter parameter name")
+        for name in names:
+            _validate_public_descriptor_value(name)
+        _validate_public_descriptor_value(self.parameters)
         try:
             _canonical_bytes(self.parameters)
         except (TypeError, ValueError):
@@ -231,6 +288,7 @@ class AdapterRequestError(RuntimeError):
 class PageAttempt(_StrictModel):
     state: Literal["running", "completed", "failed", "unknown_outcome"]
     started_at: str
+    dispatched_at: str | None = None
     finished_at: str | None = None
     request_started: bool = False
     reserved_input_tokens: int | None = Field(default=None, ge=0)
@@ -249,6 +307,13 @@ class PageAttempt(_StrictModel):
             raise ValueError("finished attempt requires finish time")
         if self.state in ("failed", "unknown_outcome") and not self.safe_error_code:
             raise ValueError("failed attempt requires safe error code")
+        if self.dispatched_at is not None and not self.request_started:
+            raise ValueError("dispatched attempt must be marked started")
+        if self.dispatched_at is not None:
+            try:
+                datetime.fromisoformat(self.dispatched_at)
+            except ValueError:
+                raise ValueError("invalid dispatch timestamp") from None
         return self
 
 
@@ -280,6 +345,14 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def inspect_pdf(
     pdf_path: str | os.PathLike[str],
     adapter: PageExtractionAdapter,
@@ -291,12 +364,9 @@ def inspect_pdf(
     path = Path(pdf_path)
     if not path.is_file():
         raise OrchestrationError("source_pdf_unavailable")
-    digest = hashlib.sha256()
     try:
         before = path.stat()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        source_sha256 = _sha256_file(path)
         with fitz.open(path) as document:
             count = document.page_count
         after = path.stat()
@@ -306,7 +376,6 @@ def inspect_pdf(
         raise OrchestrationError("source_changed_during_inspection")
     if count < 1 or count > config.max_pages:
         raise OrchestrationError("source_page_count_out_of_range")
-    source_sha256 = digest.hexdigest()
     return CheckpointIdentity(
         source_sha256=source_sha256,
         source_size_bytes=after.st_size,
@@ -328,6 +397,26 @@ def _assert_source_signature(pdf_path: str | os.PathLike[str], identity: Checkpo
         raise OrchestrationError("source_changed_during_run")
 
 
+def _verify_source_content(
+    pdf_path: str | os.PathLike[str], identity: CheckpointIdentity,
+) -> tuple[bool, str | None]:
+    path = Path(pdf_path)
+    try:
+        before = path.stat()
+        digest = _sha256_file(path)
+        after = path.stat()
+    except OSError:
+        return False, "source_integrity_unavailable"
+    expected_signature = (identity.source_size_bytes, identity.source_mtime_ns)
+    before_signature = (before.st_size, before.st_mtime_ns)
+    after_signature = (after.st_size, after.st_mtime_ns)
+    if before_signature != after_signature or after_signature != expected_signature:
+        return False, "source_changed_during_run"
+    if digest != identity.source_sha256:
+        return False, "source_integrity_mismatch"
+    return True, None
+
+
 class FitZPageRenderer:
     """Renders only the requested page and releases its PDF handle immediately."""
 
@@ -337,7 +426,20 @@ class FitZPageRenderer:
                 if page_number < 1 or page_number > document.page_count:
                     raise OrchestrationError("source_page_out_of_range")
                 page = document.load_page(page_number - 1)
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
+                scale = dpi / 72
+                rect = page.rect
+                projected_width = float(rect.width) * scale
+                projected_height = float(rect.height) * scale
+                if (
+                    not math.isfinite(projected_width)
+                    or not math.isfinite(projected_height)
+                    or projected_width <= 0
+                    or projected_height <= 0
+                ):
+                    raise OrchestrationError("page_dimensions_invalid")
+                if math.ceil(projected_width) * math.ceil(projected_height) > config.max_image_pixels:
+                    raise OrchestrationError("image_pixel_limit")
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
                 if pixmap.width * pixmap.height > config.max_image_pixels:
                     raise OrchestrationError("image_pixel_limit")
                 data = pixmap.tobytes("png")
@@ -546,12 +648,51 @@ class CheckpointStore:
 
 
 class _RateGate:
-    def __init__(self, rpm: int, tpm: int, *, window_s: float = 60.0):
+    RESTORE_SAFETY_MARGIN_S = 1.0
+
+    def __init__(
+        self, rpm: int, tpm: int, *, window_s: float = 60.0,
+        records: dict[int, PageRunRecord] | None = None,
+    ):
         self.rpm = rpm
         self.tpm = tpm
         self.window_s = window_s
         self.events: deque[tuple[float, int]] = deque()
         self._lock = asyncio.Lock()
+        self._restore_events(records or {})
+
+    def _restore_events(self, records: dict[int, PageRunRecord]) -> None:
+        if not records:
+            return
+        loop = asyncio.get_running_loop()
+        now_monotonic = loop.time()
+        now_utc = datetime.now(timezone.utc)
+        restored: list[tuple[float, int]] = []
+        for record in records.values():
+            for attempt in record.attempts:
+                if not attempt.request_started:
+                    continue
+                timestamp = attempt.dispatched_at
+                if timestamp is None:
+                    # Legacy or incomplete dispatch evidence consumes a full cooldown.
+                    age_s = 0.0
+                else:
+                    try:
+                        dispatched = datetime.fromisoformat(timestamp)
+                        if dispatched.tzinfo is None:
+                            dispatched = dispatched.replace(tzinfo=timezone.utc)
+                        age_s = max(0.0, (now_utc - dispatched.astimezone(timezone.utc)).total_seconds())
+                    except (TypeError, ValueError):
+                        age_s = 0.0
+                    age_s = max(0.0, age_s - self.RESTORE_SAFETY_MARGIN_S)
+                if age_s >= self.window_s:
+                    continue
+                if attempt.reserved_input_tokens is None or attempt.reserved_output_tokens is None:
+                    token_reservation = self.tpm
+                else:
+                    token_reservation = attempt.reserved_input_tokens + attempt.reserved_output_tokens
+                restored.append((now_monotonic - age_s, token_reservation))
+        self.events.extend(sorted(restored))
 
     async def acquire(
         self, token_count: int, cancel_event: asyncio.Event,
@@ -632,6 +773,8 @@ class OrchestrationReport(_StrictModel):
     config: OrchestrationConfig
     source_document_id: str
     source_sha256: str
+    source_integrity_verified: bool
+    source_integrity_error_code: str | None = None
     expected_page_count: int = Field(ge=1)
     pages: list[PageRunRecord]
     draft: AIDocumentDraft
@@ -653,6 +796,17 @@ class OrchestrationReport(_StrictModel):
             raise ValueError("draft must use PDF page manifest")
         if self.draft.export_authorized is not False or self.draft.extraction_is_verified is not False:
             raise ValueError("orchestration cannot authorize extraction")
+        if self.status == "completed" and not self.source_integrity_verified:
+            raise ValueError("completed report requires verified source integrity")
+        if self.source_integrity_verified and self.source_integrity_error_code is not None:
+            raise ValueError("verified source cannot have an integrity error")
+        if not self.source_integrity_verified and (
+            self.source_integrity_error_code is None
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", self.source_integrity_error_code)
+        ):
+            raise ValueError("unverified source requires a safe integrity error")
+        if not self.source_integrity_verified and any(page.status != "failed" for page in self.draft.pages):
+            raise ValueError("unverified source draft must fail every page")
         return self
 
 
@@ -685,6 +839,20 @@ class PageOrchestrator:
         self._max_image_bytes = 0
 
     async def run(
+        self,
+        pdf_path: str | os.PathLike[str],
+        *,
+        cancel_event: asyncio.Event | None = None,
+        retry_pages: set[int] | None = None,
+    ) -> OrchestrationReport:
+        try:
+            return await self._run_impl(
+                pdf_path, cancel_event=cancel_event, retry_pages=retry_pages,
+            )
+        finally:
+            self.checkpoint.close()
+
+    async def _run_impl(
         self,
         pdf_path: str | os.PathLike[str],
         *,
@@ -727,7 +895,7 @@ class PageOrchestrator:
 
         rate_gate = _RateGate(
             self.config.requests_per_minute, self.config.tokens_per_minute,
-            window_s=self.rate_window_s,
+            window_s=self.rate_window_s, records=records,
         )
         budget = _BudgetLedger(self.config.max_budget_rub, records)
         queue: asyncio.Queue[int | None] = asyncio.Queue(maxsize=max(1, self.config.concurrency * 2))
@@ -865,7 +1033,7 @@ class PageOrchestrator:
 
             attempt = PageAttempt(
                 state="running", started_at=_utc_now(),
-                request_started=True,
+                request_started=False,
                 reserved_input_tokens=estimate.reserved_input_tokens,
                 reserved_output_tokens=estimate.reserved_output_tokens,
                 reserved_cost_rub=reserve,
@@ -927,6 +1095,18 @@ class PageOrchestrator:
                     code, terminal=stop_code not in (None, "budget_exhausted"),
                 )
                 return
+
+            dispatched_at = _utc_now()
+            dispatched_attempt = running.attempts[-1].model_copy(update={
+                "request_started": True,
+                "dispatched_at": dispatched_at,
+            })
+            running = running.model_copy(update={
+                "attempts": [*running.attempts[:-1], dispatched_attempt],
+                "updated_at": dispatched_at,
+            })
+            records[number] = running
+            await self.checkpoint.write(running)
 
             response: AdapterPageResult | None = None
             error_state: str | None = None
@@ -1056,29 +1236,60 @@ class PageOrchestrator:
                     })
                 if record.state == "pending" or records[number].state == "unknown_outcome":
                     await self.checkpoint.write(records[number])
-            self.checkpoint.close()
+
+        source_integrity_verified, source_integrity_error_code = _verify_source_content(pdf_path, identity)
+        if stop_code == "source_changed_during_run":
+            source_integrity_verified = False
+            source_integrity_error_code = stop_code
+        if not source_integrity_verified:
+            stop_code = source_integrity_error_code or "source_integrity_unavailable"
+            for number, record in list(records.items()):
+                if record.state != "completed":
+                    continue
+                attempts = list(record.attempts)
+                now = _utc_now()
+                if attempts:
+                    attempts[-1] = attempts[-1].model_copy(update={
+                        "state": "failed",
+                        "safe_error_code": stop_code,
+                    })
+                else:
+                    attempts.append(PageAttempt(
+                        state="failed", started_at=now, finished_at=now,
+                        safe_error_code=stop_code,
+                    ))
+                records[number] = record.model_copy(update={
+                    "state": "failed", "attempts": attempts, "updated_at": now,
+                })
+                await self.checkpoint.write(records[number])
 
         for number in range(1, total + 1):
             if number not in records:
                 records[number] = PageRunRecord(page_number=number, state="pending", updated_at=_utc_now())
         ordered_records = [records[n] for n in range(1, total + 1)]
         draft_pages: list[AIPageExtraction] = []
-        for record in ordered_records:
-            if record.extraction is not None:
-                draft_pages.append(record.extraction)
-            else:
-                code = record.attempts[-1].safe_error_code if record.attempts else None
-                if code is None and stop_scheduling.is_set():
-                    code = (
-                        "budget_exhausted_before_dispatch"
-                        if stop_code == "budget_exhausted"
-                        else stop_code or "orchestration_stopped_before_dispatch"
-                    )
-                elif code is None and cancel_event.is_set():
-                    code = "cancelled_before_dispatch"
+        if not source_integrity_verified:
+            draft_pages = [
+                failed_page(identity.source_document_id, number, source_integrity_error_code or "source_integrity_unavailable")
+                for number in range(1, total + 1)
+            ]
+        else:
+            for record in ordered_records:
+                if record.extraction is not None:
+                    draft_pages.append(record.extraction)
                 else:
-                    code = "page_not_processed"
-                draft_pages.append(failed_page(identity.source_document_id, record.page_number, code))
+                    code = record.attempts[-1].safe_error_code if record.attempts else None
+                    if code is None and stop_scheduling.is_set():
+                        code = (
+                            "budget_exhausted_before_dispatch"
+                            if stop_code == "budget_exhausted"
+                            else stop_code or "orchestration_stopped_before_dispatch"
+                        )
+                    elif code is None and cancel_event.is_set():
+                        code = "cancelled_before_dispatch"
+                    else:
+                        code = "page_not_processed"
+                    draft_pages.append(failed_page(identity.source_document_id, record.page_number, code))
         draft = assemble_document_draft(
             identity.source_document_id,
             draft_pages,
@@ -1116,8 +1327,11 @@ class PageOrchestrator:
                     return None
                 values.append(getattr(attempt.usage, field_name))
             return sum(values)
-        if cancel_event.is_set():
-            status: Literal["completed", "completed_with_errors", "cancelled", "budget_exhausted"] = "cancelled"
+        status: Literal["completed", "completed_with_errors", "cancelled", "budget_exhausted"]
+        if not source_integrity_verified:
+            status = "completed_with_errors"
+        elif cancel_event.is_set():
+            status = "cancelled"
         elif stop_code == "budget_exhausted":
             status = "budget_exhausted"
         elif stop_code is not None:
@@ -1135,6 +1349,8 @@ class PageOrchestrator:
             config=self.config,
             source_document_id=identity.source_document_id,
             source_sha256=identity.source_sha256,
+            source_integrity_verified=source_integrity_verified,
+            source_integrity_error_code=source_integrity_error_code,
             expected_page_count=total,
             pages=ordered_records,
             draft=draft,

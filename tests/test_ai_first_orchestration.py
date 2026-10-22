@@ -134,6 +134,8 @@ def test_30_pages_concurrency_three_and_deterministic_source_order(tmp_path):
     adapter = SyntheticAdapter(delay=lambda page: (page % 5) * 0.001)
     report = run_job(tmp_path, pdf, adapter)
     assert report.status == "completed"
+    assert report.source_integrity_verified is True
+    assert report.source_integrity_error_code is None
     assert report.expected_page_count == 30
     assert report.adapter.model_version == "synthetic-v1"
     assert report.config.concurrency == 3 and report.config.dpi == 72
@@ -185,14 +187,60 @@ def test_source_change_stops_later_pages_and_preserves_completed_results(tmp_pat
     )
 
     assert report.status == "completed_with_errors"
+    assert report.source_integrity_verified is False
     assert adapter.calls == [1]
-    assert report.pages[0].state == "completed"
+    assert report.pages[0].state == "failed"
+    assert report.pages[0].extraction is not None
     assert report.pages[0].attempts[-1].usage == TokenUsage(input_tokens=10, output_tokens=8)
+    assert report.pages[0].attempts[-1].safe_error_code == "source_changed_during_run"
     assert report.pages[1].state == "failed"
     assert report.pages[1].attempts[-1].safe_error_code == "source_changed_during_run"
     assert report.pages[2].state == "pending"
-    assert report.draft.pages[0].status == "no_specification"
-    assert [page.status for page in report.draft.pages[1:]] == ["failed", "failed"]
+    assert all(page.status == "failed" for page in report.draft.pages)
+
+
+def test_final_content_hash_rejects_equal_size_mtime_mutation_after_dispatch(tmp_path):
+    pdf = make_pdf(tmp_path / "inflight-source-mutation.pdf", 3)
+    adapter = SyntheticAdapter(delay=lambda page: 0.01 if page == 1 else 0.3)
+    original_stat = pdf.stat()
+    identity = inspect_pdf(pdf, adapter, make_config(), run_id="synthetic-run")
+    checkpoint = tmp_path / "inflight-source-checkpoint"
+    mutated = False
+
+    async def mutate_after_all_requests_started(event):
+        nonlocal mutated
+        if event.page_number != 1 or event.state != "completed" or mutated:
+            return
+        deadline = time.monotonic() + 2
+        while len(adapter.calls) < 3 and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+        if len(adapter.calls) == 3:
+            content = bytearray(pdf.read_bytes())
+            content[-1] ^= 1
+            pdf.write_bytes(content)
+            os.utime(pdf, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            mutated = True
+
+    report = run_job(
+        tmp_path, pdf, adapter, checkpoint=checkpoint,
+        progress=mutate_after_all_requests_started,
+    )
+
+    assert mutated
+    assert adapter.calls == [1, 2, 3]
+    assert report.status == "completed_with_errors"
+    assert report.source_integrity_verified is False
+    assert report.source_integrity_error_code == "source_integrity_mismatch"
+    assert all(page.state == "failed" and page.extraction is not None for page in report.pages)
+    assert all(page.attempts[-1].usage is not None for page in report.pages)
+    assert all(page.status == "failed" for page in report.draft.pages)
+    assert report.actual_input_tokens == 30
+
+    recovered_store = CheckpointStore(checkpoint, identity)
+    recovered = recovered_store.open()
+    recovered_store.close()
+    assert [recovered[number].state for number in range(1, 4)] == ["failed"] * 3
+    assert all(recovered[number].extraction is not None for number in range(1, 4))
 
 
 def test_source_change_during_render_prevents_dispatch(tmp_path):
@@ -325,6 +373,66 @@ def test_rpm_and_tpm_gate_request_starts(tmp_path):
     assert all(right - left >= 0.04 for left, right in zip(adapter.started_at, adapter.started_at[1:]))
 
 
+@pytest.mark.parametrize(("rpm", "tpm"), [(1, 100), (60, 20)])
+def test_rate_limits_are_restored_across_resume(tmp_path, rpm, tpm):
+    pdf = make_pdf(tmp_path / f"rate-resume-{rpm}-{tpm}.pdf", 2)
+    adapter = SyntheticAdapter()
+    checkpoint = tmp_path / f"rate-resume-checkpoint-{rpm}-{tpm}"
+    cancel_event = asyncio.Event()
+
+    def cancel_after_first_page(event):
+        if event.page_number == 1 and event.state == "completed":
+            cancel_event.set()
+
+    config = make_config(
+        concurrency=1, requests_per_minute=rpm, tokens_per_minute=tpm,
+    )
+    first = run_job(
+        tmp_path, pdf, adapter, config=config, checkpoint=checkpoint,
+        progress=cancel_after_first_page, cancel_event=cancel_event, rate_window_s=0.12,
+    )
+    assert first.status == "cancelled"
+    assert first.pages[0].attempts[-1].request_started is True
+    assert first.pages[0].attempts[-1].dispatched_at is not None
+    assert adapter.calls == [1]
+
+    resumed = run_job(
+        tmp_path, pdf, adapter, config=config, checkpoint=checkpoint, rate_window_s=0.12,
+    )
+    assert resumed.status == "completed"
+    assert adapter.calls == [1, 2]
+    assert adapter.started_at[1] - adapter.started_at[0] >= 0.10
+
+
+def test_unknown_outcome_reservation_is_restored_before_explicit_retry(tmp_path):
+    pdf = make_pdf(tmp_path / "unknown-rate-resume.pdf", 2)
+    adapter = SyntheticAdapter(unknown_once={1})
+    checkpoint = tmp_path / "unknown-rate-resume-checkpoint"
+    cancel_event = asyncio.Event()
+
+    def cancel_after_unknown(event):
+        if event.page_number == 1 and event.state == "unknown_outcome":
+            cancel_event.set()
+
+    config = make_config(concurrency=1, requests_per_minute=1, tokens_per_minute=20)
+    first = run_job(
+        tmp_path, pdf, adapter, config=config, checkpoint=checkpoint,
+        progress=cancel_after_unknown, cancel_event=cancel_event, rate_window_s=0.12,
+    )
+    assert first.status == "cancelled"
+    assert first.pages[0].state == "unknown_outcome"
+    assert first.pages[0].attempts[-1].request_started is True
+    assert adapter.calls == [1]
+
+    resumed = run_job(
+        tmp_path, pdf, adapter, config=config, checkpoint=checkpoint,
+        retry_pages={1}, rate_window_s=0.12,
+    )
+    assert resumed.status == "completed"
+    assert adapter.calls == [1, 1, 2]
+    assert adapter.started_at[1] - adapter.started_at[0] >= 0.10
+
+
 def test_budget_exhaustion_stops_new_requests_and_keeps_page_manifest(tmp_path):
     pdf = make_pdf(tmp_path / "budget.pdf", 10)
     adapter = SyntheticAdapter()
@@ -369,6 +477,39 @@ def test_checkpoint_running_attempt_becomes_unknown_after_restart(tmp_path):
     reopened.close()
     assert recovered[1].state == "unknown_outcome"
     assert recovered[1].attempts[-1].safe_error_code == "process_restarted_during_request"
+
+
+def test_retry_write_exception_releases_checkpoint_lock_before_workers(tmp_path, monkeypatch):
+    pdf = make_pdf(tmp_path / "retry-write-failure.pdf")
+    adapter, config = SyntheticAdapter(), make_config()
+    identity = inspect_pdf(pdf, adapter, config, run_id="retry-lock-run")
+    checkpoint_dir = tmp_path / "retry-write-checkpoint"
+    seed = CheckpointStore(checkpoint_dir, identity)
+    seed.open()
+    asyncio.run(seed.write(PageRunRecord(
+        page_number=1, state="failed", updated_at="2026-01-01T00:00:01+00:00",
+        attempts=[PageAttempt(
+            state="failed", started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00", safe_error_code="synthetic_failure",
+        )],
+    )))
+    seed.close()
+
+    checkpoint = CheckpointStore(checkpoint_dir, identity)
+
+    async def fail_write(_record):
+        raise OSError("synthetic checkpoint failure")
+
+    monkeypatch.setattr(checkpoint, "write", fail_write)
+    orchestrator = PageOrchestrator(adapter, SyntheticRenderer(), config, checkpoint)
+    with pytest.raises(OSError, match="synthetic checkpoint failure"):
+        asyncio.run(orchestrator.run(pdf, retry_pages={1}))
+    assert adapter.calls == []
+
+    reopened = CheckpointStore(checkpoint_dir, identity)
+    recovered = reopened.open()
+    reopened.close()
+    assert recovered[1].state == "failed"
 
 
 def test_atomic_checkpoint_replace_keeps_old_file_and_cleans_temp(tmp_path, monkeypatch):
@@ -420,6 +561,23 @@ def test_default_configuration_has_three_workers_and_finite_budget_controls():
     assert config.max_budget_rub == Decimal("100")
 
 
+@pytest.mark.parametrize("parameters", [
+    {"transport": {"nested": [{"api_key": "synthetic-secret"}]}},
+    {"transport": [{"authorization": "synthetic-secret"}]},
+    {"endpoint": "https://user:synthetic-secret@example.test/v1"},
+    {"endpoint": "https://example.test/v1?access_token=synthetic-secret"},
+    {"header": "Bearer syntheticcredentialvalue"},
+    {"opaque_value": "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"},
+])
+def test_adapter_descriptor_rejects_nested_or_credential_like_values(parameters):
+    with pytest.raises(ValidationError):
+        AdapterDescriptor(
+            provider_id="mock-vision", model_id="synthetic-model",
+            model_version="synthetic-v1", prompt_version="prompt-v1",
+            schema_version="schema-v1", parameters=parameters,
+        )
+
+
 def test_usage_and_cost_remain_unknown_when_adapter_has_no_usage(tmp_path):
     pdf = make_pdf(tmp_path / "missing-usage.pdf")
     report = run_job(tmp_path, pdf, SyntheticAdapter(usage_missing=True))
@@ -462,6 +620,39 @@ def test_real_renderer_produces_a_bounded_png_for_one_requested_page(tmp_path):
     assert image.width * image.height <= make_config().max_image_pixels
     with pytest.raises(OrchestrationError, match="image_pixel_limit"):
         FitZPageRenderer().render(pdf, 1, 72, make_config(max_image_pixels=1))
+
+
+def test_oversized_page_is_rejected_before_pixmap_allocation(monkeypatch):
+    from types import SimpleNamespace
+
+    from averon_import.services.ai_first import orchestration
+
+    get_pixmap_calls = 0
+
+    class OversizedPage:
+        rect = SimpleNamespace(width=1_000_000, height=1_000_000)
+
+        def get_pixmap(self, **_kwargs):
+            nonlocal get_pixmap_calls
+            get_pixmap_calls += 1
+            raise AssertionError("pixmap allocation must not occur")
+
+    class SyntheticDocument:
+        page_count = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def load_page(self, _page_number):
+            return OversizedPage()
+
+    monkeypatch.setattr(orchestration.fitz, "open", lambda _path: SyntheticDocument())
+    with pytest.raises(OrchestrationError, match="image_pixel_limit"):
+        FitZPageRenderer().render("synthetic-oversized.pdf", 1, 150, make_config())
+    assert get_pixmap_calls == 0
 
 
 def test_cancel_after_partial_completion_preserves_and_resumes_successful_pages(tmp_path):
