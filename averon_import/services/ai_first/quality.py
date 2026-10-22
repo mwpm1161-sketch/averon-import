@@ -139,6 +139,14 @@ def evaluate_draft_quality(reference: QualityReference, draft: AIDocumentDraft) 
     rows = _row_map(draft)
     pages = {page.page_number: page for page in draft.pages}
     expected_items = [row for row in reference.expected_rows if row.role == "item"]
+    expected_rows_by_location = {
+        (row.page_number, row.table_index, row.row_index): row
+        for row in reference.expected_rows
+    }
+    expected_items_by_location = {
+        (row.page_number, row.table_index, row.row_index): row
+        for row in expected_items
+    }
     expected_positions = {
         (row.page_number, row.table_index, row.fields["position"])
         for row in expected_items
@@ -209,8 +217,17 @@ def evaluate_draft_quality(reference: QualityReference, draft: AIDocumentDraft) 
         key not in {(row.page_number, row.table_index, row.row_index) for row in reference.expected_rows}
         for key in rows
     )
+    # Only rows that are actually classified as items can contribute item
+    # candidates. If a physical reference row is known to be a header/section,
+    # exclude it even when the model mislabeled it as an item: its numeric
+    # contents must not make an absent position appear covered.
     observed_positions: list[tuple[int, int, int, str]] = []
     for key, row in rows.items():
+        expected_at_location = expected_rows_by_location.get(key)
+        if row.model_kind != "item" or (
+            expected_at_location is not None and expected_at_location.role != "item"
+        ):
+            continue
         page_number, table_index, _ = key
         value = _field_value(tables.get((page_number, table_index)), row, "position")
         if value not in (None, ""):
@@ -223,9 +240,18 @@ def evaluate_draft_quality(reference: QualityReference, draft: AIDocumentDraft) 
     for page_number, table_index, _, position in observed_positions:
         key = (page_number, table_index, position)
         observed_position_counts[key] = observed_position_counts.get(key, 0) + 1
-    recognized_positions = sum(
-        observed_position_counts.get(key, 0) > 0 for key in expected_positions
-    )
+    # Coverage requires the expected value at its expected physical item row.
+    # A matching number on another row (including an extra model item) cannot
+    # compensate for an omitted or misclassified position.
+    recognized_locations = {
+        key
+        for key, expected in expected_items_by_location.items()
+        if (row := rows.get(key)) is not None
+        and row.model_kind == "item"
+        and _field_value(tables.get((key[0], key[1])), row, "position")
+        == expected.fields["position"]
+    }
+    recognized_positions = len(recognized_locations)
     duplicate_positions = sum(
         count - 1 for key, count in observed_position_counts.items()
         if key in expected_positions and count > 1
@@ -233,8 +259,11 @@ def evaluate_draft_quality(reference: QualityReference, draft: AIDocumentDraft) 
 
     extra_item_rows = sum(
         row.model_kind == "item"
-        and (key[0], key[1], _field_value(tables.get((key[0], key[1])), row, "position"))
-        not in expected_positions
+        and (
+            key not in expected_items_by_location
+            or _field_value(tables.get((key[0], key[1])), row, "position")
+            != expected_items_by_location[key].fields["position"]
+        )
         for key, row in rows.items()
     )
     column_assignment_errors = header_assignment_errors + cell_column_assignment_errors
@@ -249,7 +278,7 @@ def evaluate_draft_quality(reference: QualityReference, draft: AIDocumentDraft) 
             continue
         expected_page_items = [row for row in expected_items if row.page_number == number]
         if all(
-            observed_position_counts.get((row.page_number, row.table_index, row.fields["position"]), 0) > 0
+            (row.page_number, row.table_index, row.row_index) in recognized_locations
             for row in expected_page_items
         ):
             pages_with_all_positions += 1
