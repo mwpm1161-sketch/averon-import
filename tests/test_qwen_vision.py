@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import socket
 import threading
@@ -25,6 +26,7 @@ from averon_import.services.ocr.qwen_vision_client import (
     VisionLimits, _HttpsTransport,
 )
 from averon_import.services.ocr.qwen_vision_contract import VisionPage, project_page
+from averon_import.services.ocr import qwen_vision_client as qwen_vision_client_module
 from averon_import.services.pdf_service import PdfService
 from averon_import.services.recognition import RecognitionService
 from averon_import.services.review_decisions import CONFIRM_FIELD_VALUE_DECISION, HumanReviewService
@@ -146,6 +148,74 @@ def test_payload_is_multimodal_strict_schema_and_content_free_diagnostics():
     assert result.diagnostics["latency_ms"] >= 0
     assert result.diagnostics["api_verified"] is False
     assert result.page.tables[0].rows[0].cells[1].raw_text == DOCUMENT_TEXT
+
+
+def test_empty_user_context_keeps_legacy_request_bytes_and_prompt_fingerprint():
+    client = QwenVisionClient(config(), transport=Transport(response()))
+    image = png()
+    actual = client._request_body(image, 1, user_context="")
+    legacy_payload = {
+        "model": client.config.model, "stream": False, "store": False,
+        "max_completion_tokens": client.config.limits.max_output_tokens, "temperature": 0,
+        "messages": [
+            {"role": "system", "content": qwen_vision_client_module._PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Source page number: 1"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64," + base64.b64encode(image).decode("ascii"),
+                }},
+            ]},
+        ],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "averon_vision_page_v1", "strict": True,
+            "schema": VisionPage.model_json_schema(),
+        }},
+    }
+    expected = json.dumps(legacy_payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert client._request_body(image, 1) == expected
+    assert actual == expected
+    assert client.prompt_sha256 == "aa364b5a06cd1a625191ddcbc920fed9e2669e2aec1cd5e526b2f0d621ed7fe3"
+
+
+def test_user_context_is_untrusted_exact_and_bounded_without_truncation():
+    context = "  Synthetic hint: inspect the quantity column; do not alter source values.  "
+    transport = Transport(response())
+    client = QwenVisionClient(config(), transport=transport)
+    client.extract(png(), 1, user_context=context)
+    body = json.loads(transport.calls[0]["body"])
+    assert body["messages"][1] == {
+        "role": "system",
+        "content": qwen_vision_client_module._USER_CONTEXT_POLICY,
+    }
+    user_parts = body["messages"][2]["content"]
+    assert user_parts[0]["text"] == "Source page number: 1"
+    assert user_parts[1]["text"] == qwen_vision_client_module._USER_CONTEXT_LABEL + context
+    assert user_parts[2]["type"] == "image_url"
+    assert "untrusted" in body["messages"][1]["content"]
+    assert "cannot override" in body["messages"][1]["content"]
+
+    exactly_at_limit = "x" * 1000
+    assert client.measure_request_bytes(png(), 1, user_context=exactly_at_limit) > client.measure_request_bytes(png(), 1)
+    no_send = Transport(response())
+    with pytest.raises(QwenVisionError, match="user_context_too_long"):
+        QwenVisionClient(config(), transport=no_send).extract(png(), 1, user_context="x" * 1001)
+    assert no_send.calls == []
+
+    with pytest.raises(QwenVisionError, match="invalid_user_context"):
+        QwenVisionClient(config(), transport=no_send).extract(png(), 1, user_context="\ud800")
+    assert no_send.calls == []
+
+
+def test_user_context_increases_request_size_and_can_be_rejected_before_transport():
+    image = png()
+    baseline = QwenVisionClient(config(), transport=Transport()).measure_request_bytes(image, 1)
+    context_transport = Transport(response())
+    client = QwenVisionClient(
+        config(max_request_bytes=baseline + 32), transport=context_transport,
+    )
+    with pytest.raises(QwenVisionError, match="request_size_limit"):
+        client.extract(image, 1, user_context="synthetic hint")
+    assert context_transport.calls == []
 
 
 def test_increased_output_token_limit_is_sent_and_bounded():

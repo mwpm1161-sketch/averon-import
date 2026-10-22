@@ -130,7 +130,8 @@ class FakeTransport:
 
     def post(self, url, **kwargs):
         payload = json.loads(kwargs["body"])
-        text = payload["messages"][1]["content"][0]["text"]
+        user_message = next(message for message in payload["messages"] if message["role"] == "user")
+        text = user_message["content"][0]["text"]
         page_number = int(re.search(r"(\d+)$", text).group(1))
         with self._lock:
             self._counts[page_number] = self._counts.get(page_number, 0) + 1
@@ -179,7 +180,7 @@ def _limits(**changes):
 def _adapter(
     transport, *, registry=None, rpm=1000, tpm=100000, input_bound=256,
     api_key=SYNTHETIC_KEY, limits=None, model="gpt://synthetic-folder/qwen3.6-35b-a3b",
-    base_url="https://ai.synthetic.invalid/v1", folder_id="synthetic-folder",
+    base_url="https://ai.synthetic.invalid/v1", folder_id="synthetic-folder", user_context=None,
 ):
     config = QwenVisionConfig(
         base_url,
@@ -195,6 +196,7 @@ def _adapter(
         tokens_per_minute=tpm,
         input_token_upper_bound=input_bound,
         pricing_profile_id="synthetic-tariff-v1",
+        user_context=user_context,
     )
 
 
@@ -716,6 +718,101 @@ def test_changed_prompt_invalidates_checkpoint_even_when_prompt_version_is_uncha
     with pytest.raises(OrchestrationError, match="checkpoint_identity_mismatch"):
         asyncio.run(_make_orchestrator(pdf, changed_adapter, config, checkpoint).run(pdf))
     assert len(transport.calls) == 1
+
+
+def test_user_context_is_private_checkpoint_identity_and_exactly_resumed(tmp_path):
+    context = "Synthetic hint: inspect wrapped names. Preserve every source value as read."
+    changed_context = context + " Check the note column too."
+    transport = FakeTransport()
+    adapter = _adapter(transport, user_context=context)
+    same_context_adapter = _adapter(FakeTransport(), user_context=context)
+    changed_context_adapter = _adapter(FakeTransport(), user_context=changed_context)
+    empty_adapter = _adapter(FakeTransport())
+    empty_string_adapter = _adapter(FakeTransport(), user_context="")
+
+    assert adapter.descriptor.fingerprint == empty_adapter.descriptor.fingerprint
+    assert empty_adapter.private_checkpoint_scope_fingerprint == empty_string_adapter.private_checkpoint_scope_fingerprint
+    assert adapter.descriptor.fingerprint == same_context_adapter.descriptor.fingerprint
+    assert adapter.private_checkpoint_scope_fingerprint == same_context_adapter.private_checkpoint_scope_fingerprint
+    assert adapter.private_checkpoint_scope_fingerprint != empty_adapter.private_checkpoint_scope_fingerprint
+    assert adapter.private_checkpoint_scope_fingerprint != changed_context_adapter.private_checkpoint_scope_fingerprint
+    assert context not in json.dumps(adapter.descriptor.model_dump())
+
+    pdf = _make_pdf(tmp_path / "context-identity.pdf")
+    checkpoint = tmp_path / "context-identity-checkpoint"
+    config = _orchestration_config()
+    first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    assert first.status == "completed"
+    request_messages = transport.calls[0]["payload"]["messages"]
+    assert request_messages[2]["content"][1]["text"].endswith(context)
+    public = json.dumps({"descriptor": first.adapter.model_dump(), "report": first.model_dump(mode="json")})
+    saved = "".join(path.read_text(encoding="utf-8") for path in checkpoint.glob("*.json"))
+    assert context not in public and context not in saved
+
+    resumed = asyncio.run(_make_orchestrator(
+        pdf, same_context_adapter, config, checkpoint,
+    ).run(pdf))
+    assert resumed.status == "completed"
+    assert len(transport.calls) == 1
+    with pytest.raises(OrchestrationError, match="checkpoint_identity_mismatch"):
+        asyncio.run(_make_orchestrator(
+            pdf, changed_context_adapter, config, checkpoint,
+        ).run(pdf))
+    assert len(transport.calls) == 1
+
+
+def test_user_context_has_no_silent_truncation_and_reserves_safe_tpm_bound(tmp_path):
+    context = "я" * 1000
+    accepted = _adapter(FakeTransport(), user_context=context)
+    with pytest.raises(ValueError, match="user_context_too_long"):
+        _adapter(FakeTransport(), user_context=context + "я")
+
+    pdf = _make_pdf(tmp_path / "context-token-bound.pdf")
+    image = FitZPageRenderer().render(pdf, 1, 72, _orchestration_config())
+    extra_bound = accepted.client.additional_context_token_reservation(
+        image.data, 1, context,
+    )
+    estimate = accepted.estimate(image)
+    assert extra_bound > len(context.encode("utf-8"))
+    assert estimate.reserved_input_tokens == accepted.input_token_upper_bound + extra_bound
+    assert estimate.reserved_output_tokens == accepted.client.config.limits.max_output_tokens
+
+    no_send = FakeTransport()
+    bounded = _adapter(
+        no_send, user_context=context, input_bound=10,
+        tpm=10 + _limits().max_output_tokens,
+    )
+    report = asyncio.run(_make_orchestrator(
+        pdf, bounded,
+        _orchestration_config(tpm=10 + _limits().max_output_tokens),
+        tmp_path / "context-token-bound-checkpoint",
+    ).run(pdf))
+    assert report.pages[0].state == "failed"
+    assert report.pages[0].attempts[0].safe_error_code == "request_estimate_invalid"
+    assert no_send.calls == []
+
+
+def test_context_request_size_cap_still_blocks_http_before_dispatch(tmp_path):
+    context = "Synthetic request-size test hint."
+    measurement_adapter = _adapter(FakeTransport())
+    pdf = _make_pdf(tmp_path / "context-request-size.pdf")
+    image = FitZPageRenderer().render(pdf, 1, 72, _orchestration_config())
+    baseline_bytes = measurement_adapter.client.measure_request_bytes(image.data, 1)
+    no_send = FakeTransport()
+    bounded = _adapter(
+        no_send,
+        user_context=context,
+        limits=_limits(max_request_bytes=baseline_bytes + 8),
+    )
+
+    report = asyncio.run(_make_orchestrator(
+        pdf, bounded, _orchestration_config(),
+        tmp_path / "context-request-size-checkpoint",
+    ).run(pdf))
+
+    assert report.pages[0].state == "failed"
+    assert report.pages[0].attempts[0].safe_error_code == "request_size_limit"
+    assert no_send.calls == []
 
 
 def test_secret_store_descriptor_checkpoint_and_logs_contain_no_credentials_or_http_body(tmp_path, caplog):

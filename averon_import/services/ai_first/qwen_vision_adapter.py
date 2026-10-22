@@ -26,7 +26,8 @@ from averon_import.services.ai_first.orchestration import (
     PageImage, RequestEstimate, TokenUsage,
 )
 from averon_import.services.ocr.qwen_vision_client import (
-    QwenVisionClient, QwenVisionConfig, QwenVisionError, VisionCompletion, VisionLimits,
+    USER_CONTEXT_POLICY_VERSION, QwenVisionClient, QwenVisionConfig,
+    QwenVisionError, VisionCompletion, VisionLimits, validate_user_context,
 )
 from averon_import.services.ocr.qwen_vision_contract import VisionPage
 from averon_import.services.secrets import SecretStore
@@ -132,6 +133,7 @@ class QwenVisionAdapter:
         tokens_per_minute: int,
         input_token_upper_bound: int | None,
         pricing_profile_id: str,
+        user_context: str | None = None,
     ):
         for label, value in (
             ("requests_per_minute", requests_per_minute),
@@ -145,6 +147,10 @@ class QwenVisionAdapter:
             raise ValueError("invalid input token upper bound")
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,96}", pricing_profile_id):
             raise ValueError("invalid pricing profile")
+        try:
+            user_context = validate_user_context(user_context)
+        except QwenVisionError as exc:
+            raise ValueError(exc.code) from None
 
         self.client = client
         self.requests_per_minute = requests_per_minute
@@ -154,6 +160,7 @@ class QwenVisionAdapter:
         self.max_pages = client.config.limits.max_pages
         self.input_token_upper_bound = input_token_upper_bound
         self.pricing_profile_id = pricing_profile_id
+        self._user_context = user_context
         self._quota_registry = quota_registry
         self._descriptor = self._build_descriptor()
 
@@ -169,6 +176,7 @@ class QwenVisionAdapter:
         tokens_per_minute: int,
         input_token_upper_bound: int | None,
         pricing_profile_id: str,
+        user_context: str | None = None,
         environ: Any = None,
         auth_scheme: str = "Api-Key",
         transport: Any = None,
@@ -185,6 +193,7 @@ class QwenVisionAdapter:
             tokens_per_minute=tokens_per_minute,
             input_token_upper_bound=input_token_upper_bound,
             pricing_profile_id=pricing_profile_id,
+            user_context=user_context,
         )
 
     @property
@@ -194,14 +203,25 @@ class QwenVisionAdapter:
     @property
     def private_checkpoint_scope_fingerprint(self) -> str:
         """Stable credential/account scope stored only in the private checkpoint."""
+        scope_value = {
+            "api_key": self.client.config.api_key,
+            "auth_scheme": self.client.config.auth_scheme,
+            "folder_id": self.client.config.folder_id,
+        }
         scope = json.dumps(
-            {
-                "api_key": self.client.config.api_key,
-                "auth_scheme": self.client.config.auth_scheme,
-                "folder_id": self.client.config.folder_id,
-            },
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
+        if self._user_context is not None:
+            context_binding = hmac.new(
+                self.client.config.api_key.encode("utf-8"),
+                b"averon-qwen-document-context-v1\0" + self._user_context.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            scope_value["document_context_policy_version"] = USER_CONTEXT_POLICY_VERSION
+            scope_value["document_context_hmac"] = context_binding
+            scope = json.dumps(
+                scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
         return hashlib.sha256(b"averon-qwen-checkpoint-scope-v1\0" + scope).hexdigest()
 
     def _build_descriptor(self) -> AdapterDescriptor:
@@ -265,12 +285,21 @@ class QwenVisionAdapter:
         limits = self.client.config.limits
         if image.content_type != "image/png" or image.width * image.height > limits.max_image_pixels:
             raise ValueError("qwen image constraints exceeded")
-        self.client.measure_request_bytes(image.data, image.page_number)
+        # Build the exact body here so context-specific budgeting uses the
+        # same serialization; the client enforces its byte cap immediately
+        # before dispatch, and the pilot runner reports its own preflight size.
+        self.client.measure_request_bytes(
+            image.data, image.page_number, user_context=self._user_context,
+        )
         output_bound = limits.max_output_tokens
-        if self.input_token_upper_bound + output_bound > self.tokens_per_minute:
+        context_token_reservation = self.client.additional_context_token_reservation(
+            image.data, image.page_number, self._user_context,
+        )
+        input_bound = self.input_token_upper_bound + context_token_reservation
+        if input_bound + output_bound > self.tokens_per_minute:
             raise ValueError("request token reservation exceeds provider TPM")
         return RequestEstimate(
-            reserved_input_tokens=self.input_token_upper_bound,
+            reserved_input_tokens=input_bound,
             reserved_output_tokens=output_bound,
         )
 
@@ -305,6 +334,7 @@ class QwenVisionAdapter:
             request.page_number,
             timeout_s=self.client.config.limits.request_timeout_s,
             cancel=thread_cancel,
+            user_context=self._user_context,
         ))
         try:
             completion = await asyncio.shield(call_task)
