@@ -1275,21 +1275,37 @@ class PageOrchestrator:
             ]
         else:
             for record in ordered_records:
-                if record.extraction is not None:
+                extraction = record.extraction
+                if (
+                    record.state == "completed"
+                    and extraction is not None
+                    and extraction.status in {"extracted", "no_specification"}
+                ):
                     draft_pages.append(record.extraction)
+                    continue
+
+                if record.state == "completed":
+                    code = (
+                        "page_extraction_incomplete"
+                        if extraction is not None and extraction.status == "incomplete"
+                        else "page_extraction_failed"
+                    )
                 else:
                     code = record.attempts[-1].safe_error_code if record.attempts else None
-                    if code is None and stop_scheduling.is_set():
-                        code = (
-                            "budget_exhausted_before_dispatch"
-                            if stop_code == "budget_exhausted"
-                            else stop_code or "orchestration_stopped_before_dispatch"
-                        )
-                    elif code is None and cancel_event.is_set():
-                        code = "cancelled_before_dispatch"
-                    else:
-                        code = "page_not_processed"
-                    draft_pages.append(failed_page(identity.source_document_id, record.page_number, code))
+                    if code is not None and not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+                        code = None
+                    if code is None:
+                        if stop_scheduling.is_set():
+                            code = (
+                                "budget_exhausted_before_dispatch"
+                                if stop_code == "budget_exhausted"
+                                else stop_code or "orchestration_stopped_before_dispatch"
+                            )
+                        elif cancel_event.is_set():
+                            code = "cancelled_before_dispatch"
+                        else:
+                            code = "page_not_processed"
+                draft_pages.append(failed_page(identity.source_document_id, record.page_number, code))
         draft = assemble_document_draft(
             identity.source_document_id,
             draft_pages,
@@ -1338,7 +1354,12 @@ class PageOrchestrator:
             status = "completed_with_errors"
         elif stop_scheduling.is_set():
             status = "budget_exhausted"
-        elif any(record.state in ("failed", "unknown_outcome", "pending") for record in ordered_records):
+        elif any(
+            record.state in ("failed", "unknown_outcome", "pending", "running")
+            or record.extraction is None
+            or record.extraction.status not in {"extracted", "no_specification"}
+            for record in ordered_records
+        ):
             status = "completed_with_errors"
         else:
             status = "completed"

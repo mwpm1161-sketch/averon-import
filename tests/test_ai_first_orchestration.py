@@ -13,6 +13,9 @@ import pytest
 from pydantic import ValidationError
 
 from averon_import.services.ai_first.assembly import page_from_payload
+from averon_import.services.ai_first.review import (
+    AIReviewError, assert_review_ready_for_export, new_review_state,
+)
 from averon_import.services.ai_first.orchestration import (
     AdapterDescriptor, AdapterPageResult, AdapterRequestError, CheckpointStore, FitZPageRenderer,
     OrchestrationConfig, OrchestrationError, PageAttempt, PageExtractionRequest,
@@ -303,6 +306,76 @@ def test_resume_skips_all_completed_pages_without_repeating_requests(tmp_path):
     assert first.status == second.status == "completed"
     assert adapter.calls == original_calls
     assert [page.state for page in second.pages] == ["completed"] * 4
+
+
+def test_resume_keeps_failed_checkpoint_extraction_for_audit_but_fails_draft_closed(tmp_path):
+    pdf = make_pdf(tmp_path / "synthetic-failed-resume.pdf")
+    adapter, config = SyntheticAdapter(), make_config()
+    checkpoint = tmp_path / "failed-resume-checkpoint"
+    identity = inspect_pdf(pdf, adapter, config, run_id="synthetic-run")
+    store = CheckpointStore(checkpoint, identity)
+    store.open()
+    extraction = page_from_payload({
+        "page": 1,
+        "tables": [{
+            "headers": ["Position", "Name"],
+            "rows": [{
+                "kind": "item",
+                "cells": [
+                    {"column_index": 0, "raw_text": "1"},
+                    {"column_index": 1, "raw_text": "Synthetic component"},
+                ],
+            }],
+        }],
+        "unreadable_fragments": [],
+        "handwritten_replacements": [],
+    }, source_document_id=identity.source_document_id)
+    historical_attempt = PageAttempt(
+        state="failed",
+        started_at="2026-01-01T00:00:00+00:00",
+        dispatched_at="2026-01-01T00:00:01+00:00",
+        finished_at="2026-01-01T00:00:02+00:00",
+        request_started=True,
+        reserved_input_tokens=10,
+        reserved_output_tokens=10,
+        reserved_cost_rub=Decimal("0.005"),
+        actual_cost_rub=Decimal("0.0044"),
+        usage=TokenUsage(input_tokens=10, output_tokens=8),
+        safe_error_code="source_integrity_mismatch",
+        elapsed_s=2.0,
+    )
+    seeded_record = PageRunRecord(
+        page_number=1,
+        state="failed",
+        attempts=[historical_attempt],
+        extraction=extraction,
+        updated_at="2026-01-01T00:00:02+00:00",
+    )
+    asyncio.run(store.write(seeded_record))
+    store.close()
+
+    report = run_job(tmp_path, pdf, adapter, config=config, checkpoint=checkpoint)
+
+    assert report.status == "completed_with_errors"
+    assert adapter.calls == []  # no implicit retry during resume
+    assert report.pages[0].state == "failed"
+    assert report.pages[0].extraction == extraction  # retained as audit evidence
+    assert report.pages[0].attempts == [historical_attempt]
+    assert report.actual_input_tokens == 10
+    assert report.actual_output_tokens == 8
+    assert report.actual_cost_rub == Decimal("0.0044")
+    assert report.draft.pages[0].status == "failed"
+    assert report.draft.pages[0].error_code == "source_integrity_mismatch"
+    assert report.draft.pages[0].tables == []
+    with pytest.raises(AIReviewError, match="page_processing_incomplete"):
+        assert_review_ready_for_export(report.draft, new_review_state(report.draft))
+
+    persisted_store = CheckpointStore(checkpoint, identity)
+    persisted = persisted_store.open()
+    persisted_store.close()
+    assert persisted[1].state == "failed"
+    assert persisted[1].extraction == extraction
+    assert persisted[1].attempts == [historical_attempt]
 
 
 def test_resume_rejects_a_different_pdf_before_any_request(tmp_path):
