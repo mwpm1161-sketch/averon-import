@@ -145,6 +145,8 @@ class OrchestrationConfig(_StrictModel):
 
 class CheckpointIdentity(_StrictModel):
     source_sha256: str
+    source_size_bytes: int = Field(ge=1)
+    source_mtime_ns: int = Field(ge=0)
     page_count: int = Field(ge=1)
     run_id: str
     source_document_id: str
@@ -291,24 +293,39 @@ def inspect_pdf(
         raise OrchestrationError("source_pdf_unavailable")
     digest = hashlib.sha256()
     try:
+        before = path.stat()
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         with fitz.open(path) as document:
             count = document.page_count
+        after = path.stat()
     except Exception:
         raise OrchestrationError("source_pdf_invalid") from None
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise OrchestrationError("source_changed_during_inspection")
     if count < 1 or count > config.max_pages:
         raise OrchestrationError("source_page_count_out_of_range")
     source_sha256 = digest.hexdigest()
     return CheckpointIdentity(
         source_sha256=source_sha256,
+        source_size_bytes=after.st_size,
+        source_mtime_ns=after.st_mtime_ns,
         page_count=count,
         run_id=run_id or uuid4().hex,
         source_document_id=f"pdf-sha256:{source_sha256}",
         adapter_fingerprint=adapter.descriptor.fingerprint,
         processing_fingerprint=config.processing_fingerprint(),
     )
+
+
+def _assert_source_signature(pdf_path: str | os.PathLike[str], identity: CheckpointIdentity) -> None:
+    try:
+        stat = Path(pdf_path).stat()
+    except OSError:
+        raise OrchestrationError("source_changed_during_run") from None
+    if (stat.st_size, stat.st_mtime_ns) != (identity.source_size_bytes, identity.source_mtime_ns):
+        raise OrchestrationError("source_changed_during_run")
 
 
 class FitZPageRenderer:
@@ -366,7 +383,7 @@ class CheckpointStore:
             self.close()
             raise OrchestrationError("checkpoint_invalid")
         expected = {
-            "format_version": 1,
+            "format_version": 2,
             "identity": self.identity.model_dump(mode="json"),
             "identity_fingerprint": self.identity.fingerprint,
         }
@@ -715,6 +732,7 @@ class PageOrchestrator:
         budget = _BudgetLedger(self.config.max_budget_rub, records)
         queue: asyncio.Queue[int | None] = asyncio.Queue(maxsize=max(1, self.config.concurrency * 2))
         stop_scheduling = asyncio.Event()
+        stop_code: str | None = None
         finished = sum(1 for record in records.values() if record.state in ("completed", "failed", "unknown_outcome"))
 
         async def notify(page_number: int, state: str) -> None:
@@ -744,12 +762,18 @@ class PageOrchestrator:
                 await queue.put(None)
 
         async def process_page(number: int) -> None:
+            nonlocal stop_code
             current = records[number]
             try:
+                _assert_source_signature(pdf_path, identity)
                 image = await asyncio.to_thread(
                     self.renderer.render, pdf_path, number, self.config.dpi, self.config,
                 )
+                _assert_source_signature(pdf_path, identity)
             except OrchestrationError as exc:
+                if exc.code == "source_changed_during_run":
+                    stop_code = exc.code
+                    stop_scheduling.set()
                 records[number] = current.model_copy(update={
                     "state": "failed", "updated_at": _utc_now(),
                     "attempts": [*current.attempts, PageAttempt(
@@ -761,11 +785,22 @@ class PageOrchestrator:
                 await notify(number, "failed")
                 return
             except Exception:
+                try:
+                    _assert_source_signature(pdf_path, identity)
+                except OrchestrationError as source_exc:
+                    if source_exc.code == "source_changed_during_run":
+                        stop_code = source_exc.code
+                        stop_scheduling.set()
+                        safe_error_code = source_exc.code
+                    else:
+                        safe_error_code = "page_render_failed"
+                else:
+                    safe_error_code = "page_render_failed"
                 records[number] = current.model_copy(update={
                     "state": "failed", "updated_at": _utc_now(),
                     "attempts": [*current.attempts, PageAttempt(
                         state="failed", started_at=_utc_now(), finished_at=_utc_now(),
-                        safe_error_code="page_render_failed", elapsed_s=0.0,
+                        safe_error_code=safe_error_code, elapsed_s=0.0,
                     )],
                 })
                 await self.checkpoint.write(records[number])
@@ -824,6 +859,7 @@ class PageOrchestrator:
             reserve = self.config.pricing.reserve_cost(estimate.reserved_input_tokens, estimate.reserved_output_tokens)
             if not await budget.reserve(reserve):
                 self._active_images.pop(number, None)
+                stop_code = "budget_exhausted"
                 stop_scheduling.set()
                 return
 
@@ -840,7 +876,7 @@ class PageOrchestrator:
             records[number] = running
             await self.checkpoint.write(running)
             await notify(number, "running")
-            async def stop_before_dispatch(code: str) -> None:
+            async def stop_before_dispatch(code: str, *, terminal: bool = False) -> None:
                 latest = running.attempts[-1].model_copy(update={
                     "state": "failed", "request_started": False,
                     "finished_at": _utc_now(), "safe_error_code": code,
@@ -848,25 +884,48 @@ class PageOrchestrator:
                 })
                 await budget.settle(reserve, None, request_started=False)
                 records[number] = running.model_copy(update={
-                    "state": "pending", "attempts": [*running.attempts[:-1], latest],
+                    "state": "failed" if terminal else "pending",
+                    "attempts": [*running.attempts[:-1], latest],
                     "updated_at": _utc_now(),
                 })
                 self._active_images.pop(number, None)
                 await self.checkpoint.write(records[number])
-                await notify(number, "pending")
+                await notify(number, "failed" if terminal else "pending")
 
             if cancel_event.is_set():
                 await stop_before_dispatch("cancelled_before_dispatch")
                 return
+            try:
+                _assert_source_signature(pdf_path, identity)
+            except OrchestrationError as exc:
+                stop_code = exc.code
+                stop_scheduling.set()
+                await stop_before_dispatch(exc.code, terminal=True)
+                return
             if not await rate_gate.acquire(estimate.reserved_input_tokens + estimate.reserved_output_tokens, cancel_event, stop_scheduling):
-                code = "cancelled_before_dispatch" if cancel_event.is_set() else "budget_stopped_before_dispatch"
-                await stop_before_dispatch(code)
+                code = "cancelled_before_dispatch" if cancel_event.is_set() else (
+                    "budget_stopped_before_dispatch" if stop_code == "budget_exhausted"
+                    else stop_code or "orchestration_stopped_before_dispatch"
+                )
+                await stop_before_dispatch(
+                    code, terminal=stop_code not in (None, "budget_exhausted") and not cancel_event.is_set(),
+                )
                 return
             if cancel_event.is_set():
                 await stop_before_dispatch("cancelled_before_dispatch")
                 return
+            try:
+                _assert_source_signature(pdf_path, identity)
+            except OrchestrationError as exc:
+                stop_code = exc.code
+                stop_scheduling.set()
+                await stop_before_dispatch(exc.code, terminal=True)
+                return
             if stop_scheduling.is_set():
-                await stop_before_dispatch("budget_stopped_before_dispatch")
+                code = stop_code or "orchestration_stopped_before_dispatch"
+                await stop_before_dispatch(
+                    code, terminal=stop_code not in (None, "budget_exhausted"),
+                )
                 return
 
             response: AdapterPageResult | None = None
@@ -939,6 +998,8 @@ class PageOrchestrator:
                 "elapsed_s": time.perf_counter() - request_started_at,
             })
             if await budget.settle(reserve, actual_cost, request_started=True):
+                if stop_code is None:
+                    stop_code = "budget_exhausted"
                 stop_scheduling.set()
             extraction_value = response.extraction if response is not None else running.extraction
             descriptor = self.adapter.descriptor
@@ -1008,7 +1069,11 @@ class PageOrchestrator:
             else:
                 code = record.attempts[-1].safe_error_code if record.attempts else None
                 if code is None and stop_scheduling.is_set():
-                    code = "budget_exhausted_before_dispatch"
+                    code = (
+                        "budget_exhausted_before_dispatch"
+                        if stop_code == "budget_exhausted"
+                        else stop_code or "orchestration_stopped_before_dispatch"
+                    )
                 elif code is None and cancel_event.is_set():
                     code = "cancelled_before_dispatch"
                 else:
@@ -1053,6 +1118,10 @@ class PageOrchestrator:
             return sum(values)
         if cancel_event.is_set():
             status: Literal["completed", "completed_with_errors", "cancelled", "budget_exhausted"] = "cancelled"
+        elif stop_code == "budget_exhausted":
+            status = "budget_exhausted"
+        elif stop_code is not None:
+            status = "completed_with_errors"
         elif stop_scheduling.is_set():
             status = "budget_exhausted"
         elif any(record.state in ("failed", "unknown_outcome", "pending") for record in ordered_records):

@@ -115,11 +115,17 @@ class SyntheticAdapter:
             self.finished.append(number)
 
 
-def run_job(tmp_path: Path, pdf: Path, adapter, *, config=None, checkpoint=None, run_id="synthetic-run", progress=None, rate_window_s=0.01, **kwargs):
+def run_job(
+    tmp_path: Path, pdf: Path, adapter, *, config=None, checkpoint=None,
+    run_id="synthetic-run", progress=None, renderer=None, rate_window_s=0.01, **kwargs,
+):
     config = config or make_config()
     identity = inspect_pdf(pdf, adapter, config, run_id=run_id)
     store = CheckpointStore(checkpoint or tmp_path / "private-checkpoint", identity)
-    orchestrator = PageOrchestrator(adapter, SyntheticRenderer(), config, store, progress=progress, rate_window_s=rate_window_s)
+    orchestrator = PageOrchestrator(
+        adapter, renderer or SyntheticRenderer(), config, store,
+        progress=progress, rate_window_s=rate_window_s,
+    )
     return asyncio.run(orchestrator.run(pdf, **kwargs))
 
 
@@ -162,6 +168,81 @@ def test_one_page_failure_preserves_successes_and_full_page_manifest(tmp_path):
     assert report.actual_input_tokens == 50
     assert report.actual_output_tokens == 40
     assert report.pages[0].extraction.raw_model_payload["future_vendor_field"] == SYNTHETIC_RAW
+
+
+def test_source_change_stops_later_pages_and_preserves_completed_results(tmp_path):
+    pdf = make_pdf(tmp_path / "source-changes-mid-run.pdf", 3)
+    adapter = SyntheticAdapter()
+
+    def mutate_after_first_page(event):
+        if event.page_number == 1 and event.state == "completed":
+            with pdf.open("ab") as stream:
+                stream.write(b"synthetic source mutation")
+
+    report = run_job(
+        tmp_path, pdf, adapter, config=make_config(concurrency=1),
+        progress=mutate_after_first_page,
+    )
+
+    assert report.status == "completed_with_errors"
+    assert adapter.calls == [1]
+    assert report.pages[0].state == "completed"
+    assert report.pages[0].attempts[-1].usage == TokenUsage(input_tokens=10, output_tokens=8)
+    assert report.pages[1].state == "failed"
+    assert report.pages[1].attempts[-1].safe_error_code == "source_changed_during_run"
+    assert report.pages[2].state == "pending"
+    assert report.draft.pages[0].status == "no_specification"
+    assert [page.status for page in report.draft.pages[1:]] == ["failed", "failed"]
+
+
+def test_source_change_during_render_prevents_dispatch(tmp_path):
+    pdf = make_pdf(tmp_path / "source-changes-during-render.pdf", 2)
+
+    class MutatingRenderer(SyntheticRenderer):
+        def render(self, pdf_path, page_number, dpi, config):
+            image = super().render(pdf_path, page_number, dpi, config)
+            with Path(pdf_path).open("ab") as stream:
+                stream.write(b"synthetic render-time mutation")
+            return image
+
+    adapter = SyntheticAdapter()
+    report = run_job(
+        tmp_path, pdf, adapter, config=make_config(concurrency=1),
+        renderer=MutatingRenderer(),
+    )
+
+    assert report.status == "completed_with_errors"
+    assert adapter.calls == []
+    assert report.pages[0].state == "failed"
+    assert report.pages[0].attempts[-1].safe_error_code == "source_changed_during_run"
+    assert report.pages[1].state == "pending"
+
+
+def test_source_change_after_rate_gate_prevents_dispatch(tmp_path, monkeypatch):
+    from averon_import.services.ai_first import orchestration
+
+    pdf = make_pdf(tmp_path / "source-changes-after-rate-gate.pdf")
+    adapter = SyntheticAdapter()
+    original_acquire = orchestration._RateGate.acquire
+    mutated = False
+
+    async def acquire_then_mutate(gate, *args, **kwargs):
+        nonlocal mutated
+        acquired = await original_acquire(gate, *args, **kwargs)
+        if acquired and not mutated:
+            with pdf.open("ab") as stream:
+                stream.write(b"synthetic rate-gate mutation")
+            mutated = True
+        return acquired
+
+    monkeypatch.setattr(orchestration._RateGate, "acquire", acquire_then_mutate)
+    report = run_job(tmp_path, pdf, adapter)
+
+    assert report.status == "completed_with_errors"
+    assert mutated
+    assert adapter.calls == []
+    assert report.pages[0].state == "failed"
+    assert report.pages[0].attempts[-1].safe_error_code == "source_changed_during_run"
 
 
 def test_resume_skips_all_completed_pages_without_repeating_requests(tmp_path):
