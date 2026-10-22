@@ -15,16 +15,32 @@ budget reservation. It does not send HTTP. Its `report.json` is written to a
 private per-run directory. The live request key must come from the configured
 secure secret store; an API-key environment override fails preflight.
 
-A live request requires both `--allow-paid-api` and
-`--confirm-live-preflight`. The second flag records the operator's confirmation
-that the currently applicable RPM, TPM, tariff, budget, and conservative
-input-token upper bound were checked. The runner fixes concurrency and request
-count at one, has no retry path, and only sends the selected page. The request
-may still fail after all local checks pass. An HTTP 5xx, timeout, or cancellation
-after dispatch can have an unknown provider-side outcome; the runner records
-that outcome and does not retry it. Ctrl+C requests cooperative cancellation;
-after dispatch the runner waits for the in-flight transport to settle or time
-out so it can write the final diagnostic report.
+A live request requires `--allow-paid-api` and `--confirm-live-preflight`.
+The latter confirms the successful local checks: allowed model and endpoint,
+rendered request size, protected output ACLs, configured operator limits,
+tariff, budget, and input-token bound. It does not confirm provider-account
+RPM/TPM quotas. If either account quota is unconfirmed, live also requires the
+separate `--accept-unverified-account-quotas` acknowledgement. That flag records
+acceptance of a possible provider quota rejection; it does not turn local
+limits into verified Yandex quotas.
+
+For quotas confirmed by the operator in the applicable account, pass both
+`--verified-account-rpm` and `--verified-account-tpm`. The runner records those
+operator-supplied values as verified and rejects local limits above them. It
+does not query the account or independently validate that assertion. If either
+value is omitted, `account_quota_status` remains `unconfirmed` and the separate
+risk acknowledgement is required for live mode. Reports distinguish local
+limits from account quota verification. The per-user lock only covers this
+pilot runner; the runner cannot verify whether another application or machine
+is making requests with the same credential.
+
+The runner fixes concurrency and request count at one, has no retry path, and
+only sends the selected page. The request may still fail after all local checks
+pass. An HTTP 5xx, timeout, or cancellation after dispatch can have an unknown
+provider-side outcome; the runner records that outcome and does not retry it.
+Ctrl+C requests cooperative cancellation; after dispatch the runner waits for
+the in-flight transport to settle or time out so it can write the final
+diagnostic report.
 
 Example offline preflight (replace the PDF and values with those reviewed for
 the intended pilot):
@@ -40,17 +56,33 @@ python -m averon_import.tools.qwen_vision_controlled_pilot `
 ```
 
 After the dry-run report has been reviewed and the user has explicitly
-authorized one paid request, the same command can be repeated with
-`--allow-paid-api --confirm-live-preflight`. Do not change its model, PDF,
-selected page, token bound, output limit, pricing, or budget between the
-reviewed preflight and live run. There is no automatic fallback request.
+authorized one paid request, repeat the same command with
+`--allow-paid-api --confirm-live-preflight`. If account quotas remain unknown,
+also pass `--accept-unverified-account-quotas`; if verified, pass both verified
+account quota values instead. Do not change the model, PDF, selected page, token
+bound, output limit, pricing, or budget between the reviewed preflight and live
+run. There is no automatic fallback request.
 
 The `--input-token-upper-bound` is an operator-supplied conservative reservation.
 This runner cannot independently derive the provider's image-token count, so a
 small or guessed value is not safe merely because preflight accepts it. Confirm
 it against current provider guidance or a separately approved conservative
 calculation, then ensure input bound plus maximum output tokens fit within the
-confirmed TPM. The tariff flags are also operator-supplied: verify the active
+confirmed TPM and the model context window. Yandex publishes a rounded `262k`
+context window and a default maximum output of 32,768 tokens for Qwen 3.6
+35B-A3B in its [model announcement](https://yandex.cloud/ru/blog/digest-april-2026).
+The Chat Completions reference counts completion tokens against context limits
+and defines `max_completion_tokens` as including visible and reasoning tokens
+([API reference](https://aistudio.yandex.ru/ru/docs/ai-studio/api/Chat-Completions/createChatCompletion)).
+This runner conservatively treats the context as 262,000 tokens and
+blocks preflight when the input upper bound plus output cap exceeds it. The
+bound is a reservation, not a measurement of actual image tokens; a value that
+exceeds the context cannot guarantee that the largest permitted prompt and
+completion fit. Do not lower it just to pass preflight: establish a defensible
+image-token upper bound first. For example, the pair 262,144 input plus 32,768
+output reserves 294,912 tokens and is rejected against this context limit.
+
+The tariff flags are also operator-supplied: verify the active
 model's uncached input, cached input, and output prices and include a stable,
 non-secret profile identifier. The runner checks positive finite values and
 that the budget covers the maximum reserved cost; it cannot verify a tariff
@@ -60,7 +92,11 @@ against a billing account.
 
 The V2B.2 RPM/TPM quota registry is process-local. It does not know the recent
 usage of another process, another machine, or requests made before a process
-restart. This pilot runner adds a per-user cross-process lock and a conservative
+restart. Report fields `local_rpm_limit` and `local_tpm_limit` are application
+caps, not provider quota claims. `account_quota_status`,
+`account_rpm_verified`, and `account_tpm_verified` reflect only the operator's
+explicitly supplied verification state. This pilot runner adds a per-user
+cross-process lock and a conservative
 360-second launch cooldown in the stable application data directory. The
 cooldown exceeds the 300-second maximum request timeout by one minute, so a
 restart after a client timeout cannot immediately submit another pilot request.

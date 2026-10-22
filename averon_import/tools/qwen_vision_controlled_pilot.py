@@ -1,7 +1,8 @@
 """One-page, offline-first Qwen Vision pilot runner.
 
-This entry point is intentionally isolated from the application runtime. A live
-request requires both ``--allow-paid-api`` and ``--confirm-live-preflight``.
+This entry point is intentionally isolated from the application runtime. Live
+requests require explicit permission and local-preflight confirmation; when
+account quotas are unconfirmed, a separate risk-acceptance flag is required.
 """
 from __future__ import annotations
 
@@ -50,6 +51,9 @@ from averon_import.tools.qwen_vision_pilot import (
 PILOT_RETENTION_DAYS = 7
 PILOT_COOLDOWN_SECONDS = 360
 MAX_PILOT_DPI = 300
+# Yandex publishes this model's context as 262k. Use the conservative decimal
+# interpretation until the provider documents an exact token count.
+PUBLISHED_CONTEXT_WINDOW_TOKENS = 262_000
 _ALLOWED_MODEL = re.compile(r"^gpt://[^/\s]+/qwen3\.6-35b-a3b$", re.IGNORECASE)
 _PILOT_QUOTA_REGISTRY = QwenVisionQuotaRegistry()
 
@@ -78,6 +82,28 @@ def _positive_decimal(value: str) -> Decimal:
     if not parsed.is_finite() or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a finite positive decimal")
     return parsed
+
+
+def _quota_report(args: argparse.Namespace) -> dict[str, Any]:
+    verified_rpm = getattr(args, "verified_account_rpm", None)
+    verified_tpm = getattr(args, "verified_account_tpm", None)
+    rpm_verified = type(verified_rpm) is int and verified_rpm > 0
+    tpm_verified = type(verified_tpm) is int and verified_tpm > 0
+    quotas_verified = rpm_verified and tpm_verified
+    risk_flag = bool(getattr(args, "accept_unverified_account_quotas", False))
+    return {
+        "local_rpm_limit": getattr(args, "requests_per_minute", None),
+        "local_tpm_limit": getattr(args, "tokens_per_minute", None),
+        "account_quota_status": "verified" if quotas_verified else "unconfirmed",
+        "account_quota_verification_basis": "operator_assertion" if quotas_verified else None,
+        "account_rpm_verified": rpm_verified,
+        "account_tpm_verified": tpm_verified,
+        "verified_account_rpm": verified_rpm if rpm_verified else None,
+        "verified_account_tpm": verified_tpm if tpm_verified else None,
+        "unverified_quota_risk_accepted": risk_flag and not quotas_verified,
+        "external_shared_credential_activity": "not_verifiable_by_runner",
+        "runner_lock_scope": "this_pilot_runner_only",
+    }
 
 
 def _default_output_root() -> Path:
@@ -117,8 +143,22 @@ def _parser() -> argparse.ArgumentParser:
         help="Per-request timeout (up to 300 seconds)",
     )
     parser.add_argument("--disable-reasoning", action="store_true")
-    parser.add_argument("--requests-per-minute", type=_positive_int, required=True)
-    parser.add_argument("--tokens-per-minute", type=_positive_int, required=True)
+    parser.add_argument(
+        "--requests-per-minute", type=_positive_int, required=True,
+        help="Averon-local request cap; not a verified Yandex account quota",
+    )
+    parser.add_argument(
+        "--tokens-per-minute", type=_positive_int, required=True,
+        help="Averon-local token cap; not a verified Yandex account quota",
+    )
+    parser.add_argument(
+        "--verified-account-rpm", type=_positive_int,
+        help="Operator-verified account RPM quota; omit when unknown",
+    )
+    parser.add_argument(
+        "--verified-account-tpm", type=_positive_int,
+        help="Operator-verified account TPM quota; omit when unknown",
+    )
     parser.add_argument("--input-token-upper-bound", type=_positive_int, required=True)
     parser.add_argument("--input-rub-per-1k", type=_positive_decimal, required=True)
     parser.add_argument("--cached-input-rub-per-1k", type=_positive_decimal, required=True)
@@ -133,7 +173,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--confirm-live-preflight", action="store_true",
-        help="Confirm current RPM/TPM, tariffs and input-token upper bound were verified",
+        help="Confirm local model/endpoint, request, ACL, budget, tariff and configured limits passed preflight",
+    )
+    parser.add_argument(
+        "--accept-unverified-account-quotas", action="store_true",
+        help="Explicitly accept quota rejection risk when account RPM/TPM are unconfirmed",
     )
     return parser
 
@@ -408,6 +452,13 @@ def run(
         "mode": "live" if args.allow_paid_api else "dry_run",
         "status": "preflight_failed",
         "selected_page": args.page,
+        "quota": _quota_report(args),
+        "model_context": {
+            "published_context_window_tokens": PUBLISHED_CONTEXT_WINDOW_TOKENS,
+            "published_value_label": "262k (rounded by provider)",
+            "reserved_input_plus_max_output_tokens": None,
+            "reservation_fits": None,
+        },
         "request_limits": {
             "concurrency": 1, "max_requests": 1, "automatic_retries": False,
             "cross_process_launch_cooldown_s": PILOT_COOLDOWN_SECONDS,
@@ -445,6 +496,10 @@ def run(
             raise ControlledPilotError("rpm_invalid")
         if type(args.tokens_per_minute) is not int or args.tokens_per_minute < 1:
             raise ControlledPilotError("tpm_invalid")
+        for name in ("verified_account_rpm", "verified_account_tpm"):
+            value = getattr(args, name, None)
+            if value is not None and (type(value) is not int or value < 1):
+                raise ControlledPilotError("account_quota_invalid")
         if type(args.input_token_upper_bound) is not int or args.input_token_upper_bound < 1:
             raise ControlledPilotError("input_token_bound_invalid")
         for name in ("input_rub_per_1k", "cached_input_rub_per_1k", "output_rub_per_1k", "budget_rub"):
@@ -459,6 +514,23 @@ def run(
             raise ControlledPilotError("request_timeout_invalid")
         if args.allow_paid_api and not args.confirm_live_preflight:
             raise ControlledPilotError("live_preflight_confirmation_required")
+        quota = report["quota"]
+        if (
+            args.allow_paid_api
+            and quota["account_quota_status"] == "unconfirmed"
+            and not args.accept_unverified_account_quotas
+        ):
+            raise ControlledPilotError("unverified_account_quotas_not_accepted")
+        if (
+            args.verified_account_rpm is not None
+            and args.requests_per_minute > args.verified_account_rpm
+        ):
+            raise ControlledPilotError("local_rpm_exceeds_verified_account_quota")
+        if (
+            args.verified_account_tpm is not None
+            and args.tokens_per_minute > args.verified_account_tpm
+        ):
+            raise ControlledPilotError("local_tpm_exceeds_verified_account_quota")
 
         limits = VisionLimits(
             max_requests=1,
@@ -506,6 +578,11 @@ def run(
             output_rub_per_1k=args.output_rub_per_1k,
         )
         reserved_tokens = args.input_token_upper_bound + args.max_output_tokens
+        context_fits = reserved_tokens <= PUBLISHED_CONTEXT_WINDOW_TOKENS
+        report["model_context"].update({
+            "reserved_input_plus_max_output_tokens": reserved_tokens,
+            "reservation_fits": context_fits,
+        })
         maximum_cost = pricing.reserve_cost(args.input_token_upper_bound, args.max_output_tokens)
         checks = report["preflight"]["checks"]
         checks.update({
@@ -514,14 +591,17 @@ def run(
             "credentials_configured": credential_ok,
             "credential_store_secure": secure_store,
             "credential_source": credential_source,
-            "rpm_configured": args.requests_per_minute,
-            "tpm_configured": args.tokens_per_minute,
+            "local_rpm_limit": args.requests_per_minute,
+            "local_tpm_limit": args.tokens_per_minute,
             "pricing_configured": True,
             "input_token_upper_bound_configured": args.input_token_upper_bound,
             "token_reservation": reserved_tokens,
+            "model_context_window_tokens": PUBLISHED_CONTEXT_WINDOW_TOKENS,
+            "model_context_reservation_fits": context_fits,
             "max_output_tokens": args.max_output_tokens,
             "budget_rub": str(args.budget_rub),
             "maximum_reserved_cost_rub": _safe_cost(maximum_cost),
+            "max_request_bytes": limits.max_request_bytes,
             "request_body_bytes": None,
             "image_width": None,
             "image_height": None,
@@ -548,6 +628,8 @@ def run(
             raise ControlledPilotError("environment_credential_not_allowed")
         if not secure_store:
             raise ControlledPilotError("credential_store_insecure")
+        if not context_fits:
+            raise ControlledPilotError("model_context_reservation_exceeds_window")
         if reserved_tokens > args.tokens_per_minute:
             raise ControlledPilotError("token_reservation_exceeds_tpm")
         if maximum_cost > args.budget_rub:
@@ -574,12 +656,22 @@ def run(
         estimate = adapter.estimate(image)
         if estimate.reserved_input_tokens != args.input_token_upper_bound:
             raise ControlledPilotError("input_token_reservation_mismatch")
-        if estimate.reserved_input_tokens + estimate.reserved_output_tokens > args.tokens_per_minute:
+        estimated_context_reservation = estimate.reserved_input_tokens + estimate.reserved_output_tokens
+        report["model_context"].update({
+            "reserved_input_plus_max_output_tokens": estimated_context_reservation,
+            "reservation_fits": estimated_context_reservation <= PUBLISHED_CONTEXT_WINDOW_TOKENS,
+        })
+        if estimated_context_reservation > PUBLISHED_CONTEXT_WINDOW_TOKENS:
+            raise ControlledPilotError("model_context_reservation_exceeds_window")
+        if estimated_context_reservation > args.tokens_per_minute:
             raise ControlledPilotError("token_reservation_exceeds_tpm")
+        request_body_bytes = adapter.client.measure_request_bytes(image.data, args.page)
+        checks["request_body_bytes"] = request_body_bytes
+        if request_body_bytes > limits.max_request_bytes:
+            raise ControlledPilotError("request_size_limit")
         checks.update({
             "pdf_page_count": identity.page_count,
             "source_sha256": identity.source_sha256,
-            "request_body_bytes": adapter.client.measure_request_bytes(image.data, args.page),
             "image_width": image.width,
             "image_height": image.height,
             "image_bytes": len(image.data),
@@ -588,6 +680,10 @@ def run(
         })
         report["preflight"]["status"] = "passed"
         report["preflight"]["errors"] = []
+        report["preflight"]["operator_confirmation"] = {
+            "local_preflight_confirmed": bool(args.confirm_live_preflight),
+            "unverified_quota_risk_accepted": quota["unverified_quota_risk_accepted"],
+        }
         report["configuration"] = {
             "model_family": "qwen3.6-35b-a3b",
             "model_uri_redacted": True,

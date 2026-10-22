@@ -13,7 +13,9 @@ import fitz
 import pytest
 
 from averon_import.services.ai_first import orchestration
-from averon_import.services.ocr.qwen_vision_client import _HttpsTransport, VisionHttpResponse
+from averon_import.services.ocr.qwen_vision_client import (
+    QwenVisionClient, _HttpsTransport, VisionHttpResponse,
+)
 from averon_import.tools import qwen_vision_controlled_pilot as pilot
 
 
@@ -115,6 +117,13 @@ def _args(tmp_path: Path, pdf: Path, *extra: str):
     ])
 
 
+def _unverified_quota_live_args(tmp_path: Path, pdf: Path, *extra: str):
+    return _args(
+        tmp_path, pdf, "--allow-paid-api", "--confirm-live-preflight",
+        "--accept-unverified-account-quotas", *extra,
+    )
+
+
 def _vision_payload(page: int = 2) -> dict:
     return {
         "page": page,
@@ -187,6 +196,20 @@ def test_default_is_offline_preflight_and_does_not_save_transcription(tmp_path, 
     assert report["preflight"]["checks"]["image_and_request_limits_passed"] is True
     assert report["preflight"]["checks"]["token_reservation"] == 42768
     assert report["preflight"]["checks"]["budget_covers_worst_case_reservation"] is True
+    assert report["quota"] == {
+        "local_rpm_limit": 1,
+        "local_tpm_limit": 50000,
+        "account_quota_status": "unconfirmed",
+        "account_quota_verification_basis": None,
+        "account_rpm_verified": False,
+        "account_tpm_verified": False,
+        "verified_account_rpm": None,
+        "verified_account_tpm": None,
+        "unverified_quota_risk_accepted": False,
+        "external_shared_credential_activity": "not_verifiable_by_runner",
+        "runner_lock_scope": "this_pilot_runner_only",
+    }
+    assert report["model_context"]["reservation_fits"] is True
     assert report["retention"]["automatic_deletion"] is False
     assert transport.calls == []
     assert not (run_dir / "transcription.json").exists()
@@ -220,9 +243,10 @@ def test_output_root_inside_repository_is_rejected_before_directory_creation(tmp
     ("gpt://test-folder/qwen3.6-35b-a3b", "https://example.invalid/v1", "unexpected_ai_endpoint"),
 ])
 def test_preflight_rejects_unapproved_model_or_endpoint(tmp_path, synthetic_pdf, model, endpoint, error_code):
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response())
     code, _run_dir, report = _run(
-        tmp_path, synthetic_pdf, transport=transport,
+        tmp_path, synthetic_pdf, args=args, transport=transport,
         settings_factory=_settings_factory(model=model, endpoint=endpoint),
     )
     assert code != 0
@@ -253,7 +277,7 @@ def test_preflight_rejects_missing_or_insecure_credentials(tmp_path, synthetic_p
 
 def test_preflight_rejects_environment_key_override_without_disclosing_value(tmp_path, synthetic_pdf, monkeypatch):
     monkeypatch.setenv("AVERON_YANDEX_AI_API_KEY", SYNTHETIC_KEY)
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response())
     code, run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
     assert code != 0
@@ -269,7 +293,7 @@ def test_preflight_rejects_environment_key_override_without_disclosing_value(tmp
     ({"output_rub_per_1k": Decimal("NaN")}, "tariff_or_budget_invalid"),
 ])
 def test_preflight_rejects_budget_tpm_and_invalid_tariff(tmp_path, synthetic_pdf, change, error_code):
-    args = _args(tmp_path, synthetic_pdf)
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     for name, value in change.items():
         setattr(args, name, value)
     transport = FakeTransport(_response())
@@ -288,8 +312,19 @@ def test_live_requires_both_explicit_permission_flags(tmp_path, synthetic_pdf):
     assert transport.calls == []
 
 
-def test_live_sends_only_selected_page_once_and_saves_private_transcription(tmp_path, synthetic_pdf):
+def test_live_requires_separate_acceptance_of_unverified_account_quotas(tmp_path, synthetic_pdf):
     args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    transport = FakeTransport(_response())
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+    assert code != 0
+    assert "unverified_account_quotas_not_accepted" in report["preflight"]["errors"]
+    assert report["quota"]["account_quota_status"] == "unconfirmed"
+    assert report["quota"]["unverified_quota_risk_accepted"] is False
+    assert transport.calls == []
+
+
+def test_live_sends_only_selected_page_once_and_saves_private_transcription(tmp_path, synthetic_pdf):
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response())
     code, run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
 
@@ -311,6 +346,15 @@ def test_live_sends_only_selected_page_once_and_saves_private_transcription(tmp_
     assert report["structure"]["source_row_count"] == 1
     assert report["structure"]["records_requiring_review_count"] == 1
     assert report["structure"]["completeness_verified"] is False
+    assert report["quota"]["account_quota_status"] == "unconfirmed"
+    assert report["quota"]["account_rpm_verified"] is False
+    assert report["quota"]["account_tpm_verified"] is False
+    assert report["quota"]["unverified_quota_risk_accepted"] is True
+    assert report["quota"]["external_shared_credential_activity"] == "not_verifiable_by_runner"
+    assert report["preflight"]["operator_confirmation"] == {
+        "local_preflight_confirmed": True,
+        "unverified_quota_risk_accepted": True,
+    }
     assert report["transcription_saved"] is True
     assert len(transport.calls) == 1
     assert "Source page number: 2" in transport.calls[0]["payload"]["messages"][1]["content"][0]["text"]
@@ -323,7 +367,7 @@ def test_live_sends_only_selected_page_once_and_saves_private_transcription(tmp_
 
 
 def test_cancel_before_dispatch_does_not_send_http(tmp_path, synthetic_pdf):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     event = asyncio.Event()
     event.set()
     transport = FakeTransport(_response())
@@ -337,7 +381,7 @@ def test_cancel_before_dispatch_does_not_send_http(tmp_path, synthetic_pdf):
 
 
 def test_cancel_after_dispatch_records_unknown_and_does_not_retry(tmp_path, synthetic_pdf):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     event = asyncio.Event()
 
     class CancelAfterDispatchTransport(FakeTransport):
@@ -364,7 +408,7 @@ def test_cancel_after_dispatch_records_unknown_and_does_not_retry(tmp_path, synt
 
 
 def test_http_503_is_unknown_and_not_retried_but_keeps_usage(tmp_path, synthetic_pdf):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response(status=503))
     code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
     assert code != 0
@@ -377,7 +421,7 @@ def test_http_503_is_unknown_and_not_retried_but_keeps_usage(tmp_path, synthetic
 
 
 def test_http_429_is_reported_as_failure_without_retry(tmp_path, synthetic_pdf):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response(status=429))
     code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
     assert code != 0
@@ -389,7 +433,7 @@ def test_http_429_is_reported_as_failure_without_retry(tmp_path, synthetic_pdf):
 
 
 def test_incomplete_response_reports_finish_reason_and_is_not_retried(tmp_path, synthetic_pdf):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response(finish_reason="length"))
     code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
     assert code != 0
@@ -403,7 +447,7 @@ def test_incomplete_response_reports_finish_reason_and_is_not_retried(tmp_path, 
 
 
 def test_transport_error_is_unknown_keeps_reserved_possible_cost_and_no_retry(tmp_path, synthetic_pdf):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(error=OSError(f"private {SYNTHETIC_KEY} response text"))
     code, run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
     assert code != 0
@@ -427,7 +471,7 @@ def test_persistent_guard_enforces_cooldown_across_runner_restarts(tmp_path, mon
 
 
 def test_live_refuses_http_when_output_acl_cannot_be_verified(tmp_path, synthetic_pdf, monkeypatch):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response())
 
     def unverified(_path):
@@ -440,7 +484,7 @@ def test_live_refuses_http_when_output_acl_cannot_be_verified(tmp_path, syntheti
 
 
 def test_live_refuses_http_when_checkpoint_acl_cannot_be_established(tmp_path, synthetic_pdf, monkeypatch):
-    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
     transport = FakeTransport(_response())
 
     original_verifier = pilot.verify_private_tree
@@ -456,4 +500,87 @@ def test_live_refuses_http_when_checkpoint_acl_cannot_be_established(tmp_path, s
     assert code != 0
     assert "checkpoint_permissions_failed" in report["errors"]
     assert report["storage_security"]["checkpoint_tree_dacl"] == "unverified"
+    assert transport.calls == []
+
+
+def test_verified_account_quotas_allow_live_without_risk_override(tmp_path, synthetic_pdf):
+    args = _args(
+        tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight",
+        "--verified-account-rpm", "5", "--verified-account-tpm", "60000",
+    )
+    transport = FakeTransport(_response())
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+
+    assert code == 0
+    assert report["status"] == "completed"
+    assert report["quota"]["account_quota_status"] == "verified"
+    assert report["quota"]["account_quota_verification_basis"] == "operator_assertion"
+    assert report["quota"]["account_rpm_verified"] is True
+    assert report["quota"]["account_tpm_verified"] is True
+    assert report["quota"]["verified_account_rpm"] == 5
+    assert report["quota"]["verified_account_tpm"] == 60000
+    assert report["quota"]["unverified_quota_risk_accepted"] is False
+    assert len(transport.calls) == 1
+
+
+def test_partial_quota_verification_still_requires_risk_acceptance(tmp_path, synthetic_pdf):
+    args = _args(
+        tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight",
+        "--verified-account-rpm", "5",
+    )
+    transport = FakeTransport(_response())
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+
+    assert code != 0
+    assert "unverified_account_quotas_not_accepted" in report["errors"]
+    assert report["quota"]["account_quota_status"] == "unconfirmed"
+    assert report["quota"]["account_rpm_verified"] is True
+    assert report["quota"]["account_tpm_verified"] is False
+    assert transport.calls == []
+
+
+def test_local_limits_cannot_exceed_operator_verified_account_quotas(tmp_path, synthetic_pdf):
+    args = _args(
+        tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight",
+        "--verified-account-rpm", "1", "--verified-account-tpm", "40000",
+    )
+    transport = FakeTransport(_response())
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+
+    assert code != 0
+    assert "local_tpm_exceeds_verified_account_quota" in report["errors"]
+    assert transport.calls == []
+
+
+def test_request_body_size_failure_still_blocks_http_after_quota_risk_acceptance(
+    tmp_path, synthetic_pdf, monkeypatch,
+):
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
+    transport = FakeTransport(_response())
+    monkeypatch.setattr(
+        QwenVisionClient, "measure_request_bytes",
+        lambda *_args, **_kwargs: 6 * 1024 * 1024 + 1,
+    )
+
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+
+    assert code != 0
+    assert "request_size_limit" in report["errors"]
+    assert report["preflight"]["checks"]["request_body_bytes"] == 6 * 1024 * 1024 + 1
+    assert transport.calls == []
+
+
+def test_context_reservation_above_published_window_fails_closed(tmp_path, synthetic_pdf):
+    args = _unverified_quota_live_args(tmp_path, synthetic_pdf)
+    args.input_token_upper_bound = 262144
+    args.tokens_per_minute = 294912
+    args.budget_rub = Decimal("63")
+    transport = FakeTransport(_response())
+
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+
+    assert code != 0
+    assert report["model_context"]["reserved_input_plus_max_output_tokens"] == 294912
+    assert report["model_context"]["reservation_fits"] is False
+    assert "model_context_reservation_exceeds_window" in report["errors"]
     assert transport.calls == []
