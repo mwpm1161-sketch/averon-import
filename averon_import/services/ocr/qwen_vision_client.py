@@ -6,6 +6,7 @@ Image + strict schema support for a specific deployed model is NOT live-tested.
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import math
@@ -178,7 +179,15 @@ class _HttpsTransport:
             response = connection.getresponse()
             response_headers = {"x-request-id": response.getheader("x-request-id", "")}
             if not 200 <= response.status < 300:
-                return VisionHttpResponse(response.status, b"", response_headers)
+                try:
+                    error_body = response.read(max_response_bytes + 1)
+                    if len(error_body) > max_response_bytes:
+                        error_body = b""
+                except Exception:
+                    # Preserve the known HTTP status even if the optional body
+                    # cannot be read before the request deadline.
+                    error_body = b""
+                return VisionHttpResponse(response.status, error_body, response_headers)
             chunks: list[bytes] = []
             size = 0
             while True:
@@ -296,6 +305,11 @@ class QwenVisionClient:
         self._transport = transport if transport is not None else _HttpsTransport()
         self._clock = clock
 
+    @property
+    def prompt_sha256(self) -> str:
+        """Stable identity of the exact system prompt used in request bodies."""
+        return hashlib.sha256(_PROMPT.encode("utf-8")).hexdigest()
+
     def _request_body(self, image: bytes, page: int) -> bytes:
         payload = {
             "model": self.config.model, "stream": False, "store": False,
@@ -390,6 +404,15 @@ class QwenVisionClient:
             except (ValueError, TypeError, AttributeError):
                 diagnostics["request_id"] = None
             if type(response.status) is not int or not 200 <= response.status < 300:
+                if response.body and len(response.body) <= limits.max_response_bytes:
+                    try:
+                        error_payload = _json(response.body.decode("utf-8"))
+                        if isinstance(error_payload, dict):
+                            diagnostics["usage"] = _usage(error_payload.get("usage"))
+                    except (ValueError, TypeError, UnicodeError, RecursionError):
+                        # Provider error content is untrusted and never crosses
+                        # this boundary; only the whitelisted usage fields do.
+                        pass
                 raise QwenVisionError("http_error")
             if len(response.body) > limits.max_response_bytes:
                 raise QwenVisionError("response_too_large")

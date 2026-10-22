@@ -28,6 +28,7 @@ from averon_import.services.ocr.qwen_vision_client import (
     QwenVisionClient, QwenVisionConfig, VisionHttpResponse, VisionLimits, _HttpsTransport,
 )
 from averon_import.services.secrets import MemorySecretStore, YANDEX_AI_API_KEY
+from averon_import.services.ocr import qwen_vision_client as qwen_vision_client_module
 
 
 SYNTHETIC_KEY = "synthetic-qwen-secret-never-log"
@@ -89,7 +90,10 @@ def _vision_page(number: int, *, headers=None, rows=None, tables=None, unreadabl
     }
 
 
-def _response(page_number: int, *, payload=None, status=200, finish_reason="stop", content=None):
+def _response(
+    page_number: int, *, payload=None, status=200, finish_reason="stop", content=None,
+    include_error_usage=False,
+):
     if content is None:
         content = json.dumps(payload or _vision_page(page_number), ensure_ascii=False)
     outer = {
@@ -102,7 +106,12 @@ def _response(page_number: int, *, payload=None, status=200, finish_reason="stop
             "completion_tokens_details": {"reasoning_tokens": 5},
         },
     }
-    body = b"" if status >= 400 else json.dumps(outer, ensure_ascii=False).encode("utf-8")
+    body = (
+        json.dumps({"usage": outer["usage"]}, ensure_ascii=False).encode("utf-8")
+        if status >= 400 and include_error_usage
+        else b"" if status >= 400
+        else json.dumps(outer, ensure_ascii=False).encode("utf-8")
+    )
     return VisionHttpResponse(status, body, {})
 
 
@@ -169,13 +178,14 @@ def _limits(**changes):
 
 def _adapter(
     transport, *, registry=None, rpm=1000, tpm=100000, input_bound=256,
-    api_key=SYNTHETIC_KEY, limits=None,
+    api_key=SYNTHETIC_KEY, limits=None, model="gpt://synthetic-folder/qwen3.6-35b-a3b",
+    base_url="https://ai.synthetic.invalid/v1", folder_id="synthetic-folder",
 ):
     config = QwenVisionConfig(
-        "https://ai.synthetic.invalid/v1",
-        "gpt://synthetic-folder/qwen3.6-35b-a3b",
+        base_url,
+        model,
         api_key,
-        folder_id="synthetic-folder",
+        folder_id=folder_id,
         limits=limits or _limits(),
     )
     return QwenVisionAdapter(
@@ -416,18 +426,68 @@ def test_transport_loss_after_send_is_unknown_and_not_retried_on_resume(tmp_path
     assert len(transport.calls) == 1
 
 
-@pytest.mark.parametrize(("status", "safe_code"), [(429, "http_429"), (500, "http_5xx")])
-def test_definite_http_errors_fail_without_automatic_retries(tmp_path, status, safe_code):
-    transport = FakeTransport(lambda _page, _call, _kw: _response(1, status=status))
+@pytest.mark.parametrize(
+    ("status", "safe_code", "expected_state"),
+    [
+        (429, "http_429", "failed"),
+        (500, "http_500", "unknown_outcome"),
+        (502, "http_502", "unknown_outcome"),
+        (503, "http_503", "unknown_outcome"),
+        (504, "http_504", "unknown_outcome"),
+    ],
+)
+def test_http_errors_are_not_automatically_retried_on_resume(
+    tmp_path, status, safe_code, expected_state,
+):
+    transport = FakeTransport(lambda _page, _call, _kw: _response(
+        1, status=status, include_error_usage=status == 500,
+    ))
     adapter = _adapter(transport)
     pdf = _make_pdf(tmp_path / f"http-{status}.pdf")
     checkpoint = tmp_path / f"http-{status}-checkpoint"
     config = _orchestration_config()
     first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
     resumed = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
-    assert first.pages[0].state == resumed.pages[0].state == "failed"
+    assert first.pages[0].state == resumed.pages[0].state == expected_state
     assert first.pages[0].attempts[0].safe_error_code == safe_code
+    assert first.pages[0].attempts[0].request_started is True
     assert len(transport.calls) == 1
+    if status == 500:
+        attempt = resumed.pages[0].attempts[0]
+        assert attempt.usage.input_tokens == 100
+        assert attempt.usage.output_tokens == 40
+        assert attempt.actual_cost_rub is not None
+        assert resumed.actual_input_tokens == 100
+    elif status >= 500:
+        assert resumed.actual_cost_rub is None
+        assert resumed.reserved_unknown_cost_rub > 0
+
+
+def test_unknown_http_5xx_is_retried_only_after_explicit_page_selection(tmp_path):
+    transport = FakeTransport(lambda page, call, _kw: (
+        _response(page, status=503) if call == 1 else _response(page)
+    ))
+    adapter = _adapter(transport)
+    pdf = _make_pdf(tmp_path / "explicit-5xx-retry.pdf")
+    checkpoint = tmp_path / "explicit-5xx-retry-checkpoint"
+    config = _orchestration_config()
+
+    first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    resumed = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    assert first.pages[0].state == resumed.pages[0].state == "unknown_outcome"
+    assert len(transport.calls) == 1
+    assert resumed.reserved_unknown_cost_rub > 0
+    assert resumed.actual_cost_rub is None
+
+    retried = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(
+        pdf, retry_pages={1},
+    ))
+    assert retried.pages[0].state == "completed"
+    assert [attempt.state for attempt in retried.pages[0].attempts] == [
+        "unknown_outcome", "completed",
+    ]
+    assert len(transport.calls) == 2
+    assert retried.reserved_unknown_cost_rub > 0
 
 
 def test_multiple_inflight_requests_are_cancelled_without_orphan_threads(tmp_path):
@@ -574,6 +634,90 @@ def test_adding_optional_pricing_profile_preserves_legacy_resume_fingerprint():
     })
 
 
+def test_checkpoint_descriptor_binds_full_model_uri_and_effective_endpoint(tmp_path):
+    transport = FakeTransport()
+    model_a = _adapter(
+        transport, model="gpt://private-folder-a/shared-model",
+        folder_id="private-folder-a",
+    )
+    model_b = _adapter(
+        transport, model="gpt://private-folder-b/shared-model",
+        folder_id="private-folder-b",
+    )
+    endpoint_b = _adapter(
+        transport, model="gpt://private-folder-a/shared-model",
+        folder_id="private-folder-a", base_url="https://other.synthetic.invalid/v1",
+    )
+
+    assert model_a.descriptor.model_version == model_b.descriptor.model_version == "shared-model"
+    assert model_a.descriptor.fingerprint != model_b.descriptor.fingerprint
+    assert model_a.descriptor.fingerprint != endpoint_b.descriptor.fingerprint
+    public_descriptor = json.dumps(model_a.descriptor.model_dump())
+    assert "private-folder-a" not in public_descriptor
+    assert "ai.synthetic.invalid" not in public_descriptor
+    assert model_a.descriptor.parameters["model_deployment_sha256"] != model_b.descriptor.parameters[
+        "model_deployment_sha256"
+    ]
+    assert model_a.descriptor.parameters["effective_endpoint_sha256"] != endpoint_b.descriptor.parameters[
+        "effective_endpoint_sha256"
+    ]
+
+    pdf = _make_pdf(tmp_path / "deployment-identity.pdf")
+    config = _orchestration_config()
+    checkpoint = tmp_path / "deployment-identity-checkpoint"
+    first = asyncio.run(_make_orchestrator(pdf, model_a, config, checkpoint).run(pdf))
+    assert first.status == "completed"
+    for changed_adapter in (model_b, endpoint_b):
+        with pytest.raises(OrchestrationError, match="checkpoint_identity_mismatch"):
+            asyncio.run(_make_orchestrator(pdf, changed_adapter, config, checkpoint).run(pdf))
+    assert len(transport.calls) == 1
+
+
+def test_private_credential_scope_invalidates_checkpoint_without_public_identifier(tmp_path):
+    pdf = _make_pdf(tmp_path / "credential-scope.pdf")
+    config = _orchestration_config()
+    first_adapter = _adapter(FakeTransport(), api_key=SYNTHETIC_KEY)
+    same_adapter = _adapter(FakeTransport(), api_key=SYNTHETIC_KEY)
+    rotated_adapter = _adapter(FakeTransport(), api_key="another-synthetic-key")
+    first_identity = inspect_pdf(pdf, first_adapter, config, run_id="same-synthetic-run")
+    same_identity = inspect_pdf(pdf, same_adapter, config, run_id="same-synthetic-run")
+    rotated_identity = inspect_pdf(pdf, rotated_adapter, config, run_id="same-synthetic-run")
+
+    assert first_adapter.descriptor.fingerprint == rotated_adapter.descriptor.fingerprint
+    assert first_identity.fingerprint == same_identity.fingerprint
+    assert first_identity.private_adapter_scope_fingerprint != rotated_identity.private_adapter_scope_fingerprint
+    assert first_identity.fingerprint != rotated_identity.fingerprint
+    serialized_identity = json.dumps(first_identity.model_dump())
+    assert SYNTHETIC_KEY not in serialized_identity
+    assert "synthetic-folder" not in serialized_identity
+    assert first_identity.private_adapter_scope_fingerprint in serialized_identity
+
+
+def test_changed_prompt_invalidates_checkpoint_even_when_prompt_version_is_unchanged(tmp_path, monkeypatch):
+    pdf = _make_pdf(tmp_path / "prompt-fingerprint.pdf")
+    checkpoint = tmp_path / "prompt-fingerprint-checkpoint"
+    config = _orchestration_config()
+    transport = FakeTransport()
+    original_adapter = _adapter(transport)
+    original_prompt_version = original_adapter.descriptor.prompt_version
+    first = asyncio.run(_make_orchestrator(
+        pdf, original_adapter, config, checkpoint,
+    ).run(pdf))
+    assert first.status == "completed"
+
+    monkeypatch.setattr(
+        qwen_vision_client_module,
+        "_PROMPT",
+        qwen_vision_client_module._PROMPT + "\nSynthetic prompt revision for fingerprint test.",
+    )
+    changed_adapter = _adapter(transport)
+    assert changed_adapter.descriptor.prompt_version == original_prompt_version
+    assert changed_adapter.descriptor.fingerprint != original_adapter.descriptor.fingerprint
+    with pytest.raises(OrchestrationError, match="checkpoint_identity_mismatch"):
+        asyncio.run(_make_orchestrator(pdf, changed_adapter, config, checkpoint).run(pdf))
+    assert len(transport.calls) == 1
+
+
 def test_secret_store_descriptor_checkpoint_and_logs_contain_no_credentials_or_http_body(tmp_path, caplog):
     store = MemorySecretStore()
     store.set(YANDEX_AI_API_KEY, SYNTHETIC_KEY)
@@ -609,6 +753,7 @@ def test_secret_store_descriptor_checkpoint_and_logs_contain_no_credentials_or_h
     saved = "".join(path.read_text(encoding="utf-8") for path in checkpoint.glob("*.json"))
     assert SYNTHETIC_KEY not in repr(adapter.descriptor)
     assert SYNTHETIC_KEY not in public and SYNTHETIC_KEY not in saved
+    assert "synthetic-folder" not in public and "synthetic-folder" not in saved
     assert SYNTHETIC_TEXT in public and SYNTHETIC_TEXT in saved
     assert SYNTHETIC_TEXT not in caplog.text
     assert SYNTHETIC_KEY not in caplog.text

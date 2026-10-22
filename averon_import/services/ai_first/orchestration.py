@@ -214,6 +214,7 @@ class CheckpointIdentity(_StrictModel):
     run_id: str
     source_document_id: str
     adapter_fingerprint: str
+    private_adapter_scope_fingerprint: str | None = None
     processing_fingerprint: str
 
     @model_validator(mode="after")
@@ -224,6 +225,10 @@ class CheckpointIdentity(_StrictModel):
             raise ValueError("invalid run id")
         if self.source_document_id != f"pdf-sha256:{self.source_sha256}":
             raise ValueError("source id mismatch")
+        if self.private_adapter_scope_fingerprint is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.private_adapter_scope_fingerprint,
+        ):
+            raise ValueError("invalid private adapter scope fingerprint")
         return self
 
     @property
@@ -275,6 +280,9 @@ class AdapterPageResult(_StrictModel):
 class PageExtractionAdapter(Protocol):
     @property
     def descriptor(self) -> AdapterDescriptor: ...
+
+    @property
+    def private_checkpoint_scope_fingerprint(self) -> str | None: ...
 
     def estimate(self, image: PageImage) -> RequestEstimate: ...
 
@@ -400,6 +408,9 @@ def inspect_pdf(
         run_id=run_id or uuid4().hex,
         source_document_id=f"pdf-sha256:{source_sha256}",
         adapter_fingerprint=adapter.descriptor.fingerprint,
+        private_adapter_scope_fingerprint=getattr(
+            adapter, "private_checkpoint_scope_fingerprint", None,
+        ),
         processing_fingerprint=config.processing_fingerprint(),
     )
 

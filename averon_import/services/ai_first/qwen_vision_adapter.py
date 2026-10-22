@@ -17,6 +17,7 @@ import secrets as random_secrets
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from averon_import.services.ai_first.assembly import page_from_payload
 from averon_import.services.ai_first.contracts import AIPageExtraction, AIReviewIssue
@@ -190,10 +191,32 @@ class QwenVisionAdapter:
     def descriptor(self) -> AdapterDescriptor:
         return self._descriptor
 
+    @property
+    def private_checkpoint_scope_fingerprint(self) -> str:
+        """Stable credential/account scope stored only in the private checkpoint."""
+        scope = json.dumps(
+            {
+                "api_key": self.client.config.api_key,
+                "auth_scheme": self.client.config.auth_scheme,
+                "folder_id": self.client.config.folder_id,
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(b"averon-qwen-checkpoint-scope-v1\0" + scope).hexdigest()
+
     def _build_descriptor(self) -> AdapterDescriptor:
         config = self.client.config
         limits = config.limits
         model_version = config.model.rsplit("/", 1)[-1]
+        endpoint = urlsplit(config.base_url + "/chat/completions")
+        hostname = (endpoint.hostname or "").casefold()
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        port = endpoint.port
+        authority = hostname if port in (None, 443) else f"{hostname}:{port}"
+        normalized_endpoint = urlunsplit((
+            endpoint.scheme.casefold(), authority, endpoint.path or "/", "", "",
+        ))
         schema = json.dumps(
             VisionPage.model_json_schema(),
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -223,6 +246,14 @@ class QwenVisionAdapter:
                 "max_columns_per_table": limits.max_columns_per_table,
                 "max_cells_per_page": limits.max_cells_per_page,
                 "pricing_profile_id": self.pricing_profile_id,
+                "model_deployment_sha256": "sha256:" + hashlib.sha256(
+                    config.model.encode("utf-8"),
+                ).hexdigest(),
+                "effective_endpoint_sha256": "sha256:" + hashlib.sha256(
+                    normalized_endpoint.encode("utf-8"),
+                ).hexdigest(),
+                "prompt_sha256": "sha256:" + self.client.prompt_sha256,
+                "auth_scheme": config.auth_scheme,
             },
         )
 
@@ -307,12 +338,13 @@ class QwenVisionAdapter:
         request_started = diagnostics.get("request_attempted") is True
         status = diagnostics.get("http_status")
         if exc.code == "http_error" and type(status) is int:
-            safe_code = "http_429" if status == 429 else (
-                f"http_{status}" if 400 <= status < 500 else "http_5xx" if 500 <= status < 600 else "http_error"
-            )
+            safe_code = f"http_{status}" if 400 <= status < 600 else "http_error"
         else:
             safe_code = exc.code
-        outcome_unknown = request_started and exc.code in {"timeout", "transport_error", "cancelled"}
+        status_unknown = type(status) is int and 500 <= status < 600
+        outcome_unknown = request_started and (
+            exc.code in {"timeout", "transport_error", "cancelled"} or status_unknown
+        )
         raise AdapterRequestError(
             safe_code,
             outcome_unknown=outcome_unknown,
