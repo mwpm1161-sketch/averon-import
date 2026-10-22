@@ -330,10 +330,26 @@ class QwenVisionAdapter:
     def _raise_client_error(self, exc: QwenVisionError, request: PageExtractionRequest) -> AdapterPageResult:
         diagnostics = exc.diagnostics
         usage = self._usage(diagnostics.get("usage"))
+        http_status = diagnostics.get("http_status")
+        http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        finish_reason = diagnostics.get("finish_reason")
+        finish_reason = finish_reason if isinstance(finish_reason, str) else None
+        request_latency_ms = diagnostics.get("latency_ms")
+        request_latency_ms = (
+            float(request_latency_ms)
+            if isinstance(request_latency_ms, (int, float))
+            and not isinstance(request_latency_ms, bool)
+            and math.isfinite(request_latency_ms)
+            and request_latency_ms >= 0
+            else None
+        )
         if exc.code == "incomplete_response":
             return AdapterPageResult(
                 extraction=self._empty_incomplete_page(request, "incomplete_response"),
                 usage=usage,
+                http_status=http_status,
+                finish_reason=finish_reason,
+                request_latency_ms=request_latency_ms,
             )
         request_started = diagnostics.get("request_attempted") is True
         status = diagnostics.get("http_status")
@@ -350,6 +366,9 @@ class QwenVisionAdapter:
             outcome_unknown=outcome_unknown,
             usage=usage,
             request_started=request_started,
+            http_status=http_status,
+            finish_reason=finish_reason,
+            request_latency_ms=request_latency_ms,
         ) from None
 
     @staticmethod
@@ -417,6 +436,24 @@ class QwenVisionAdapter:
         return AdapterPageResult(
             extraction=extraction,
             usage=QwenVisionAdapter._usage(completion.diagnostics.get("usage")),
+            http_status=(
+                completion.diagnostics.get("http_status")
+                if type(completion.diagnostics.get("http_status")) is int
+                and 100 <= completion.diagnostics["http_status"] <= 599 else None
+            ),
+            finish_reason=(
+                completion.diagnostics.get("finish_reason")
+                if completion.diagnostics.get("finish_reason") in (
+                    "stop", "length", "content_filter", "tool_calls", "unknown",
+                ) else None
+            ),
+            request_latency_ms=(
+                float(completion.diagnostics["latency_ms"])
+                if isinstance(completion.diagnostics.get("latency_ms"), (int, float))
+                and not isinstance(completion.diagnostics.get("latency_ms"), bool)
+                and math.isfinite(completion.diagnostics["latency_ms"])
+                and completion.diagnostics["latency_ms"] >= 0 else None
+            ),
         )
 
     @staticmethod

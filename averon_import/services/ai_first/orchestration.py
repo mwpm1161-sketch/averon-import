@@ -275,6 +275,9 @@ class PageExtractionRequest:
 class AdapterPageResult(_StrictModel):
     extraction: AIPageExtraction
     usage: TokenUsage | None = None
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    finish_reason: Literal["stop", "length", "content_filter", "tool_calls", "unknown"] | None = None
+    request_latency_ms: float | None = Field(default=None, ge=0)
 
 
 class PageExtractionAdapter(Protocol):
@@ -294,7 +297,8 @@ class AdapterRequestError(RuntimeError):
 
     def __init__(
         self, safe_code: str, *, outcome_unknown: bool, usage: TokenUsage | None = None,
-        request_started: bool | None = None,
+        request_started: bool | None = None, http_status: int | None = None,
+        finish_reason: str | None = None, request_latency_ms: float | None = None,
     ):
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
             safe_code = "adapter_error"
@@ -303,6 +307,20 @@ class AdapterRequestError(RuntimeError):
         self.outcome_unknown = outcome_unknown
         self.usage = usage
         self.request_started = request_started
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        self.finish_reason = (
+            finish_reason
+            if finish_reason in ("stop", "length", "content_filter", "tool_calls", "unknown")
+            else None
+        )
+        self.request_latency_ms = (
+            float(request_latency_ms)
+            if isinstance(request_latency_ms, (int, float))
+            and not isinstance(request_latency_ms, bool)
+            and math.isfinite(request_latency_ms)
+            and request_latency_ms >= 0
+            else None
+        )
 
 
 class PageAttempt(_StrictModel):
@@ -316,6 +334,9 @@ class PageAttempt(_StrictModel):
     reserved_cost_rub: Decimal | None = Field(default=None, ge=0)
     actual_cost_rub: Decimal | None = Field(default=None, ge=0)
     usage: TokenUsage | None = None
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    finish_reason: Literal["stop", "length", "content_filter", "tool_calls", "unknown"] | None = None
+    request_latency_ms: float | None = Field(default=None, ge=0)
     safe_error_code: str | None = None
     elapsed_s: float | None = Field(default=None, ge=0)
 
@@ -871,10 +892,12 @@ class PageOrchestrator:
         *,
         cancel_event: asyncio.Event | None = None,
         retry_pages: set[int] | None = None,
+        selected_pages: set[int] | None = None,
     ) -> OrchestrationReport:
         try:
             return await self._run_impl(
                 pdf_path, cancel_event=cancel_event, retry_pages=retry_pages,
+                selected_pages=selected_pages,
             )
         finally:
             self.checkpoint.close()
@@ -885,10 +908,17 @@ class PageOrchestrator:
         *,
         cancel_event: asyncio.Event | None = None,
         retry_pages: set[int] | None = None,
+        selected_pages: set[int] | None = None,
     ) -> OrchestrationReport:
         started = time.perf_counter()
         cancel_event = cancel_event or asyncio.Event()
         identity = self.checkpoint.identity
+        page_selection = set(range(1, identity.page_count + 1)) if selected_pages is None else set(selected_pages)
+        if not page_selection or any(
+            type(page) is not int or page < 1 or page > identity.page_count
+            for page in page_selection
+        ):
+            raise OrchestrationError("invalid_page_selection")
         if identity.adapter_fingerprint != self.adapter.descriptor.fingerprint:
             raise OrchestrationError("adapter_fingerprint_mismatch")
         if identity.processing_fingerprint != self.config.processing_fingerprint():
@@ -910,7 +940,7 @@ class PageOrchestrator:
         if adapter_page_limit is not None:
             if type(adapter_page_limit) is not int or adapter_page_limit < 1:
                 raise OrchestrationError("adapter_page_limit_invalid")
-            if identity.page_count > adapter_page_limit:
+            if len(page_selection) > adapter_page_limit:
                 raise OrchestrationError("adapter_page_limit_exceeded")
         actual_identity = inspect_pdf(pdf_path, self.adapter, self.config, run_id=identity.run_id)
         if actual_identity != identity:
@@ -921,6 +951,9 @@ class PageOrchestrator:
         if any(type(page) is not int or page < 1 or page > total for page in retry_pages):
             self.checkpoint.close()
             raise OrchestrationError("invalid_retry_page")
+        if not retry_pages.issubset(page_selection):
+            self.checkpoint.close()
+            raise OrchestrationError("retry_page_not_selected")
         for page_number in retry_pages:
             current = records.get(page_number)
             if current is None or current.state not in ("failed", "incomplete", "unknown_outcome"):
@@ -936,7 +969,7 @@ class PageOrchestrator:
             if record is None:
                 record = PageRunRecord(page_number=number, state="pending", updated_at=_utc_now())
                 records[number] = record
-            if record.state == "pending":
+            if record.state == "pending" and number in page_selection:
                 pending.append(number)
 
         rate_gate = _RateGate(
@@ -1188,6 +1221,9 @@ class PageOrchestrator:
             error_code: str | None = None
             error_usage: TokenUsage | None = None
             error_request_started: bool | None = None
+            error_http_status: int | None = None
+            error_finish_reason: str | None = None
+            error_request_latency_ms: float | None = None
             request_task = asyncio.create_task(self.adapter.extract(PageExtractionRequest(
                 identity.source_document_id, number, image, identity.run_id,
                 cancel_event=cancel_event,
@@ -1214,6 +1250,9 @@ class PageOrchestrator:
                         error_code = settled.safe_code
                         error_usage = settled.usage
                         error_request_started = settled.request_started
+                        error_http_status = settled.http_status
+                        error_finish_reason = settled.finish_reason
+                        error_request_latency_ms = settled.request_latency_ms
                     else:
                         error_state, error_code = "unknown_outcome", "cancelled_after_dispatch"
             except AdapterRequestError as exc:
@@ -1221,6 +1260,9 @@ class PageOrchestrator:
                 error_code = exc.safe_code
                 error_usage = exc.usage
                 error_request_started = exc.request_started
+                error_http_status = exc.http_status
+                error_finish_reason = exc.finish_reason
+                error_request_latency_ms = exc.request_latency_ms
             except asyncio.CancelledError:
                 request_task.cancel()
                 cancel_task.cancel()
@@ -1236,12 +1278,18 @@ class PageOrchestrator:
 
             usage: TokenUsage | None = error_usage
             actual_cost: Decimal | None = self.config.pricing.actual_cost(usage) if usage is not None else None
+            http_status = error_http_status
+            finish_reason = error_finish_reason
+            request_latency_ms = error_request_latency_ms
             if response is not None and not isinstance(response, AdapterPageResult):
                 error_state, error_code = "failed", "adapter_response_invalid"
                 response = None
             if response is not None:
                 usage = response.usage
                 actual_cost = self.config.pricing.actual_cost(usage) if usage is not None else None
+                http_status = response.http_status
+                finish_reason = response.finish_reason
+                request_latency_ms = response.request_latency_ms
                 extraction = response.extraction
                 if extraction.source_document_id != identity.source_document_id or extraction.page_number != number:
                     error_state, error_code = "failed", "response_identity_mismatch"
@@ -1269,6 +1317,9 @@ class PageOrchestrator:
                 "finished_at": _utc_now(),
                 "actual_cost_rub": actual_cost,
                 "usage": usage,
+                "http_status": http_status,
+                "finish_reason": finish_reason,
+                "request_latency_ms": request_latency_ms,
                 "safe_error_code": error_code,
                 "elapsed_s": time.perf_counter() - request_started_at,
             })
