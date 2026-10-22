@@ -155,6 +155,7 @@ class TokenUsage(_StrictModel):
 
 
 class TokenPricing(_StrictModel):
+    profile_id: str | None = Field(default=None, min_length=1, max_length=96)
     input_rub_per_1k: Decimal = Field(gt=0)
     cached_input_rub_per_1k: Decimal | None = Field(default=None, gt=0)
     output_rub_per_1k: Decimal = Field(gt=0)
@@ -181,6 +182,7 @@ class TokenPricing(_StrictModel):
 class OrchestrationConfig(_StrictModel):
     concurrency: int = Field(default=3, ge=1, le=8)
     dpi: int = Field(default=150, ge=36, le=600)
+    max_requests: int = Field(default=1000, ge=1, le=10000)
     requests_per_minute: int = Field(default=60, ge=1, le=10000)
     tokens_per_minute: int = Field(default=120000, ge=1, le=100000000)
     max_budget_rub: Decimal = Field(gt=0)
@@ -192,11 +194,15 @@ class OrchestrationConfig(_StrictModel):
     def processing_fingerprint(self) -> str:
         # Concurrency, RPM, TPM, and the budget cap may be adjusted for resume.
         # They do not alter the image or model extraction content.
+        pricing = self.pricing.model_dump(mode="json")
+        if self.pricing.profile_id is None:
+            # Keep pre-profile checkpoints compatible with the original pricing DTO.
+            pricing.pop("profile_id", None)
         return _fingerprint({
             "dpi": self.dpi,
             "max_image_bytes": self.max_image_bytes,
             "max_image_pixels": self.max_image_pixels,
-            "pricing": self.pricing.model_dump(mode="json"),
+            "pricing": pricing,
         })
 
 
@@ -248,13 +254,17 @@ class RequestEstimate(_StrictModel):
 
 
 class PageExtractionRequest:
-    __slots__ = ("source_document_id", "page_number", "image", "run_id")
+    __slots__ = ("source_document_id", "page_number", "image", "run_id", "cancel_event")
 
-    def __init__(self, source_document_id: str, page_number: int, image: PageImage, run_id: str):
+    def __init__(
+        self, source_document_id: str, page_number: int, image: PageImage, run_id: str,
+        cancel_event: asyncio.Event | None = None,
+    ):
         self.source_document_id = source_document_id
         self.page_number = page_number
         self.image = image
         self.run_id = run_id
+        self.cancel_event = cancel_event
 
 
 class AdapterPageResult(_StrictModel):
@@ -276,6 +286,7 @@ class AdapterRequestError(RuntimeError):
 
     def __init__(
         self, safe_code: str, *, outcome_unknown: bool, usage: TokenUsage | None = None,
+        request_started: bool | None = None,
     ):
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
             safe_code = "adapter_error"
@@ -283,10 +294,11 @@ class AdapterRequestError(RuntimeError):
         self.safe_code = safe_code
         self.outcome_unknown = outcome_unknown
         self.usage = usage
+        self.request_started = request_started
 
 
 class PageAttempt(_StrictModel):
-    state: Literal["running", "completed", "failed", "unknown_outcome"]
+    state: Literal["running", "completed", "incomplete", "failed", "unknown_outcome"]
     started_at: str
     dispatched_at: str | None = None
     finished_at: str | None = None
@@ -305,7 +317,7 @@ class PageAttempt(_StrictModel):
             raise ValueError("running attempt cannot have finish time")
         if self.state != "running" and self.finished_at is None:
             raise ValueError("finished attempt requires finish time")
-        if self.state in ("failed", "unknown_outcome") and not self.safe_error_code:
+        if self.state in ("incomplete", "failed", "unknown_outcome") and not self.safe_error_code:
             raise ValueError("failed attempt requires safe error code")
         if self.dispatched_at is not None and not self.request_started:
             raise ValueError("dispatched attempt must be marked started")
@@ -319,7 +331,7 @@ class PageAttempt(_StrictModel):
 
 class PageRunRecord(_StrictModel):
     page_number: int = Field(ge=1)
-    state: Literal["pending", "running", "completed", "failed", "unknown_outcome"]
+    state: Literal["pending", "running", "completed", "incomplete", "failed", "unknown_outcome"]
     attempts: list[PageAttempt] = Field(default_factory=list)
     extraction: AIPageExtraction | None = None
     provider_id: str | None = None
@@ -334,6 +346,10 @@ class PageRunRecord(_StrictModel):
     def record_consistency(self) -> PageRunRecord:
         if self.state == "completed" and self.extraction is None:
             raise ValueError("completed page requires extraction")
+        if self.state == "incomplete" and (
+            self.extraction is None or self.extraction.status != "incomplete"
+        ):
+            raise ValueError("incomplete page requires an incomplete extraction")
         if self.extraction is not None and self.extraction.page_number != self.page_number:
             raise ValueError("record page mismatch")
         if self.state == "running" and (not self.attempts or self.attempts[-1].state != "running"):
@@ -761,7 +777,7 @@ class _BudgetLedger:
 
 class ProgressEvent(_StrictModel):
     page_number: int
-    state: Literal["pending", "running", "completed", "failed", "unknown_outcome"]
+    state: Literal["pending", "running", "completed", "incomplete", "failed", "unknown_outcome"]
     finished_pages: int = Field(ge=0)
     total_pages: int = Field(ge=1)
 
@@ -866,6 +882,25 @@ class PageOrchestrator:
             raise OrchestrationError("adapter_fingerprint_mismatch")
         if identity.processing_fingerprint != self.config.processing_fingerprint():
             raise OrchestrationError("processing_fingerprint_mismatch")
+        adapter_rate_limits = getattr(self.adapter, "rate_limits", None)
+        if adapter_rate_limits is not None and adapter_rate_limits != (
+            self.config.requests_per_minute, self.config.tokens_per_minute,
+        ):
+            raise OrchestrationError("adapter_rate_limit_mismatch")
+        adapter_pricing_profile = getattr(self.adapter, "pricing_profile_id", None)
+        if adapter_pricing_profile is not None and adapter_pricing_profile != self.config.pricing.profile_id:
+            raise OrchestrationError("adapter_pricing_profile_mismatch")
+        adapter_request_limit = getattr(self.adapter, "max_requests", None)
+        if adapter_request_limit is not None and (
+            type(adapter_request_limit) is not int or adapter_request_limit < 1
+        ):
+            raise OrchestrationError("adapter_request_limit_invalid")
+        adapter_page_limit = getattr(self.adapter, "max_pages", None)
+        if adapter_page_limit is not None:
+            if type(adapter_page_limit) is not int or adapter_page_limit < 1:
+                raise OrchestrationError("adapter_page_limit_invalid")
+            if identity.page_count > adapter_page_limit:
+                raise OrchestrationError("adapter_page_limit_exceeded")
         actual_identity = inspect_pdf(pdf_path, self.adapter, self.config, run_id=identity.run_id)
         if actual_identity != identity:
             raise OrchestrationError("source_or_configuration_identity_mismatch")
@@ -877,9 +912,9 @@ class PageOrchestrator:
             raise OrchestrationError("invalid_retry_page")
         for page_number in retry_pages:
             current = records.get(page_number)
-            if current is None or current.state not in ("failed", "unknown_outcome"):
+            if current is None or current.state not in ("failed", "incomplete", "unknown_outcome"):
                 self.checkpoint.close()
-                raise OrchestrationError("retry_requires_failed_page")
+                raise OrchestrationError("retry_requires_retryable_page")
             reset = current.model_copy(update={"state": "pending", "updated_at": _utc_now()})
             records[page_number] = reset
             await self.checkpoint.write(reset)
@@ -898,14 +933,24 @@ class PageOrchestrator:
             window_s=self.rate_window_s, records=records,
         )
         budget = _BudgetLedger(self.config.max_budget_rub, records)
+        adapter_request_limit = getattr(self.adapter, "max_requests", None)
+        request_limit = min(self.config.max_requests, adapter_request_limit or self.config.max_requests)
+        requests_reserved = sum(
+            1 for record in records.values() for attempt in record.attempts
+            if attempt.request_started
+        )
+        request_slots_lock = asyncio.Lock()
         queue: asyncio.Queue[int | None] = asyncio.Queue(maxsize=max(1, self.config.concurrency * 2))
         stop_scheduling = asyncio.Event()
         stop_code: str | None = None
-        finished = sum(1 for record in records.values() if record.state in ("completed", "failed", "unknown_outcome"))
+        finished = sum(
+            1 for record in records.values()
+            if record.state in ("completed", "incomplete", "failed", "unknown_outcome")
+        )
 
         async def notify(page_number: int, state: str) -> None:
             nonlocal finished
-            if state in ("completed", "failed", "unknown_outcome"):
+            if state in ("completed", "incomplete", "failed", "unknown_outcome"):
                 finished += 1
             self.logger.info("ai_first_page_state", extra={
                 "page_number": page_number, "state": state, "finished_pages": finished, "total_pages": total,
@@ -920,6 +965,19 @@ class PageOrchestrator:
                         await result
                 except Exception:
                     self.logger.warning("ai_first_progress_callback_failed", extra={"page_number": page_number})
+
+        async def reserve_request_slot() -> bool:
+            nonlocal requests_reserved
+            async with request_slots_lock:
+                if requests_reserved >= request_limit:
+                    return False
+                requests_reserved += 1
+                return True
+
+        async def release_request_slot() -> None:
+            nonlocal requests_reserved
+            async with request_slots_lock:
+                requests_reserved = max(0, requests_reserved - 1)
 
         async def produce() -> None:
             for number in pending:
@@ -1096,6 +1154,12 @@ class PageOrchestrator:
                 )
                 return
 
+            if not await reserve_request_slot():
+                stop_code = "request_limit_exhausted"
+                stop_scheduling.set()
+                await stop_before_dispatch(stop_code, terminal=True)
+                return
+
             dispatched_at = _utc_now()
             dispatched_attempt = running.attempts[-1].model_copy(update={
                 "request_started": True,
@@ -1112,8 +1176,10 @@ class PageOrchestrator:
             error_state: str | None = None
             error_code: str | None = None
             error_usage: TokenUsage | None = None
+            error_request_started: bool | None = None
             request_task = asyncio.create_task(self.adapter.extract(PageExtractionRequest(
                 identity.source_document_id, number, image, identity.run_id,
+                cancel_event=cancel_event,
             )))
             cancel_task = asyncio.create_task(cancel_event.wait())
             self._active_requests += 1
@@ -1128,12 +1194,22 @@ class PageOrchestrator:
                     response = await request_task
                 else:
                     request_task.cancel()
-                    await asyncio.gather(request_task, return_exceptions=True)
-                    error_state, error_code = "unknown_outcome", "cancelled_after_dispatch"
+                    request_result = await asyncio.gather(request_task, return_exceptions=True)
+                    settled = request_result[0]
+                    if isinstance(settled, AdapterPageResult):
+                        response = settled
+                    elif isinstance(settled, AdapterRequestError):
+                        error_state = "unknown_outcome" if settled.outcome_unknown else "failed"
+                        error_code = settled.safe_code
+                        error_usage = settled.usage
+                        error_request_started = settled.request_started
+                    else:
+                        error_state, error_code = "unknown_outcome", "cancelled_after_dispatch"
             except AdapterRequestError as exc:
                 error_state = "unknown_outcome" if exc.outcome_unknown else "failed"
                 error_code = exc.safe_code
                 error_usage = exc.usage
+                error_request_started = exc.request_started
             except asyncio.CancelledError:
                 request_task.cancel()
                 cancel_task.cancel()
@@ -1166,18 +1242,26 @@ class PageOrchestrator:
                     if error_code != extraction.error_code:
                         safe_extraction = extraction.model_copy(update={"error_code": error_code})
                         response = response.model_copy(update={"extraction": safe_extraction})
+                elif extraction.status == "incomplete":
+                    error_state, error_code = "incomplete", "transcription_incomplete"
+
+            if error_request_started is False:
+                await release_request_slot()
 
             old_attempts = running.attempts
             final_state = error_state or "completed"
+            attempt_request_started = True if error_request_started is None else error_request_started
             updated_attempt = old_attempts[-1].model_copy(update={
                 "state": final_state,
+                "request_started": attempt_request_started,
+                "dispatched_at": old_attempts[-1].dispatched_at if attempt_request_started else None,
                 "finished_at": _utc_now(),
                 "actual_cost_rub": actual_cost,
                 "usage": usage,
                 "safe_error_code": error_code,
                 "elapsed_s": time.perf_counter() - request_started_at,
             })
-            if await budget.settle(reserve, actual_cost, request_started=True):
+            if await budget.settle(reserve, actual_cost, request_started=attempt_request_started):
                 if stop_code is None:
                     stop_code = "budget_exhausted"
                 stop_scheduling.set()
@@ -1277,6 +1361,15 @@ class PageOrchestrator:
             for record in ordered_records:
                 extraction = record.extraction
                 if (
+                    record.state == "incomplete"
+                    and extraction is not None
+                    and extraction.status == "incomplete"
+                ):
+                    # Preserve the partial transcription for explicit human review/retry.
+                    # The V2A export guard rejects pages with incomplete status.
+                    draft_pages.append(extraction)
+                    continue
+                if (
                     record.state == "completed"
                     and extraction is not None
                     and extraction.status in {"extracted", "no_specification"}
@@ -1355,7 +1448,7 @@ class PageOrchestrator:
         elif stop_scheduling.is_set():
             status = "budget_exhausted"
         elif any(
-            record.state in ("failed", "unknown_outcome", "pending", "running")
+            record.state in ("incomplete", "failed", "unknown_outcome", "pending", "running")
             or record.extraction is None
             or record.extraction.status not in {"extracted", "no_specification"}
             for record in ordered_records
