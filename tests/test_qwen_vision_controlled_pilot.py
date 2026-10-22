@@ -93,7 +93,7 @@ class NoopLiveGuard:
         return None
 
 
-def _settings_factory(*, model="gpt://test-folder/qwen3.6-35b-a3b/latest",
+def _settings_factory(*, model="gpt://test-folder/qwen3.6-35b-a3b",
                       endpoint="https://ai.api.cloud.yandex.net/v1"):
     settings = SimpleNamespace(yandex=SimpleNamespace(
         folder_id="test-folder", llm_model=model, llm_base_url=endpoint,
@@ -211,7 +211,8 @@ def test_output_root_inside_repository_is_rejected_before_directory_creation(tmp
 
 @pytest.mark.parametrize("model,endpoint,error_code", [
     ("gpt://test-folder/other-model/latest", "https://ai.api.cloud.yandex.net/v1", "unexpected_model_configuration"),
-    ("gpt://test-folder/qwen3.6-35b-a3b/latest", "https://example.invalid/v1", "unexpected_ai_endpoint"),
+    ("gpt://test-folder/qwen3.6-35b-a3b/latest", "https://ai.api.cloud.yandex.net/v1", "unexpected_model_configuration"),
+    ("gpt://test-folder/qwen3.6-35b-a3b", "https://example.invalid/v1", "unexpected_ai_endpoint"),
 ])
 def test_preflight_rejects_unapproved_model_or_endpoint(tmp_path, synthetic_pdf, model, endpoint, error_code):
     transport = FakeTransport(_response())

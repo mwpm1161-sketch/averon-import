@@ -47,7 +47,7 @@ from averon_import.tools.qwen_vision_pilot import (
 PILOT_RETENTION_DAYS = 7
 PILOT_COOLDOWN_SECONDS = 360
 MAX_PILOT_DPI = 300
-_ALLOWED_MODEL = re.compile(r"^gpt://[^/\s]+/qwen3\.6-35b-a3b/latest$", re.IGNORECASE)
+_ALLOWED_MODEL = re.compile(r"^gpt://[^/\s]+/qwen3\.6-35b-a3b$", re.IGNORECASE)
 _PILOT_QUOTA_REGISTRY = QwenVisionQuotaRegistry()
 
 

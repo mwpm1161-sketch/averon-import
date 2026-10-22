@@ -26,7 +26,7 @@ python -m averon_import.tools.qwen_vision_pilot `
   --request-timeout-s 300
 ```
 
-`--crop` is optional and uses normalized `x,y,width,height` coordinates. `--request-timeout-s` defaults to 120 seconds and accepts finite positive values up to 300 seconds; the common total run timeout remains 600 seconds. The chosen request and total timeouts appear in the safe report. Reasoning can optionally be disabled with `--disable-reasoning`; omitting it keeps the API default. The configured model and HTTPS base URL come from the existing non-secret Yandex settings and model/base URL environment overrides. The configured Qwen Vision model should be `gpt://<folder_id>/qwen3.6-35b-a3b/latest`.
+`--crop` is optional and uses normalized `x,y,width,height` coordinates. `--request-timeout-s` defaults to 120 seconds and accepts finite positive values up to 300 seconds; the common total run timeout remains 600 seconds. The chosen request and total timeouts appear in the safe report. Reasoning can optionally be disabled with `--disable-reasoning`; omitting it keeps the API default. The configured model and HTTPS base URL come from the existing non-secret Yandex settings and model/base URL environment overrides. The configured Qwen Vision model should be `gpt://<folder_id>/qwen3.6-35b-a3b`.
 
 For an explicitly authorized future live pilot, add `--allow-paid-api`, and provide real tariff values from the applicable Yandex AI Studio price schedule:
 

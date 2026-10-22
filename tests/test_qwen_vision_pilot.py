@@ -40,7 +40,7 @@ def _settings(data_dir: Path) -> None:
     (data_dir / "settings.json").write_text(json.dumps({
         "yandex": {
             "folder_id": "test-folder",
-            "llm_model": "gpt://test-folder/qwen3.6-35b-a3b/latest",
+            "llm_model": "gpt://test-folder/qwen3.6-35b-a3b",
             "llm_base_url": "https://ai.api.cloud.yandex.net/v1",
         },
     }), encoding="utf-8")
