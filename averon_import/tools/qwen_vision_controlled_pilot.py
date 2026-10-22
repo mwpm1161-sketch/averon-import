@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import re
 import signal
-import subprocess
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -24,6 +23,10 @@ import uuid
 from averon_import.services.ai_first.orchestration import (
     CheckpointStore, FitZPageRenderer, OrchestrationConfig, OrchestrationError,
     PageOrchestrator, TokenPricing, inspect_pdf,
+)
+from averon_import.services.ai_first.private_acl import (
+    PrivateAclError, create_private_directory, secure_private_tree,
+    verify_private_path, verify_private_tree,
 )
 from averon_import.services.ai_first.qwen_vision_adapter import (
     QwenVisionAdapter, QwenVisionQuotaRegistry,
@@ -36,8 +39,8 @@ from averon_import.services.app_settings import AppSettingsService
 from averon_import.tools.qwen_vision_pilot import (
     _default_data_dir as _default_data_dir_v12,
     _default_output_root as _default_output_root_v12,
-    _identity_sid,
     _max_output_tokens,
+    PilotError as OutputPilotError,
     _request_timeout_s,
     _secure_run_directory,
     _write_json_private,
@@ -196,35 +199,20 @@ class _LiveInvocationGuard:
 
     def __enter__(self) -> _LiveInvocationGuard:
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
             if self.directory.is_symlink():
                 raise ControlledPilotError("pilot_lock_permissions_failed")
-            if os.name == "nt":
-                try:
-                    sid = _identity_sid()
-                    subprocess.run(
-                        [
-                            "icacls.exe", str(self.directory), "/inheritance:r", "/grant:r",
-                            f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F",
-                            "*S-1-5-32-544:(OI)(CI)F",
-                        ],
-                        check=True, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", stdin=subprocess.DEVNULL, timeout=15,
-                    )
-                except Exception:
-                    raise ControlledPilotError("pilot_lock_permissions_failed") from None
+            if self.directory.exists():
+                secure_private_tree(self.directory)
             else:
-                os.chmod(self.directory, 0o700)
-                if self.directory.stat().st_mode & 0o077:
-                    raise ControlledPilotError("pilot_lock_permissions_failed")
+                create_private_directory(self.directory)
+            verify_private_tree(self.directory)
             if self.path.is_symlink():
                 raise ControlledPilotError("pilot_lock_permissions_failed")
             fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
             self.stream = os.fdopen(fd, "r+b", buffering=0)
             if os.name != "nt":
                 os.chmod(self.path, 0o600)
-                if self.path.stat().st_mode & 0o077:
-                    raise ControlledPilotError("pilot_lock_permissions_failed")
+            verify_private_path(self.path, directory=False)
 
             self.stream.seek(0, os.SEEK_END)
             if self.stream.tell() == 0:
@@ -248,6 +236,9 @@ class _LiveInvocationGuard:
         except ControlledPilotError:
             self.__exit__(None, None, None)
             raise
+        except PrivateAclError:
+            self.__exit__(None, None, None)
+            raise ControlledPilotError("pilot_lock_permissions_failed") from None
         except Exception:
             self.__exit__(None, None, None)
             raise ControlledPilotError("pilot_lock_unavailable") from None
@@ -398,8 +389,13 @@ def run(
         else:
             raise ControlledPilotError("pilot_output_must_be_outside_repository")
         run_dir = output_factory(output_root)
+        verify_private_tree(run_dir)
+    except PrivateAclError:
+        raise ControlledPilotError("pilot_output_permissions_failed") from None
     except ControlledPilotError:
         raise
+    except OutputPilotError as exc:
+        raise ControlledPilotError(exc.code) from None
     except Exception:
         raise ControlledPilotError("output_directory_unavailable") from None
 
@@ -431,9 +427,15 @@ def run(
             "transcription_file": "transcription.json",
             "deletion_method": "Delete the complete run directory after review and no later than the stated date.",
         },
+        "storage_security": {
+            "output_directory_dacl": "verified",
+            "checkpoint_tree_dacl": "not_created_in_dry_run",
+            "protected_file_dacl": "verified_before_and_after_write",
+        },
         "errors": [],
     }
     transcription_path: Path | None = None
+    checkpoint: CheckpointStore | None = None
     try:
         if type(args.page) is not int or args.page < 1:
             raise ControlledPilotError("invalid_page_selection")
@@ -616,6 +618,8 @@ def run(
                 result = asyncio.run(_execute_one_page(
                     orchestrator, args.pdf.expanduser(), args.page, cancel_event,
                 ))
+                report["storage_security"]["checkpoint_tree_dacl"] = "verified"
+                report["storage_security"]["checkpoint_entry_count"] = verify_private_tree(checkpoint.directory)
                 selected = _report_from_orchestration(result, args.page)
                 private_extraction = selected.pop("_private_extraction")
                 report.update(selected)
@@ -661,8 +665,19 @@ def run(
             report["preflight"]["errors"].append("pilot_run_failed")
     finally:
         report["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        if checkpoint is not None:
+            try:
+                report["storage_security"]["checkpoint_tree_dacl"] = "verified"
+                report["storage_security"]["checkpoint_entry_count"] = verify_private_tree(checkpoint.directory)
+            except PrivateAclError:
+                report["storage_security"]["checkpoint_tree_dacl"] = "unverified"
+                if "checkpoint_permissions_failed" not in report["errors"]:
+                    report["errors"].append("checkpoint_permissions_failed")
+                if report["status"] in {"completed", "dry_run_ready"}:
+                    report["status"] = "completed_with_errors"
         try:
             _write_json_private(run_dir / "report.json", report)
+            verify_private_tree(run_dir)
         except Exception:
             raise ControlledPilotError("report_write_failed") from None
 

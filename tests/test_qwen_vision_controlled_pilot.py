@@ -12,6 +12,7 @@ import uuid
 import fitz
 import pytest
 
+from averon_import.services.ai_first import orchestration
 from averon_import.services.ocr.qwen_vision_client import _HttpsTransport, VisionHttpResponse
 from averon_import.tools import qwen_vision_controlled_pilot as pilot
 
@@ -35,10 +36,11 @@ def prohibit_real_network(monkeypatch):
             os.chmod(run_dir, 0o700)
         return run_dir
 
-    # Existing V1.2 tests exercise the real ACL helper. Use temporary synthetic
-    # output directories here so this integration suite stays fast on Windows.
-    monkeypatch.setattr(pilot, "_secure_run_directory", private_synthetic_run_dir)
-    monkeypatch.setattr(pilot.CheckpointStore, "_secure_tree", lambda _self: None)
+    # Keep fast synthetic permissions on POSIX. Windows integration runs the
+    # real ACL path so permission failures cannot be hidden by the test setup.
+    if os.name != "nt":
+        monkeypatch.setattr(pilot, "_secure_run_directory", private_synthetic_run_dir)
+        monkeypatch.setattr(pilot.CheckpointStore, "_secure_tree", lambda _self: None)
 
 
 @pytest.fixture
@@ -174,6 +176,8 @@ def test_default_is_offline_preflight_and_does_not_save_transcription(tmp_path, 
     assert report["status"] == "dry_run_ready"
     assert report["preflight"]["status"] == "passed"
     assert report["selected_page"] == 2
+    assert report["storage_security"]["output_directory_dacl"] == "verified"
+    assert report["storage_security"]["protected_file_dacl"] == "verified_before_and_after_write"
     assert report["request_limits"] == {
         "concurrency": 1, "max_requests": 1, "automatic_retries": False,
         "cross_process_launch_cooldown_s": 360,
@@ -186,6 +190,7 @@ def test_default_is_offline_preflight_and_does_not_save_transcription(tmp_path, 
     assert report["retention"]["automatic_deletion"] is False
     assert transport.calls == []
     assert not (run_dir / "transcription.json").exists()
+    assert "S-1-3-4" not in (run_dir / "report.json").read_text(encoding="utf-8")
 
 
 def test_invalid_pdf_is_a_preflight_failure_and_never_reaches_transport(tmp_path, synthetic_pdf):
@@ -419,3 +424,36 @@ def test_persistent_guard_enforces_cooldown_across_runner_restarts(tmp_path, mon
     with pytest.raises(pilot.ControlledPilotError, match="pilot_cooldown_active"):
         with pilot._LiveInvocationGuard(state_dir):
             pass
+
+
+def test_live_refuses_http_when_output_acl_cannot_be_verified(tmp_path, synthetic_pdf, monkeypatch):
+    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    transport = FakeTransport(_response())
+
+    def unverified(_path):
+        raise pilot.PrivateAclError("private_acl_unverified")
+
+    monkeypatch.setattr(pilot, "verify_private_tree", unverified)
+    with pytest.raises(pilot.ControlledPilotError, match="pilot_output_permissions_failed"):
+        _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+    assert transport.calls == []
+
+
+def test_live_refuses_http_when_checkpoint_acl_cannot_be_established(tmp_path, synthetic_pdf, monkeypatch):
+    args = _args(tmp_path, synthetic_pdf, "--allow-paid-api", "--confirm-live-preflight")
+    transport = FakeTransport(_response())
+
+    original_verifier = pilot.verify_private_tree
+
+    def fail_checkpoint_acl(path):
+        if Path(path).name == "checkpoint":
+            raise pilot.PrivateAclError("private_acl_unverified")
+        return original_verifier(path)
+
+    monkeypatch.setattr(pilot, "verify_private_tree", fail_checkpoint_acl)
+    monkeypatch.setattr(orchestration, "verify_private_tree", fail_checkpoint_acl)
+    code, _run_dir, report = _run(tmp_path, synthetic_pdf, args=args, transport=transport)
+    assert code != 0
+    assert "checkpoint_permissions_failed" in report["errors"]
+    assert report["storage_security"]["checkpoint_tree_dacl"] == "unverified"
+    assert transport.calls == []

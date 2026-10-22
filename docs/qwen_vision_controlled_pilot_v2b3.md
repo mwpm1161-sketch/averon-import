@@ -99,3 +99,11 @@ Remove-Item -LiteralPath 'C:\path\to\vision-pilot\run-YYYYMMDDTHHMMSSZ-id' -Recu
 
 The runner does not automatically delete results. The operator is responsible
 for removing the run directory by its recorded deadline.
+
+On Windows, the run directory is created with a protected DACL and its final
+permissions are read back through the Windows security APIs. The check accepts
+only the current user, SYSTEM, and built-in Administrators with Full Control;
+unknown or unverifiable ACEs fail closed. Checkpoint directories and files are
+checked before use, and each protected file is verified around its write. The
+runner does not change the output root's parent ACL. Safe reports include only
+the verification status, not SIDs or account names.

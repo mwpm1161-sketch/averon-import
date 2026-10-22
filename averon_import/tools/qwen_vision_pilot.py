@@ -12,8 +12,6 @@ from io import BytesIO
 import json
 import math
 import os
-import re
-import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +24,10 @@ import fitz
 from PIL import Image
 
 from averon_import.services.app_settings import AppSettingsService
+from averon_import.services.ai_first.private_acl import (
+    PrivateAclError, create_private_directory, verify_private_path,
+    verify_private_tree,
+)
 from averon_import.services.ocr.qwen_vision import QwenVisionProvider
 from averon_import.services.ocr.qwen_vision_client import (
     QwenVisionClient,
@@ -46,7 +48,6 @@ _CANONICAL_FIELDS = (
     "position", "name", "type_mark", "code", "manufacturer", "unit",
     "quantity", "mass", "note",
 )
-_KEY_RE = re.compile(r"^S-\d-(?:\d+-)*\d+$")
 
 
 class PilotError(RuntimeError):
@@ -115,77 +116,47 @@ def _crop(value: str | None) -> dict[str, float] | None:
     return {"x": x, "y": y, "width": width, "height": height}
 
 
-def _identity_sid() -> str:
-    try:
-        result = subprocess.run(
-            ["whoami.exe", "/user", "/fo", "csv", "/nh"],
-            check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            stdin=subprocess.DEVNULL, timeout=10,
-        )
-        records = list(csv.reader(result.stdout.splitlines()))
-        sid = records[0][-1].strip() if records else ""
-    except Exception:
-        raise PilotError("secure_output_identity_unavailable") from None
-    if not _KEY_RE.fullmatch(sid):
-        raise PilotError("secure_output_identity_unavailable")
-    return sid
-
-
 def _secure_run_directory(root: Path) -> Path:
-    root = root.expanduser().resolve()
     try:
+        root = root.expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_dir = root / f"run-{stamp}-{uuid.uuid4().hex[:12]}"
-        run_dir.mkdir(mode=0o700)
+        create_private_directory(run_dir)
+        verify_private_tree(run_dir)
+    except PrivateAclError:
+        raise PilotError("secure_output_acl_unverified") from None
     except OSError:
         raise PilotError("output_directory_unavailable") from None
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                [
-                    "icacls.exe", str(run_dir), "/inheritance:r", "/grant:r",
-                    f"*{_identity_sid()}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F",
-                    "*S-1-5-32-544:(OI)(CI)F",
-                ],
-                check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                stdin=subprocess.DEVNULL, timeout=15,
-            )
-        except PilotError:
-            try:
-                run_dir.rmdir()
-            except OSError:
-                pass
-            raise
-        except Exception:
-            try:
-                run_dir.rmdir()
-            except OSError:
-                pass
-            raise PilotError("secure_output_acl_failed") from None
-    else:
-        try:
-            os.chmod(run_dir, 0o700)
-            if run_dir.stat().st_mode & 0o077:
-                raise OSError("permissions not private")
-        except OSError:
-            try:
-                run_dir.rmdir()
-            except OSError:
-                pass
-            raise PilotError("secure_output_permissions_failed") from None
     return run_dir
 
 
 def _write_json_private(path: Path, payload: Any) -> None:
     encoded = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    descriptor: int | None = None
+    created = False
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(encoded)
+        created = True
         if os.name != "nt":
-            os.chmod(path, 0o600)
+            os.fchmod(descriptor, 0o600)
+        verify_private_path(path, directory=False)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            descriptor = None
+            stream.write(encoded)
+        verify_private_path(path, directory=False)
+    except PrivateAclError:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise PilotError("secure_output_acl_unverified") from None
     except (OSError, TypeError, ValueError):
+        if descriptor is not None:
+            os.close(descriptor)
         raise PilotError("output_write_failed") from None
 
 
@@ -501,6 +472,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> tuple[int, Path, dict[str, Any]]:
     run_dir = _secure_run_directory(args.output_dir)
+    try:
+        verify_private_tree(run_dir)
+    except PrivateAclError:
+        raise PilotError("secure_output_acl_unverified") from None
     started = time.perf_counter()
     report: dict[str, Any] = {
         "format": "averon-qwen-vision-pilot-report-v1",
@@ -517,6 +492,10 @@ def run(args: argparse.Namespace) -> tuple[int, Path, dict[str, Any]]:
         "duration_ms": None,
         "actual_usage": None,
         "cost_estimate": None,
+        "storage_security": {
+            "output_directory_dacl": "verified",
+            "created_protected_files": "verified_before_and_after_write",
+        },
     }
     try:
         pages = args.pages

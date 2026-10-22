@@ -17,12 +17,15 @@ import math
 import os
 from pathlib import Path
 import re
-import subprocess
 import tempfile
 import time
 from typing import Any, Awaitable, Callable, Literal, Protocol
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
+
+from averon_import.services.ai_first.private_acl import (
+    PrivateAclError, secure_private_tree, verify_private_path, verify_private_tree,
+)
 
 import fitz
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -568,7 +571,11 @@ class CheckpointStore:
                     })
                     self._atomic_json(path, record.model_dump(mode="json"))
                 records[record.page_number] = record
+            verify_private_tree(self.directory)
             return records
+        except PrivateAclError:
+            self.close()
+            raise OrchestrationError("checkpoint_permissions_failed") from None
         except OrchestrationError:
             self.close()
             raise
@@ -577,46 +584,10 @@ class CheckpointStore:
             raise OrchestrationError("checkpoint_invalid") from None
 
     def _secure_tree(self) -> None:
-        if os.name == "nt":
-            try:
-                sid_result = subprocess.run(
-                    ["whoami.exe", "/user", "/fo", "csv", "/nh"],
-                    check=True, capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", stdin=subprocess.DEVNULL, timeout=10,
-                )
-                import csv
-                rows = list(csv.reader(sid_result.stdout.splitlines()))
-                sid = rows[0][-1].strip() if rows else ""
-                if not re.fullmatch(r"S-\d-(?:\d+-)*\d+", sid):
-                    raise OSError
-                subprocess.run(
-                    ["icacls.exe", str(self.directory), "/inheritance:r", "/grant:r",
-                     f"*{sid}:F", "*S-1-5-18:F", "*S-1-5-32-544:F", "/T", "/Q"],
-                    check=True, capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", stdin=subprocess.DEVNULL, timeout=20,
-                )
-                subprocess.run(
-                    ["icacls.exe", str(self.directory), "/grant",
-                     f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F",
-                     "*S-1-5-32-544:(OI)(CI)F", "/Q"],
-                    check=True, capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", stdin=subprocess.DEVNULL, timeout=20,
-                )
-            except Exception:
-                raise OrchestrationError("checkpoint_permissions_failed") from None
-        else:
-            try:
-                for root, dirs, files in os.walk(self.directory, followlinks=False):
-                    root_path = Path(root)
-                    if root_path.is_symlink() or any((root_path / name).is_symlink() for name in files + dirs):
-                        raise OSError
-                    os.chmod(root_path, 0o700)
-                    for name in files:
-                        os.chmod(root_path / name, 0o600)
-                if self.directory.stat().st_mode & 0o077:
-                    raise OSError
-            except Exception:
-                raise OrchestrationError("checkpoint_permissions_failed") from None
+        try:
+            secure_private_tree(self.directory)
+        except PrivateAclError:
+            raise OrchestrationError("checkpoint_permissions_failed") from None
 
     def _acquire_process_lock(self) -> None:
         lock_path = self.directory / ".run.lock"
@@ -624,6 +595,7 @@ class CheckpointStore:
         try:
             if os.name != "nt":
                 os.chmod(lock_path, 0o600)
+            verify_private_path(lock_path, directory=False)
             self._lock_stream.seek(0, os.SEEK_END)
             if self._lock_stream.tell() == 0:
                 self._lock_stream.write(b"\0")
@@ -635,6 +607,9 @@ class CheckpointStore:
             else:
                 import fcntl
                 fcntl.flock(self._lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except PrivateAclError:
+            self.close()
+            raise OrchestrationError("checkpoint_permissions_failed") from None
         except Exception:
             self.close()
             raise OrchestrationError("checkpoint_in_use") from None
@@ -650,17 +625,21 @@ class CheckpointStore:
                 temp_name = stream.name
                 if os.name != "nt":
                     os.chmod(temp_name, 0o600)
+                verify_private_path(temp_name, directory=False)
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp_name, path)
             temp_name = None
+            verify_private_path(path, directory=False)
             if os.name != "nt":
                 descriptor = os.open(self.directory, os.O_RDONLY)
                 try:
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
+        except PrivateAclError:
+            raise OrchestrationError("checkpoint_permissions_failed") from None
         except Exception:
             raise OrchestrationError("checkpoint_write_failed") from None
         finally:
