@@ -34,6 +34,7 @@ from averon_import.services.secrets import SecretStore
 
 
 QWEN_VISION_PROMPT_VERSION = "qwen-vision-page-v1.4"
+QWEN_VISION_CONTEXT_WINDOW_TOKENS = 262144
 
 
 class _SharedQuota:
@@ -296,6 +297,8 @@ class QwenVisionAdapter:
             image.data, image.page_number, self._user_context,
         )
         input_bound = self.input_token_upper_bound + context_token_reservation
+        if input_bound + output_bound > QWEN_VISION_CONTEXT_WINDOW_TOKENS:
+            raise ValueError("request token reservation exceeds model context window")
         if input_bound + output_bound > self.tokens_per_minute:
             raise ValueError("request token reservation exceeds provider TPM")
         return RequestEstimate(

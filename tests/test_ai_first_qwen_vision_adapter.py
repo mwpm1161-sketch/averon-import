@@ -792,6 +792,23 @@ def test_user_context_has_no_silent_truncation_and_reserves_safe_tpm_bound(tmp_p
     assert no_send.calls == []
 
 
+def test_input_and_output_reservation_must_fit_documented_context_window(tmp_path):
+    pdf = _make_pdf(tmp_path / "context-window-boundary.pdf")
+    config = _orchestration_config(tpm=300000)
+    image = FitZPageRenderer().render(pdf, 1, 72, config)
+    no_send = FakeTransport()
+    adapter = _adapter(
+        no_send,
+        input_bound=262144,
+        tpm=300000,
+        limits=_limits(max_output_tokens=32768),
+    )
+
+    with pytest.raises(ValueError, match="model context window"):
+        adapter.estimate(image)
+    assert no_send.calls == []
+
+
 def test_context_request_size_cap_still_blocks_http_before_dispatch(tmp_path):
     context = "Synthetic request-size test hint."
     measurement_adapter = _adapter(FakeTransport())
