@@ -1,0 +1,25 @@
+# Offline OCR comparison V2C.2
+
+This isolated evaluator compares the standard OCR and AI-first Qwen Vision with the same independently prepared reference. It does not call an OCR provider, alter an extraction, grant review/export permission, or connect to a production route.
+
+## Reproducible comparison
+
+For each control document, prepare one reference from the source pages independently of both OCR outputs. Record the source PDF's SHA-256 in the reference and both run records; report generation rejects mismatches and omits the hash from the report. This checks that the three inputs declare the same source revision; it does not independently calculate or attest to the supplied hash. Record expected page numbers, each table's canonical column mapping, and every physical row in page reading order. Each row has a page, table, table-local row index, page-global `order_index`, role, optional section label, field values, and optional independently established normalized location. Neither row index is used as the identity key for matching.
+
+Convert the two saved results with `comparison_run_from_ocr_result()` for the existing `OcrResult` contract and `comparison_run_from_ai_draft()` for an `AIDocumentDraft`. Supply the locally computed source SHA-256 to each adapter. Both adapters produce the same version-1 run shape and preserve a page-global reading order. Pass the reference and both runs to `build_comparison_report()`. The JSON-compatible shape is exercised by the committed synthetic fixture and its tests. Use a non-identifying `case_id` in any local experiment notes.
+
+The matcher groups by page and uses maximum-weight assignment across rows, based on content and section evidence. A position number is only a secondary cue when it is unique on that page. A number alone never establishes a match; matching requires similar article/name text or independently trusted provider geometry. Repeated numbers across tables, sections, or pages therefore cannot create identity by themselves. Unmatched gold rows and OCR rows remain separate counts, so an insertion or omission does not shift later comparisons. Ambiguous rows may remain unmatched and lower measured coverage; this is safer than asserting an unsupported correspondence.
+
+## Metric meanings
+
+- Page presence, processing completion, and completeness are separate. A page is complete only when the run reports a successful page status and all expected item rows on it were matched.
+- Position detection counts gold item rows aligned to any candidate row. Classification is measured separately, so an item mislabeled as a section can still count as detected while also recording a classification error. Unmatched candidate item rows are reported separately as possible false additions.
+- Order counts inversions among matched gold item pairs using the page-global reference and run reading order. Missing and extra rows do not shift the remaining alignment; rows in separate tables can still be ordered against each other.
+- Position, article/code, name, quantity, and unit use exact text comparison after only Unicode composition and line-ending normalization. A missing candidate value is an error when the independent reference has a value.
+- Column assignment is compared by table after matched rows establish a unique table correspondence. If no table correspondence can be established, the metric is unavailable rather than inferred from a matching table index.
+- Physical-location accuracy is reported only for independently referenced locations against provider geometry. Model-proposed boxes are shown in a separate unverified-candidate count and are not treated as physical evidence.
+- Runtime is observed elapsed time when supplied. Cost has an explicit `actual_billing`, `estimated`, or `unknown` basis. Unknown cost is `null`; estimated cost is never labelled as actual billing. Token usage fields remain `null` when unavailable.
+
+The report is aggregate-only: it contains the case identifier, engine names, metrics, usage, duration, and cost metadata, but not source field values. Keep non-synthetic references, OCR outputs, and generated reports in the approved local protected location. The committed fixture contains synthetic values only. The client pilot material remains closed and is not a fixture or a GitHub artifact.
+
+The tests validate parsing, matching, and metric handling over deterministic saved outputs. They do not call either OCR, measure recognition accuracy, or establish model accuracy. An OCR accuracy claim requires independent adjudication of source images and the corresponding outputs under a reproducible protocol.
