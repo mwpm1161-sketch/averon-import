@@ -60,7 +60,7 @@ def record_row_decision(
     values = dict(values or {})
     if disposition == "corrected" and not values:
         raise AIReviewError("corrected_decision_requires_values")
-    if disposition != "corrected" and values:
+    if disposition == "excluded" and values:
         raise AIReviewError("values_require_corrected_decision")
     row_pages = {row_id: page for row_id, (page, _) in _rows(draft).items()}
     row_pages.update({row.id: row.page_number for row in state.manual_rows if row.active})
@@ -69,6 +69,12 @@ def record_row_decision(
         raise AIReviewError("unknown_review_record")
     if disposition != "excluded" and record_id in _active_lineage_sources(state):
         raise AIReviewError("review_source_superseded")
+    prior = state.decisions.get(record_id)
+    if disposition == "confirmed" and not values and prior is not None and prior.active:
+        # Confirmation changes the review status, not the values already
+        # corrected by a reviewer. An empty confirmation payload must never
+        # silently reset those values.
+        values = dict(prior.values)
     action = {"confirmed": "confirm_row", "corrected": "edit_value", "excluded": "exclude_row"}[disposition]
     updated = state.model_copy(deep=True)
     updated.decisions[record_id] = AIReviewDecision(
@@ -299,6 +305,9 @@ def resolve_review_issue(
     issue = issues.get(issue_id)
     if issue is None or not reviewer_id or not detail.strip():
         raise AIReviewError("invalid_issue_resolution")
+    page = next((page for page in draft.pages if page.page_number == issue.page_number), None)
+    if issue.code == "page_extraction_failed" or (page is not None and page.status == "failed"):
+        raise AIReviewError("processing_issue_requires_retry")
     updated = state.model_copy(deep=True)
     updated.resolved_issue_ids.add(issue_id)
     updated.history.append(AIReviewEvent(

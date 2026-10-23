@@ -237,7 +237,7 @@ def test_export_guard_rejects_empty_documents_and_missing_manifest():
 
 
 @pytest.mark.parametrize("failed_status", ["failed", "incomplete"])
-def test_export_guard_rejects_failed_or_incomplete_page_even_after_resolution(failed_status):
+def test_export_guard_rejects_failed_or_incomplete_page_even_after_available_issue_resolutions(failed_status):
     page_one = page_from_payload(_payload(), source_document_id="doc-test")
     page_two = (
         failed_page("doc-test", 2, "transport_failed")
@@ -256,6 +256,10 @@ def test_export_guard_rejects_failed_or_incomplete_page_even_after_resolution(fa
     for page in draft.pages:
         state = confirm_page_complete(draft, state, page.page_number, reviewer_id="reviewer")
     for issue in draft.issues:
+        if issue.code == "page_extraction_failed":
+            with pytest.raises(AIReviewError, match="processing_issue_requires_retry"):
+                resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Reviewed source.")
+            continue
         state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Reviewed source.")
     with pytest.raises(AIReviewError, match="page_processing_incomplete"):
         assert_review_ready_for_export(draft, state)

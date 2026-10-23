@@ -263,6 +263,7 @@
               </label>
               <p class="ai-first-demo-warning" id="ai-first-demo-warning" hidden>Синтетический режим не анализирует PDF и выполняет ноль сетевых запросов. Он нужен для проверки интерфейса.</p>
               <div class="ai-first-resume-controls" id="ai-first-resume-controls" hidden></div>
+              <div class="ai-first-run-feedback" id="ai-first-run-feedback" hidden></div>
             </section>
             <div class="divider"></div>
             <div class="crop-section">
@@ -305,28 +306,33 @@
         </div>
       </section>
 
-      <section id="ai-first-review-view" class="view ai-first-review-view">
+      <section id="ai-first-review-view" class="view review-view ai-first-review-view">
         <div class="ai-first-review-toolbar">
-          <div><span class="eyebrow">AI-first · локальный Human Review</span><h2>Проверьте результат по PDF</h2><p id="ai-first-review-status" role="status" aria-live="polite"></p></div>
+          <div><span class="eyebrow">Проверка распознавания</span><h2>Сверьте позиции с PDF</h2><p id="ai-first-review-status" role="status" aria-live="polite"></p></div>
           <div class="ai-first-review-actions">
-            <button class="button ghost" type="button" id="ai-first-back-to-pages">Страницы и продолжение</button>
+            <button class="button ghost" type="button" id="ai-first-back-to-pages">К страницам</button>
             <button class="button secondary" type="button" id="ai-first-add-row">+ Добавить позицию</button>
             <button class="button secondary" type="button" id="ai-first-confirm-selected" disabled>Подтвердить выбранные</button>
-            <button class="button primary" type="button" id="ai-first-save-review">Сохранить проверенный результат</button>
+            <button class="button primary" type="button" id="ai-first-save-review">Сохранить черновик проверки</button>
           </div>
         </div>
-        <div class="ai-first-review-summary" id="ai-first-review-summary"></div>
-        <div class="ai-first-review-workspace">
-          <section class="panel ai-first-pdf-panel" aria-label="Исходная страница PDF">
-            <div class="pane-header"><div><b>Исходный PDF</b><small id="ai-first-pdf-page-label">Страница 1</small></div><div class="ai-first-page-nav"><button class="button ghost" type="button" id="ai-first-prev-page" aria-label="Предыдущая страница">←</button><select class="select" id="ai-first-page-select" aria-label="Страница для проверки"></select><button class="button ghost" type="button" id="ai-first-next-page" aria-label="Следующая страница">→</button></div></div>
-            <div class="ai-first-pdf-scroll"><img id="ai-first-pdf-image" alt="Исходная страница документа"></div>
-          </section>
-          <section class="panel ai-first-table-panel" aria-label="Распознанная спецификация">
-            <div class="panel-heading ai-first-table-heading"><div><h3>Распознанная таблица</h3><p>Исходный текст сохраняется отдельно; правки попадают в аудит.</p></div><button class="button ghost" type="button" id="ai-first-confirm-page">Подтвердить полноту страницы</button></div>
+        <p class="ai-first-workflow-hint">Порядок работы: сверьте строки с PDF → исправьте и сохраните ячейки → подтвердите проверенные строки и полноту страниц → сохраните черновик.</p>
+        <div class="summary-row ai-first-review-summary" id="ai-first-review-summary"></div>
+        <details class="ai-first-page-details" id="ai-first-page-details">
+          <summary id="ai-first-page-details-label">Страницы документа</summary>
+          <div id="ai-first-page-status-list"></div>
+        </details>
+        <div class="split-workspace ai-first-review-workspace">
+          <div class="pdf-pane ai-first-pdf-panel" aria-label="Исходный PDF">
+            <div class="pane-header"><div><b>Исходный PDF</b><small id="ai-first-pdf-page-label">Страница 1</small></div><div class="ai-first-page-nav"><button class="button ghost" type="button" id="ai-first-prev-page" aria-label="Предыдущая страница">←</button><select class="select" id="ai-first-page-select" aria-label="Перейти к странице"></select><button class="button ghost" type="button" id="ai-first-next-page" aria-label="Следующая страница">→</button></div></div>
+            <div class="pdf-stage ai-first-pdf-stage"><div class="pdf-image-wrap ai-first-pdf-image-wrap"><img id="ai-first-pdf-image" alt="Исходная страница документа"></div></div>
+          </div>
+          <div class="table-pane ai-first-table-panel" aria-label="Распознанная спецификация">
+            <div class="panel-heading ai-first-table-heading"><div><h3>Позиции документа</h3><p>Нажмите строку, чтобы открыть страницу источника; исходный текст хранится отдельно от правок.</p></div><button class="button ghost" type="button" id="ai-first-confirm-page">Подтвердить полноту страницы</button></div>
             <div id="ai-first-page-issues" class="ai-first-issues"></div>
-            <div class="ai-first-table-scroll" id="ai-first-table-scroll"></div>
-            <p class="ai-first-export-note" id="ai-first-export-note">Экспорт и sourcing этим экспериментальным режимом не разрешаются. Все действующие проверки допуска остаются обязательными.</p>
-          </section>
+            <div class="table-scroll ai-first-table-scroll" id="ai-first-table-scroll"></div>
+            <p class="ai-first-export-note" id="ai-first-export-note">Это локальный черновик проверки. Подготовка Excel здесь пока не подключена.</p>
+          </div>
         </div>
       </section>
 

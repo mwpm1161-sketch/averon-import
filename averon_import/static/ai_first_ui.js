@@ -74,12 +74,21 @@ async function pollAIFirstJob(jobId) {
     if (job.status === "completed") {
       state.aiFirst.data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first`);
       state.document.has_ai_first_result = true;
-      document.querySelector("#ai-first-open-saved").hidden = false;
+      const hasSuccessfulPage = (state.aiFirst.data.pages || []).some((page) => page.state === "completed");
+      document.querySelector("#ai-first-open-saved").hidden = !hasSuccessfulPage;
       state.aiFirst.page = Math.max(1, Math.min(state.aiFirst.page || 1, state.document.page_count));
       state.aiFirst.selectedRows.clear();
+      const result = job.result || {};
+      if ((result.completed_pages || 0) === 0 && result.status !== "completed") {
+        renderAIFirstRunFeedback(state.aiFirst.data, true);
+        setView("pages");
+        toast("Ни одна страница не распознана. Документ не открыт как готовая проверка; изучите причины и повторите только после устранения ошибки.", "error");
+        return;
+      }
+      renderAIFirstRunFeedback(state.aiFirst.data);
       renderAIFirstReview();
       setView("ai-first-review");
-      const status = job.result?.status;
+      const status = result.status;
       toast(status === "cancelled" ? "Обработка отменена. Сохранены доступные страницы и checkpoint." : status === "completed_with_errors" ? "Готово частично. Страницы с ошибками требуют явного продолжения." : "Распознавание сохранено. Сверьте строки с исходным PDF.", status === "completed" ? "success" : "warning");
       return;
     }
@@ -102,92 +111,245 @@ function renderAIFirstLiveProgress(progress) {
 function aiFirstDecision(recordId) { return state.aiFirst.data?.review?.decisions?.[recordId] || null; }
 function aiFirstPageRecord(pageNumber) { return state.aiFirst.data?.draft?.pages?.find((page) => page.page_number === pageNumber) || null; }
 
+function aiFirstRowInputSnapshot(recordId) {
+  const sourceRow = (state.aiFirst.data?.draft?.pages || []).flatMap((page) => (page.tables || []).flatMap((table) => table.rows || [])).find((row) => row.id === recordId);
+  const manualRow = (state.aiFirst.data?.review?.manual_rows || []).find((row) => row.id === recordId && row.active);
+  const sourceValues = {};
+  if (manualRow) Object.assign(sourceValues, manualRow.values || {});
+  else for (const cell of sourceRow?.raw_cells || []) sourceValues[`cell:${cell.column_index}`] = cell.raw_value || "";
+  const decision = aiFirstDecision(recordId);
+  return [...document.querySelectorAll("#ai-first-table-scroll [data-ai-first-cell]")]
+    .filter((input) => input.dataset.aiFirstCell === recordId)
+    .map((input) => {
+      const key = `cell:${input.dataset.columnIndex}`;
+      const baseline = decision?.active && Object.prototype.hasOwnProperty.call(decision.values || {}, key)
+        ? decision.values[key] : (sourceValues[key] || "");
+      return {key, label:input.getAttribute("aria-label") || key, value:input.value, baseline};
+    });
+}
+
+function aiFirstRowValues(snapshot) {
+  return Object.fromEntries(snapshot.map((item) => [item.key, item.value]));
+}
+
 function aiFirstRowIssues(row, page) {
   const issues = [...(page?.issues || []), ...(state.aiFirst.data?.draft?.issues || [])];
   const ids = new Set([row.id, ...(row.raw_cells || []).map((cell) => cell.id)]);
-  return issues.filter((issue, index) => issue.record_ids?.some((id) => ids.has(id))
+  return issues.filter((issue, index) => issue.code !== "page_extraction_failed" && issue.record_ids?.some((id) => ids.has(id))
     && issues.findIndex((candidate) => candidate.id === issue.id) === index);
+}
+
+function aiFirstProcessingMessage(code) {
+  const messages = {
+    image_pixel_limit:"Страница слишком велика для безопасной обработки с текущим разрешением.",
+    image_byte_limit:"Изображение страницы превышает допустимый размер.",
+    page_render_failed:"Не удалось подготовить изображение страницы.",
+    page_dimensions_invalid:"Не удалось определить размер страницы PDF.",
+    page_extraction_failed:"Не удалось распознать содержимое страницы.",
+    transcription_incomplete:"Ответ распознавания неполный; доступные данные требуют проверки.",
+    adapter_outcome_unknown:"Не удалось достоверно получить результат распознавания.",
+    page_not_processed:"Обработка страницы не была завершена.",
+    page_result_missing:"В результате нет данных по странице.",
+    request_limit_exhausted:"Достигнут настроенный лимит запросов.",
+    budget_exhausted:"Достигнут настроенный лимит расходов.",
+    pending:"Страница ожидает запуска обработки.",
+  };
+  return messages[code] || "Страницу не удалось обработать. Проверьте PDF и повторите обработку.";
+}
+
+function aiFirstIssueMessage(code) {
+  const messages = {
+    row_has_uncertain_visual_evidence:"В строке есть нечитаемый фрагмент, зачёркивание или рукописная пометка. Сверьте ячейки с PDF.",
+    continuation_unverified:"Возможное продолжение таблицы с другой страницы не подтверждено.",
+    unreadable_page_fragment:"На странице есть текст, который не удалось прочитать.",
+    page_handwriting_unlocalized:"Найдена рукописная пометка без надёжной привязки к строке.",
+    duplicate_position_candidate:"Номер позиции встречается в нескольких строках.",
+    position_gap_candidate:"В нумерации есть пропуск; проверьте, не потерялась ли позиция.",
+    page_transcription_incomplete:"Часть страницы распознана неполно. Сверьте результат с оригиналом.",
+  };
+  return messages[code] || "Проверьте отмеченный фрагмент по PDF.";
+}
+
+function aiFirstReportPages(data) {
+  return new Map((data?.pages || []).map((page) => [page.page_number, page]));
+}
+
+function showAIFirstPage(pageNumber) {
+  const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
+  if (!pageNumbers.includes(pageNumber)) return;
+  state.aiFirst.page = pageNumber;
+  const selector = document.querySelector("#ai-first-page-select");
+  selector.value = String(pageNumber);
+  document.querySelector("#ai-first-pdf-page-label").textContent = `Страница ${pageNumber}`;
+  document.querySelector("#ai-first-pdf-image").src = documentPageImageUrl(state.document.document_id, pageNumber, 200);
+  document.querySelector("#ai-first-prev-page").disabled = pageNumber <= 1;
+  document.querySelector("#ai-first-next-page").disabled = pageNumber >= pageNumbers.length;
+  const page = aiFirstPageRecord(pageNumber), report = aiFirstReportPages(state.aiFirst.data).get(pageNumber);
+  const ready = report?.state === "completed" && ["extracted", "no_specification"].includes(page?.status);
+  document.querySelector("#ai-first-confirm-page").disabled = !ready || (state.aiFirst.data.review.confirmed_complete_pages || []).includes(pageNumber);
+  document.querySelectorAll("[data-ai-first-row]").forEach((row) => row.classList.toggle("active", Number(row.dataset.pageNumber) === pageNumber));
+}
+
+function renderAIFirstRunFeedback(data, includePending = false) {
+  const root = document.querySelector("#ai-first-run-feedback");
+  const failed = (data?.pages || []).filter((page) => page.state !== "completed" && (includePending || page.state !== "pending" || page.safe_error_code));
+  if (!failed.length) { root.hidden = true; root.innerHTML = ""; return; }
+  const groups = new Map();
+  for (const page of failed) {
+    const code = page.safe_error_code || page.state;
+    const item = groups.get(code) || {pages:[],message:aiFirstProcessingMessage(code)};
+    item.pages.push(page.page_number);
+    groups.set(code, item);
+  }
+  const retryable = [...groups.entries()].filter(([code]) => !["image_pixel_limit","image_byte_limit","page_dimensions_invalid"].includes(code)).flatMap(([, item]) => item.pages);
+  root.hidden = false;
+  root.innerHTML = `<b>Распознавание завершилось не полностью</b><p>Документ не считается проверенным. Для ${failed.length} страниц нет завершённого результата; проверьте статусы ниже.</p><ul>${[...groups.values()].map((item) => `<li>${item.pages.length} стр. (${item.pages.join(", ")}) — ${escapeHtml(item.message)}</li>`).join("")}</ul>${retryable.length ? `<button class="button secondary" type="button" data-ai-first-retry-pages="${retryable.join(",")}">Повторить обработку доступных страниц</button>` : `<small>Для этих страниц текущие ограничения рендеринга не позволяют повторить обработку с теми же настройками.</small>`}`;
+  root.querySelector("[data-ai-first-retry-pages]")?.addEventListener("click", () => retryAIFirstPages(retryable));
+}
+
+function retryAIFirstPages(pageNumbers) {
+  if (!pageNumbers.length) return;
+  const modeValue = state.aiFirst.data?.mode === "fake_vision" ? "fake" : "qwen";
+  const modeSelect = document.querySelector("#ai-first-mode");
+  if (modeSelect.querySelector(`option[value="${modeValue}"]`)?.hidden) {
+    toast("Этот режим сейчас выключен. Попросите администратора проверить настройки локального тестового режима.", "error");
+    return;
+  }
+  state.aiFirst.mode = modeValue;
+  modeSelect.value = modeValue;
+  state.selectedPages = new Set(pageNumbers);
+  const reportPages = aiFirstReportPages(state.aiFirst.data);
+  state.aiFirst.retryPages = new Set(pageNumbers.filter((number) => ["failed","incomplete","unknown_outcome"].includes(reportPages.get(number)?.state)));
+  updatePageSelection();
+  renderAIFirstResumeControls();
+  document.querySelector("#ai-first-live-confirm").checked = false;
+  updateAIFirstModeControls();
+  if (modeValue === "fake") void startAIFirstRecognition();
+  else {
+    setView("pages");
+    toast("Страницы выбраны для явного повтора. Подтвердите платную обработку перед запуском.", "warning");
+  }
 }
 
 function renderAIFirstReview() {
   const data = state.aiFirst.data;
   if (!data?.draft || !state.document) return;
   const draft = data.draft, review = data.review;
-  const pageNumbers = draft.expected_page_numbers || draft.pages.map((page) => page.page_number);
+  const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
   if (!pageNumbers.includes(state.aiFirst.page)) state.aiFirst.page = pageNumbers[0] || 1;
-  const page = aiFirstPageRecord(state.aiFirst.page);
-  const pageReports = new Map((data.pages || []).map((item) => [item.page_number, item]));
-  const sourceRows = (draft.pages || []).flatMap((item) => item.tables.flatMap((table) => table.rows));
-  const manualRows = (review.manual_rows || []).filter((row) => row.active);
-  const totalRows = sourceRows.length + manualRows.length;
-  const reviewedRows = Object.values(review.decisions || {}).filter((decision) => decision.active).length;
-  const unresolved = (draft.issues || []).filter((issue) => ["review", "blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)).length;
+  const pageReports = aiFirstReportPages(data);
+  const entries = aiFirstDocumentEntries(draft, review);
+  const totalRows = entries.length;
+  const reviewedRows = entries.filter((entry) => review.decisions?.[entry.row.id]?.active).length;
+  const unresolved = (draft.issues || []).filter((issue) => issue.code !== "page_extraction_failed" && ["review", "blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)).length;
   const confirmedPages = (review.confirmed_complete_pages || []).length;
-  const pageIssues = (page?.issues || []).filter((issue) => ["review", "blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)).length;
-  const report = pageReports.get(state.aiFirst.page);
-  const pageError = report?.safe_error_code ? ` · Код ошибки: ${report.safe_error_code}` : "";
-  document.querySelector("#ai-first-review-status").textContent = `Статус страницы: ${report?.state || page?.status || "нет данных"}${pageError} · ${totalRows} строк · действия сохраняются локально`;
-  document.querySelector("#ai-first-review-summary").innerHTML = `<span>Страницы: ${pageNumbers.length} / ${state.document.page_count}</span><span>Строки: ${reviewedRows} решений из ${totalRows}</span><span class="${pageIssues ? "warning" : "success"}">Замечания на странице: ${pageIssues}</span><span>Полнота страниц: ${confirmedPages} / ${state.document.page_count}</span><span class="${unresolved ? "warning" : "success"}">Неразрешённые замечания: ${unresolved}</span><span class="${data.review_ready_for_guard?.ready ? "success" : "warning"}">Export guard: ${data.review_ready_for_guard?.ready ? "проверки пройдены" : "заблокирован"}</span>`;
+  const processedPages = pageNumbers.filter((number) => pageReports.get(number)?.state === "completed" && ["extracted","no_specification"].includes(aiFirstPageRecord(number)?.status)).length;
+  const failedPages = (data.pages || []).filter((item) => item.state !== "completed" && (item.state !== "pending" || item.safe_error_code)).length;
+  document.querySelector("#ai-first-review-status").textContent = `${processedPages} из ${state.document.page_count} страниц обработано · ${totalRows} позиций · изменения сохраняются локально`;
+  const summaries = [
+    ["Позиции", totalRows, ""],
+    ["Проверено", reviewedRows, reviewedRows < totalRows ? "warning" : ""],
+    ["Осталось проверить", Math.max(0, totalRows - reviewedRows), totalRows > reviewedRows ? "warning" : ""],
+    ["Страницы обработаны", `${processedPages} / ${state.document.page_count}`, processedPages < state.document.page_count ? "warning" : ""],
+    ["Полнота подтверждена", `${confirmedPages} / ${state.document.page_count}`, confirmedPages < state.document.page_count ? "warning" : ""],
+  ];
+  document.querySelector("#ai-first-review-summary").innerHTML = summaries.map(([label,value,kind]) => `<div class="summary-card ${kind}"><small>${label}</small><b>${value}</b></div>`).join("");
   const selector = document.querySelector("#ai-first-page-select");
-  selector.innerHTML = pageNumbers.map((number) => `<option value="${number}" ${number === state.aiFirst.page ? "selected" : ""}>Страница ${number} · ${pageReports.get(number)?.state || aiFirstPageRecord(number)?.status || "ожидает"}</option>`).join("");
-  document.querySelector("#ai-first-pdf-page-label").textContent = `Страница ${state.aiFirst.page}`;
-  document.querySelector("#ai-first-pdf-image").src = documentPageImageUrl(state.document.document_id, state.aiFirst.page, 200);
-  document.querySelector("#ai-first-prev-page").disabled = pageNumbers.indexOf(state.aiFirst.page) <= 0;
-  document.querySelector("#ai-first-next-page").disabled = pageNumbers.indexOf(state.aiFirst.page) >= pageNumbers.length - 1;
-  document.querySelector("#ai-first-confirm-page").disabled = !page || !["extracted", "no_specification"].includes(page.status) || (review.confirmed_complete_pages || []).includes(state.aiFirst.page);
-  const issueMap = new Map();
-  for (const issue of [...(page?.issues || []), ...(draft.issues || [])]) issueMap.set(issue.id, issue);
-  const unresolvedIssues = [...issueMap.values()].filter((issue) => ["review", "blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id));
-  document.querySelector("#ai-first-page-issues").innerHTML = unresolvedIssues.map((issue) => `<div class="ai-first-issue ${issue.severity === "blocking" ? "blocking" : ""}"><div><b>${escapeHtml(issue.code)}</b> · ${escapeHtml(issue.detail)}<div class="ai-first-resolve-row"><input class="input" data-ai-first-issue-note="${escapeHtml(issue.id)}" maxlength="2000" placeholder="Что проверили по PDF?"><button class="button secondary" type="button" data-ai-first-resolve="${escapeHtml(issue.id)}">Разрешить</button></div></div></div>`).join("");
+  selector.innerHTML = pageNumbers.map((number) => `<option value="${number}">Страница ${number}</option>`).join("");
+  document.querySelector("#ai-first-page-status-list").innerHTML = pageNumbers.map((number) => {
+    const page = aiFirstPageRecord(number), report = pageReports.get(number);
+    const complete = report?.state === "completed" && ["extracted","no_specification"].includes(page?.status);
+    let label = "Не входила в последний запуск";
+    let detail = "Эта страница не подтверждена в текущем результате.";
+    if (complete && page.status === "no_specification") { label = "Таблица не обнаружена"; detail = "Сверьте PDF и подтвердите полноту, если на странице нет позиций."; }
+    else if (complete) { label = "Обработана"; detail = `${page.tables.reduce((sum, table) => sum + table.rows.length, 0)} позиций на странице.`; }
+    else if (report?.state === "pending" && !report.safe_error_code) { label = "Не запускалась"; detail = "Страница не входила в последний запуск."; }
+    else if (report) { label = "Требует обработки"; detail = aiFirstProcessingMessage(report.safe_error_code || report.state); }
+    const confirmed = (review.confirmed_complete_pages || []).includes(number);
+    const retryable = report && (report.state !== "pending" || report.safe_error_code) && report.state !== "completed" && !["image_pixel_limit","image_byte_limit","page_dimensions_invalid"].includes(report.safe_error_code);
+    return `<div class="ai-first-page-status"><button class="button ghost" type="button" data-ai-first-show-page="${number}">Страница ${number} · ${label}</button><span>${escapeHtml(detail)}${confirmed ? " · полнота подтверждена" : ""}</span>${complete && !confirmed ? `<button class="button text" type="button" data-ai-first-complete-page="${number}">Подтвердить полноту</button>` : ""}${retryable ? `<button class="button text" type="button" data-ai-first-retry-one="${number}">Повторить</button>` : ""}</div>`;
+  }).join("");
+  document.querySelector("#ai-first-page-details-label").textContent = `Страницы: ${processedPages} обработано из ${state.document.page_count} · ${confirmedPages} подтверждено${failedPages ? ` · ${failedPages} требуют внимания` : ""}`;
+  document.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", () => showAIFirstPage(Number(button.dataset.aiFirstShowPage))));
+  document.querySelectorAll("[data-ai-first-complete-page]").forEach((button) => button.addEventListener("click", () => void postAIFirstReview("complete-page", {page_number:Number(button.dataset.aiFirstCompletePage)})));
+  document.querySelectorAll("[data-ai-first-retry-one]").forEach((button) => button.addEventListener("click", () => retryAIFirstPages([Number(button.dataset.aiFirstRetryOne)])));
+  const page = aiFirstPageRecord(state.aiFirst.page);
+  const pageIssues = [...(page?.issues || []), ...(draft.issues || [])]
+    .filter((issue, index, all) => issue.page_number === state.aiFirst.page && issue.code !== "page_extraction_failed"
+      && ["review","blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)
+      && all.findIndex((item) => item.id === issue.id) === index);
+  document.querySelector("#ai-first-page-issues").innerHTML = pageIssues.map((issue) => `<div class="ai-first-issue ${issue.severity === "blocking" ? "blocking" : ""}"><div>${escapeHtml(aiFirstIssueMessage(issue.code))}<div class="ai-first-resolve-row"><input class="input" data-ai-first-issue-note="${escapeHtml(issue.id)}" maxlength="2000" placeholder="Что проверили по PDF?"><button class="button secondary" type="button" data-ai-first-resolve="${escapeHtml(issue.id)}">Отметить проверенным</button></div></div></div>`).join("");
   document.querySelector("#ai-first-page-issues").querySelectorAll("[data-ai-first-resolve]").forEach((button) => button.addEventListener("click", () => {
     const id = button.dataset.aiFirstResolve;
     const detail = document.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
     void postAIFirstReview("resolve-issue", {issue_id:id,detail});
   }));
-  renderAIFirstTables(page, issueMap);
+  renderAIFirstTables(entries);
   document.querySelector("#ai-first-confirm-selected").disabled = state.aiFirst.selectedRows.size === 0;
   document.querySelector("#ai-first-export-note").textContent = data.review_ready_for_guard?.ready
-    ? "Результат сохранён локально. AI-first не запускает Excel или sourcing; действующие export guards остаются обязательными."
-    : `Результат сохранён локально. Блокер допуска: ${data.review_ready_for_guard?.code || "проверка страниц или замечаний"}.`;
+    ? "Проверки завершены. Здесь сохраняется локальный черновик; создание файла Excel не выполняется."
+    : `Сохранён локальный черновик. До завершения проверки осталось: ${unresolved ? `${unresolved} замеч.` : "подтвердить страницы или проверить строки"}.`;
+  showAIFirstPage(state.aiFirst.page);
 }
 
-function renderAIFirstTables(page) {
-  const root = document.querySelector("#ai-first-table-scroll");
-  if (!page) { root.innerHTML = '<div class="ai-first-empty-page">Страница ещё не обработана.</div>'; return; }
-  const tables = [...(page.tables || [])];
-  const manualRows = (state.aiFirst.data.review.manual_rows || []).filter((row) => row.active && row.page_number === state.aiFirst.page);
-  if (!tables.length && ["failed", "incomplete", "no_specification"].includes(page.status)) {
-    root.innerHTML = `<div class="ai-first-empty-page">Статус страницы: ${escapeHtml(page.status)}. Проверьте PDF; ошибочные страницы можно повторить только явным выбором на экране страниц.</div>`;
-    return;
+function aiFirstColumnList(table) {
+  const occurrences = new Map();
+  return [...(table.columns || [])].sort((a,b)=>a.index-b.index).map((column) => {
+    const label = (column.raw_header || `Колонка ${column.index + 1}`).trim();
+    const base = label.toLocaleLowerCase("ru-RU");
+    const occurrence = (occurrences.get(base) || 0) + 1;
+    occurrences.set(base, occurrence);
+    return {index:column.index,label:occurrence > 1 ? `${label} (${occurrence})` : label,key:`${base}\0${occurrence}`};
+  });
+}
+
+function aiFirstDocumentEntries(draft, review) {
+  const entries = [];
+  for (const page of draft.pages || []) for (const table of page.tables || []) {
+    const columns = aiFirstColumnList(table);
+    for (const row of table.rows || []) entries.push({row,page,table,columns,manual:false});
   }
-  if (!tables.length) tables.push({id:"manual-table",columns:["Поз.","Наименование","Артикул","Ед. изм.","Количество","Примечание"].map((raw_header,index)=>({id:`manual-column-${index}`,index,raw_header})),rows:[]});
-  root.innerHTML = tables.map((table, tableIndex) => {
-    const columns = [...(table.columns || [])].sort((a,b)=>a.index-b.index);
-    const rows = [...(table.rows || []).map((row) => ({row,manual:false}))];
-    if (tableIndex === 0) for (const row of manualRows) rows.push({row,manual:true});
-    const header = columns.map((column) => `<th>${escapeHtml(column.raw_header || `Колонка ${column.index + 1}`)}</th>`).join("");
-    const body = rows.map(({row,manual}) => {
-      const decision = aiFirstDecision(row.id);
-      const rowIssues = manual ? [] : aiFirstRowIssues(row, page);
-      const flagged = rowIssues.some((issue) => ["review", "blocking"].includes(issue.severity) && !(state.aiFirst.data.review.resolved_issue_ids || []).includes(issue.id));
-      const excluded = decision?.active && decision.disposition === "excluded";
-      const cells = columns.map((column) => {
-        const key = `cell:${column.index}`;
-        const cell = manual ? null : (row.raw_cells || []).find((item) => item.column_index === column.index);
-        const source = manual ? row.values?.[key] || "" : cell?.raw_value ?? "";
-        const edited = decision?.disposition === "corrected" && Object.prototype.hasOwnProperty.call(decision.values || {}, key);
-        const shown = edited ? decision.values[key] : source;
-        const sourceNote = edited && decision.values[key] !== source ? `<small class="ai-first-cell-source">Исходно: ${escapeHtml(source || "пусто")}</small>` : "";
-        const uncertain = !manual && (cell?.unreadable || cell?.struck_through || cell?.handwritten || cell?.alternatives?.length);
-        return `<td class="${flagged || uncertain ? "ai-first-row-flagged" : ""}"><input class="ai-first-cell-input" data-ai-first-cell="${escapeHtml(row.id)}" data-column-index="${column.index}" aria-label="${escapeHtml(column.raw_header || `Колонка ${column.index + 1}`)}" value="${escapeHtml(shown)}">${sourceNote}${uncertain ? `<small class="ai-first-cell-source">Неопределённость${cell?.alternatives?.length ? ` · ${escapeHtml(cell.alternatives.join(" / "))}` : ""}</small>` : ""}</td>`;
-      }).join("");
-      const label = manual ? "ручная позиция" : (row.model_kind || "тип не указан");
-      const decisionLabel = excluded ? "исключена" : decision?.active ? (decision.disposition === "corrected" ? "исправлена" : "подтверждена") : "требует проверки";
-      return `<tr class="${flagged ? "is-flagged" : ""} ${excluded ? "is-excluded" : ""}"><td><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td>${manual ? "ручная" : row.index + 1}<small class="ai-first-cell-source">${escapeHtml(label)} · ${decisionLabel}</small></td>${cells}<td><div class="ai-first-row-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(row.id)}">Сохранить правки</button><button class="button ghost" type="button" data-ai-first-confirm-row="${escapeHtml(row.id)}">Подтвердить</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(row.id)}">${excluded ? "Восстановить" : "Исключить"}</button></div></td></tr>`;
+  const defaultHeaders = ["Поз.","Наименование","Артикул","Ед. изм.","Количество","Примечание"];
+  for (const row of (review.manual_rows || []).filter((item) => item.active)) {
+    const page = (draft.pages || []).find((item) => item.page_number === row.page_number);
+    const table = page?.tables?.[0] || {columns:defaultHeaders.map((raw_header,index)=>({index,raw_header}))};
+    entries.push({row,page,table,columns:aiFirstColumnList(table),manual:true});
+  }
+  return entries;
+}
+
+function renderAIFirstTables(entries) {
+  const root = document.querySelector("#ai-first-table-scroll");
+  const columns = new Map();
+  for (const entry of entries) for (const column of entry.columns) if (!columns.has(column.key)) columns.set(column.key, column);
+  const allColumns = [...columns.values()];
+  const body = entries.map(({row,page,columns:rowColumns,manual}) => {
+    const decision = aiFirstDecision(row.id);
+    const rowIssues = manual ? [] : aiFirstRowIssues(row, page);
+    const flagged = rowIssues.some((issue) => ["review", "blocking"].includes(issue.severity) && !(state.aiFirst.data.review.resolved_issue_ids || []).includes(issue.id));
+    const excluded = decision?.active && decision.disposition === "excluded";
+    const cells = allColumns.map((column) => {
+      const sourceColumn = rowColumns.find((item) => item.key === column.key);
+      if (!sourceColumn) return "<td></td>";
+      const key = `cell:${sourceColumn.index}`;
+      const cell = manual ? null : (row.raw_cells || []).find((item) => item.column_index === sourceColumn.index);
+      const source = manual ? row.values?.[key] || "" : cell?.raw_value ?? "";
+      const edited = decision?.active && Object.prototype.hasOwnProperty.call(decision.values || {}, key);
+      const shown = edited ? decision.values[key] : source;
+      const sourceNote = edited && decision.values[key] !== source ? `<small class="ai-first-cell-source">Исходно: ${escapeHtml(source || "пусто")}</small>` : "";
+      const uncertain = !manual && (cell?.unreadable || cell?.struck_through || cell?.handwritten || cell?.alternatives?.length);
+      return `<td class="${flagged || uncertain ? "critical-review" : ""}"><input class="cell-input ai-first-cell-input" data-ai-first-cell="${escapeHtml(row.id)}" data-column-index="${sourceColumn.index}" aria-label="${escapeHtml(sourceColumn.label)}" maxlength="2000" value="${escapeHtml(shown)}">${sourceNote}${uncertain ? `<small class="critical-warning">Требует сверки${cell?.alternatives?.length ? ` · варианты: ${escapeHtml(cell.alternatives.join(" / "))}` : ""}</small>` : ""}</td>`;
     }).join("");
-    const addForm = tableIndex === 0 && state.aiFirst.addRowOpen ? `<div class="ai-first-add-form"><b>Новая ручная позиция · страница ${state.aiFirst.page}</b><div class="ai-first-add-fields">${columns.map((column) => `<label><span>${escapeHtml(column.raw_header || `Колонка ${column.index + 1}`)}</span><input class="input" data-ai-first-new-cell="${column.index}" maxlength="2000"></label>`).join("")}</div><button class="button primary" type="button" id="ai-first-add-row-submit">Добавить позицию с записью в аудит</button></div>` : "";
-    return `${addForm}<div class="ai-first-table-caption">Таблица ${tableIndex + 1} · исходные колонки сохранены</div><table class="ai-first-table"><thead><tr><th>Выбор</th><th>Строка</th>${header}<th>Решение</th></tr></thead><tbody>${body || `<tr><td colspan="${columns.length + 3}" class="ai-first-empty-page">В таблице пока нет строк.</td></tr>`}</tbody></table>`;
+    const decisionLabel = excluded ? "Исключена" : decision?.active ? (decision.disposition === "corrected" ? "Исправлена" : Object.keys(decision.values || {}).length ? "Подтверждена с правками" : "Подтверждена") : "Нужно проверить";
+    const kindLabel = ({item:"Позиция",item_candidate:"Возможная позиция",header:"Заголовок",section:"Раздел",note:"Примечание"})[row.model_kind] || (manual ? "Ручная позиция" : "Строка документа");
+    const rowLabel = manual ? "Ручная" : String((row.index ?? 0) + 1);
+    return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${page?.page_number || row.page_number}" class="${flagged ? "critical-review" : ""} ${excluded ? "is-excluded" : ""} ${Number(page?.page_number || row.page_number) === state.aiFirst.page ? "active" : ""}"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td>${rowLabel}<small class="ai-first-cell-source">${escapeHtml(kindLabel)} · ${decisionLabel}</small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${page?.page_number || row.page_number}">Стр. ${page?.page_number || row.page_number}</button></td>${cells}<td><div class="ai-first-row-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(row.id)}">Сохранить правки</button><button class="button ghost" type="button" data-ai-first-confirm-row="${escapeHtml(row.id)}">Подтвердить</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(row.id)}">${excluded ? "Восстановить" : "Исключить"}</button></div></td></tr>`;
   }).join("");
+  const currentPage = aiFirstPageRecord(state.aiFirst.page);
+  const addColumns = aiFirstColumnList(currentPage?.tables?.[0] || {columns:["Поз.","Наименование","Артикул","Ед. изм.","Количество","Примечание"].map((raw_header,index)=>({index,raw_header}))});
+  const addForm = state.aiFirst.addRowOpen ? `<div class="ai-first-add-form"><b>Новая позиция · страница ${state.aiFirst.page}</b><div class="ai-first-add-fields">${addColumns.map((column) => `<label><span>${escapeHtml(column.label)}</span><input class="input" data-ai-first-new-cell="${column.index}" maxlength="2000"></label>`).join("")}</div><button class="button primary" type="button" id="ai-first-add-row-submit">Добавить позицию</button></div>` : "";
+  const header = allColumns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("");
+  root.innerHTML = `${addForm}<table class="data-table ai-first-table"><thead><tr><th class="selector">Выбор</th><th>Строка</th><th>Страница</th>${header}<th>Действия</th></tr></thead><tbody>${body || `<tr><td colspan="${allColumns.length + 4}" class="empty-table">Для обработанных страниц позиции не найдены. Проверьте сводку страниц.</td></tr>`}</tbody></table>`;
   root.querySelectorAll("[data-ai-first-select-row]").forEach((input) => input.addEventListener("change", () => {
     const id = input.dataset.aiFirstSelectRow;
     if (input.checked) state.aiFirst.selectedRows.add(id); else state.aiFirst.selectedRows.delete(id);
@@ -198,7 +360,16 @@ function renderAIFirstTables(page) {
     root.querySelectorAll("[data-ai-first-cell]").forEach((input) => { if (input.dataset.aiFirstCell === id) values[`cell:${input.dataset.columnIndex}`] = input.value; });
     void postAIFirstReview("row", {record_id:id,disposition:"corrected",values});
   }));
-  root.querySelectorAll("[data-ai-first-confirm-row]").forEach((button) => button.addEventListener("click", () => void postAIFirstReview("row", {record_id:button.dataset.aiFirstConfirmRow,disposition:"confirmed",values:{}})));
+  root.querySelectorAll("[data-ai-first-confirm-row]").forEach((button) => button.addEventListener("click", () => {
+    const id = button.dataset.aiFirstConfirmRow, snapshot = aiFirstRowInputSnapshot(id);
+    const changed = snapshot.filter((item) => item.value !== item.baseline);
+    const preview = snapshot.map((item) => `${item.label}: ${item.value || "пусто"}`).join("\n");
+    const question = changed.length
+      ? `Сохранить несохранённые изменения и подтвердить эту строку?\n\n${changed.map((item) => `${item.label}: ${item.baseline || "пусто"} → ${item.value || "пусто"}`).join("\n")}`
+      : `Подтвердить показанные значения после сверки с PDF?\n\n${preview}`;
+    if (!confirm(question)) return;
+    void postAIFirstReview("row", {record_id:id,disposition:"confirmed",values:changed.length ? aiFirstRowValues(snapshot) : {}});
+  }));
   root.querySelectorAll("[data-ai-first-exclude-row]").forEach((button) => button.addEventListener("click", () => {
     const id = button.dataset.aiFirstExcludeRow, current = aiFirstDecision(id);
     const disposition = current?.active && current.disposition === "excluded" ? "confirmed" : "excluded";
@@ -216,22 +387,52 @@ function renderAIFirstTables(page) {
     root.querySelectorAll("[data-ai-first-new-cell]").forEach((input) => { values[`cell:${input.dataset.aiFirstNewCell}`] = input.value; });
     void postAIFirstReview("add-row", {page_number:state.aiFirst.page,values});
   });
+  root.querySelectorAll("[data-ai-first-row]").forEach((row) => row.addEventListener("click", () => showAIFirstPage(Number(row.dataset.pageNumber))));
+  root.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    showAIFirstPage(Number(button.dataset.aiFirstShowPage));
+  }));
 }
 
 async function postAIFirstReview(action, body) {
+  const affected = new Set(body.record_id ? [body.record_id] : (body.record_ids || []));
+  const pending = new Map();
+  for (const input of document.querySelectorAll("#ai-first-table-scroll [data-ai-first-cell]")) {
+    const id = input.dataset.aiFirstCell;
+    const rowPending = pending.get(id) || {};
+    rowPending[`cell:${input.dataset.columnIndex}`] = input.value;
+    pending.set(id, rowPending);
+  }
+  for (const [id, values] of pending) {
+    const snapshot = aiFirstRowInputSnapshot(id);
+    if (!snapshot.some((item) => item.value !== item.baseline)) pending.delete(id);
+    else pending.set(id, values);
+  }
   try {
     await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/review/${action}`, {
       method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),
     });
     state.aiFirst.data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first`);
     renderAIFirstReview();
-    toast("Решение сохранено локально и добавлено в аудит.", "success");
+    for (const [id, values] of pending) {
+      if (affected.has(id)) continue;
+      for (const input of document.querySelectorAll("#ai-first-table-scroll [data-ai-first-cell]")) {
+        if (input.dataset.aiFirstCell === id) input.value = values[`cell:${input.dataset.columnIndex}`] ?? input.value;
+      }
+    }
+    toast("Изменение сохранено в черновике и добавлено в историю проверки.", "success");
   } catch (error) { toast(error.message || "Не удалось сохранить решение.", "error"); }
 }
 
 async function confirmSelectedAIFirstRows() {
   const recordIds = [...state.aiFirst.selectedRows];
-  if (!recordIds.length || !confirm(`Подтвердить ${recordIds.length} выбранных строк после сверки с PDF?`)) return;
+  if (!recordIds.length) return;
+  const changedRows = recordIds.filter((id) => aiFirstRowInputSnapshot(id).some((item) => item.value !== item.baseline));
+  if (changedRows.length) {
+    toast(`В ${changedRows.length} выбранных строках есть несохранённые правки. Сохраните каждую строку отдельно, затем подтвердите их вместе.`, "error");
+    return;
+  }
+  if (!confirm(`Подтвердить ${recordIds.length} выбранных строк? Будут подтверждены значения, показанные в таблице; несохранённых правок нет. Сначала сверьте строки с PDF.`)) return;
   await postAIFirstReview("bulk-confirm", {record_ids:recordIds});
   state.aiFirst.selectedRows.clear();
   renderAIFirstReview();
@@ -285,18 +486,20 @@ function installAIFirstUIEvents() {
     renderAIFirstReview();
     document.querySelector("#ai-first-add-row").textContent = state.aiFirst.addRowOpen ? "Отменить добавление" : "+ Добавить позицию";
   });
-  document.querySelector("#ai-first-page-select").addEventListener("change", (event) => {
-    state.aiFirst.page = Number(event.target.value);
-    state.aiFirst.selectedRows.clear();
-    renderAIFirstReview();
-  });
-  document.querySelector("#ai-first-prev-page").addEventListener("click", () => changeAIFirstPage(-1));
-  document.querySelector("#ai-first-next-page").addEventListener("click", () => changeAIFirstPage(1));
+  document.querySelector("#ai-first-page-select").addEventListener("change", (event) => showAIFirstPage(Number(event.target.value)));
+  document.querySelector("#ai-first-prev-page").addEventListener("click", () => showAIFirstPage(state.aiFirst.page - 1));
+  document.querySelector("#ai-first-next-page").addEventListener("click", () => showAIFirstPage(state.aiFirst.page + 1));
   document.querySelector("#ai-first-open-saved").addEventListener("click", async () => {
     if (!state.document) return;
     try {
       const data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first`);
       state.aiFirst.data = data;
+      if (!(data.pages || []).some((page) => page.state === "completed")) {
+        renderAIFirstRunFeedback(data, true);
+        setView("pages");
+        toast("В сохранённом запуске нет успешно обработанных страниц. Документ не открыт как готовая проверка.", "error");
+        return;
+      }
       const modeValue = data.mode === "fake_vision" ? "fake" : data.mode === "qwen_vision" ? "qwen" : "standard";
       if (modeValue !== "standard" && !document.querySelector(`#ai-first-mode option[value="${modeValue}"]`)?.hidden) {
         document.querySelector("#ai-first-mode").value = modeValue;

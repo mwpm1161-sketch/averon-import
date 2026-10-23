@@ -2039,6 +2039,11 @@ class AIFirstBulkConfirmRequest(BaseModel):
     record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
 
 
+def require_ai_first_enabled():
+    if not AI_FIRST_UI_ENABLED:
+        raise HTTPException(404, "Экспериментальный режим выключен")
+
+
 class AIFirstAddRowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -2094,7 +2099,7 @@ def _ai_first_page_counts(draft: AIDocumentDraft) -> dict[str, int]:
 
 @app.post(
     "/api/documents/{document_id}/ai-first/recognize",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 async def recognize_ai_first(
     document_id: str,
@@ -2108,8 +2113,6 @@ async def recognize_ai_first(
             422,
             detail={"code": "AI_FIRST_INVALID_REQUEST", "message": "Проверьте режим, выбор страниц и длину подсказки."},
         ) from None
-    if not AI_FIRST_UI_ENABLED:
-        raise HTTPException(404, "Экспериментальный режим выключен")
     if request.mode == "fake" and not AI_FIRST_FAKE_OCR_ENABLED:
         raise HTTPException(403, "Синтетический режим не разрешён конфигурацией сервера")
     if request.mode == "qwen" and not AI_FIRST_LIVE_ENABLED:
@@ -2204,19 +2207,7 @@ async def recognize_ai_first(
                 )
 
             report = asyncio.run(execute())
-            old_draft_data = store.read("transcription.json")
-            old_review_data = store.read("review.json")
-            if old_draft_data is None or old_review_data is None:
-                review = new_review_state(report.draft)
-            else:
-                old_draft = AIDocumentDraft.model_validate(old_draft_data)
-                old_review = AIReviewState.model_validate_json(json.dumps(old_review_data, ensure_ascii=False))
-                review = reconcile_reprocessed_pages(old_draft, report.draft, old_review)
-            store.write("transcription.json", report.draft.model_dump(mode="json"))
-            store.write("review.json", review.model_dump(mode="json"))
-            store.write("report.json", report.model_dump(
-                mode="json", exclude={"draft": True, "pages": {"__all__": {"extraction"}}},
-            ))
+            _publish_ai_first_report(document_id, store, report)
             counts = _ai_first_page_counts(report.draft)
             return {
                 "workflow": "ai_first",
@@ -2251,7 +2242,7 @@ async def recognize_ai_first(
     return job.public()
 
 
-@app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(require_authenticated)])
+@app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(require_authenticated), Depends(require_ai_first_enabled)])
 def cancel_ai_first_job(job_id: str, user: CurrentUser = Depends(require_authenticated)):
     try:
         job = job_service.get(job_id, owner_id=_job_owner_id(user))
@@ -2271,15 +2262,16 @@ def cancel_ai_first_job(job_id: str, user: CurrentUser = Depends(require_authent
 
 @app.get(
     "/api/documents/{document_id}/ai-first",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def get_ai_first_state(document_id: str):
     try:
         workspace = workspace_service.get(document_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
-    store, draft, review, report = _ai_first_read_state(workspace)
-    progress_state = store.read("progress.json") or {}
+    with document_mutation_locks.for_document(document_id):
+        store, draft, review, report = _ai_first_read_state(workspace)
+        progress_state = store.read("progress.json") or {}
     try:
         assert_review_ready_for_export(draft, review)
         guard = {"ready": True, "code": None}
@@ -2306,7 +2298,7 @@ def get_ai_first_state(document_id: str):
 
 @app.get(
     "/api/documents/{document_id}/ai-first/progress",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def get_ai_first_progress(document_id: str):
     try:
@@ -2333,9 +2325,27 @@ def _mutate_ai_first_state(document_id: str, operation):
         return {"review": updated.model_dump(mode="json")}
 
 
+def _publish_ai_first_report(document_id: str, store: AIWorkspaceStore, report):
+    """Publish extraction and its reconciled review state as one document mutation."""
+    with document_mutation_locks.for_document(document_id):
+        old_draft_data = store.read("transcription.json")
+        old_review_data = store.read("review.json")
+        if old_draft_data is None or old_review_data is None:
+            review = new_review_state(report.draft)
+        else:
+            old_draft = AIDocumentDraft.model_validate(old_draft_data)
+            old_review = AIReviewState.model_validate_json(json.dumps(old_review_data, ensure_ascii=False))
+            review = reconcile_reprocessed_pages(old_draft, report.draft, old_review)
+        store.write("transcription.json", report.draft.model_dump(mode="json"))
+        store.write("review.json", review.model_dump(mode="json"))
+        store.write("report.json", report.model_dump(
+            mode="json", exclude={"draft": True, "pages": {"__all__": {"extraction"}}},
+        ))
+
+
 @app.post(
     "/api/documents/{document_id}/ai-first/review/row",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def decide_ai_first_row(document_id: str, request: AIFirstRowDecisionRequest, user: CurrentUser = Depends(require_authenticated)):
     try:
@@ -2349,7 +2359,7 @@ def decide_ai_first_row(document_id: str, request: AIFirstRowDecisionRequest, us
 
 @app.post(
     "/api/documents/{document_id}/ai-first/review/bulk-confirm",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def bulk_confirm_ai_first_rows(document_id: str, request: AIFirstBulkConfirmRequest, user: CurrentUser = Depends(require_authenticated)):
     if len(set(request.record_ids)) != len(request.record_ids):
@@ -2366,7 +2376,7 @@ def bulk_confirm_ai_first_rows(document_id: str, request: AIFirstBulkConfirmRequ
 
 @app.post(
     "/api/documents/{document_id}/ai-first/review/add-row",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def add_ai_first_row(document_id: str, request: AIFirstAddRowRequest, user: CurrentUser = Depends(require_authenticated)):
     if not request.values or not any(value.strip() for value in request.values.values()):
@@ -2379,7 +2389,7 @@ def add_ai_first_row(document_id: str, request: AIFirstAddRowRequest, user: Curr
 
 @app.post(
     "/api/documents/{document_id}/ai-first/review/complete-page",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def confirm_ai_first_page(document_id: str, request: AIFirstPageRequest, user: CurrentUser = Depends(require_authenticated)):
     def apply(draft, state):
@@ -2392,7 +2402,7 @@ def confirm_ai_first_page(document_id: str, request: AIFirstPageRequest, user: C
 
 @app.post(
     "/api/documents/{document_id}/ai-first/review/resolve-issue",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def resolve_ai_first_issue(document_id: str, request: AIFirstResolveIssueRequest, user: CurrentUser = Depends(require_authenticated)):
     return _mutate_ai_first_state(document_id, lambda draft, state: resolve_review_issue(
@@ -2402,7 +2412,7 @@ def resolve_ai_first_issue(document_id: str, request: AIFirstResolveIssueRequest
 
 @app.post(
     "/api/documents/{document_id}/ai-first/review/save",
-    dependencies=[Depends(require_authenticated), Depends(require_document_activity)],
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
 def save_ai_first_review(document_id: str):
     try:

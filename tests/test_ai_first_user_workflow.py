@@ -108,6 +108,23 @@ def _make_document(main, page_count: int = 2):
     return workspace
 
 
+def _make_sized_document(main, dimensions):
+    pdf = fitz.open()
+    for number, (width, height) in enumerate(dimensions, 1):
+        page = pdf.new_page(width=width, height=height)
+        page.insert_text((36, 48), f"Synthetic sized page {number}")
+    source = main.workspace_service.data_dir / "synthetic-sized.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    pdf.save(source)
+    pdf.close()
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    return main.workspace_service.create(
+        source,
+        {"filename":"synthetic-sized.pdf","page_count":len(dimensions),"size":source.stat().st_size},
+        source_sha256=digest,
+    )
+
+
 def _wait_for_job(client, job_id, timeout_s=15):
     deadline = time.monotonic() + timeout_s
     last_job = None
@@ -165,6 +182,43 @@ def test_fake_ai_first_runs_all_pdf_pages_and_preserves_private_local_state(ai_f
     assert "Демо-позиция A" in transcription_text
 
 
+def test_fake_ai_first_completes_28_pages_including_large_format_and_persists_checkpoint(ai_first_client):
+    main, client = ai_first_client
+    dimensions = [(612, 792) if number % 2 else (1190, 1684) for number in range(1, 29)]
+    workspace = _make_sized_document(main, dimensions)
+
+    result = _start_fake(client, workspace.document_id)
+
+    assert result["status"] == "completed"
+    assert result["completed_pages"] == result["total_pages"] == 28
+    assert result["counts"] == {"tables":28,"rows":56,"cells":336}
+    state = client.get(f"/api/documents/{workspace.document_id}/ai-first").json()
+    assert len(state["draft"]["pages"]) == 28
+    assert all(page["status"] == "extracted" for page in state["draft"]["pages"])
+    assert all(page["state"] == "completed" for page in state["pages"])
+    assert len(list((workspace.root / "ai_first" / "checkpoint").glob("page-*.json"))) == 28
+
+
+def test_oversized_page_fails_safely_and_processing_issue_cannot_be_resolved(ai_first_client):
+    main, client = ai_first_client
+    workspace = _make_sized_document(main, [(3000, 4000)])
+
+    result = _start_fake(client, workspace.document_id)
+    state = client.get(f"/api/documents/{workspace.document_id}/ai-first").json()
+    assert result["status"] == "completed_with_errors"
+    assert result["completed_pages"] == 0
+    assert state["draft"]["pages"][0]["status"] == "failed"
+    assert state["pages"][0]["safe_error_code"] == "image_pixel_limit"
+    issue = next(item for item in state["draft"]["issues"] if item["code"] == "page_extraction_failed")
+    response = client.post(
+        f"/api/documents/{workspace.document_id}/ai-first/review/resolve-issue",
+        json={"issue_id":issue["id"],"detail":"Synthetic check"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "processing_issue_requires_retry"
+    assert client.get(f"/api/documents/{workspace.document_id}/ai-first").json()["review"]["resolved_issue_ids"] == []
+
+
 def test_review_edits_adds_excludes_and_bulk_confirms_without_changing_source_draft(ai_first_client):
     main, client = ai_first_client
     workspace = _make_document(main, 1)
@@ -211,6 +265,116 @@ def test_review_edits_adds_excludes_and_bulk_confirms_without_changing_source_dr
     assert "add_row" in [event["action"] for event in final["review"]["history"]]
     assert "exclude_row" in [event["action"] for event in final["review"]["history"]]
     assert client.post(f"{path}/review/save").json()["saved"] is True
+
+
+def test_corrected_quantity_survives_confirmation_save_and_reopen(ai_first_client):
+    _main, client = ai_first_client
+    workspace = _make_document(_main, 1)
+    _start_fake(client, workspace.document_id)
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+    before = client.get(path).json()
+    row = before["draft"]["pages"][0]["tables"][0]["rows"][0]
+
+    correction = client.post(
+        f"{path}/review/row",
+        json={"record_id":row["id"],"disposition":"corrected","values":{"cell:4":"9"}},
+    )
+    assert correction.status_code == 200, correction.text
+    confirmed = client.post(
+        f"{path}/review/row",
+        json={"record_id":row["id"],"disposition":"confirmed","values":{}},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert client.post(f"{path}/review/save").json()["saved"] is True
+
+    reopened = client.get(path).json()
+    decision = reopened["review"]["decisions"][row["id"]]
+    assert decision["disposition"] == "confirmed"
+    assert decision["values"]["cell:4"] == "9"
+    confirm_event = next(event for event in reversed(reopened["review"]["history"]) if event["action"] == "confirm_row")
+    assert confirm_event["payload"]["values"]["cell:4"] == "9"
+
+
+def test_review_change_during_result_publication_is_serialized_and_audited(ai_first_client, monkeypatch):
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    _start_fake(client, workspace.document_id)
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+    row = client.get(path).json()["draft"]["pages"][0]["tables"][0]["rows"][0]
+
+    from averon_import.services.ai_first.local_workflow import AIWorkspaceStore
+    original_write = AIWorkspaceStore.write
+    publication_blocked = threading.Event()
+    release_publication = threading.Event()
+
+    def pause_publication(store, name, payload):
+        if name == "transcription.json" and not publication_blocked.is_set():
+            publication_blocked.set()
+            assert release_publication.wait(5), "test did not release AI-first publication"
+        return original_write(store, name, payload)
+
+    monkeypatch.setattr(AIWorkspaceStore, "write", pause_publication)
+    start = client.post(
+        f"/api/documents/{workspace.document_id}/ai-first/recognize",
+        json={"mode":"fake","pages":[1]},
+    )
+    assert start.status_code == 200, start.text
+    job_id = start.json()["id"]
+    assert publication_blocked.wait(5), "recognition should reach atomic publication"
+
+    review_started = threading.Event()
+    review_finished = threading.Event()
+    review_result = {}
+
+    def update_review():
+        review_started.set()
+        review_result["response"] = client.post(
+            f"{path}/review/row",
+            json={"record_id":row["id"],"disposition":"corrected","values":{"cell:4":"11"}},
+        )
+        review_finished.set()
+
+    reviewer = threading.Thread(target=update_review)
+    reviewer.start()
+    assert review_started.wait(2)
+    assert not review_finished.wait(0.15), "review mutation must wait while publication holds the document lock"
+    release_publication.set()
+    job = _wait_for_job(client, job_id)
+    reviewer.join(timeout=3)
+    assert not reviewer.is_alive()
+    assert job["status"] == "completed", job
+    assert review_result["response"].status_code == 200, review_result["response"].text
+
+    reopened = client.get(path).json()
+    decision = reopened["review"]["decisions"][row["id"]]
+    assert decision["disposition"] == "corrected"
+    assert decision["values"]["cell:4"] == "11"
+    assert any(
+        event["action"] == "edit_value" and event["payload"]["values"].get("cell:4") == "11"
+        for event in reopened["review"]["history"]
+    )
+
+
+def test_ai_first_server_routes_are_hidden_when_experiment_flag_is_disabled(ai_first_client, monkeypatch):
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    monkeypatch.setattr(main, "AI_FIRST_UI_ENABLED", False)
+    base = f"/api/documents/{workspace.document_id}/ai-first"
+    blocked = [
+        client.post(f"{base}/recognize", json={"mode":"fake","pages":[1]}),
+        client.get(base),
+        client.get(f"{base}/progress"),
+        client.post(f"{base}/review/row", json={"record_id":"row","disposition":"confirmed","values":{}}),
+        client.post(f"{base}/review/bulk-confirm", json={"record_ids":["row"]}),
+        client.post(f"{base}/review/add-row", json={"page_number":1,"values":{"cell:0":"1"}}),
+        client.post(f"{base}/review/complete-page", json={"page_number":1}),
+        client.post(f"{base}/review/resolve-issue", json={"issue_id":"issue","detail":"checked"}),
+        client.post(f"{base}/review/save"),
+        client.post("/api/jobs/not-a-job/cancel"),
+    ]
+    assert [response.status_code for response in blocked] == [404] * len(blocked)
+    assert all("Экспериментальный режим выключен" in response.text for response in blocked)
+    assert not (workspace.root / "ai_first").exists()
 
 
 def test_bulk_confirmation_does_not_confirm_page_or_resolve_remarks(ai_first_client):
@@ -332,5 +496,8 @@ def test_existing_averon_template_exposes_ai_first_review_only_behind_server_con
     assert 'postAIFirstReview("add-row"' in ai_js
     assert 'postAIFirstReview("row"' in ai_js
     assert 'ai-first/review/save' in ai_js
+    assert "aiFirstRowInputSnapshot" in ai_js
+    assert "Сохранить несохранённые изменения и подтвердить эту строку?" in ai_js
+    assert "несохранённых правок нет" in ai_js
     assert 'if (mode === "qwen") {' in ai_js and 'updateAIFirstModeControls();' in ai_js
     assert 'page.safe_error_code' in ai_js
