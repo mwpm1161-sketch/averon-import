@@ -249,6 +249,7 @@ def build_live_qwen_runtime(
     )
     limits = VisionLimits(
         max_output_tokens=output_cap,
+        reasoning_effort="none",
         max_requests=max_requests,
         max_pages=max(1, min(page_count, 10000)),
         request_timeout_s=timeout,

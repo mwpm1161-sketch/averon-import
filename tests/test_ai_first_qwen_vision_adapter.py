@@ -885,3 +885,70 @@ def test_v2a_export_guard_stays_closed_for_unconfirmed_qwen_draft(tmp_path):
     assert report.draft.export_authorized is False
     with pytest.raises(AIReviewError, match="page_completeness_not_human_confirmed"):
         assert_review_ready_for_export(report.draft, new_review_state(report.draft))
+
+
+def test_live_qwen_runtime_disables_reasoning_in_payload_and_fingerprints_it(monkeypatch, tmp_path):
+    from averon_import.services.ai_first.local_workflow import build_live_qwen_runtime
+
+    transport = FakeTransport()
+    original_from_settings = QwenVisionAdapter.from_app_settings
+
+    def with_fake_transport(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_from_settings(*args, **kwargs)
+
+    monkeypatch.setattr(
+        QwenVisionAdapter, "from_app_settings", staticmethod(with_fake_transport),
+    )
+    env = {
+        "AVERON_AI_FIRST_RPM_LIMIT": "1",
+        "AVERON_AI_FIRST_TPM_LIMIT": "1000",
+        "AVERON_AI_FIRST_INPUT_TOKEN_UPPER_BOUND": "512",
+        "AVERON_AI_FIRST_MAX_REQUESTS": "1",
+        "AVERON_AI_FIRST_MAX_BUDGET_RUB": "1",
+        "AVERON_AI_FIRST_INPUT_RUB_PER_1K": "0.20",
+        "AVERON_AI_FIRST_CACHED_INPUT_RUB_PER_1K": "0.05",
+        "AVERON_AI_FIRST_OUTPUT_RUB_PER_1K": "0.30",
+        "AVERON_AI_FIRST_MAX_OUTPUT_TOKENS": "256",
+        "AVERON_AI_FIRST_DPI": "72",
+        "AVERON_AI_FIRST_REQUEST_TIMEOUT_S": "120",
+        "AVERON_YANDEX_AI_MODEL": "gpt://synthetic-folder/qwen3.6-35b-a3b",
+        "AVERON_YANDEX_AI_BASE_URL": "https://ai.api.cloud.yandex.net/v1",
+        "AVERON_YANDEX_AI_API_KEY": "synthetic-key",
+    }
+    settings = SimpleNamespace(
+        folder_id="synthetic-folder",
+        llm_model="qwen3.6-35b-a3b",
+        llm_base_url="https://ai.api.cloud.yandex.net/v1",
+    )
+    adapter, _config = build_live_qwen_runtime(
+        settings=settings,
+        secret_store=MemorySecretStore(),
+        quota_registry=QwenVisionQuotaRegistry(),
+        user_context=None,
+        page_count=1,
+        environ=env,
+    )
+
+    assert adapter.client.config.limits.reasoning_effort == "none"
+    assert adapter.descriptor.parameters["reasoning_effort"] == "none"
+
+    pdf = _make_pdf(tmp_path / "reasoning-runtime.pdf")
+    with fitz.open(pdf) as document:
+        image = document[0].get_pixmap(dpi=72).tobytes("png")
+    adapter.client.extract(image, 1)
+    assert transport.calls[0]["payload"]["reasoning_effort"] == "none"
+
+    baseline_limits = replace(adapter.client.config.limits, reasoning_effort=None)
+    baseline_client = QwenVisionClient(
+        replace(adapter.client.config, limits=baseline_limits), transport=transport,
+    )
+    baseline_adapter = QwenVisionAdapter(
+        baseline_client,
+        quota_registry=QwenVisionQuotaRegistry(),
+        requests_per_minute=adapter.requests_per_minute,
+        tokens_per_minute=adapter.tokens_per_minute,
+        input_token_upper_bound=adapter.input_token_upper_bound,
+        pricing_profile_id=adapter.pricing_profile_id,
+    )
+    assert baseline_adapter.descriptor.fingerprint != adapter.descriptor.fingerprint
