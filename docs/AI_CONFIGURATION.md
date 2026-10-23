@@ -39,10 +39,10 @@ AVERON_YANDEX_AI_API_KEY=<секретный API-ключ>
 AVERON_YANDEX_AI_MODEL=gpt://<folder_id>/<model_id>/latest
 ```
 
-Пример URI модели:
+Для Qwen 3.6 35B используйте документированный URI без суффикса `/latest`:
 
 ```text
-gpt://<folder_id>/qwen3.6-35b-a3b/latest
+gpt://<folder_id>/qwen3.6-35b-a3b
 ```
 
 API-ключ нельзя добавлять в Git, `.bat`, HTML/JavaScript или `result.json`. Для корпоративного развёртывания рекомендуется передавать секрет через переменную окружения или защищённое хранилище ОС/инфраструктуры.
