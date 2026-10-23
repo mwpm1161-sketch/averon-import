@@ -318,11 +318,13 @@ def _has_identity_anchor(expected: Mapping[str, Any], candidate: Mapping[str, An
     )
 
 
-def _maximum_weight_assignment(weights: list[list[float]]) -> list[int]:
-    """Return a maximum-weight square assignment using the Hungarian method."""
+def _maximum_weight_assignment(
+    weights: list[list[float]],
+) -> tuple[list[int], list[float], list[float]]:
+    """Return an optimal assignment and its Hungarian dual potentials."""
     size = len(weights)
     if not size:
-        return []
+        return [], [], []
     # Hungarian potentials for a minimum-cost assignment; negated weights turn
     # it into a maximum assignment. Zero-weight cells are unmatched fillers.
     u = [0.0] * (size + 1)
@@ -367,7 +369,51 @@ def _maximum_weight_assignment(weights: list[list[float]]) -> list[int]:
     for j in range(1, size + 1):
         if p[j]:
             assigned[p[j] - 1] = j - 1
-    return assigned
+    return assigned, u, v
+
+
+def _strong_components(graph: list[set[int]]) -> list[int]:
+    """Find strongly connected components without recursion depth limits."""
+    size = len(graph)
+    reverse: list[set[int]] = [set() for _ in range(size)]
+    for node, neighbors in enumerate(graph):
+        for neighbor in neighbors:
+            reverse[neighbor].add(node)
+
+    visited: set[int] = set()
+    order: list[int] = []
+    for start in range(size):
+        if start in visited:
+            continue
+        visited.add(start)
+        stack: list[tuple[int, Any]] = [(start, iter(graph[start]))]
+        while stack:
+            node, neighbors = stack[-1]
+            try:
+                neighbor = next(neighbors)
+            except StopIteration:
+                order.append(node)
+                stack.pop()
+                continue
+            if neighbor not in visited:
+                visited.add(neighbor)
+                stack.append((neighbor, iter(graph[neighbor])))
+
+    components = [-1] * size
+    component_index = 0
+    for start in reversed(order):
+        if components[start] >= 0:
+            continue
+        components[start] = component_index
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for neighbor in reverse[node]:
+                if components[neighbor] < 0:
+                    components[neighbor] = component_index
+                    stack.append(neighbor)
+        component_index += 1
+    return components
 
 
 def _align_rows(
@@ -413,40 +459,59 @@ def _align_rows(
                 raw_scores[(row_i, col_i)] = score
                 if score >= _MIN_MATCH_SCORE and _has_identity_anchor(expected, candidate):
                     weights[row_i][col_i] = score
-        assignment = _maximum_weight_assignment(weights)
-        optimal_weight = sum(
-            weights[row_i][col_i]
-            for row_i, col_i in enumerate(assignment)
-            if col_i >= 0
-        )
-        # If forbidding one selected real edge preserves the optimal objective,
-        # the row correspondence is not uniquely supported by the observations.
-        # Exclude every endpoint that changes in such an equal-weight solution
-        # from downstream order, location, field, and table metrics.
+        assignment, row_potentials, column_potentials = _maximum_weight_assignment(weights)
+        inverse_assignment = [-1] * size
+        for row_i, col_i in enumerate(assignment):
+            inverse_assignment[col_i] = row_i
+
+        # A tight edge can participate in an optimal assignment when it is
+        # already selected or belongs to an alternating cycle in the equality
+        # graph. SCC membership finds all such alternatives, including rows
+        # currently assigned to a zero-weight (unmatched) edge.
+        equality_graph: list[set[int]] = [set() for _ in range(size)]
+        tight_edges: set[tuple[int, int]] = set()
+        for row_i in range(size):
+            for col_i in range(size):
+                reduced_cost = -weights[row_i][col_i] - row_potentials[row_i + 1] - column_potentials[col_i + 1]
+                if math.isclose(reduced_cost, 0.0, rel_tol=0.0, abs_tol=1e-9):
+                    tight_edges.add((row_i, col_i))
+                    equality_graph[row_i].add(inverse_assignment[col_i])
+        components = _strong_components(equality_graph)
+
+        def can_use_edge(row_i: int, col_i: int) -> bool:
+            matched_row = inverse_assignment[col_i]
+            return (assignment[row_i] == col_i
+                    or components[row_i] == components[matched_row])
+
         ambiguous_rows: set[int] = set()
         ambiguous_columns: set[int] = set()
-        for row_i, col_i in enumerate(assignment[:len(expected_indexes)]):
-            if col_i < 0 or col_i >= len(candidate_indexes) or weights[row_i][col_i] <= 0:
-                continue
-            alternative_weights = [row.copy() for row in weights]
-            alternative_weights[row_i][col_i] = 0.0
-            alternative = _maximum_weight_assignment(alternative_weights)
-            alternative_weight = sum(
-                alternative_row[col]
-                for alternative_row, col in zip(alternative_weights, alternative)
-                if col >= 0
-            )
-            if not math.isclose(alternative_weight, optimal_weight, rel_tol=0.0, abs_tol=1e-9):
-                continue
-            for changed_row in range(len(expected_indexes)):
-                old_column = assignment[changed_row]
-                new_column = alternative[changed_row]
-                if old_column == new_column:
+        expected_targets: dict[int, set[int]] = defaultdict(set)
+        candidate_sources: dict[int, set[int]] = defaultdict(set)
+        expected_can_be_unmatched: set[int] = set()
+        candidate_can_be_unmatched: set[int] = set()
+        for row_i in range(size):
+            for col_i in range(size):
+                if (row_i, col_i) not in tight_edges or not can_use_edge(row_i, col_i):
                     continue
-                ambiguous_rows.add(changed_row)
-                for changed_column in (old_column, new_column):
-                    if 0 <= changed_column < len(candidate_indexes):
-                        ambiguous_columns.add(changed_column)
+                is_real_expected = row_i < len(expected_indexes)
+                is_real_candidate = col_i < len(candidate_indexes)
+                if is_real_expected and is_real_candidate and weights[row_i][col_i] > 0:
+                    expected_targets[row_i].add(col_i)
+                    candidate_sources[col_i].add(row_i)
+                else:
+                    if is_real_expected:
+                        expected_can_be_unmatched.add(row_i)
+                    if is_real_candidate:
+                        candidate_can_be_unmatched.add(col_i)
+
+        for row_i, targets in expected_targets.items():
+            if len(targets) > 1 or row_i in expected_can_be_unmatched:
+                ambiguous_rows.add(row_i)
+                ambiguous_columns.update(targets)
+        for col_i, sources in candidate_sources.items():
+            if len(sources) > 1 or col_i in candidate_can_be_unmatched:
+                ambiguous_columns.add(col_i)
+                ambiguous_rows.update(sources)
         ambiguous_expected.update(expected_indexes[index] for index in ambiguous_rows)
         ambiguous_candidate.update(candidate_indexes[index] for index in ambiguous_columns)
         for row_i, col_i in enumerate(assignment[:len(expected_indexes)]):

@@ -202,50 +202,55 @@ def test_position_detection_is_independent_of_candidate_classification():
 
 def test_equal_weight_duplicate_rows_are_not_reported_as_confirmed_matches():
     source_sha256 = "1" * 64
-    reference = {
-        "format_version": 1,
-        "case_id": "synthetic_ambiguous_duplicate",
-        "source_sha256": source_sha256,
-        "expected_pages": [1],
-        "expected_columns": [
-            {"page": 1, "table_index": index, "fields": ["position", "code", "name"]}
-            for index in (0, 1)
-        ],
-        "expected_rows": [
-            {
-                "page": 1, "table_index": index, "row_index": 0, "order_index": index,
-                "role": "item", "values": {
-                    "position": "1", "code": "SYN-DUP", "name": "Synthetic duplicate",
-                },
-            }
-            for index in (0, 1)
-        ],
-    }
-    run = {
-        "engine": "standard_ocr", "source_sha256": source_sha256,
-        "pages": [{
-            "page": 1, "status": "completed", "tables": [
-                {"table_index": index, "columns": ["position", "code", "name"], "rows": [{
-                    "kind": "item", "page_order": index, "values": {
+    for expected_count, candidate_count in ((2, 2), (3, 1), (1, 3), (3, 2), (2, 3)):
+        reference = {
+            "format_version": 1,
+            "case_id": f"synthetic_ambiguous_{expected_count}_{candidate_count}",
+            "source_sha256": source_sha256,
+            "expected_pages": [1],
+            "expected_columns": [
+                {"page": 1, "table_index": index, "fields": ["position", "code", "name"]}
+                for index in range(expected_count)
+            ],
+            "expected_rows": [
+                {
+                    "page": 1, "table_index": index, "row_index": 0, "order_index": index,
+                    "role": "item", "values": {
                         "position": "1", "code": "SYN-DUP", "name": "Synthetic duplicate",
                     },
-                }]}
-                for index in (0, 1)
+                }
+                for index in range(expected_count)
             ],
-        }],
-    }
+        }
+        run = {
+            "engine": "standard_ocr", "source_sha256": source_sha256,
+            "pages": [{
+                "page": 1, "status": "completed", "tables": [
+                    {"table_index": index, "columns": ["position", "code", "name"], "rows": [{
+                        "kind": "item", "page_order": index, "values": {
+                            "position": "1", "code": "SYN-DUP", "name": "Synthetic duplicate",
+                        },
+                    }]}
+                    for index in range(candidate_count)
+                ],
+            }],
+        }
 
-    result = _run(build_comparison_report(reference, [run]), "standard_ocr")
-    assert result["matching"] == {"ambiguous_expected_rows": 2, "ambiguous_candidate_rows": 2}
-    assert result["position_detection"]["detected_item_rows"] == 0
-    assert result["position_detection"]["missing_item_rows"] == 2
-    assert result["order"]["preserved"] is None
-    assert result["physical_location"]["status"] == "unavailable"
-    assert result["column_assignment"]["status"] == "unavailable"
-    assert result["field_accuracy"]["name"] == {
-        "compared": 0, "correct": 0, "errors": 0,
-        "unresolved_ambiguous_rows": 2, "accuracy_rate": None,
-    }
+        result = _run(build_comparison_report(reference, [run]), "standard_ocr")
+        assert result["matching"] == {
+            "ambiguous_expected_rows": expected_count,
+            "ambiguous_candidate_rows": candidate_count,
+        }
+        assert result["position_detection"]["detected_item_rows"] == 0
+        assert result["position_detection"]["missing_item_rows"] == expected_count
+        assert result["position_detection"]["unmatched_item_candidates"] == candidate_count
+        assert result["order"]["preserved"] is None
+        assert result["physical_location"]["status"] == "unavailable"
+        assert result["column_assignment"]["status"] == "unavailable"
+        assert result["field_accuracy"]["name"] == {
+            "compared": 0, "correct": 0, "errors": 0,
+            "unresolved_ambiguous_rows": expected_count, "accuracy_rate": None,
+        }
 
 
 def test_reference_rejects_non_independent_geometry():
