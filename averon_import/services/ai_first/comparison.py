@@ -157,11 +157,14 @@ def _reference(value: Mapping[str, Any]) -> dict[str, Any]:
         section = raw.get("section")
         if section is not None and not isinstance(section, str):
             raise ValueError("invalid_comparison_reference")
+        location = _location(raw.get("location"), default_basis="independent_reference")
+        if location is not None and location["basis"] != "independent_reference":
+            raise ValueError("invalid_comparison_reference")
         expected_rows.append({
             "page": page, "table_index": table_index, "order": row_index,
             "page_order": page_order,
             "role": _role(role), "section": section, "values": fields,
-            "location": _location(raw.get("location"), default_basis="independent_reference"),
+            "location": location,
         })
         seen.add(identity)
         seen_page_orders.add((page, page_order))
@@ -367,8 +370,12 @@ def _maximum_weight_assignment(weights: list[list[float]]) -> list[int]:
     return assigned
 
 
-def _align_rows(reference_rows: list[dict[str, Any]], candidate_rows: list[dict[str, Any]]) -> list[tuple[int, int]]:
+def _align_rows(
+    reference_rows: list[dict[str, Any]], candidate_rows: list[dict[str, Any]],
+) -> tuple[list[tuple[int, int]], set[int], set[int]]:
     matches: list[tuple[int, int]] = []
+    ambiguous_expected: set[int] = set()
+    ambiguous_candidate: set[int] = set()
     by_page_ref: dict[int, list[int]] = defaultdict(list)
     by_page_cand: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(reference_rows):
@@ -399,8 +406,7 @@ def _align_rows(reference_rows: list[dict[str, Any]], candidate_rows: list[dict[
                 candidate = candidate_rows[candidate_index]
                 position = _match_text(expected["values"].get("position"))
                 unique_position = bool(
-                    expected["role"] == "item" and candidate["role"] == "item"
-                    and position and expected_positions[position] == 1
+                    expected["role"] == "item" and position and expected_positions[position] == 1
                     and candidate_positions[position] == 1
                 )
                 score = _score_pair(expected, candidate, unique_position=unique_position)
@@ -408,15 +414,52 @@ def _align_rows(reference_rows: list[dict[str, Any]], candidate_rows: list[dict[
                 if score >= _MIN_MATCH_SCORE and _has_identity_anchor(expected, candidate):
                     weights[row_i][col_i] = score
         assignment = _maximum_weight_assignment(weights)
+        optimal_weight = sum(
+            weights[row_i][col_i]
+            for row_i, col_i in enumerate(assignment)
+            if col_i >= 0
+        )
+        # If forbidding one selected real edge preserves the optimal objective,
+        # the row correspondence is not uniquely supported by the observations.
+        # Exclude every endpoint that changes in such an equal-weight solution
+        # from downstream order, location, field, and table metrics.
+        ambiguous_rows: set[int] = set()
+        ambiguous_columns: set[int] = set()
+        for row_i, col_i in enumerate(assignment[:len(expected_indexes)]):
+            if col_i < 0 or col_i >= len(candidate_indexes) or weights[row_i][col_i] <= 0:
+                continue
+            alternative_weights = [row.copy() for row in weights]
+            alternative_weights[row_i][col_i] = 0.0
+            alternative = _maximum_weight_assignment(alternative_weights)
+            alternative_weight = sum(
+                alternative_row[col]
+                for alternative_row, col in zip(alternative_weights, alternative)
+                if col >= 0
+            )
+            if not math.isclose(alternative_weight, optimal_weight, rel_tol=0.0, abs_tol=1e-9):
+                continue
+            for changed_row in range(len(expected_indexes)):
+                old_column = assignment[changed_row]
+                new_column = alternative[changed_row]
+                if old_column == new_column:
+                    continue
+                ambiguous_rows.add(changed_row)
+                for changed_column in (old_column, new_column):
+                    if 0 <= changed_column < len(candidate_indexes):
+                        ambiguous_columns.add(changed_column)
+        ambiguous_expected.update(expected_indexes[index] for index in ambiguous_rows)
+        ambiguous_candidate.update(candidate_indexes[index] for index in ambiguous_columns)
         for row_i, col_i in enumerate(assignment[:len(expected_indexes)]):
             if col_i < 0 or col_i >= len(candidate_indexes):
+                continue
+            if row_i in ambiguous_rows or col_i in ambiguous_columns:
                 continue
             expected_index = expected_indexes[row_i]
             candidate_index = candidate_indexes[col_i]
             if (raw_scores.get((row_i, col_i), 0) >= _MIN_MATCH_SCORE
                     and _has_identity_anchor(reference_rows[expected_index], candidate_rows[candidate_index])):
                 matches.append((expected_index, candidate_index))
-    return matches
+    return matches, ambiguous_expected, ambiguous_candidate
 
 
 def _column_metrics(reference: dict[str, Any], run: dict[str, Any], matches: list[tuple[int, int]],
@@ -467,7 +510,7 @@ def _report_one(reference: dict[str, Any], run: dict[str, Any]) -> dict[str, Any
         for table in sorted(run["pages"][page]["tables"])
         for row in run["pages"][page]["tables"][table]["rows"]
     ]
-    matches = _align_rows(reference_rows, candidate_rows)
+    matches, ambiguous_expected, ambiguous_candidate = _align_rows(reference_rows, candidate_rows)
     expected_to_candidate = {expected: candidate for expected, candidate in matches}
     candidate_to_expected = {candidate: expected for expected, candidate in matches}
     expected_items = [index for index, row in enumerate(reference_rows) if row["role"] == "item"]
@@ -486,10 +529,13 @@ def _report_one(reference: dict[str, Any], run: dict[str, Any]) -> dict[str, Any
     class_compared = len(matches)
     field_metrics: dict[str, dict[str, Any]] = {}
     for field in _ITEM_FIELDS:
-        compared = correct = 0
+        compared = correct = unresolved = 0
         for expected_index in expected_items:
             expected_value = reference_rows[expected_index]["values"].get(field)
             if expected_value is None:
+                continue
+            if expected_index in ambiguous_expected:
+                unresolved += 1
                 continue
             compared += 1
             candidate_index = expected_to_candidate.get(expected_index)
@@ -497,6 +543,7 @@ def _report_one(reference: dict[str, Any], run: dict[str, Any]) -> dict[str, Any
             correct += _exact_text(expected_value) == _exact_text(actual_value)
         field_metrics[field] = {
             "compared": compared, "correct": correct, "errors": compared - correct,
+            "unresolved_ambiguous_rows": unresolved,
             "accuracy_rate": correct / compared if compared else None,
         }
 
@@ -569,6 +616,10 @@ def _report_one(reference: dict[str, Any], run: dict[str, Any]) -> dict[str, Any
             "unmatched_candidate_rows": extra_rows,
             "unmatched_item_candidates": unmatched_item_candidates,
             "coverage_rate": detected_items / len(expected_items) if expected_items else None,
+        },
+        "matching": {
+            "ambiguous_expected_rows": len(ambiguous_expected),
+            "ambiguous_candidate_rows": len(ambiguous_candidate),
         },
         "classification": {
             "compared_rows": class_compared, "correct_rows": classified,

@@ -173,6 +173,97 @@ def test_classification_errors_do_not_change_position_detection_or_field_scores(
     assert run["position_detection"]["candidate_item_rows"] == 5
 
 
+def test_position_detection_is_independent_of_candidate_classification():
+    source_sha256 = "2" * 64
+    reference = {
+        "format_version": 1, "case_id": "synthetic_misclassified_position",
+        "source_sha256": source_sha256, "expected_pages": [1],
+        "expected_columns": [{"page": 1, "table_index": 0, "fields": ["position", "name"]}],
+        "expected_rows": [{
+            "page": 1, "table_index": 0, "row_index": 0, "order_index": 0,
+            "role": "item", "values": {"position": "1", "name": "abcd"},
+        }],
+    }
+    run = {
+        "engine": "standard_ocr", "source_sha256": source_sha256,
+        "pages": [{"page": 1, "status": "completed", "tables": [{
+            "table_index": 0, "columns": ["position", "name"], "rows": [{
+                "kind": "section", "page_order": 0,
+                "values": {"position": "1", "name": "abxy"},
+            }],
+        }]}],
+    }
+
+    result = _run(build_comparison_report(reference, [run]), "standard_ocr")
+    assert result["position_detection"]["detected_item_rows"] == 1
+    assert result["classification"]["errors"] == 1
+    assert result["field_accuracy"]["name"]["errors"] == 1
+
+
+def test_equal_weight_duplicate_rows_are_not_reported_as_confirmed_matches():
+    source_sha256 = "1" * 64
+    reference = {
+        "format_version": 1,
+        "case_id": "synthetic_ambiguous_duplicate",
+        "source_sha256": source_sha256,
+        "expected_pages": [1],
+        "expected_columns": [
+            {"page": 1, "table_index": index, "fields": ["position", "code", "name"]}
+            for index in (0, 1)
+        ],
+        "expected_rows": [
+            {
+                "page": 1, "table_index": index, "row_index": 0, "order_index": index,
+                "role": "item", "values": {
+                    "position": "1", "code": "SYN-DUP", "name": "Synthetic duplicate",
+                },
+            }
+            for index in (0, 1)
+        ],
+    }
+    run = {
+        "engine": "standard_ocr", "source_sha256": source_sha256,
+        "pages": [{
+            "page": 1, "status": "completed", "tables": [
+                {"table_index": index, "columns": ["position", "code", "name"], "rows": [{
+                    "kind": "item", "page_order": index, "values": {
+                        "position": "1", "code": "SYN-DUP", "name": "Synthetic duplicate",
+                    },
+                }]}
+                for index in (0, 1)
+            ],
+        }],
+    }
+
+    result = _run(build_comparison_report(reference, [run]), "standard_ocr")
+    assert result["matching"] == {"ambiguous_expected_rows": 2, "ambiguous_candidate_rows": 2}
+    assert result["position_detection"]["detected_item_rows"] == 0
+    assert result["position_detection"]["missing_item_rows"] == 2
+    assert result["order"]["preserved"] is None
+    assert result["physical_location"]["status"] == "unavailable"
+    assert result["column_assignment"]["status"] == "unavailable"
+    assert result["field_accuracy"]["name"] == {
+        "compared": 0, "correct": 0, "errors": 0,
+        "unresolved_ambiguous_rows": 2, "accuracy_rate": None,
+    }
+
+
+def test_reference_rejects_non_independent_geometry():
+    payload = _fixture()
+    for basis in ("provider_geometry", "model_candidate_unverified"):
+        reference = deepcopy(payload["reference"])
+        reference["expected_rows"][0]["location"] = {
+            "bbox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.1},
+            "basis": basis,
+        }
+        try:
+            build_comparison_report(reference, [deepcopy(payload["standard_run"])])
+        except ValueError as error:
+            assert str(error) == "invalid_comparison_reference"
+        else:
+            raise AssertionError("reference geometry must be independently established")
+
+
 def test_article_name_quantity_and_unit_errors_have_independent_counts():
     payload = _fixture()
     standard = deepcopy(payload["standard_run"])
