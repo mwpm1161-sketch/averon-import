@@ -84,7 +84,7 @@ def _text_values(value: Any) -> dict[str, str | None]:
     return result
 
 
-def _location(value: Any, *, default_basis: str | None = None) -> dict[str, Any] | None:
+def _location(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     location = _safe_mapping(value)
@@ -100,7 +100,7 @@ def _location(value: Any, *, default_basis: str | None = None) -> dict[str, Any]
             or box["x"] + box["width"] > 1.000001
             or box["y"] + box["height"] > 1.000001):
         raise ValueError("invalid_comparison_input")
-    basis = location.get("basis", default_basis)
+    basis = location.get("basis")
     if basis not in {"independent_reference", "provider_geometry", "model_candidate_unverified"}:
         raise ValueError("invalid_comparison_input")
     return {"bbox": box, "basis": basis, "coordinate_space": "page_normalized"}
@@ -157,9 +157,20 @@ def _reference(value: Mapping[str, Any]) -> dict[str, Any]:
         section = raw.get("section")
         if section is not None and not isinstance(section, str):
             raise ValueError("invalid_comparison_reference")
-        location = _location(raw.get("location"), default_basis="independent_reference")
-        if location is not None and location["basis"] != "independent_reference":
-            raise ValueError("invalid_comparison_reference")
+        raw_location = raw.get("location")
+        if raw_location is None:
+            location = None
+        else:
+            try:
+                location_input = _safe_mapping(raw_location)
+            except ValueError:
+                raise ValueError("invalid_comparison_reference") from None
+            if location_input.get("basis") != "independent_reference":
+                raise ValueError("invalid_comparison_reference")
+            try:
+                location = _location(location_input)
+            except ValueError:
+                raise ValueError("invalid_comparison_reference") from None
         expected_rows.append({
             "page": page, "table_index": table_index, "order": row_index,
             "page_order": page_order,

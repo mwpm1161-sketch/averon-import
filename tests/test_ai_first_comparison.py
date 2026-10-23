@@ -269,6 +269,24 @@ def test_reference_rejects_non_independent_geometry():
             raise AssertionError("reference geometry must be independently established")
 
 
+def test_reference_requires_explicit_independent_geometry_basis():
+    payload = _fixture()
+    for basis in (None, ""):
+        reference = deepcopy(payload["reference"])
+        location = {
+            "bbox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.1},
+        }
+        if basis is not None:
+            location["basis"] = basis
+        reference["expected_rows"][0]["location"] = location
+        try:
+            build_comparison_report(reference, [deepcopy(payload["standard_run"])])
+        except ValueError as error:
+            assert str(error) == "invalid_comparison_reference"
+        else:
+            raise AssertionError("reference geometry requires explicit independent provenance")
+
+
 def test_article_name_quantity_and_unit_errors_have_independent_counts():
     payload = _fixture()
     standard = deepcopy(payload["standard_run"])
