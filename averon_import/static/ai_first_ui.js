@@ -210,10 +210,10 @@ function renderAIFirstPageIssues(pageNumber) {
   }));
 }
 
-function renderAIFirstAddRowForm() {
+function renderAIFirstAddRowForm(preserveCurrentValues = true) {
   const root = document.querySelector("#ai-first-add-row-form");
   if (!root) return;
-  const previousValues = new Map([...root.querySelectorAll("[data-ai-first-new-cell]")]
+  const previousValues = new Map((preserveCurrentValues ? [...root.querySelectorAll("[data-ai-first-new-cell]")] : [])
     .map((input) => [input.dataset.aiFirstNewColumnKey, input.value]));
   state.aiFirst.addRowValues ||= {};
   if (!state.aiFirst.addRowOpen) {
@@ -233,9 +233,10 @@ function renderAIFirstAddRowForm() {
   if (add) add.addEventListener("click", async () => {
     const values = {};
     root.querySelectorAll("[data-ai-first-new-cell]").forEach((input) => { values[`cell:${input.dataset.aiFirstNewCell}`] = input.value; });
-    await postAIFirstReview("add-row", {page_number:state.aiFirst.page,values});
+    const result = await postAIFirstReview("add-row", {page_number:state.aiFirst.page,values});
+    if (!result?.saved) return;
     state.aiFirst.addRowValues = {};
-    renderAIFirstAddRowForm();
+    renderAIFirstAddRowForm(false);
   });
 }
 
@@ -441,6 +442,11 @@ async function postAIFirstReview(action, body) {
     await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/review/${action}`, {
       method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),
     });
+  } catch (error) {
+    toast(error.message || "Не удалось сохранить решение.", "error");
+    return {saved:false,refreshed:false};
+  }
+  try {
     state.aiFirst.data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first`);
     renderAIFirstReview();
     for (const [id, values] of pending) {
@@ -450,7 +456,11 @@ async function postAIFirstReview(action, body) {
       }
     }
     toast("Изменение сохранено в черновике и добавлено в историю проверки.", "success");
-  } catch (error) { toast(error.message || "Не удалось сохранить решение.", "error"); }
+    return {saved:true,refreshed:true};
+  } catch (_) {
+    toast("Изменение сохранено, но не удалось обновить данные. Перезагрузите документ перед продолжением.", "warning");
+    return {saved:true,refreshed:false};
+  }
 }
 
 async function confirmSelectedAIFirstRows() {
@@ -462,9 +472,15 @@ async function confirmSelectedAIFirstRows() {
     return;
   }
   if (!confirm(`Подтвердить ${recordIds.length} выбранных строк? Будут подтверждены значения, показанные в таблице; несохранённых правок нет. Сначала сверьте строки с PDF.`)) return;
-  await postAIFirstReview("bulk-confirm", {record_ids:recordIds});
+  const result = await postAIFirstReview("bulk-confirm", {record_ids:recordIds});
+  if (!result?.saved) return;
   state.aiFirst.selectedRows.clear();
-  renderAIFirstReview();
+  if (result.refreshed) renderAIFirstReview();
+  else {
+    document.querySelectorAll("#ai-first-table-scroll [data-ai-first-select-row]").forEach((input) => { input.checked = false; });
+    const confirmButton = document.querySelector("#ai-first-confirm-selected");
+    if (confirmButton) confirmButton.disabled = true;
+  }
 }
 
 async function cancelAIFirstRecognition() {
