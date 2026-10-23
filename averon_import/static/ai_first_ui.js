@@ -188,6 +188,55 @@ function showAIFirstPage(pageNumber) {
   const ready = report?.state === "completed" && ["extracted", "no_specification"].includes(page?.status);
   document.querySelector("#ai-first-confirm-page").disabled = !ready || (state.aiFirst.data.review.confirmed_complete_pages || []).includes(pageNumber);
   document.querySelectorAll("[data-ai-first-row]").forEach((row) => row.classList.toggle("active", Number(row.dataset.pageNumber) === pageNumber));
+  renderAIFirstPageIssues(pageNumber);
+  renderAIFirstAddRowForm();
+}
+
+function renderAIFirstPageIssues(pageNumber) {
+  const root = document.querySelector("#ai-first-page-issues");
+  if (!root) return;
+  const page = aiFirstPageRecord(pageNumber);
+  const draft = state.aiFirst.data?.draft;
+  const review = state.aiFirst.data?.review;
+  const pageIssues = [...(page?.issues || []), ...(draft?.issues || [])]
+    .filter((issue, index, all) => issue.page_number === pageNumber && issue.code !== "page_extraction_failed"
+      && ["review", "blocking"].includes(issue.severity) && !(review?.resolved_issue_ids || []).includes(issue.id)
+      && all.findIndex((item) => item.id === issue.id) === index);
+  root.innerHTML = pageIssues.map((issue) => `<div class="ai-first-issue ${issue.severity === "blocking" ? "blocking" : ""}"><div>${escapeHtml(aiFirstIssueMessage(issue.code))}<div class="ai-first-resolve-row"><input class="input" data-ai-first-issue-note="${escapeHtml(issue.id)}" maxlength="2000" placeholder="Что проверили по PDF?"><button class="button secondary" type="button" data-ai-first-resolve="${escapeHtml(issue.id)}">Отметить проверенным</button></div></div></div>`).join("");
+  root.querySelectorAll("[data-ai-first-resolve]").forEach((button) => button.addEventListener("click", () => {
+    const id = button.dataset.aiFirstResolve;
+    const detail = root.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
+    void postAIFirstReview("resolve-issue", {issue_id:id,detail});
+  }));
+}
+
+function renderAIFirstAddRowForm() {
+  const root = document.querySelector("#ai-first-add-row-form");
+  if (!root) return;
+  const previousValues = new Map([...root.querySelectorAll("[data-ai-first-new-cell]")]
+    .map((input) => [input.dataset.aiFirstNewColumnKey, input.value]));
+  state.aiFirst.addRowValues ||= {};
+  if (!state.aiFirst.addRowOpen) {
+    root.innerHTML = "";
+    return;
+  }
+  const page = aiFirstPageRecord(state.aiFirst.page);
+  const fallback = {columns:["Поз.","Наименование","Артикул","Ед. изм.","Количество","Примечание"].map((raw_header,index)=>({index,raw_header}))};
+  const columns = aiFirstColumnList(page?.tables?.[0] || fallback);
+  root.innerHTML = `<div class="ai-first-add-form"><b>Новая позиция · страница ${state.aiFirst.page}</b><div class="ai-first-add-fields">${columns.map((column) => `<label><span>${escapeHtml(column.label)}</span><input class="input" data-ai-first-new-cell="${column.index}" data-ai-first-new-column-key="${escapeHtml(column.valueKey)}" maxlength="2000"></label>`).join("")}</div><button class="button primary" type="button" id="ai-first-add-row-submit">Добавить позицию</button></div>`;
+  root.querySelectorAll("[data-ai-first-new-cell]").forEach((input) => {
+    const key = input.dataset.aiFirstNewColumnKey;
+    input.value = previousValues.has(key) ? previousValues.get(key) : (state.aiFirst.addRowValues[key] || "");
+    input.addEventListener("input", () => { state.aiFirst.addRowValues[key] = input.value; });
+  });
+  const add = root.querySelector("#ai-first-add-row-submit");
+  if (add) add.addEventListener("click", async () => {
+    const values = {};
+    root.querySelectorAll("[data-ai-first-new-cell]").forEach((input) => { values[`cell:${input.dataset.aiFirstNewCell}`] = input.value; });
+    await postAIFirstReview("add-row", {page_number:state.aiFirst.page,values});
+    state.aiFirst.addRowValues = {};
+    renderAIFirstAddRowForm();
+  });
 }
 
 function renderAIFirstRunFeedback(data, includePending = false) {
@@ -273,17 +322,6 @@ function renderAIFirstReview() {
   document.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", () => showAIFirstPage(Number(button.dataset.aiFirstShowPage))));
   document.querySelectorAll("[data-ai-first-complete-page]").forEach((button) => button.addEventListener("click", () => void postAIFirstReview("complete-page", {page_number:Number(button.dataset.aiFirstCompletePage)})));
   document.querySelectorAll("[data-ai-first-retry-one]").forEach((button) => button.addEventListener("click", () => retryAIFirstPages([Number(button.dataset.aiFirstRetryOne)])));
-  const page = aiFirstPageRecord(state.aiFirst.page);
-  const pageIssues = [...(page?.issues || []), ...(draft.issues || [])]
-    .filter((issue, index, all) => issue.page_number === state.aiFirst.page && issue.code !== "page_extraction_failed"
-      && ["review","blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)
-      && all.findIndex((item) => item.id === issue.id) === index);
-  document.querySelector("#ai-first-page-issues").innerHTML = pageIssues.map((issue) => `<div class="ai-first-issue ${issue.severity === "blocking" ? "blocking" : ""}"><div>${escapeHtml(aiFirstIssueMessage(issue.code))}<div class="ai-first-resolve-row"><input class="input" data-ai-first-issue-note="${escapeHtml(issue.id)}" maxlength="2000" placeholder="Что проверили по PDF?"><button class="button secondary" type="button" data-ai-first-resolve="${escapeHtml(issue.id)}">Отметить проверенным</button></div></div></div>`).join("");
-  document.querySelector("#ai-first-page-issues").querySelectorAll("[data-ai-first-resolve]").forEach((button) => button.addEventListener("click", () => {
-    const id = button.dataset.aiFirstResolve;
-    const detail = document.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
-    void postAIFirstReview("resolve-issue", {issue_id:id,detail});
-  }));
   renderAIFirstTables(entries);
   document.querySelector("#ai-first-confirm-selected").disabled = state.aiFirst.selectedRows.size === 0;
   document.querySelector("#ai-first-export-note").textContent = data.review_ready_for_guard?.ready
@@ -299,7 +337,7 @@ function aiFirstColumnList(table) {
     const base = label.toLocaleLowerCase("ru-RU");
     const occurrence = (occurrences.get(base) || 0) + 1;
     occurrences.set(base, occurrence);
-    return {index:column.index,label:occurrence > 1 ? `${label} (${occurrence})` : label,key:`${base}\0${occurrence}`};
+    return {index:column.index,label:occurrence > 1 ? `${label} (${occurrence})` : label,key:`${base}\0${occurrence}`,valueKey:`${base}#${occurrence}`};
   });
 }
 
@@ -345,11 +383,8 @@ function renderAIFirstTables(entries) {
     const rowLabel = manual ? "Ручная" : String((row.index ?? 0) + 1);
     return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${page?.page_number || row.page_number}" class="${flagged ? "critical-review" : ""} ${excluded ? "is-excluded" : ""} ${Number(page?.page_number || row.page_number) === state.aiFirst.page ? "active" : ""}"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td>${rowLabel}<small class="ai-first-cell-source">${escapeHtml(kindLabel)} · ${decisionLabel}</small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${page?.page_number || row.page_number}">Стр. ${page?.page_number || row.page_number}</button></td>${cells}<td><div class="ai-first-row-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(row.id)}">Сохранить правки</button><button class="button ghost" type="button" data-ai-first-confirm-row="${escapeHtml(row.id)}">Подтвердить</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(row.id)}">${excluded ? "Восстановить" : "Исключить"}</button></div></td></tr>`;
   }).join("");
-  const currentPage = aiFirstPageRecord(state.aiFirst.page);
-  const addColumns = aiFirstColumnList(currentPage?.tables?.[0] || {columns:["Поз.","Наименование","Артикул","Ед. изм.","Количество","Примечание"].map((raw_header,index)=>({index,raw_header}))});
-  const addForm = state.aiFirst.addRowOpen ? `<div class="ai-first-add-form"><b>Новая позиция · страница ${state.aiFirst.page}</b><div class="ai-first-add-fields">${addColumns.map((column) => `<label><span>${escapeHtml(column.label)}</span><input class="input" data-ai-first-new-cell="${column.index}" maxlength="2000"></label>`).join("")}</div><button class="button primary" type="button" id="ai-first-add-row-submit">Добавить позицию</button></div>` : "";
   const header = allColumns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("");
-  root.innerHTML = `${addForm}<table class="data-table ai-first-table"><thead><tr><th class="selector">Выбор</th><th>Строка</th><th>Страница</th>${header}<th>Действия</th></tr></thead><tbody>${body || `<tr><td colspan="${allColumns.length + 4}" class="empty-table">Для обработанных страниц позиции не найдены. Проверьте сводку страниц.</td></tr>`}</tbody></table>`;
+  root.innerHTML = `<table class="data-table ai-first-table"><thead><tr><th class="selector">Выбор</th><th>Строка</th><th>Страница</th>${header}<th>Действия</th></tr></thead><tbody>${body || `<tr><td colspan="${allColumns.length + 4}" class="empty-table">Для обработанных страниц позиции не найдены. Проверьте сводку страниц.</td></tr>`}</tbody></table>`;
   root.querySelectorAll("[data-ai-first-select-row]").forEach((input) => input.addEventListener("change", () => {
     const id = input.dataset.aiFirstSelectRow;
     if (input.checked) state.aiFirst.selectedRows.add(id); else state.aiFirst.selectedRows.delete(id);
@@ -381,12 +416,6 @@ function renderAIFirstTables(entries) {
     const detail = document.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
     void postAIFirstReview("resolve-issue", {issue_id:id,detail});
   }));
-  const add = document.querySelector("#ai-first-add-row-submit");
-  if (add) add.addEventListener("click", () => {
-    const values = {};
-    root.querySelectorAll("[data-ai-first-new-cell]").forEach((input) => { values[`cell:${input.dataset.aiFirstNewCell}`] = input.value; });
-    void postAIFirstReview("add-row", {page_number:state.aiFirst.page,values});
-  });
   root.querySelectorAll("[data-ai-first-row]").forEach((row) => row.addEventListener("click", () => showAIFirstPage(Number(row.dataset.pageNumber))));
   root.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -483,7 +512,8 @@ function installAIFirstUIEvents() {
   });
   document.querySelector("#ai-first-add-row").addEventListener("click", () => {
     state.aiFirst.addRowOpen = !state.aiFirst.addRowOpen;
-    renderAIFirstReview();
+    if (!state.aiFirst.addRowOpen) state.aiFirst.addRowValues = {};
+    renderAIFirstAddRowForm();
     document.querySelector("#ai-first-add-row").textContent = state.aiFirst.addRowOpen ? "Отменить добавление" : "+ Добавить позицию";
   });
   document.querySelector("#ai-first-page-select").addEventListener("change", (event) => showAIFirstPage(Number(event.target.value)));
@@ -517,7 +547,7 @@ function changeAIFirstPage(delta) {
   const pages = state.aiFirst.data?.draft?.expected_page_numbers || [];
   const index = pages.indexOf(state.aiFirst.page);
   const next = pages[index + delta];
-  if (next) { state.aiFirst.page = next; state.aiFirst.selectedRows.clear(); renderAIFirstReview(); }
+  if (next) showAIFirstPage(next);
 }
 
 document.addEventListener("DOMContentLoaded", installAIFirstUIEvents, {once:true});

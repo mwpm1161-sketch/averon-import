@@ -31,7 +31,7 @@ const state = {
   config: null,
   document: null,
   selectedPages: new Set(),
-  aiFirst: {mode:"standard",previousPages:null,data:null,page:1,selectedRows:new Set(),retryPages:new Set(),jobId:null,addRowOpen:false},
+  aiFirst: {mode:"standard",previousPages:null,data:null,page:1,selectedRows:new Set(),retryPages:new Set(),jobId:null,addRowOpen:false,addRowValues:{}},
   previewPage: null,
   crop: null,
   cropSelecting: false,
