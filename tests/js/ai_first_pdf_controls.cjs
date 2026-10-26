@@ -17,6 +17,7 @@ const wrap = {style:{}};
 const label = {textContent:""};
 const button = {disabled:false};
 const exportNote = {textContent:""};
+const retryButton = {hidden:true};
 const elements = new Map([
   ["#ai-first-pdf-image",image],
   [".ai-first-pdf-stage",stage],
@@ -24,10 +25,13 @@ const elements = new Map([
   ["#ai-first-zoom-label",label],
   ["#ai-first-export-pilot",button],
   ["#ai-first-export-note",exportNote],
+  ["#ai-first-retry-export-preview",retryButton],
 ]);
-const state = {document:{document_id:"synthetic-document"},aiFirst:{pdfZoom:1,pdfFitWidth:true,exportPages:new Set([1]),reviewGeneration:4}};
+const state = {document:{document_id:"synthetic-document"},aiFirst:{pdfZoom:1,pdfFitWidth:true,exportPages:new Set([1]),reviewGeneration:4,exportPreviewSelectionKey:"1|4"}};
 let previewCalls = 0;
 let previewFails = false;
+let holdPreview = false;
+let rejectHeldPreview = null;
 const context = {
   state,
   document:{querySelector:selector=>elements.get(selector) || null},
@@ -36,8 +40,9 @@ const context = {
     previewCalls += 1;
     assert(url.endsWith("/ai-first/pilot-export/preview"));
     assert.equal(JSON.stringify(JSON.parse(options.body)),"{\"page_numbers\":[1]}");
+    if (holdPreview) return new Promise((_resolve,reject)=>{rejectHeldPreview=reject;});
     if (previewFails) throw new Error("synthetic preview failure");
-    return {page_numbers:[1],recognized_row_count:3,verified_position_count:2,document_page_count:8};
+    return {page_numbers:[1],ocr_row_count:2,manual_row_count:1,total_row_count:3,verified_position_count:2,document_page_count:8};
   },
 };
 
@@ -55,14 +60,17 @@ context.setZoom(99);
 assert.equal(image.style.width,"2880px","maximum zoom remains bounded");
 
 const exportCode = sourceBetween("function updateAIFirstExportControls", "function aiFirstColumnList");
-vm.runInNewContext(`${exportCode}; globalThis.updateExport=updateAIFirstExportControls; globalThis.loadPreview=loadAIFirstPilotExportPreview;`,context);
+  vm.runInNewContext(`${exportCode}; globalThis.updateExport=updateAIFirstExportControls; globalThis.loadPreview=loadAIFirstPilotExportPreview; globalThis.retryPreview=retryAIFirstPilotExportPreview;`,context);
 async function run() {
   await context.loadPreview([1],"1|4");
   context.updateExport();
   assert.equal(previewCalls,1,"the preview comes from the server once per selected fragment and review generation");
   assert.equal(button.disabled,false,"the test export is enabled only after the server has checked the fragment");
-  assert(exportNote.textContent.includes("2 проверенных самостоятельных позиций"));
-  assert(exportNote.textContent.includes("3 распознанных строк"));
+  assert(exportNote.textContent.includes("Предварительно допущено 2 самостоятельных позиций"));
+  assert(exportNote.textContent.includes("всего 3 строк"));
+  assert(exportNote.textContent.includes("распознано OCR — 2"));
+  assert(exportNote.textContent.includes("добавлено вручную — 1"));
+  assert(exportNote.textContent.includes("экспорт дополнительно проверяет ограничения Excel"));
   state.aiFirst.exportPages.clear();
   context.updateExport();
   assert.equal(button.disabled,true,"the workbook remains disabled without selected pages");
@@ -70,9 +78,28 @@ async function run() {
   state.aiFirst.exportPages = new Set([1]);
   state.aiFirst.reviewGeneration = 5;
   previewFails = true;
-  await context.loadPreview([1],"1|5");
+  context.updateExport();
+  await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(button.disabled,true,"the workbook stays disabled when the server cannot verify its contents");
-  assert(exportNote.textContent.includes("Не удалось проверить состав"));
+  assert(exportNote.textContent.includes("Не удалось проверить допуск"));
+  assert.equal(retryButton.hidden,false,"an explicit retry is offered after preview failure");
+  previewFails = false;
+  await context.retryPreview();
+  assert.equal(previewCalls,3,"manual retry issues one fresh preview request");
+  assert.equal(button.disabled,false,"a successful retry unlocks the export button");
+  assert.equal(retryButton.hidden,true,"the retry control hides after successful preview");
+
+  state.aiFirst.reviewGeneration = 6;
+  state.aiFirst.exportPages = new Set([1]);
+  holdPreview = true;
+  context.updateExport();
+  assert.equal(typeof rejectHeldPreview,"function","a pending preview request was started");
+  state.aiFirst.exportPages.clear();
+  context.updateExport();
+  rejectHeldPreview(new Error("stale preview failure"));
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.notEqual(state.aiFirst.exportPreviewErrorKey,"1|6","a stale response cannot mark a changed selection as failed");
+  assert.equal(button.disabled,true,"no selected pages remains fail-closed while a stale response settles");
   console.log("PASS: AI-first PDF zoom bounds and server-derived test-export count");
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});

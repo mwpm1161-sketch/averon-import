@@ -554,13 +554,23 @@ function renderAIFirstReview() {
 function updateAIFirstExportControls() {
   const button = document.querySelector("#ai-first-export-pilot");
   const label = document.querySelector("#ai-first-export-note");
+  const retryButton = document.querySelector("#ai-first-retry-export-preview");
   if (!button || !label) return;
   state.aiFirst.exportPages ||= new Set();
   const selected = [...state.aiFirst.exportPages].sort((a,b)=>a-b);
-  if (!selected.length) {
+  const scope = selected.join(",");
+  const generation = state.aiFirst.reviewGeneration || 0;
+  const key = selected.length ? `${scope}|${generation}` : "";
+  if (state.aiFirst.exportPreviewSelectionKey !== key) {
+    state.aiFirst.exportPreviewSelectionKey = key;
     state.aiFirst.exportPreviewRequestId = (state.aiFirst.exportPreviewRequestId || 0) + 1;
     state.aiFirst.exportPreview = null;
     state.aiFirst.exportPreviewLoadingKey = null;
+    state.aiFirst.exportPreviewErrorKey = null;
+    state.aiFirst.exportDownloadError = null;
+  }
+  if (retryButton) retryButton.hidden = true;
+  if (!selected.length) {
     button.disabled = true;
     label.textContent = "Выберите от одной до трёх успешно обработанных страниц. Недоступные страницы отмечены причиной; файл не является коммерческой сметой.";
     return;
@@ -570,46 +580,65 @@ function updateAIFirstExportControls() {
     label.textContent = "Для тестового XLSX выберите не более трёх страниц.";
     return;
   }
-  const scope = selected.join(",");
-  const generation = state.aiFirst.reviewGeneration || 0;
-  const key = `${scope}|${generation}`;
   if (state.aiFirst.exportPreview?.key === key) {
     button.disabled = false;
     const preview = state.aiFirst.exportPreview.data;
-    label.textContent = `Сервер допускает ${preview.verified_position_count} проверенных самостоятельных позиций из ${preview.recognized_row_count} распознанных строк на страницах ${scope}. Охват документа будет отмечен как частичный, если выбраны не все страницы. Это тестовый файл.`;
+    const lastFailure = state.aiFirst.exportDownloadError ? ` Последняя попытка экспорта: ${state.aiFirst.exportDownloadError}` : "";
+    label.textContent = `Предварительно допущено ${preview.verified_position_count} самостоятельных позиций; в выгрузке всего ${preview.total_row_count} строк: распознано OCR — ${preview.ocr_row_count}, добавлено вручную — ${preview.manual_row_count}. Это только проверка допуска: экспорт дополнительно проверяет ограничения Excel и может отказать.${lastFailure} Охват документа будет отмечен как частичный, если выбраны не все страницы. Это тестовый файл.`;
     return;
   }
   if (state.aiFirst.exportPreviewErrorKey === key) {
     button.disabled = true;
-    label.textContent = "Не удалось проверить состав тестового XLSX. Повторите проверку или откройте документ заново.";
+    label.textContent = "Не удалось проверить допуск строк. Повторите проверку; скачать книгу пока нельзя.";
+    if (retryButton) retryButton.hidden = false;
     return;
   }
   if (state.aiFirst.exportPreviewLoadingKey === key) return;
   void loadAIFirstPilotExportPreview(selected, key);
 }
 
+function retryAIFirstPilotExportPreview() {
+  const selected = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b);
+  if (!selected.length || selected.length > 3) return;
+  const key = `${selected.join(",")}|${state.aiFirst.reviewGeneration || 0}`;
+  state.aiFirst.exportPreviewRequestId = (state.aiFirst.exportPreviewRequestId || 0) + 1;
+  state.aiFirst.exportPreview = null;
+  state.aiFirst.exportPreviewErrorKey = null;
+  state.aiFirst.exportPreviewLoadingKey = null;
+  state.aiFirst.exportDownloadError = null;
+  state.aiFirst.exportPreviewSelectionKey = key;
+  return loadAIFirstPilotExportPreview(selected, key);
+}
+
 async function loadAIFirstPilotExportPreview(pageNumbers, key) {
   const button = document.querySelector("#ai-first-export-pilot");
   const label = document.querySelector("#ai-first-export-note");
   if (!button || !label) return;
+  const selection = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b);
+  const currentKey = selection.length ? `${selection.join(",")}|${state.aiFirst.reviewGeneration || 0}` : "";
+  if (key !== currentKey || selection.length > 3) return;
   const requestId = (state.aiFirst.exportPreviewRequestId || 0) + 1;
   state.aiFirst.exportPreviewRequestId = requestId;
   state.aiFirst.exportPreviewLoadingKey = key;
+  const retryButton = document.querySelector("#ai-first-retry-export-preview");
+  if (retryButton) retryButton.hidden = true;
   button.disabled = true;
   label.textContent = "Проверяем по серверным правилам, сколько позиций попадёт в тестовый XLSX…";
   try {
     const data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/pilot-export/preview`, {
       method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({page_numbers:pageNumbers}),
     });
-    const currentPages = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b).join(",");
-    const currentKey = `${currentPages}|${state.aiFirst.reviewGeneration || 0}`;
-    if (requestId !== state.aiFirst.exportPreviewRequestId || key !== currentKey) return;
+    const currentPages = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b);
+    const currentSelectionKey = currentPages.length ? `${currentPages.join(",")}|${state.aiFirst.reviewGeneration || 0}` : "";
+    if (requestId !== state.aiFirst.exportPreviewRequestId || key !== currentSelectionKey) return;
     state.aiFirst.exportPreview = {key,data};
     state.aiFirst.exportPreviewErrorKey = null;
     state.aiFirst.exportPreviewLoadingKey = null;
     updateAIFirstExportControls();
   } catch (_) {
-    if (requestId !== state.aiFirst.exportPreviewRequestId) return;
+    const currentPages = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b);
+    const currentSelectionKey = currentPages.length ? `${currentPages.join(",")}|${state.aiFirst.reviewGeneration || 0}` : "";
+    if (requestId !== state.aiFirst.exportPreviewRequestId || key !== currentSelectionKey) return;
     state.aiFirst.exportPreviewErrorKey = key;
     state.aiFirst.exportPreviewLoadingKey = null;
     updateAIFirstExportControls();
@@ -1098,6 +1127,7 @@ async function downloadAIFirstPilotXlsx() {
   }
   const button = document.querySelector("#ai-first-export-pilot");
   button.disabled = true;
+  state.aiFirst.exportDownloadError = null;
   try {
     const headers = new Headers({"Content-Type":"application/json"});
     const csrfToken = typeof readCsrfCookie === "function" ? readCsrfCookie() : "";
@@ -1124,7 +1154,9 @@ async function downloadAIFirstPilotXlsx() {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     toast("Тестовый XLSX сформирован из сохранённых решений проверки.", "success");
   } catch (error) {
-    toast(error.message || "Не удалось подготовить тестовый XLSX.", "error");
+    const message = error.message || "Не удалось подготовить тестовый XLSX.";
+    state.aiFirst.exportDownloadError = message;
+    toast(message, "error");
   } finally {
     updateAIFirstExportControls();
   }
@@ -1156,6 +1188,7 @@ function installAIFirstUIEvents() {
   document.querySelector("#ai-first-back-to-pages").addEventListener("click", () => { setView("pages"); renderAIFirstResumeControls(); });
   document.querySelector("#ai-first-save-review").addEventListener("click", () => void saveAIFirstReview());
   document.querySelector("#ai-first-export-pilot").addEventListener("click", () => void downloadAIFirstPilotXlsx());
+  document.querySelector("#ai-first-retry-export-preview").addEventListener("click", () => void retryAIFirstPilotExportPreview());
   document.querySelector("#ai-first-confirm-page").addEventListener("click", async () => {
     await confirmAIFirstPageCompleteness(state.aiFirst.page);
   });

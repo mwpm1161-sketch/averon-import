@@ -2511,9 +2511,16 @@ def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
                 document_name=document_name,
             )
         except PilotExportError as exc:
+            code = str(exc)
+            message = (
+                "Тестовый XLSX не создан: текст одной ячейки превышает лимит Excel в 32 767 символов. "
+                "Исходный текст не сокращён; исправьте или разделите длинное значение и повторите выгрузку."
+                if code == "export_cell_limit_exceeded"
+                else "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и локальные данные."
+            )
             raise HTTPException(
                 409,
-                detail={"code": str(exc), "message": "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и локальные данные."},
+                detail={"code": code, "message": message},
             ) from None
     filename = f"Averon_AI-first_TEST_{workspace.document_id[:8]}.xlsx"
     return Response(

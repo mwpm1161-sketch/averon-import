@@ -284,14 +284,21 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
         "record_id":first_id,"disposition":"corrected","values":{"cell:1":"Synthetic corrected item"},
     }).status_code == 200
     assert client.post(f"{path}/review/row", json={"record_id":second_id,"disposition":"confirmed"}).status_code == 200
+    added = client.post(
+        f"{path}/review/add-row",
+        json={"page_number":1,"values":{"cell:0":"3","cell:1":"Synthetic manual row"}},
+    )
+    assert added.status_code == 200, added.text
     assert client.post(f"{path}/review/complete-page", json={"page_number":1}).status_code == 200
 
     preview = client.post(f"{path}/pilot-export/preview", json={"page_numbers":[1]})
     assert preview.status_code == 200, preview.text
     preview_data = preview.json()
     assert preview_data["verified_position_count"] == 1
-    assert preview_data["recognized_row_count"] == 2
-    assert preview_data["pages"] == [{"page_number":1,"recognized_row_count":2,"verified_position_count":1}]
+    assert preview_data["ocr_row_count"] == 2
+    assert preview_data["manual_row_count"] == 1
+    assert preview_data["total_row_count"] == 3
+    assert preview_data["pages"] == [{"page_number":1,"ocr_row_count":2,"manual_row_count":1,"total_row_count":3,"verified_position_count":1}]
 
     response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
     assert response.status_code == 200, response.text
@@ -299,9 +306,30 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
     workbook = load_workbook(BytesIO(response.content), data_only=False)
     assert {"Проверенные позиции", "Все распознанные строки", "Охват страниц", "Исходная структура"} <= set(workbook.sheetnames)
     assert workbook["Проверенные позиции"].max_row == 5
-    assert workbook["Все распознанные строки"].max_row == 6
+    assert workbook["Все распознанные строки"].max_row == 7
     assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in workbook["Проверенные позиции"]["A2"].value
     assert preview_data["verified_position_count"] == workbook["Проверенные позиции"].max_row - 4
+
+
+def test_pilot_export_reports_excel_cell_limit_after_admission_preview(ai_first_client):
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    _start_fake(client, workspace.document_id)
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+    store, draft, _review, _report = main._ai_first_read_state(workspace)
+    row = draft.pages[0].tables[0].rows[0]
+    row.raw_cells[0] = row.raw_cells[0].model_copy(update={"raw_value":"x" * 32768})
+    store.write("transcription.json", draft.model_dump(mode="json"))
+
+    preview = client.post(f"{path}/pilot-export/preview", json={"page_numbers":[1]})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["total_row_count"] == 2
+
+    response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "export_cell_limit_exceeded"
+    assert "32 767" in response.json()["detail"]["message"]
+    assert "не сокращён" in response.json()["detail"]["message"]
 
 
 def test_ai_first_locator_returns_only_safe_no_match_status_for_fake_page(ai_first_client):

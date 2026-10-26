@@ -407,15 +407,21 @@ def preview_ai_first_pilot_export(
     prepared = _prepare_pilot_export_rows(draft, review, report, page_numbers, document_name)
     all_rows = prepared["all_rows"]
     selected_rows = prepared["selected_rows"]
+    ocr_rows = [row for row in all_rows if not row["manual"]]
+    manual_rows = [row for row in all_rows if row["manual"]]
     return {
         "page_numbers": prepared["selected"],
         "document_page_count": prepared["page_count"],
-        "recognized_row_count": len(all_rows),
+        "ocr_row_count": len(ocr_rows),
+        "manual_row_count": len(manual_rows),
+        "total_row_count": len(all_rows),
         "verified_position_count": len(selected_rows),
         "pages": [
             {
                 "page_number": number,
-                "recognized_row_count": sum(row["page"] == number for row in all_rows),
+                "ocr_row_count": sum(row["page"] == number and not row["manual"] for row in all_rows),
+                "manual_row_count": sum(row["page"] == number and row["manual"] for row in all_rows),
+                "total_row_count": sum(row["page"] == number for row in all_rows),
                 "verified_position_count": sum(row["page"] == number for row in selected_rows),
             }
             for number in prepared["selected"]
