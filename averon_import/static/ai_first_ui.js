@@ -122,7 +122,8 @@ function aiFirstRowInputSnapshot(recordId) {
     .filter((input) => input.dataset.aiFirstCell === recordId)
     .map((input) => {
       const key = `cell:${input.dataset.columnIndex}`;
-      const baseline = decision?.active && Object.prototype.hasOwnProperty.call(decision.values || {}, key)
+      const retainedAfterRoleChange = decision?.invalidation_reason === "role_change";
+      const baseline = (decision?.active || retainedAfterRoleChange) && Object.prototype.hasOwnProperty.call(decision.values || {}, key)
         ? decision.values[key] : (sourceValues[key] || "");
       return {key, label:input.getAttribute("aria-label") || key, value:input.value, baseline};
     });
@@ -177,6 +178,9 @@ function aiFirstReportPages(data) {
 function showAIFirstPage(pageNumber) {
   const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
   if (!pageNumbers.includes(pageNumber)) return;
+  state.aiFirst.locatorRequestId = (state.aiFirst.locatorRequestId || 0) + 1;
+  const highlight = document.querySelector("#ai-first-row-highlight");
+  if (highlight) highlight.hidden = true;
   state.aiFirst.page = pageNumber;
   const selector = document.querySelector("#ai-first-page-select");
   selector.value = String(pageNumber);
@@ -190,6 +194,32 @@ function showAIFirstPage(pageNumber) {
   document.querySelectorAll("[data-ai-first-row]").forEach((row) => row.classList.toggle("active", Number(row.dataset.pageNumber) === pageNumber));
   renderAIFirstPageIssues(pageNumber);
   renderAIFirstAddRowForm();
+}
+
+async function locateAIFirstSource(recordId, cellIndex = null) {
+  const page = (state.aiFirst.data?.draft?.pages || []).find((item) =>
+    (item.tables || []).some((table) => (table.rows || []).some((row) => row.id === recordId))
+    || (state.aiFirst.data?.review?.manual_rows || []).some((row) => row.id === recordId && row.page_number === item.page_number));
+  const pageNumber = page?.page_number
+    ?? (state.aiFirst.data?.review?.manual_rows || []).find((row) => row.id === recordId && row.active)?.page_number;
+  if (!pageNumber) return;
+  showAIFirstPage(pageNumber);
+  const requestId = (state.aiFirst.locatorRequestId || 0) + 1;
+  state.aiFirst.locatorRequestId = requestId;
+  const highlight = document.querySelector("#ai-first-row-highlight");
+  if (highlight) highlight.hidden = true;
+  const params = new URLSearchParams({record_id:recordId});
+  if (Number.isInteger(cellIndex)) params.set("cell_index", String(cellIndex));
+  try {
+    const result = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/locator?${params.toString()}`);
+    if (requestId !== state.aiFirst.locatorRequestId || state.aiFirst.page !== pageNumber || !highlight) return;
+    if (result?.matched && result.bbox && typeof positionHighlight === "function") {
+      positionHighlight({bbox:result.bbox}, highlight);
+    }
+  } catch (_) {
+    // Exact matching is optional. The selected source page remains visible
+    // without a guessed rectangle when the local locator cannot confirm it.
+  }
 }
 
 function renderAIFirstPageIssues(pageNumber) {
@@ -285,21 +315,36 @@ function renderAIFirstReview() {
   const data = state.aiFirst.data;
   if (!data?.draft || !state.document) return;
   const draft = data.draft, review = data.review;
+  state.aiFirst.exportPages ||= new Set();
   const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
   if (!pageNumbers.includes(state.aiFirst.page)) state.aiFirst.page = pageNumbers[0] || 1;
   const pageReports = aiFirstReportPages(data);
+  const exportablePages = new Set(pageNumbers.filter((number) => pageReports.get(number)?.state === "completed"
+    && ["extracted", "no_specification"].includes(aiFirstPageRecord(number)?.status)));
+  state.aiFirst.exportPages = new Set([...(state.aiFirst.exportPages || [])].filter((number) => exportablePages.has(number)));
   const entries = aiFirstDocumentEntries(draft, review);
   const totalRows = entries.length;
   const reviewedRows = entries.filter((entry) => review.decisions?.[entry.row.id]?.active).length;
+  const humanRoles = review.row_roles || {};
+  const subjectRows = entries.filter((entry) => {
+    const role = humanRoles[entry.row.id];
+    return role?.active && ["standalone_item", "component"].includes(role.role);
+  }).length;
+  const confirmedItems = entries.filter((entry) => {
+    const role = humanRoles[entry.row.id], decision = review.decisions?.[entry.row.id];
+    return role?.active && role.role === "standalone_item" && decision?.active
+      && ["confirmed", "corrected"].includes(decision.disposition);
+  }).length;
   const unresolved = (draft.issues || []).filter((issue) => issue.code !== "page_extraction_failed" && ["review", "blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)).length;
   const confirmedPages = (review.confirmed_complete_pages || []).length;
   const processedPages = pageNumbers.filter((number) => pageReports.get(number)?.state === "completed" && ["extracted","no_specification"].includes(aiFirstPageRecord(number)?.status)).length;
   const failedPages = (data.pages || []).filter((item) => item.state !== "completed" && (item.state !== "pending" || item.safe_error_code)).length;
-  document.querySelector("#ai-first-review-status").textContent = `${processedPages} из ${state.document.page_count} страниц обработано · ${totalRows} позиций · изменения сохраняются локально`;
+  document.querySelector("#ai-first-review-status").textContent = `${processedPages} из ${state.document.page_count} страниц обработано · ${totalRows} строк распознано · изменения сохраняются локально`;
   const summaries = [
-    ["Позиции", totalRows, ""],
-    ["Проверено", reviewedRows, reviewedRows < totalRows ? "warning" : ""],
-    ["Осталось проверить", Math.max(0, totalRows - reviewedRows), totalRows > reviewedRows ? "warning" : ""],
+    ["Строк распознано", totalRows, ""],
+    ["Предметных строк", subjectRows, ""],
+    ["Подтверждённые самостоятельные позиции", confirmedItems, ""],
+    ["Решения сохранены", reviewedRows, reviewedRows < totalRows ? "warning" : ""],
     ["Страницы обработаны", `${processedPages} / ${state.document.page_count}`, processedPages < state.document.page_count ? "warning" : ""],
     ["Полнота подтверждена", `${confirmedPages} / ${state.document.page_count}`, confirmedPages < state.document.page_count ? "warning" : ""],
   ];
@@ -317,18 +362,40 @@ function renderAIFirstReview() {
     else if (report) { label = "Требует обработки"; detail = aiFirstProcessingMessage(report.safe_error_code || report.state); }
     const confirmed = (review.confirmed_complete_pages || []).includes(number);
     const retryable = report && (report.state !== "pending" || report.safe_error_code) && report.state !== "completed" && !["image_pixel_limit","image_byte_limit","page_dimensions_invalid"].includes(report.safe_error_code);
-    return `<div class="ai-first-page-status"><button class="button ghost" type="button" data-ai-first-show-page="${number}">Страница ${number} · ${label}</button><span>${escapeHtml(detail)}${confirmed ? " · полнота подтверждена" : ""}</span>${complete && !confirmed ? `<button class="button text" type="button" data-ai-first-complete-page="${number}">Подтвердить полноту</button>` : ""}${retryable ? `<button class="button text" type="button" data-ai-first-retry-one="${number}">Повторить</button>` : ""}</div>`;
+    const exportChecked = state.aiFirst.exportPages.has(number) ? "checked" : "";
+    return `<div class="ai-first-page-status"><button class="button ghost" type="button" data-ai-first-show-page="${number}">Страница ${number} · ${label}</button><span>${escapeHtml(detail)}${confirmed ? " · полнота подтверждена" : ""}</span>${complete && !confirmed ? `<button class="button text" type="button" data-ai-first-complete-page="${number}">Подтвердить полноту</button>` : ""}${retryable ? `<button class="button text" type="button" data-ai-first-retry-one="${number}">Повторить</button>` : ""}${complete ? `<label class="ai-first-export-page"><input type="checkbox" data-ai-first-export-page="${number}" ${exportChecked}> В тестовый XLSX</label>` : ""}</div>`;
   }).join("");
   document.querySelector("#ai-first-page-details-label").textContent = `Страницы: ${processedPages} обработано из ${state.document.page_count} · ${confirmedPages} подтверждено${failedPages ? ` · ${failedPages} требуют внимания` : ""}`;
   document.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", () => showAIFirstPage(Number(button.dataset.aiFirstShowPage))));
   document.querySelectorAll("[data-ai-first-complete-page]").forEach((button) => button.addEventListener("click", () => void postAIFirstReview("complete-page", {page_number:Number(button.dataset.aiFirstCompletePage)})));
   document.querySelectorAll("[data-ai-first-retry-one]").forEach((button) => button.addEventListener("click", () => retryAIFirstPages([Number(button.dataset.aiFirstRetryOne)])));
+  document.querySelectorAll("[data-ai-first-export-page]").forEach((input) => input.addEventListener("change", () => {
+    const pageNumber = Number(input.dataset.aiFirstExportPage);
+    if (input.checked && state.aiFirst.exportPages.size >= 3) {
+      input.checked = false;
+      toast("Для тестовой выгрузки выберите не более трёх страниц.", "error");
+      return;
+    }
+    if (input.checked) state.aiFirst.exportPages.add(pageNumber); else state.aiFirst.exportPages.delete(pageNumber);
+    updateAIFirstExportControls();
+  }));
   renderAIFirstTables(entries);
   document.querySelector("#ai-first-confirm-selected").disabled = state.aiFirst.selectedRows.size === 0;
-  document.querySelector("#ai-first-export-note").textContent = data.review_ready_for_guard?.ready
-    ? "Проверки завершены. Здесь сохраняется локальный черновик; создание файла Excel не выполняется."
-    : `Сохранён локальный черновик. До завершения проверки осталось: ${unresolved ? `${unresolved} замеч.` : "подтвердить страницы или проверить строки"}.`;
+  document.querySelector("#ai-first-export-note").textContent = "Тестовый XLSX содержит отдельный лист подтверждённых самостоятельных позиций и полный лист распознанных строк. Он не является коммерческой сметой и не запускает sourcing.";
+  updateAIFirstExportControls();
   showAIFirstPage(state.aiFirst.page);
+}
+
+function updateAIFirstExportControls() {
+  const button = document.querySelector("#ai-first-export-pilot");
+  const label = document.querySelector("#ai-first-export-note");
+  if (!button || !label) return;
+  state.aiFirst.exportPages ||= new Set();
+  button.disabled = state.aiFirst.exportPages.size === 0;
+  const selected = [...state.aiFirst.exportPages].sort((a,b)=>a-b);
+  label.textContent = selected.length
+    ? `В тестовый XLSX выбраны страницы ${selected.join(", ")}. Охват документа будет явно отмечен; файл не является коммерческой сметой.`
+    : "Выберите от одной до трёх обработанных страниц в сводке. Неподтверждённые строки останутся на отдельном листе; файл не является коммерческой сметой.";
 }
 
 function aiFirstColumnList(table) {
@@ -373,16 +440,31 @@ function renderAIFirstTables(entries) {
       const key = `cell:${sourceColumn.index}`;
       const cell = manual ? null : (row.raw_cells || []).find((item) => item.column_index === sourceColumn.index);
       const source = manual ? row.values?.[key] || "" : cell?.raw_value ?? "";
-      const edited = decision?.active && Object.prototype.hasOwnProperty.call(decision.values || {}, key);
+      const retainedAfterRoleChange = decision?.invalidation_reason === "role_change";
+      const edited = (decision?.active || retainedAfterRoleChange) && Object.prototype.hasOwnProperty.call(decision.values || {}, key);
       const shown = edited ? decision.values[key] : source;
-      const sourceNote = edited && decision.values[key] !== source ? `<small class="ai-first-cell-source">Исходно: ${escapeHtml(source || "пусто")}</small>` : "";
+      const sourceNote = edited && decision.values[key] !== source
+        ? `<small class="ai-first-cell-source">${retainedAfterRoleChange ? "Сохранённая правка требует повторного подтверждения. Исходно:" : "Исходно:"} ${escapeHtml(source || "пусто")}</small>` : "";
       const uncertain = !manual && (cell?.unreadable || cell?.struck_through || cell?.handwritten || cell?.alternatives?.length);
       return `<td class="${flagged || uncertain ? "critical-review" : ""}"><input class="cell-input ai-first-cell-input" data-ai-first-cell="${escapeHtml(row.id)}" data-column-index="${sourceColumn.index}" aria-label="${escapeHtml(sourceColumn.label)}" maxlength="2000" value="${escapeHtml(shown)}">${sourceNote}${uncertain ? `<small class="critical-warning">Требует сверки${cell?.alternatives?.length ? ` · варианты: ${escapeHtml(cell.alternatives.join(" / "))}` : ""}</small>` : ""}</td>`;
     }).join("");
-    const decisionLabel = excluded ? "Исключена" : decision?.active ? (decision.disposition === "corrected" ? "Исправлена" : Object.keys(decision.values || {}).length ? "Подтверждена с правками" : "Подтверждена") : "Нужно проверить";
+    const decisionLabel = excluded ? "Исключена" : decision?.active ? (decision.disposition === "corrected" ? "Исправлена" : Object.keys(decision.values || {}).length ? "Подтверждена с правками" : "Подтверждена") : decision?.invalidation_reason === "role_change" ? "Роль изменена · подтвердите значения повторно" : "Нужно проверить";
     const kindLabel = ({item:"Позиция",item_candidate:"Возможная позиция",header:"Заголовок",section:"Раздел",note:"Примечание"})[row.model_kind] || (manual ? "Ручная позиция" : "Строка документа");
     const rowLabel = manual ? "Ручная" : String((row.index ?? 0) + 1);
-    return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${page?.page_number || row.page_number}" class="${flagged ? "critical-review" : ""} ${excluded ? "is-excluded" : ""} ${Number(page?.page_number || row.page_number) === state.aiFirst.page ? "active" : ""}"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td>${rowLabel}<small class="ai-first-cell-source">${escapeHtml(kindLabel)} · ${decisionLabel}</small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${page?.page_number || row.page_number}">Стр. ${page?.page_number || row.page_number}</button></td>${cells}<td><div class="ai-first-row-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(row.id)}">Сохранить правки</button><button class="button ghost" type="button" data-ai-first-confirm-row="${escapeHtml(row.id)}">Подтвердить</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(row.id)}">${excluded ? "Восстановить" : "Исключить"}</button></div></td></tr>`;
+    const role = state.aiFirst.data.review.row_roles?.[row.id];
+    const selectedRole = role?.active ? role.role : "unknown";
+    const rowPage = Number(page?.page_number || row.page_number);
+    const rowTableId = manual ? null : row.table_id;
+    const parentCandidates = entries.filter((candidate) => {
+      if (candidate.row.id === row.id || Number(candidate.page?.page_number || candidate.row.page_number) !== rowPage) return false;
+      if (rowTableId && candidate.row.table_id && candidate.row.table_id !== rowTableId) return false;
+      const candidateRole = state.aiFirst.data.review.row_roles?.[candidate.row.id];
+      return candidateRole?.active && candidateRole.role === "standalone_item";
+    });
+    const parentOptions = `<option value="">Выберите самостоятельную позицию</option>${parentCandidates.map((candidate) => `<option value="${escapeHtml(candidate.row.id)}" ${role?.parent_record_id === candidate.row.id ? "selected" : ""}>Строка ${escapeHtml(candidate.manual ? "ручная" : String((candidate.row.index ?? 0) + 1))}</option>`).join("")}`;
+    const roleOptions = [["unknown","Не определена"],["standalone_item","Самостоятельная позиция"],["component","Компонент комплекта"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
+    const roleControls = `<div class="ai-first-role-controls"><label>Роль строки<select class="select" data-ai-first-row-role="${escapeHtml(row.id)}">${roleOptions.map(([value,label]) => `<option value="${value}" ${selectedRole === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><select class="select" data-ai-first-parent-row="${escapeHtml(row.id)}" ${selectedRole === "component" ? "" : "hidden"}>${parentOptions}</select><button class="button text" type="button" data-ai-first-save-role="${escapeHtml(row.id)}">Сохранить роль</button></div>`;
+    return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${rowPage}" class="${flagged ? "critical-review" : ""} ${excluded ? "is-excluded" : ""} ${rowPage === state.aiFirst.page ? "active" : ""}"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td>${rowLabel}<small class="ai-first-cell-source">${escapeHtml(kindLabel)} · ${decisionLabel}</small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${rowPage}">Стр. ${rowPage}</button></td>${cells}<td>${roleControls}<div class="ai-first-row-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(row.id)}">Сохранить правки</button><button class="button ghost" type="button" data-ai-first-confirm-row="${escapeHtml(row.id)}">Подтвердить значения</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(row.id)}">${excluded ? "Восстановить" : "Исключить"}</button></div></td></tr>`;
   }).join("");
   const header = allColumns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("");
   root.innerHTML = `<table class="data-table ai-first-table"><thead><tr><th class="selector">Выбор</th><th>Строка</th><th>Страница</th>${header}<th>Действия</th></tr></thead><tbody>${body || `<tr><td colspan="${allColumns.length + 4}" class="empty-table">Для обработанных страниц позиции не найдены. Проверьте сводку страниц.</td></tr>`}</tbody></table>`;
@@ -395,6 +477,26 @@ function renderAIFirstTables(entries) {
     const id = button.dataset.aiFirstSaveRow, values = {};
     root.querySelectorAll("[data-ai-first-cell]").forEach((input) => { if (input.dataset.aiFirstCell === id) values[`cell:${input.dataset.columnIndex}`] = input.value; });
     void postAIFirstReview("row", {record_id:id,disposition:"corrected",values});
+  }));
+  root.querySelectorAll("[data-ai-first-row-role]").forEach((select) => select.addEventListener("change", () => {
+    const parent = root.querySelector(`[data-ai-first-parent-row="${CSS.escape(select.dataset.aiFirstRowRole)}"]`);
+    if (parent) parent.hidden = select.value !== "component";
+  }));
+  root.querySelectorAll("[data-ai-first-save-role]").forEach((button) => button.addEventListener("click", () => {
+    const recordId = button.dataset.aiFirstSaveRole;
+    const snapshot = aiFirstRowInputSnapshot(recordId);
+    if (snapshot.some((item) => item.value !== item.baseline)) {
+      toast("Сначала сохраните или отмените правки ячеек этой строки, затем измените её роль.", "error");
+      return;
+    }
+    const role = root.querySelector(`[data-ai-first-row-role="${CSS.escape(recordId)}"]`)?.value;
+    const parent = root.querySelector(`[data-ai-first-parent-row="${CSS.escape(recordId)}"]`)?.value || null;
+    if (role === "component" && !parent) {
+      toast("Для компонента выберите самостоятельную позицию-родителя на этой странице.", "error");
+      return;
+    }
+    if (!role) return;
+    void postAIFirstReview("row-role", {record_id:recordId,role,parent_record_id:role === "component" ? parent : null});
   }));
   root.querySelectorAll("[data-ai-first-confirm-row]").forEach((button) => button.addEventListener("click", () => {
     const id = button.dataset.aiFirstConfirmRow, snapshot = aiFirstRowInputSnapshot(id);
@@ -417,7 +519,14 @@ function renderAIFirstTables(entries) {
     const detail = document.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
     void postAIFirstReview("resolve-issue", {issue_id:id,detail});
   }));
-  root.querySelectorAll("[data-ai-first-row]").forEach((row) => row.addEventListener("click", () => showAIFirstPage(Number(row.dataset.pageNumber))));
+  root.querySelectorAll("[data-ai-first-row]").forEach((row) => row.addEventListener("click", (event) => {
+    if (event.target.closest("button, input, select, textarea")) return;
+    void locateAIFirstSource(row.dataset.aiFirstRow, null);
+  }));
+  root.querySelectorAll("[data-ai-first-cell]").forEach((input) => input.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void locateAIFirstSource(input.dataset.aiFirstCell, Number(input.dataset.columnIndex));
+  }));
   root.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     showAIFirstPage(Number(button.dataset.aiFirstShowPage));
@@ -503,6 +612,64 @@ async function saveAIFirstReview() {
   } catch (error) { toast(error.message || "Не удалось сохранить результат.", "error"); }
 }
 
+function aiFirstHasUnsavedReviewEdits() {
+  const recordIds = new Set([...document.querySelectorAll("#ai-first-table-scroll [data-ai-first-cell]")].map((item) => item.dataset.aiFirstCell));
+  for (const recordId of recordIds) {
+    if (aiFirstRowInputSnapshot(recordId).some((item) => item.value !== item.baseline)) return true;
+  }
+  for (const select of document.querySelectorAll("#ai-first-table-scroll [data-ai-first-row-role]")) {
+    const role = state.aiFirst.data?.review?.row_roles?.[select.dataset.aiFirstRowRole];
+    if (select.value !== (role?.active ? role.role : "unknown")) return true;
+    const parent = document.querySelector(`[data-ai-first-parent-row="${CSS.escape(select.dataset.aiFirstRowRole)}"]`);
+    if (parent && !parent.hidden && parent.value !== (role?.active ? role.parent_record_id || "" : "")) return true;
+  }
+  return false;
+}
+
+async function downloadAIFirstPilotXlsx() {
+  const pages = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b);
+  if (!pages.length || pages.length > 3) {
+    toast("Выберите от одной до трёх обработанных страниц в сводке.", "error");
+    return;
+  }
+  if (aiFirstHasUnsavedReviewEdits()) {
+    toast("Сначала сохраните или отмените несохранённые правки и изменения ролей.", "error");
+    return;
+  }
+  const button = document.querySelector("#ai-first-export-pilot");
+  button.disabled = true;
+  try {
+    const headers = new Headers({"Content-Type":"application/json"});
+    const csrfToken = typeof readCsrfCookie === "function" ? readCsrfCookie() : "";
+    if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
+    const response = await fetch(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/pilot-export`, {
+      method:"POST", headers, body:JSON.stringify({page_numbers:pages}),
+    });
+    if (!response.ok) {
+      let message = "Не удалось подготовить тестовый XLSX.";
+      try {
+        const payload = await response.json();
+        message = payload?.detail?.message || payload?.detail || message;
+      } catch (_) {}
+      throw new Error(typeof message === "string" ? message : "Не удалось подготовить тестовый XLSX.");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `Averon_AI-first_TEST_${String(state.document.document_id).slice(0, 8)}.xlsx`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("Тестовый XLSX сформирован из сохранённых решений проверки.", "success");
+  } catch (error) {
+    toast(error.message || "Не удалось подготовить тестовый XLSX.", "error");
+  } finally {
+    button.disabled = pages.length === 0;
+  }
+}
+
 function installAIFirstUIEvents() {
   const mode = document.querySelector("#ai-first-mode");
   mode.addEventListener("change", () => {
@@ -523,6 +690,7 @@ function installAIFirstUIEvents() {
   document.querySelector("#ai-first-back-to-pages").addEventListener("click", () => { setView("pages"); renderAIFirstResumeControls(); });
   document.querySelector("#ai-first-save-review").addEventListener("click", () => void saveAIFirstReview());
   document.querySelector("#ai-first-confirm-selected").addEventListener("click", () => void confirmSelectedAIFirstRows());
+  document.querySelector("#ai-first-export-pilot").addEventListener("click", () => void downloadAIFirstPilotXlsx());
   document.querySelector("#ai-first-confirm-page").addEventListener("click", async () => {
     await postAIFirstReview("complete-page", {page_number:state.aiFirst.page});
   });

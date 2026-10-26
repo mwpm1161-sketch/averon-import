@@ -17,6 +17,11 @@ ReviewAction = Literal[
     "confirm_row", "edit_value", "exclude_row", "add_row", "split_row",
     "merge_rows", "confirm_handwriting", "confirm_page_complete",
     "resolve_issue", "page_reprocessed", "undo_structure_change",
+    "classify_row_role",
+]
+AIHumanRowRole = Literal[
+    "header", "column_numbering", "section", "standalone_item",
+    "component", "continuation", "note", "unknown",
 ]
 
 
@@ -176,6 +181,53 @@ class AIReviewDecision(_StrictModel):
     reviewer_id: str
     values: dict[str, str] = Field(default_factory=dict)
     active: bool = True
+    invalidation_reason: Literal["role_change", "page_reprocessed", "structure_change"] | None = None
+
+
+class AIReviewRowRole(_StrictModel):
+    """Human-reviewed structural role, separate from immutable AI observations."""
+
+    record_id: str
+    source_document_id: str
+    page_number: int = Field(ge=1)
+    page_extraction_fingerprint: str = Field(min_length=1)
+    table_id: str | None = None
+    role: AIHumanRowRole
+    parent_record_id: str | None = None
+    reviewer_id: str
+    active: bool = True
+
+    @model_validator(mode="after")
+    def parent_matches_role(self) -> AIReviewRowRole:
+        if not self.reviewer_id:
+            raise ValueError("row role requires a reviewer")
+        if self.role == "component":
+            if not self.parent_record_id or self.parent_record_id == self.record_id:
+                raise ValueError("component role requires a different parent record")
+        elif self.parent_record_id is not None:
+            raise ValueError("only component roles may have a parent record")
+        return self
+
+
+class AIReviewRoleChange(_StrictModel):
+    record_id: str
+    previous: AIReviewRowRole | None = None
+    current: AIReviewRowRole
+    invalidated_dependents: list[AIReviewRowRole] = Field(default_factory=list)
+    invalidated_decisions: list[AIReviewDecision] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def change_identity_matches(self) -> AIReviewRoleChange:
+        if self.current.record_id != self.record_id or not self.current.active:
+            raise ValueError("row role change identity mismatch")
+        if self.previous is not None and self.previous.record_id != self.record_id:
+            raise ValueError("previous row role identity mismatch")
+        if any(item.record_id == self.record_id for item in self.invalidated_dependents):
+            raise ValueError("target role is not a dependent")
+        allowed_ids = {self.record_id, *(item.record_id for item in self.invalidated_dependents)}
+        if any(item.record_id not in allowed_ids or item.active for item in self.invalidated_decisions):
+            raise ValueError("invalidated row decision snapshot mismatch")
+        return self
 
 
 class AIReviewEvent(_StrictModel):
@@ -189,6 +241,19 @@ class AIReviewEvent(_StrictModel):
     result_record_ids: list[str] = Field(default_factory=list)
     detail: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    role_change: AIReviewRoleChange | None = None
+    invalidated_row_roles: list[AIReviewRowRole] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def typed_role_event_matches_action(self) -> AIReviewEvent:
+        if (self.action == "classify_row_role") != (self.role_change is not None):
+            raise ValueError("typed row role event is required for role classification")
+        if self.role_change is not None and (
+            self.role_change.record_id not in self.source_record_ids
+            or self.role_change.current.page_number != self.page_number
+        ):
+            raise ValueError("typed row role event provenance mismatch")
+        return self
 
 
 class AIManualRow(_StrictModel):
@@ -203,9 +268,13 @@ class AIManualRow(_StrictModel):
 
 
 class AIReviewState(_StrictModel):
+    # Legacy review.json files omit this version and row_roles. Pydantic defaults
+    # preserve their existing decisions/history while the next write records v2.
+    review_schema_version: Literal[2] = 2
     source_document_id: str
     revision_id: str
     decisions: dict[str, AIReviewDecision] = Field(default_factory=dict)
+    row_roles: dict[str, AIReviewRowRole] = Field(default_factory=dict)
     manual_rows: list[AIManualRow] = Field(default_factory=list)
     confirmed_complete_pages: set[int] = Field(default_factory=set)
     resolved_issue_ids: set[str] = Field(default_factory=set)
@@ -215,4 +284,17 @@ class AIReviewState(_StrictModel):
     def decision_keys_match(self) -> AIReviewState:
         if any(key != decision.record_id for key, decision in self.decisions.items()):
             raise ValueError("review decision key mismatch")
+        for key, role in self.row_roles.items():
+            if key != role.record_id or role.source_document_id != self.source_document_id:
+                raise ValueError("review row role key or source mismatch")
+            if not role.active or role.role != "component":
+                continue
+            parent = self.row_roles.get(role.parent_record_id or "")
+            if (parent is None or not parent.active or parent.role != "standalone_item"
+                    or parent.source_document_id != role.source_document_id
+                    or parent.page_number != role.page_number
+                    or parent.page_extraction_fingerprint != role.page_extraction_fingerprint
+                    or (parent.table_id is not None and role.table_id is not None
+                        and parent.table_id != role.table_id)):
+                raise ValueError("active component role has no compatible active parent")
         return self

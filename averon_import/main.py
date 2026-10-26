@@ -125,10 +125,15 @@ from averon_import.services.document_lifecycle import (
     DocumentActivityRegistry,
     DocumentUnavailable,
 )
-from averon_import.services.ai_first.contracts import AIDocumentDraft, AIReviewState
+from averon_import.services.ai_first.contracts import AIHumanRowRole, AIDocumentDraft, AIReviewState
 from averon_import.services.ai_first.local_workflow import (
     AICancellationSignal, AIWorkspaceStore, SyntheticPageAdapter, build_live_qwen_runtime,
 )
+from averon_import.services.ai_first.pilot_export import (
+    MAX_PILOT_EXPORT_PAGES, XLSX_MIME as AI_FIRST_PILOT_XLSX_MIME,
+    PilotExportError, build_ai_first_pilot_xlsx,
+)
+from averon_import.services.ai_first.pdf_locator import locate_ai_first_pdf_bbox
 from averon_import.services.ai_first.orchestration import (
     CheckpointStore, FitZPageRenderer, OrchestrationConfig, PageOrchestrator,
     TokenPricing, inspect_pdf,
@@ -136,7 +141,8 @@ from averon_import.services.ai_first.orchestration import (
 from averon_import.services.ai_first.qwen_vision_adapter import QwenVisionQuotaRegistry
 from averon_import.services.ai_first.review import (
     AIReviewError, assert_review_ready_for_export, confirm_page_complete, new_review_state,
-    reconcile_reprocessed_pages, record_row_decision, record_structure_change, resolve_review_issue,
+    reconcile_reprocessed_pages, record_row_decision, record_row_role_classification,
+    record_structure_change, resolve_review_issue,
 )
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.pdf_service import PdfService
@@ -2033,6 +2039,14 @@ class AIFirstRowDecisionRequest(BaseModel):
         return self
 
 
+class AIFirstRowRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    record_id: StrictStr
+    role: AIHumanRowRole
+    parent_record_id: StrictStr | None = None
+
+
 class AIFirstBulkConfirmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2063,6 +2077,18 @@ class AIFirstPageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     page_number: StrictInt = Field(ge=1)
+
+
+class AIFirstPilotExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    page_numbers: list[StrictInt] = Field(min_length=1, max_length=MAX_PILOT_EXPORT_PAGES)
+
+    @model_validator(mode="after")
+    def unique_pages(self):
+        if len(set(self.page_numbers)) != len(self.page_numbers):
+            raise ValueError("duplicate_page_scope")
+        return self
 
 
 class AIFirstResolveIssueRequest(BaseModel):
@@ -2358,6 +2384,17 @@ def decide_ai_first_row(document_id: str, request: AIFirstRowDecisionRequest, us
 
 
 @app.post(
+    "/api/documents/{document_id}/ai-first/review/row-role",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def classify_ai_first_row_role(document_id: str, request: AIFirstRowRoleRequest, user: CurrentUser = Depends(require_authenticated)):
+    return _mutate_ai_first_state(document_id, lambda draft, state: record_row_role_classification(
+        draft, state, request.record_id, role=request.role,
+        parent_record_id=request.parent_record_id, reviewer_id=_job_owner_id(user),
+    ))
+
+
+@app.post(
     "/api/documents/{document_id}/ai-first/review/bulk-confirm",
     dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
@@ -2425,6 +2462,59 @@ def save_ai_first_review(document_id: str):
         store.write("review.json", review.model_dump(mode="json"))
         store.write("report.json", report)
     return {"saved": True, "history_events": len(review.history)}
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/pilot-export",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
+    """Download a test-marked workbook from the saved local Human Review ledger."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        _store, draft, review, report = _ai_first_read_state(workspace)
+        metadata = workspace_service.read_json(workspace.metadata_path) or {}
+        document_name = str(metadata.get("filename") or "document.pdf")
+        try:
+            content = build_ai_first_pilot_xlsx(
+                draft, review, report, page_numbers=request.page_numbers,
+                document_name=document_name,
+            )
+        except PilotExportError as exc:
+            raise HTTPException(
+                409,
+                detail={"code": str(exc), "message": "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и локальные данные."},
+            ) from None
+    filename = f"Averon_AI-first_TEST_{workspace.document_id[:8]}.xlsx"
+    return Response(
+        content=content,
+        media_type=AI_FIRST_PILOT_XLSX_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get(
+    "/api/documents/{document_id}/ai-first/locator",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def locate_ai_first_row(document_id: str, record_id: str = Query(min_length=1, max_length=256), cell_index: int | None = Query(default=None, ge=0, le=63)):
+    """Resolve only unique exact text-layer matches; never returns document text."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        _store, draft, _review, _report = _ai_first_read_state(workspace)
+        return locate_ai_first_pdf_bbox(
+            workspace.pdf_path, draft, record_id, cell_index=cell_index,
+        )
 
 
 @app.get(

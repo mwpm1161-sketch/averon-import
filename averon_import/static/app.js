@@ -31,7 +31,7 @@ const state = {
   config: null,
   document: null,
   selectedPages: new Set(),
-  aiFirst: {mode:"standard",previousPages:null,data:null,page:1,selectedRows:new Set(),retryPages:new Set(),jobId:null,addRowOpen:false,addRowValues:{}},
+  aiFirst: {mode:"standard",previousPages:null,data:null,page:1,selectedRows:new Set(),retryPages:new Set(),exportPages:new Set(),locatorRequestId:0,jobId:null,addRowOpen:false,addRowValues:{}},
   previewPage: null,
   crop: null,
   cropSelecting: false,
@@ -6044,14 +6044,20 @@ async function selectRow(id) {
   } else positionHighlight(row);
 }
 
-function positionHighlight(row) {
-  const highlight = $("#row-highlight");
-  if (!row?.bbox) { highlight.hidden = true; return; }
+function positionHighlight(row, targetHighlight = null) {
+  const highlight = targetHighlight || $("#row-highlight");
+  const box = row?.bbox;
+  if (!box || ![box.x, box.y, box.width, box.height].every(Number.isFinite)
+      || box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0
+      || box.x + box.width > 1.000001 || box.y + box.height > 1.000001) {
+    highlight.hidden = true;
+    return;
+  }
   highlight.hidden = false;
-  highlight.style.left = `${row.bbox.x * 100}%`;
-  highlight.style.top = `${row.bbox.y * 100}%`;
-  highlight.style.width = `${row.bbox.width * 100}%`;
-  highlight.style.height = `${row.bbox.height * 100}%`;
+  highlight.style.left = `${box.x * 100}%`;
+  highlight.style.top = `${box.y * 100}%`;
+  highlight.style.width = `${box.width * 100}%`;
+  highlight.style.height = `${box.height * 100}%`;
   requestAnimationFrame(() => highlight.scrollIntoView({block:"center",inline:"nearest",behavior:"smooth"}));
 }
 

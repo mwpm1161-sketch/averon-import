@@ -13,8 +13,8 @@ from averon_import.services.ai_first.contracts import AIRow
 from averon_import.services.ai_first.review import (
     AIReviewError, assert_review_ready_for_export, confirm_page_complete,
     new_review_state, record_handwriting_confirmation, record_row_decision,
-    record_structure_change, reconcile_reprocessed_pages, resolve_review_issue,
-    undo_structure_change,
+    record_row_role_classification, record_structure_change,
+    reconcile_reprocessed_pages, resolve_review_issue, undo_structure_change,
 )
 from averon_import.tools.ai_first_replay import main as replay_main
 
@@ -65,6 +65,21 @@ def _draft(payload=None, *, requested=(1,), document_id="doc-test"):
 
 def _all_rows(draft):
     return [row for page in draft.pages for table in page.tables for row in table.rows]
+
+
+def _classify_items(draft, state, record_ids=None):
+    selected = set(record_ids) if record_ids is not None else {row.id for row in _all_rows(draft)}
+    for row in _all_rows(draft):
+        if row.id in selected:
+            state = record_row_role_classification(
+                draft, state, row.id, role="standalone_item", reviewer_id="reviewer",
+            )
+    for row in state.manual_rows:
+        if row.active and (record_ids is None or row.id in selected):
+            state = record_row_role_classification(
+                draft, state, row.id, role="standalone_item", reviewer_id="reviewer",
+            )
+    return state
 
 
 def test_arbitrary_headers_columns_tables_and_missing_geometry_are_preserved():
@@ -191,8 +206,193 @@ def test_review_guard_requires_explicit_row_page_and_issue_decisions():
         assert_review_ready_for_export(draft, state)
     for issue in draft.issues:
         state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Checked against source.")
+    state = _classify_items(draft, state)
     assert_review_ready_for_export(draft, state) is None
     assert draft.export_authorized is False
+
+
+def test_review_guard_requires_human_role_and_keeps_model_role_unverified():
+    draft = _draft(_payload(rows=[_row(0, "1", "Насос", kind="item")]))
+    row = _all_rows(draft)[0]
+    state = record_row_decision(
+        draft, new_review_state(draft), row.id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="row_role_missing_or_stale"):
+        assert_review_ready_for_export(draft, state)
+
+    state = record_row_role_classification(
+        draft, state, row.id, role="section", reviewer_id="reviewer",
+    )
+    with pytest.raises(AIReviewError, match="included_row_role_not_position"):
+        assert_review_ready_for_export(draft, state)
+    state = record_row_role_classification(
+        draft, state, row.id, role="standalone_item", reviewer_id="reviewer",
+    )
+    assert state.row_roles[row.id].role == "standalone_item"
+    assert row.role_verified is False
+    assert row.model_kind == "item"
+    # Changing an already assigned role invalidates the earlier value decision.
+    state = record_row_decision(
+        draft, state, row.id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    assert_review_ready_for_export(draft, state)
+
+
+def test_component_role_requires_same_page_confirmed_standalone_parent():
+    draft = _draft(_payload(rows=[_row(0, "1", "Комплект"), _row(1, "", "Компонент")]))
+    parent, component = _all_rows(draft)
+    state = new_review_state(draft)
+    with pytest.raises(AIReviewError, match="component_parent_not_confirmed_item"):
+        record_row_role_classification(
+            draft, state, component.id, role="component", reviewer_id="reviewer",
+            parent_record_id=parent.id,
+        )
+    state = record_row_role_classification(
+        draft, state, parent.id, role="standalone_item", reviewer_id="reviewer",
+    )
+    state = record_row_role_classification(
+        draft, state, component.id, role="component", reviewer_id="reviewer",
+        parent_record_id=parent.id,
+    )
+    state = record_row_decision(
+        draft, state, parent.id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    state = record_row_decision(
+        draft, state, component.id, disposition="corrected", reviewer_id="reviewer",
+        values={"cell:1": "Исправленный компонент"},
+    )
+    assert state.row_roles[component.id].parent_record_id == parent.id
+    component_role_event = next(
+        event for event in reversed(state.history)
+        if event.role_change is not None
+        and event.role_change.current.record_id == component.id
+    )
+    assert component_role_event.role_change.current.parent_record_id == parent.id
+
+    state = record_row_role_classification(
+        draft, state, parent.id, role="section", reviewer_id="reviewer",
+    )
+    assert state.row_roles[parent.id].role == "section"
+    assert state.row_roles[component.id].active is False
+    assert component.id in {item.record_id for item in state.history[-1].invalidated_row_roles}
+    assert component.id in {item.record_id for item in state.history[-1].role_change.invalidated_dependents}
+    assert state.decisions[parent.id].active is False
+    assert state.decisions[parent.id].invalidation_reason == "role_change"
+    assert state.decisions[component.id].active is False
+    assert state.decisions[component.id].invalidation_reason == "role_change"
+    assert state.decisions[component.id].values == {"cell:1": "Исправленный компонент"}
+    invalidated_decisions = {
+        item.record_id: item for item in state.history[-1].role_change.invalidated_decisions
+    }
+    assert invalidated_decisions[component.id].values == {
+        "cell:1": "Исправленный компонент",
+    }
+
+    state = record_row_role_classification(
+        draft, state, parent.id, role="standalone_item", reviewer_id="reviewer",
+    )
+    state = record_row_role_classification(
+        draft, state, component.id, role="component", reviewer_id="reviewer",
+        parent_record_id=parent.id,
+    )
+    assert state.decisions[parent.id].active is False
+    assert state.decisions[component.id].active is False
+    state = record_row_decision(
+        draft, state, component.id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    assert state.decisions[component.id].values == {"cell:1": "Исправленный компонент"}
+
+
+def test_component_parent_change_is_audited_and_old_link_is_invalidated():
+    draft = _draft(_payload(rows=[
+        _row(0, "1", "Комплект А"), _row(1, "2", "Комплект Б"), _row(2, "", "Деталь"),
+    ]))
+    parent_a, parent_b, component = _all_rows(draft)
+    state = new_review_state(draft)
+    for parent in (parent_a, parent_b):
+        state = record_row_role_classification(
+            draft, state, parent.id, role="standalone_item", reviewer_id="reviewer",
+        )
+    state = record_row_role_classification(
+        draft, state, component.id, role="component", reviewer_id="reviewer",
+        parent_record_id=parent_a.id,
+    )
+    previous = state.row_roles[component.id]
+    state = record_row_role_classification(
+        draft, state, component.id, role="component", reviewer_id="reviewer-2",
+        parent_record_id=parent_b.id,
+    )
+    change = state.history[-1].role_change
+    assert change.previous == previous
+    assert change.current.parent_record_id == parent_b.id
+    assert state.row_roles[component.id].active is True
+
+
+def test_component_cannot_cross_page_and_parent_must_be_included_for_guard_readiness():
+    page_one = page_from_payload(_payload(), source_document_id="doc-test", page_number=1)
+    page_two = page_from_payload(
+        _payload(2, rows=[_row(0, "", "Компонент")]), source_document_id="doc-test", page_number=2,
+    )
+    draft = assemble_document_draft("doc-test", [page_one, page_two], requested_pages=[1, 2])
+    parent = draft.pages[0].tables[0].rows[0]
+    component = draft.pages[1].tables[0].rows[0]
+    state = record_row_role_classification(
+        draft, new_review_state(draft), parent.id, role="standalone_item", reviewer_id="reviewer",
+    )
+    with pytest.raises(AIReviewError, match="component_parent_provenance_mismatch"):
+        record_row_role_classification(
+            draft, state, component.id, role="component", reviewer_id="reviewer",
+            parent_record_id=parent.id,
+        )
+
+    draft = _draft(_payload(rows=[_row(0, "1", "Комплект"), _row(1, "", "Компонент")]))
+    parent, component = _all_rows(draft)
+    state = record_row_role_classification(
+        draft, new_review_state(draft), parent.id, role="standalone_item", reviewer_id="reviewer",
+    )
+    state = record_row_role_classification(
+        draft, state, component.id, role="component", reviewer_id="reviewer",
+        parent_record_id=parent.id,
+    )
+    state = record_row_decision(
+        draft, state, parent.id, disposition="excluded", reviewer_id="reviewer",
+    )
+    state = record_row_decision(
+        draft, state, component.id, disposition="confirmed", reviewer_id="reviewer",
+    )
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
+    for issue in draft.issues:
+        state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Checked.")
+    with pytest.raises(AIReviewError, match="component_parent_not_included"):
+        assert_review_ready_for_export(draft, state)
+
+
+def test_legacy_review_state_defaults_new_role_ledger_without_losing_decisions_or_history():
+    draft = _draft(_payload())
+    row = _all_rows(draft)[0]
+    state = record_row_decision(
+        draft, new_review_state(draft), row.id, disposition="corrected", reviewer_id="reviewer",
+        values={"Наименование": "Исправленное название"},
+    )
+    legacy = state.model_dump(mode="json")
+    legacy.pop("review_schema_version")
+    legacy.pop("row_roles")
+    for decision in legacy["decisions"].values():
+        decision.pop("invalidation_reason", None)
+    for event in legacy["history"]:
+        event.pop("role_change", None)
+        event.pop("invalidated_row_roles", None)
+
+    migrated = type(state).model_validate_json(json.dumps(legacy, ensure_ascii=False))
+    assert migrated.review_schema_version == 2
+    assert migrated.row_roles == {}
+    assert migrated.decisions[row.id].values == {"Наименование": "Исправленное название"}
+    assert migrated.decisions[row.id].invalidation_reason is None
+    assert migrated.history[0].action == "edit_value"
+    assert migrated.history[0].payload["values"] == {"Наименование": "Исправленное название"}
+    assert migrated.history[0].role_change is None
+    assert migrated.model_dump(mode="json")["history"][0]["event_id"] == legacy["history"][0]["event_id"]
 
 
 def test_export_guard_rejects_empty_documents_and_missing_manifest():
@@ -328,12 +528,17 @@ def test_latest_structure_change_can_be_undone_with_audit_and_invalidated_comple
     state = record_row_decision(
         draft, new_review_state(draft), source_id, disposition="confirmed", reviewer_id="reviewer",
     )
+    state = record_row_role_classification(
+        draft, state, source_id, role="standalone_item", reviewer_id="reviewer",
+    )
     state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
     state = record_structure_change(
         draft, state, action="split_row", source_record_ids=[source_id],
         result_rows=[{"Наименование": "Часть А"}, {"Наименование": "Часть Б"}],
         reviewer_id="reviewer",
     )
+    assert state.row_roles[source_id].active is False
+    assert state.history[-1].invalidated_row_roles[0].record_id == source_id
     structure_event = state.history[-1]
     restored = undo_structure_change(draft, state, structure_event.event_id, reviewer_id="reviewer")
     assert restored.decisions[source_id].disposition == "confirmed"
@@ -344,8 +549,10 @@ def test_latest_structure_change_can_be_undone_with_audit_and_invalidated_comple
     assert restored.history[-1].action == "undo_structure_change"
     assert restored.history[-1].payload["reverted_event_id"] == structure_event.event_id
     assert any(event.event_id == structure_event.event_id for event in restored.history)
+    assert restored.row_roles[source_id].active is False
 
     restored = confirm_page_complete(draft, restored, 1, reviewer_id="reviewer")
+    restored = _classify_items(draft, restored, [source_id])
     assert_review_ready_for_export(draft, restored)
 
 
@@ -355,6 +562,9 @@ def test_merge_can_be_undone_in_the_same_extraction_revision():
     state = new_review_state(draft)
     for row in rows:
         state = record_row_decision(draft, state, row.id, disposition="confirmed", reviewer_id="reviewer")
+        state = record_row_role_classification(
+            draft, state, row.id, role="standalone_item", reviewer_id="reviewer",
+        )
     state = record_structure_change(
         draft, state, action="merge_rows", source_record_ids=[row.id for row in rows],
         result_rows=[{"Наименование": "Объединённая строка"}], reviewer_id="reviewer",
@@ -362,12 +572,15 @@ def test_merge_can_be_undone_in_the_same_extraction_revision():
     merge_event = state.history[-1]
     assert all(state.decisions[row.id].active for row in rows)
     assert state.decisions[merge_event.result_record_ids[0]].active
+    assert all(not state.row_roles[row.id].active for row in rows)
+    assert {item.record_id for item in merge_event.invalidated_row_roles} == {row.id for row in rows}
 
     restored = undo_structure_change(draft, state, merge_event.event_id, reviewer_id="reviewer")
     assert all(restored.decisions[row.id].disposition == "confirmed" for row in rows)
     assert all(restored.decisions[row.id].active for row in rows)
     assert not restored.manual_rows[0].active
     assert not restored.decisions[merge_event.result_record_ids[0]].active
+    assert all(not restored.row_roles[row.id].active for row in rows)
     assert restored.history[-1].payload["reverted_event_id"] == merge_event.event_id
 
 
@@ -445,14 +658,20 @@ def test_reprocessing_invalidates_changed_page_decisions_and_confirmations():
     row = _all_rows(old)[0]
     state = new_review_state(old)
     state = record_row_decision(old, state, row.id, disposition="confirmed", reviewer_id="reviewer")
+    state = record_row_role_classification(
+        old, state, row.id, role="standalone_item", reviewer_id="reviewer",
+    )
     state = confirm_page_complete(old, state, 1, reviewer_id="reviewer")
     new = _draft(_payload(rows=[_row(0, "1", "Переработанное значение")]))
     reconciled = reconcile_reprocessed_pages(old, new, state)
     assert reconciled.revision_id == new.revision_id
     assert reconciled.decisions[row.id].active is False
+    assert reconciled.row_roles[row.id].active is False
+    assert reconciled.decisions[row.id].invalidation_reason == "page_reprocessed"
     assert reconciled.confirmed_complete_pages == set()
     assert not any(new_row.id in reconciled.decisions for new_row in _all_rows(new))
     assert reconciled.history[-1].action == "page_reprocessed"
+    assert reconciled.history[-1].invalidated_row_roles[0].record_id == row.id
     with pytest.raises(AIReviewError):
         assert_review_ready_for_export(new, reconciled)
 
@@ -461,9 +680,13 @@ def test_reprocessing_identical_page_retains_decisions():
     old = _draft(_payload())
     row = _all_rows(old)[0]
     state = record_row_decision(old, new_review_state(old), row.id, disposition="confirmed", reviewer_id="reviewer")
+    state = record_row_role_classification(
+        old, state, row.id, role="standalone_item", reviewer_id="reviewer",
+    )
     same = _draft(_payload())
     reconciled = reconcile_reprocessed_pages(old, same, state)
     assert reconciled.decisions[row.id].active is True
+    assert reconciled.row_roles[row.id].active is True
     assert reconciled.revision_id == same.revision_id
 
 

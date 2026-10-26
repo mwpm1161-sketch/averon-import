@@ -5,7 +5,8 @@ from uuid import uuid4
 from typing import Iterable
 
 from averon_import.services.ai_first.contracts import (
-    AIDocumentDraft, AIManualRow, AIReviewDecision, AIReviewEvent, AIReviewState,
+    AIDocumentDraft, AIHumanRowRole, AIManualRow, AIReviewDecision, AIReviewEvent,
+    AIReviewRoleChange, AIReviewRowRole, AIReviewState,
 )
 
 
@@ -49,6 +50,121 @@ def _check_current(draft: AIDocumentDraft, state: AIReviewState) -> None:
         raise AIReviewError("review_state_revision_mismatch")
 
 
+def _row_role_source(draft: AIDocumentDraft, state: AIReviewState, record_id: str):
+    pages = {page.page_number: page for page in draft.pages}
+    row = _rows(draft).get(record_id)
+    if row is not None:
+        page_number, source_row = row
+        page = pages.get(page_number)
+        if page is None or page.status in {"failed", "incomplete"}:
+            raise AIReviewError("page_processing_incomplete")
+        return page_number, page, source_row.table_id
+    manual = next((item for item in state.manual_rows if item.id == record_id and item.active), None)
+    if manual is None:
+        raise AIReviewError("unknown_review_record")
+    page = pages.get(manual.page_number)
+    if (page is None or page.status in {"failed", "incomplete"}
+            or not manual.page_extraction_fingerprint
+            or manual.page_extraction_fingerprint != page.extraction_fingerprint):
+        raise AIReviewError("manual_row_page_revision_mismatch")
+    return manual.page_number, page, None
+
+
+def _deactivate_row_role_dependencies(
+    state: AIReviewState, root_record_ids: Iterable[str],
+) -> tuple[list[AIReviewRowRole], list[AIReviewRowRole]]:
+    """Deactivate roots and all active component descendants, retaining audit snapshots."""
+    active = {record_id: role for record_id, role in state.row_roles.items() if role.active}
+    children: dict[str, list[str]] = {}
+    for role in active.values():
+        if role.parent_record_id:
+            children.setdefault(role.parent_record_id, []).append(role.record_id)
+    roots = set(root_record_ids)
+    affected: set[str] = set()
+    pending = list(roots)
+    while pending:
+        record_id = pending.pop()
+        if record_id in affected:
+            continue
+        affected.add(record_id)
+        pending.extend(children.get(record_id, []))
+    snapshots = [active[record_id] for record_id in sorted(affected) if record_id in active]
+    for role in snapshots:
+        state.row_roles[role.record_id] = role.model_copy(update={"active": False})
+    dependent_snapshots = [role for role in snapshots if role.record_id not in roots]
+    return snapshots, dependent_snapshots
+
+
+def record_row_role_classification(
+    draft: AIDocumentDraft, state: AIReviewState, record_id: str, *, role: AIHumanRowRole,
+    reviewer_id: str, parent_record_id: str | None = None,
+) -> AIReviewState:
+    """Record a human role and optional parent link without mutating the AI row."""
+    _check_current(draft, state)
+    allowed_roles = {
+        "header", "column_numbering", "section", "standalone_item",
+        "component", "continuation", "note", "unknown",
+    }
+    if not reviewer_id or role not in allowed_roles:
+        raise AIReviewError("invalid_row_role")
+    if record_id in _active_lineage_sources(state):
+        raise AIReviewError("review_source_superseded")
+    page_number, page, table_id = _row_role_source(draft, state, record_id)
+    if role == "component":
+        if not parent_record_id or parent_record_id == record_id:
+            raise AIReviewError("component_parent_required")
+        parent_page_number, parent_page, parent_table_id = _row_role_source(draft, state, parent_record_id)
+        parent_role = state.row_roles.get(parent_record_id)
+        if (parent_page_number != page_number or parent_page.extraction_fingerprint != page.extraction_fingerprint
+                or (table_id is not None and parent_table_id is not None and table_id != parent_table_id)):
+            raise AIReviewError("component_parent_provenance_mismatch")
+        if parent_role is None or not parent_role.active or parent_role.role != "standalone_item":
+            raise AIReviewError("component_parent_not_confirmed_item")
+    elif parent_record_id is not None:
+        raise AIReviewError("parent_only_allowed_for_component")
+
+    current = AIReviewRowRole(
+        record_id=record_id, source_document_id=draft.source_document_id,
+        page_number=page_number, page_extraction_fingerprint=page.extraction_fingerprint,
+        table_id=table_id, role=role, parent_record_id=parent_record_id,
+        reviewer_id=reviewer_id,
+    )
+    updated = state.model_copy(deep=True)
+    previous = updated.row_roles.get(record_id)
+    changed = previous is None or not previous.active or (
+        previous.role != current.role
+        or previous.parent_record_id != current.parent_record_id
+        or previous.page_extraction_fingerprint != current.page_extraction_fingerprint
+    )
+    snapshots: list[AIReviewRowRole] = []
+    dependents: list[AIReviewRowRole] = []
+    invalidated_decisions = []
+    role_semantics_changed = previous is not None and previous.active and changed
+    if changed:
+        snapshots, dependents = _deactivate_row_role_dependencies(updated, [record_id])
+    if role_semantics_changed:
+        for old_role in snapshots:
+            decision = updated.decisions.get(old_role.record_id)
+            if decision is not None and decision.active:
+                invalidated = decision.model_copy(update={
+                    "active": False, "invalidation_reason": "role_change",
+                })
+                updated.decisions[old_role.record_id] = invalidated
+                invalidated_decisions.append(invalidated)
+    updated.row_roles[record_id] = current
+    updated.history.append(AIReviewEvent(
+        action="classify_row_role", source_document_id=draft.source_document_id,
+        reviewer_id=reviewer_id, page_number=page_number, source_record_ids=[record_id],
+        role_change=AIReviewRoleChange(
+            record_id=record_id, previous=previous, current=current,
+            invalidated_dependents=dependents,
+            invalidated_decisions=invalidated_decisions,
+        ),
+        invalidated_row_roles=snapshots,
+    ))
+    return updated
+
+
 def record_row_decision(
     draft: AIDocumentDraft, state: AIReviewState, record_id: str, *,
     disposition: str, reviewer_id: str, values: dict[str, str] | None = None,
@@ -70,7 +186,8 @@ def record_row_decision(
     if disposition != "excluded" and record_id in _active_lineage_sources(state):
         raise AIReviewError("review_source_superseded")
     prior = state.decisions.get(record_id)
-    if disposition == "confirmed" and not values and prior is not None and prior.active:
+    if (disposition == "confirmed" and not values and prior is not None
+            and (prior.active or prior.invalidation_reason == "role_change")):
         # Confirmation changes the review status, not the values already
         # corrected by a reviewer. An empty confirmation payload must never
         # silently reset those values.
@@ -160,6 +277,7 @@ def record_structure_change(
         for record_id in source_ids
         if any(row.id == record_id for row in state.manual_rows)
     }
+    invalidated_row_roles, _invalidated_dependents = _deactivate_row_role_dependencies(updated, source_ids)
     for record_id in source_ids:
         is_manual = any(row.id == record_id for row in updated.manual_rows)
         if is_manual:
@@ -202,6 +320,7 @@ def record_structure_change(
             "page_status": page.status,
             "draft_revision_id": draft.revision_id,
         },
+        invalidated_row_roles=invalidated_row_roles,
     ))
     updated.confirmed_complete_pages.discard(page_number)
     return updated
@@ -240,7 +359,10 @@ def undo_structure_change(
         raise AIReviewError("structure_change_not_latest_for_page")
     affected = set(event.source_record_ids) | set(event.result_record_ids)
     if any(
-        affected.intersection(later_event.source_record_ids + later_event.result_record_ids)
+        affected.intersection(
+            later_event.source_record_ids + later_event.result_record_ids
+            + [role.record_id for role in later_event.invalidated_row_roles]
+        )
         for later_event in later
     ):
         raise AIReviewError("structure_change_has_dependent_edits")
@@ -254,7 +376,9 @@ def undo_structure_change(
     for record_id in result_ids:
         decision = updated.decisions.get(record_id)
         if decision is not None:
-            updated.decisions[record_id] = decision.model_copy(update={"active": False})
+            updated.decisions[record_id] = decision.model_copy(update={
+                "active": False, "invalidation_reason": "structure_change",
+            })
 
     prior_decisions = event.payload.get("prior_decisions", {})
     prior_manual_active = event.payload.get("prior_manual_active", {})
@@ -348,7 +472,9 @@ def reconcile_reprocessed_pages(
     old_rows.update({row.id: row.page_number for row in state.manual_rows})
     for record_id, decision in list(updated.decisions.items()):
         if old_rows.get(record_id) in changed:
-            updated.decisions[record_id] = decision.model_copy(update={"active": False})
+            updated.decisions[record_id] = decision.model_copy(update={
+                "active": False, "invalidation_reason": "page_reprocessed",
+            })
     updated.manual_rows = [
         row.model_copy(update={"active": False}) if row.page_number in changed else row
         for row in updated.manual_rows
@@ -359,6 +485,14 @@ def reconcile_reprocessed_pages(
         issue_id for issue_id in updated.resolved_issue_ids
         if old_issue_pages.get(issue_id) not in changed
     }
+    invalidated_roles_by_page: dict[int, list[AIReviewRowRole]] = {}
+    for page_number in sorted(changed):
+        roots = [
+            role.record_id for role in updated.row_roles.values()
+            if role.page_number == page_number and role.active
+        ]
+        snapshots, _dependents = _deactivate_row_role_dependencies(updated, roots)
+        invalidated_roles_by_page[page_number] = snapshots
     updated.revision_id = new_draft.revision_id
     for page_number in sorted(changed):
         old_fingerprint = old_pages[page_number].extraction_fingerprint if page_number in old_pages else None
@@ -367,6 +501,7 @@ def reconcile_reprocessed_pages(
             action="page_reprocessed", source_document_id=new_draft.source_document_id, reviewer_id="system", page_number=page_number,
             detail="Prior page decisions were invalidated because the extraction changed.",
             payload={"old_fingerprint": old_fingerprint, "new_fingerprint": new_fingerprint},
+            invalidated_row_roles=invalidated_roles_by_page.get(page_number, []),
         ))
     return updated
 
@@ -422,6 +557,23 @@ def assert_review_ready_for_export(draft: AIDocumentDraft, state: AIReviewState)
     } - state.resolved_issue_ids
     if unresolved:
         raise AIReviewError("review_issues_unresolved")
+    for record_id, page_number in required.items():
+        decision = state.decisions[record_id]
+        if record_id in active_lineage_sources and decision.disposition == "excluded":
+            # A split/merge result replaces this source row. Its role must be
+            # reviewed on the new manual rows and is never inherited.
+            continue
+        role = state.row_roles.get(record_id)
+        page = pages_by_number[page_number]
+        if (role is None or not role.active or role.source_document_id != draft.source_document_id
+                or role.page_number != page_number
+                or role.page_extraction_fingerprint != page.extraction_fingerprint):
+            raise AIReviewError("row_role_missing_or_stale")
+        if decision.disposition in {"confirmed", "corrected"}:
+            if role.role not in {"standalone_item", "component"}:
+                raise AIReviewError("included_row_role_not_position")
+            if role.role == "component" and role.parent_record_id not in included:
+                raise AIReviewError("component_parent_not_included")
     if draft.extraction_is_verified or draft.export_authorized:
         # These are fixed-false contract fields; reject any malformed serialized draft.
         raise AIReviewError("model_authorization_forbidden")

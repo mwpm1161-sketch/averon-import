@@ -5,6 +5,7 @@ const vm = require("node:vm");
 
 const sourcePath = process.argv[2] || path.resolve(__dirname, "../../averon_import/static/ai_first_ui.js");
 const source = fs.readFileSync(sourcePath, "utf8");
+const appSource = fs.readFileSync(path.resolve(__dirname, "../../averon_import/static/app.js"), "utf8");
 function sourceBetween(start, end) {
   const first = source.indexOf(start);
   const last = source.indexOf(end, first + start.length);
@@ -155,6 +156,34 @@ context.showPage(1);
 assert(elements.get("#ai-first-page-issues").innerHTML.includes("Номер позиции встречается"), "returning to a page restores its issue set");
 assert.equal(elements.get("#ai-first-add-row-form").newCells.find(input => input.dataset.aiFirstNewColumnKey === "количество#1").value, "24", "add-row values remain available when returning");
 console.log("PASS: AI-first page navigation refreshes page issues and add-row columns while preserving unsaved values");
+
+const roleUi = sourceBetween("function renderAIFirstTables", "async function postAIFirstReview");
+assert(roleUi.includes('role?.active ? role.role : "unknown"'), "row roles start unverified instead of inheriting model classification");
+assert(roleUi.includes('data-ai-first-save-role'), "Human Review can save a row role explicitly");
+assert(roleUi.includes('role === "component" ? parent : null'), "component rows require an explicit standalone parent");
+assert(roleUi.includes("Сначала сохраните или отмените правки ячеек"), "role changes cannot discard unsaved cell edits");
+const exportUi = sourceBetween("function renderAIFirstReview", "function aiFirstColumnList");
+assert(exportUi.includes("exportPages.size >= 3"), "pilot export scope is bounded to three pages");
+assert(source.includes("Averon_AI-first_TEST_"), "pilot download is explicitly test-marked");
+
+const positionHighlightCode = (() => {
+  const first = appSource.indexOf("function positionHighlight(");
+  const last = appSource.indexOf("function updateSummary(", first);
+  assert(first >= 0 && last > first, "legacy highlight function is available");
+  return appSource.slice(first, last);
+})();
+const makeHighlight = () => ({hidden:true,style:{},scrollIntoView() { this.scrolled = true; }});
+const legacyHighlight = makeHighlight();
+const aiFirstHighlight = makeHighlight();
+const highlightContext = {$:() => legacyHighlight,requestAnimationFrame:callback => callback()};
+vm.runInNewContext(`${positionHighlightCode}; globalThis.sharedPositionHighlight=positionHighlight;`, highlightContext);
+highlightContext.sharedPositionHighlight({bbox:{x:0.1,y:0.2,width:0.3,height:0.1}}, aiFirstHighlight);
+assert.equal(aiFirstHighlight.hidden, false, "AI-first uses the existing row highlight renderer");
+assert.equal(aiFirstHighlight.style.left, "10%");
+assert.equal(legacyHighlight.hidden, true, "targeted AI-first highlight leaves the standard review target untouched");
+highlightContext.sharedPositionHighlight({bbox:{x:0.9,y:0.9,width:0.3,height:0.3}}, aiFirstHighlight);
+assert.equal(aiFirstHighlight.hidden, true, "out-of-bounds geometry is rejected fail-closed");
+console.log("PASS: AI-first reuses the existing PDF highlight renderer and rejects invalid boxes");
 
 const reviewSnippet = sourceBetween("async function postAIFirstReview", "async function cancelAIFirstRecognition");
 vm.runInNewContext(`${reviewSnippet}; globalThis.aiFirstRowInputSnapshot=() => []; globalThis.submitAddRow=postAIFirstReview; globalThis.confirmSelected=confirmSelectedAIFirstRows;`, context);

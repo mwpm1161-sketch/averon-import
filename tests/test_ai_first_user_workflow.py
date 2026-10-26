@@ -5,10 +5,12 @@ import hashlib
 import json as json_module
 import threading
 import time
+from io import BytesIO
 from urllib.parse import urlsplit
 
 import fitz
 import pytest
+from openpyxl import load_workbook
 
 from averon_import.services.ai_first.local_workflow import SyntheticPageAdapter
 from averon_import.services.ai_first.private_acl import verify_private_tree
@@ -267,6 +269,49 @@ def test_review_edits_adds_excludes_and_bulk_confirms_without_changing_source_dr
     assert client.post(f"{path}/review/save").json()["saved"] is True
 
 
+def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_first_client):
+    main, client = ai_first_client
+    workspace = _make_document(main, 2)
+    _start_fake(client, workspace.document_id, pages=[1])
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+    snapshot = client.get(path).json()
+    rows = snapshot["draft"]["pages"][0]["tables"][0]["rows"]
+    first_id, second_id = (row["id"] for row in rows)
+
+    assert client.post(f"{path}/review/row-role", json={"record_id":first_id,"role":"standalone_item"}).status_code == 200
+    assert client.post(f"{path}/review/row-role", json={"record_id":second_id,"role":"section"}).status_code == 200
+    assert client.post(f"{path}/review/row", json={
+        "record_id":first_id,"disposition":"corrected","values":{"cell:1":"Synthetic corrected item"},
+    }).status_code == 200
+    assert client.post(f"{path}/review/row", json={"record_id":second_id,"disposition":"confirmed"}).status_code == 200
+    assert client.post(f"{path}/review/complete-page", json={"page_number":1}).status_code == 200
+
+    response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
+    assert response.status_code == 200, response.text
+    assert not workspace.result_path.exists()
+    workbook = load_workbook(BytesIO(response.content), data_only=False)
+    assert {"Проверенные позиции", "Все распознанные строки", "Охват страниц", "Исходная структура"} <= set(workbook.sheetnames)
+    assert workbook["Проверенные позиции"].max_row == 5
+    assert workbook["Все распознанные строки"].max_row == 6
+    assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in workbook["Проверенные позиции"]["A2"].value
+
+
+def test_ai_first_locator_returns_only_safe_no_match_status_for_fake_page(ai_first_client):
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    _start_fake(client, workspace.document_id)
+    state = client.get(f"/api/documents/{workspace.document_id}/ai-first").json()
+    row = state["draft"]["pages"][0]["tables"][0]["rows"][0]
+
+    response = client.get(
+        f"/api/documents/{workspace.document_id}/ai-first/locator?record_id={row['id']}"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["matched"] is False
+    assert "bbox" not in response.json()
+    assert "raw_value" not in response.text
+
+
 def test_corrected_quantity_survives_confirmation_save_and_reopen(ai_first_client):
     _main, client = ai_first_client
     workspace = _make_document(_main, 1)
@@ -365,11 +410,14 @@ def test_ai_first_server_routes_are_hidden_when_experiment_flag_is_disabled(ai_f
         client.get(base),
         client.get(f"{base}/progress"),
         client.post(f"{base}/review/row", json={"record_id":"row","disposition":"confirmed","values":{}}),
+        client.post(f"{base}/review/row-role", json={"record_id":"row","role":"standalone_item"}),
         client.post(f"{base}/review/bulk-confirm", json={"record_ids":["row"]}),
         client.post(f"{base}/review/add-row", json={"page_number":1,"values":{"cell:0":"1"}}),
         client.post(f"{base}/review/complete-page", json={"page_number":1}),
         client.post(f"{base}/review/resolve-issue", json={"issue_id":"issue","detail":"checked"}),
         client.post(f"{base}/review/save"),
+        client.post(f"{base}/pilot-export", json={"page_numbers":[1]}),
+        client.get(f"{base}/locator?record_id=row"),
         client.post("/api/jobs/not-a-job/cancel"),
     ]
     assert [response.status_code for response in blocked] == [404] * len(blocked)
@@ -400,6 +448,13 @@ def test_bulk_confirmation_does_not_confirm_page_or_resolve_remarks(ai_first_cli
             json={"issue_id":issue["id"],"detail":"Сверено с синтетической страницей."},
         )
         assert resolved.status_code == 200, resolved.text
+    assert client.get(path).json()["review_ready_for_guard"]["ready"] is False
+    for row in rows:
+        classified = client.post(
+            f"{path}/review/row-role",
+            json={"record_id": row["id"], "role": "standalone_item"},
+        )
+        assert classified.status_code == 200, classified.text
     assert client.get(path).json()["review_ready_for_guard"]["ready"] is True
 
 
