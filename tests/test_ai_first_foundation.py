@@ -211,6 +211,52 @@ def test_review_guard_requires_explicit_row_page_and_issue_decisions():
     assert draft.export_authorized is False
 
 
+def test_excluding_and_restoring_row_preserves_reviewed_values_and_audit():
+    draft = _draft(_payload(rows=[_row(0, "1", "Original name")]))
+    row = _all_rows(draft)[0]
+    state = new_review_state(draft)
+    reviewed_values = {"cell:0": "1", "cell:1": "Corrected name"}
+    state = record_row_decision(
+        draft, state, row.id, disposition="corrected", reviewer_id="reviewer", values=reviewed_values,
+    )
+    state = record_row_decision(
+        draft, state, row.id, disposition="excluded", reviewer_id="reviewer",
+    )
+    assert state.decisions[row.id].disposition == "excluded"
+    assert state.decisions[row.id].values == reviewed_values
+    assert state.history[-1].payload["values"] == reviewed_values
+    state = type(state).model_validate_json(state.model_dump_json())
+    assert state.decisions[row.id].values == reviewed_values, "the saved correction survives reopening review.json"
+
+    state = record_row_decision(
+        draft, state, row.id, disposition="corrected", reviewer_id="reviewer", values=reviewed_values,
+    )
+    assert state.decisions[row.id].disposition == "corrected"
+    assert state.decisions[row.id].values == reviewed_values
+    assert [event.action for event in state.history[-3:]] == ["edit_value", "exclude_row", "edit_value"]
+
+
+def test_page_only_review_issue_is_resolvable_and_blocks_review_guard_until_explicitly_cleared():
+    from averon_import.services.ai_first.contracts import AIReviewIssue
+
+    draft = _draft(_payload())
+    issue = AIReviewIssue(
+        id="page-only-note", source_document_id=draft.source_document_id,
+        code="unreadable_page_fragment", severity="review", page_number=1,
+        record_ids=[], detail="synthetic page remark",
+    )
+    draft.pages[0].issues.append(issue)
+    state = new_review_state(draft)
+    row = _all_rows(draft)[0]
+    state = record_row_decision(draft, state, row.id, disposition="confirmed", reviewer_id="reviewer")
+    state = _classify_items(draft, state)
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="review_issues_unresolved"):
+        assert_review_ready_for_export(draft, state)
+    state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Проверено вручную")
+    assert_review_ready_for_export(draft, state) is None
+
+
 def test_review_guard_requires_human_role_and_keeps_model_role_unverified():
     draft = _draft(_payload(rows=[_row(0, "1", "Насос", kind="item")]))
     row = _all_rows(draft)[0]

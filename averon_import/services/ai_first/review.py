@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from uuid import uuid4
-from typing import Iterable
+from typing import Any, Iterable
 
 from averon_import.services.ai_first.contracts import (
     AIDocumentDraft, AIHumanRowRole, AIManualRow, AIReviewDecision, AIReviewEvent,
@@ -43,6 +43,13 @@ def _active_lineage_sources(state: AIReviewState) -> set[str]:
         if ancestor is not None:
             pending.extend(ancestor.source_record_ids)
     return sources
+
+
+def _all_draft_issues(draft: AIDocumentDraft) -> dict[str, Any]:
+    return {
+        issue.id: issue
+        for issue in [*draft.issues, *(issue for page in draft.pages for issue in page.issues)]
+    }
 
 
 def _check_current(draft: AIDocumentDraft, state: AIReviewState) -> None:
@@ -186,6 +193,11 @@ def record_row_decision(
     if disposition != "excluded" and record_id in _active_lineage_sources(state):
         raise AIReviewError("review_source_superseded")
     prior = state.decisions.get(record_id)
+    if disposition == "excluded" and prior is not None and prior.disposition != "excluded":
+        # Exclusion changes eligibility, not the reviewed cell contents. Keep
+        # the prior values in the ledger so an explicit restore can return to
+        # the same edited values instead of silently falling back to OCR.
+        values = dict(prior.values)
     if (disposition == "confirmed" and not values and prior is not None
             and (prior.active or prior.invalidation_reason == "role_change")):
         # Confirmation changes the review status, not the values already
@@ -425,7 +437,7 @@ def resolve_review_issue(
     detail: str,
 ) -> AIReviewState:
     _check_current(draft, state)
-    issues = {issue.id: issue for issue in draft.issues}
+    issues = _all_draft_issues(draft)
     issue = issues.get(issue_id)
     if issue is None or not reviewer_id or not detail.strip():
         raise AIReviewError("invalid_issue_resolution")
@@ -480,7 +492,7 @@ def reconcile_reprocessed_pages(
         for row in updated.manual_rows
     ]
     updated.confirmed_complete_pages.difference_update(changed)
-    old_issue_pages = {issue.id: issue.page_number for issue in old_draft.issues}
+    old_issue_pages = {issue_id: issue.page_number for issue_id, issue in _all_draft_issues(old_draft).items()}
     updated.resolved_issue_ids = {
         issue_id for issue_id in updated.resolved_issue_ids
         if old_issue_pages.get(issue_id) not in changed
@@ -553,7 +565,8 @@ def assert_review_ready_for_export(draft: AIDocumentDraft, state: AIReviewState)
     if not included:
         raise AIReviewError("empty_document")
     unresolved = {
-        issue.id for issue in draft.issues if issue.severity in {"review", "blocking"}
+        issue.id for issue in _all_draft_issues(draft).values()
+        if issue.severity in {"review", "blocking"}
     } - state.resolved_issue_ids
     if unresolved:
         raise AIReviewError("review_issues_unresolved")

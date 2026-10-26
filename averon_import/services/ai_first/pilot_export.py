@@ -286,10 +286,13 @@ def _row_issue_open(row: Mapping[str, Any], issue_index: Mapping[int, list[Any]]
         uncertain = bool(cell.unreadable or cell.struck_through or cell.handwritten or cell.alternatives or cell.handwritten_replacements)
         if not uncertain:
             continue
+        scope_ids = {cell.id, record_id}
+        if table_id:
+            scope_ids.add(str(table_id))
         related_issue_ids = {
             issue.id for issue in issue_index.get(int(row["page"]), [])
             if issue.severity in {"review", "blocking"}
-            and ({cell.id, record_id} & set(issue.record_ids))
+            and (not issue.record_ids or scope_ids.intersection(issue.record_ids))
         }
         if not related_issue_ids or any(issue_id not in review.resolved_issue_ids for issue_id in related_issue_ids):
             return True

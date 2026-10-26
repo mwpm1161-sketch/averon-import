@@ -427,7 +427,8 @@ def test_unresolved_table_level_continuation_issue_blocks_confirmed_positions():
         id="table-continuation", source_document_id="synthetic-doc", code="continuation_unverified",
         severity="review", page_number=1, record_ids=[parent.table_id], detail="synthetic continuation review",
     )
-    draft = draft.model_copy(update={"issues": [issue]})
+    # Page-level issue storage is supported independently of the draft index.
+    draft.pages[0].issues.append(issue)
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="table-issue.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
     assert book["Проверенные позиции"].max_row == 4
