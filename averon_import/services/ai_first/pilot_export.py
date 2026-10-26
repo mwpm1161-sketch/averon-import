@@ -322,6 +322,8 @@ def _review_status(row: Mapping[str, Any], complete_page: bool, processing_state
         return "Значения требуют проверки"
     if decision.disposition == "excluded":
         return "Исключена из проверяемой спецификации"
+    if not decision.human_confirmed:
+        return "Исправления сохранены, но не подтверждены"
     if not complete_page:
         return "Страница не подтверждена полностью"
     if processing_state != "completed":
@@ -478,6 +480,7 @@ def build_ai_first_pilot_xlsx(
             and row["role"] == "standalone_item"
             and row["decision"] is not None and row["decision"].active
             and row["decision"].disposition in {"confirmed", "corrected"}
+            and row["decision"].human_confirmed
             and row["page_confirmed"] and row["processing_state"] == "completed"
             and page is not None and page.status == "extracted" and not row["open_issue"]
             and not row["ambiguous_field_mapping"]

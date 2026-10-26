@@ -433,21 +433,25 @@ def test_bulk_confirmation_does_not_confirm_page_or_resolve_remarks(ai_first_cli
     initial = client.get(path).json()
     assert initial["review_ready_for_guard"]["ready"] is False
     rows = initial["draft"]["pages"][0]["tables"][0]["rows"]
-    assert client.post(f"{path}/review/bulk-confirm", json={"record_ids":[row["id"] for row in rows]}).status_code == 200
+    bulk_blocked = client.post(f"{path}/review/bulk-confirm", json={"record_ids":[row["id"] for row in rows]})
+    assert bulk_blocked.status_code == 409
+    assert bulk_blocked.json()["detail"]["code"] == "bulk_selection_has_open_issues"
+    assert client.get(path).json()["review"]["decisions"] == {}, "a rejected bulk action must be atomic"
     after_rows = client.get(path).json()
-    assert after_rows["review"]["confirmed_complete_pages"] == []
-    assert after_rows["review_ready_for_guard"]["ready"] is False
-
     page = after_rows["draft"]["pages"][0]
-    assert client.post(f"{path}/review/complete-page", json={"page_number":1}).status_code == 200
-    still_blocked = client.get(path).json()
-    assert still_blocked["review_ready_for_guard"]["ready"] is False
     for issue in page["issues"]:
         resolved = client.post(
             f"{path}/review/resolve-issue",
             json={"issue_id":issue["id"],"detail":"Сверено с синтетической страницей."},
         )
         assert resolved.status_code == 200, resolved.text
+    assert client.post(f"{path}/review/bulk-confirm", json={"record_ids":[row["id"] for row in rows]}).status_code == 200
+    after_rows = client.get(path).json()
+    assert after_rows["review"]["confirmed_complete_pages"] == []
+    assert after_rows["review_ready_for_guard"]["ready"] is False
+    assert client.post(f"{path}/review/complete-page", json={"page_number":1}).status_code == 200
+    still_blocked = client.get(path).json()
+    assert still_blocked["review_ready_for_guard"]["ready"] is False
     assert client.get(path).json()["review_ready_for_guard"]["ready"] is False
     for row in rows:
         classified = client.post(
@@ -456,6 +460,45 @@ def test_bulk_confirmation_does_not_confirm_page_or_resolve_remarks(ai_first_cli
         )
         assert classified.status_code == 200, classified.text
     assert client.get(path).json()["review_ready_for_guard"]["ready"] is True
+
+
+def test_bulk_role_assignment_is_human_audited_and_preserves_source_rows(ai_first_client):
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    _start_fake(client, workspace.document_id)
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+    before = client.get(path).json()
+    row = before["draft"]["pages"][0]["tables"][0]["rows"][0]
+    original_kind = row["model_kind"]
+    response = client.post(f"{path}/review/bulk-role", json={"record_ids":[row["id"]],"role":"standalone_item"})
+    assert response.status_code == 200, response.text
+    after = client.get(path).json()
+    assert after["draft"]["pages"][0]["tables"][0]["rows"][0]["model_kind"] == original_kind
+    assert after["review"]["row_roles"][row["id"]]["role"] == "standalone_item"
+    assert after["review"]["row_roles"][row["id"]]["reviewer_id"]
+    assert after["review"]["history"][-1]["action"] == "classify_row_role"
+
+
+def test_save_only_correction_survives_reload_until_explicit_confirmation(ai_first_client):
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    _start_fake(client, workspace.document_id)
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+    row = client.get(path).json()["draft"]["pages"][0]["tables"][0]["rows"][0]
+    corrected_values = {"cell:1":"Synthetic saved correction"}
+    saved = client.post(f"{path}/review/row", json={
+        "record_id":row["id"],"disposition":"corrected","confirmed":False,"values":corrected_values,
+    })
+    assert saved.status_code == 200, saved.text
+    reopened = client.get(path).json()
+    assert reopened["review"]["decisions"][row["id"]]["values"] == corrected_values
+    assert reopened["review"]["decisions"][row["id"]]["human_confirmed"] is False
+
+    confirmed = client.post(f"{path}/review/row", json={"record_id":row["id"],"disposition":"confirmed"})
+    assert confirmed.status_code == 200, confirmed.text
+    reopened = client.get(path).json()
+    assert reopened["review"]["decisions"][row["id"]]["values"] == corrected_values
+    assert reopened["review"]["decisions"][row["id"]]["human_confirmed"] is True
 
 
 def test_context_limit_is_fail_closed_and_context_is_not_echoed(ai_first_client):
@@ -543,7 +586,8 @@ def test_existing_averon_template_exposes_ai_first_review_only_behind_server_con
     assert 'id="ai-first-context" maxlength="1000"' in template
     assert 'id="ai-first-review-view"' in template
     assert 'id="ai-first-pdf-image"' in template and 'id="ai-first-table-scroll"' in template
-    assert 'id="ai-first-confirm-selected"' in template and 'id="ai-first-confirm-page"' in template
+    assert 'id="ai-first-confirm-selected"' not in template and 'id="ai-first-confirm-page"' in template
+    assert 'id="ai-first-confirm-selected"' in ai_js, "bulk confirmation belongs inside the contextual row table"
     assert 'if (state.aiFirst.mode !== "standard") return startAIFirstRecognition();' in app_js
     assert 'postAIFirstReview("bulk-confirm"' in ai_js
     assert 'postAIFirstReview("complete-page"' in ai_js

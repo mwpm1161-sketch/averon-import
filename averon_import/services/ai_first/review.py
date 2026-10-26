@@ -175,11 +175,16 @@ def record_row_role_classification(
 def record_row_decision(
     draft: AIDocumentDraft, state: AIReviewState, record_id: str, *,
     disposition: str, reviewer_id: str, values: dict[str, str] | None = None,
+    human_confirmed: bool = True,
 ) -> AIReviewState:
     """Record an explicit human decision; nothing in extraction calls this."""
     _check_current(draft, state)
     if not reviewer_id or disposition not in {"confirmed", "corrected", "excluded"}:
         raise AIReviewError("invalid_review_decision")
+    if disposition == "confirmed" and not human_confirmed:
+        raise AIReviewError("confirmation_required")
+    if disposition == "excluded":
+        human_confirmed = False
     values = dict(values or {})
     if disposition == "corrected" and not values:
         raise AIReviewError("corrected_decision_requires_values")
@@ -209,13 +214,66 @@ def record_row_decision(
     updated.decisions[record_id] = AIReviewDecision(
         record_id=record_id, source_document_id=draft.source_document_id,
         page_number=page_number, disposition=disposition, reviewer_id=reviewer_id,
-        values=values, active=True,
+        values=values, human_confirmed=human_confirmed, active=True,
     )
     updated.history.append(AIReviewEvent(
         action=action, source_document_id=draft.source_document_id, reviewer_id=reviewer_id, page_number=page_number,
         source_record_ids=[record_id], payload={"disposition": disposition, "values": values},
     ))
     return updated
+
+
+def assert_no_open_review_conflicts(
+    draft: AIDocumentDraft, state: AIReviewState, record_ids: Iterable[str],
+) -> None:
+    """Fail closed for bulk actions when selected rows have unresolved evidence."""
+    _check_current(draft, state)
+    source_rows = {
+        row.id: (page, table, row)
+        for page in draft.pages for table in page.tables for row in table.rows
+    }
+    manual_rows = {row.id: row for row in state.manual_rows if row.active}
+    issues = _all_draft_issues(draft)
+    for record_id in set(record_ids):
+        source = source_rows.get(record_id)
+        manual = manual_rows.get(record_id)
+        if source is None and manual is None:
+            raise AIReviewError("unknown_review_record")
+        if source is not None:
+            page, table, row = source
+            cells = row.raw_cells
+            scope_ids = {row.id, table.id, *(cell.id for cell in cells)}
+            page_number = page.page_number
+        else:
+            page_number = manual.page_number
+            page = next((item for item in draft.pages if item.page_number == page_number), None)
+            cells = []
+            scope_ids = {manual.id}
+        relevant = [
+            issue for issue in issues.values()
+            if issue.severity in {"review", "blocking"}
+            and issue.id not in state.resolved_issue_ids
+            and (issue.page_number is None or issue.page_number == page_number)
+            and (not issue.record_ids or scope_ids.intersection(issue.record_ids))
+        ]
+        if relevant:
+            raise AIReviewError("bulk_selection_has_open_issues")
+        for cell in cells:
+            uncertain = bool(cell.unreadable or cell.struck_through or cell.handwritten
+                or cell.alternatives or cell.handwritten_replacements)
+            if not uncertain:
+                continue
+            cell_scope = {cell.id, record_id}
+            if source is not None:
+                cell_scope.add(str(source[1].id))
+            evidence_issues = [
+                issue for issue in issues.values()
+                if issue.severity in {"review", "blocking"}
+                and (issue.page_number is None or issue.page_number == page_number)
+                and (not issue.record_ids or cell_scope.intersection(issue.record_ids))
+            ]
+            if not evidence_issues or any(issue.id not in state.resolved_issue_ids for issue in evidence_issues):
+                raise AIReviewError("bulk_selection_has_open_issues")
 
 
 def record_handwriting_confirmation(
@@ -564,6 +622,8 @@ def assert_review_ready_for_export(draft: AIDocumentDraft, state: AIReviewState)
         raise AIReviewError("conflicting_active_lineage")
     if not included:
         raise AIReviewError("empty_document")
+    if any(not state.decisions[record_id].human_confirmed for record_id in included):
+        raise AIReviewError("row_values_not_human_confirmed")
     unresolved = {
         issue.id for issue in _all_draft_issues(draft).values()
         if issue.severity in {"review", "blocking"}

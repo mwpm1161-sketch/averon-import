@@ -60,8 +60,12 @@ const elements = new Map([
 const rows = [1, 2].map(page => {
   const row = new Element();
   row.dataset.pageNumber = String(page);
+  row.dataset.aiFirstRow = `row-${page}`;
   return row;
 });
+const tableRoot = new Element();
+tableRoot.querySelectorAll = selector => selector === "tr[data-ai-first-row]" ? rows : [];
+elements.set("#ai-first-table-scroll", tableRoot);
 const tableCell = new Element();
 tableCell.dataset.aiFirstCell = "row-1";
 tableCell.dataset.columnIndex = "1";
@@ -115,7 +119,12 @@ const context = {
   confirm:message => { context.confirmMessages.push(message); return context.confirmAnswer; },
 };
 context.reviewRenderCount = 0;
+context.pendingCaptureCount = 0;
+context.reviewTableRenderCount = 0;
 context.renderAIFirstReview = () => { context.reviewRenderCount += 1; };
+context.captureAIFirstPendingEdits = () => { context.pendingCaptureCount += 1; };
+context.aiFirstDocumentEntries = () => [];
+context.renderAIFirstTables = () => { context.reviewTableRenderCount += 1; };
 context.document = {
   querySelector:selector => elements.get(selector) || null,
   querySelectorAll:selector => selector === "[data-ai-first-row]" ? rows : selector === "#ai-first-table-scroll [data-ai-first-cell]" ? [tableCell] : [],
@@ -142,6 +151,8 @@ pageOneFields.find(input => input.dataset.aiFirstNewColumnKey === "количе�
 
 context.showPage(2);
 assert.equal(state.aiFirst.page, 2, "page selection updates review state");
+assert.equal(context.pendingCaptureCount, 1, "page changes capture unsaved review values before rerendering");
+assert.equal(context.reviewTableRenderCount, 1, "the table is scoped to the newly selected page");
 assert.equal(elements.get("#ai-first-page-select").value, "2", "page selector follows the selected page");
 assert.equal(elements.get("#ai-first-pdf-page-label").textContent, "Страница 2");
 assert.equal(elements.get("#ai-first-pdf-image").src, "/synthetic/synthetic-doc/2/200");

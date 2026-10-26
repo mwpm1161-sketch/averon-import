@@ -440,3 +440,27 @@ def test_unresolved_table_level_continuation_issue_blocks_confirmed_positions():
     review = resolve_review_issue(draft, review, issue.id, reviewer_id="synthetic-reviewer", detail="Проверено вручную")
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="table-issue.pdf")
     assert load_workbook(BytesIO(content), data_only=False)["Проверенные позиции"].max_row == 5
+
+
+def test_saved_correction_is_visible_but_not_in_confirmed_positions_until_confirmed():
+    draft, review, report, parent, *_ = _fixture()
+    saved_values = {"cell:6": "3", "cell:2": "Saved synthetic correction"}
+    review = record_row_decision(
+        draft, review, parent.id, disposition="corrected", reviewer_id="synthetic-reviewer",
+        values=saved_values, human_confirmed=False,
+    )
+    workbook = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="saved-correction.pdf",
+    )), data_only=False)
+    assert workbook["Проверенные позиции"].max_row == 4
+    summary = workbook["Все распознанные строки"]
+    headers = {summary.cell(4, column).value: column for column in range(1, summary.max_column + 1)}
+    exported_parent = next(row for row in range(5, summary.max_row + 1) if summary.cell(row, headers["ID строки"]).value == parent.id)
+    assert summary.cell(exported_parent, headers["Статус проверки"]).value == "Исправления сохранены, но не подтверждены"
+
+    review = record_row_decision(draft, review, parent.id, disposition="confirmed", reviewer_id="synthetic-reviewer")
+    assert review.decisions[parent.id].values == saved_values
+    workbook = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="saved-correction.pdf",
+    )), data_only=False)
+    assert workbook["Проверенные позиции"].max_row == 5

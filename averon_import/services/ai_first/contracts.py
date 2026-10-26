@@ -180,6 +180,9 @@ class AIReviewDecision(_StrictModel):
     disposition: ReviewDisposition
     reviewer_id: str
     values: dict[str, str] = Field(default_factory=dict)
+    # Existing review.json decisions were explicit Human Review actions.
+    # New save-only corrections set this false until the reviewer confirms them.
+    human_confirmed: bool = True
     active: bool = True
     invalidation_reason: Literal["role_change", "page_reprocessed", "structure_change"] | None = None
 

@@ -97,6 +97,11 @@ data.review.decisions[row.id] = {...decision({"cell:1":"Human reading"}),disposi
 assert.equal(evaluate().status,"neutral","excluded rows use the neutral state");
 data.review.decisions[row.id] = decision({"cell:1":"Saved correction"});
 input.value = "Saved correction";
+data.review.decisions[row.id] = {...decision({"cell:1":"Saved correction"}),disposition:"corrected",human_confirmed:false};
+assert.equal(evaluate().status,"attention","a saved correction stays unconfirmed until an explicit human confirmation");
+assert.equal(evaluate().exportReady,false,"a save-only correction cannot enter the checked export state");
+assert(context.statusLabel(evaluate()).includes("подтвердите значения"));
+data.review.decisions[row.id] = decision({"cell:1":"Saved correction"});
 input.value = "Unsaved correction";
 assert.equal(evaluate().status,"unsaved","unsaved DOM edits are visibly distinct");
 
@@ -121,7 +126,24 @@ async function verifySaveGuard() {
   assert.equal(saveCalls,1,"draft save proceeds after unsaved edits are cleared");
 }
 verifySaveGuard().then(() => {
-  console.log("PASS: AI-first review state, open issue scope, stale decisions, service/excluded rows, export readiness, corrected confirmation and explicit draft-save guard");
+  const bulkContext = {
+    state:{aiFirst:{selectedRows:new Set(["row-visible","row-hidden"])}},
+    aiFirstVisibleSelectedIds:() => ["row-visible"],
+    aiFirstRowInputSnapshot:() => [],
+    confirm:() => true,
+    postAIFirstReview:async (action, body) => {
+      assert.equal(action,"bulk-confirm");
+      assert.deepEqual(Array.from(body.record_ids),["row-visible"],"bulk actions apply only to selected visible rows");
+      return {saved:false,refreshed:false};
+    },
+    toast:() => {},
+  };
+  vm.runInNewContext(`${sourceBetween("async function confirmSelectedAIFirstRows", "async function cancelAIFirstRecognition")}; globalThis.confirmSelected=confirmSelectedAIFirstRows;`, bulkContext);
+  return bulkContext.confirmSelected().then(() => {
+    assert(bulkContext.state.aiFirst.selectedRows.has("row-visible"),"a rejected bulk request preserves its selection");
+    assert(bulkContext.state.aiFirst.selectedRows.has("row-hidden"),"hidden selections are not accidentally cleared");
+    console.log("PASS: AI-first review state, open issue scope, stale decisions, unconfirmed corrections, visible-only bulk selection and explicit draft-save guard");
+  });
 }).catch(error => {
   console.error(error);
   process.exitCode = 1;

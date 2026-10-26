@@ -11,7 +11,7 @@ from averon_import.services.ai_first.assembly import (
 )
 from averon_import.services.ai_first.contracts import AIRow
 from averon_import.services.ai_first.review import (
-    AIReviewError, assert_review_ready_for_export, confirm_page_complete,
+    AIReviewError, assert_no_open_review_conflicts, assert_review_ready_for_export, confirm_page_complete,
     new_review_state, record_handwriting_confirmation, record_row_decision,
     record_row_role_classification, record_structure_change,
     reconcile_reprocessed_pages, resolve_review_issue, undo_structure_change,
@@ -236,6 +236,26 @@ def test_excluding_and_restoring_row_preserves_reviewed_values_and_audit():
     assert [event.action for event in state.history[-3:]] == ["edit_value", "exclude_row", "edit_value"]
 
 
+def test_saved_correction_is_not_export_ready_until_explicit_confirmation():
+    draft = _draft(_payload(rows=[_row(0, "1", "Original name")]))
+    row = _all_rows(draft)[0]
+    state = new_review_state(draft)
+    saved_values = {"cell:0": "1", "cell:1": "Saved correction"}
+    state = record_row_decision(
+        draft, state, row.id, disposition="corrected", reviewer_id="reviewer",
+        values=saved_values, human_confirmed=False,
+    )
+    state = _classify_items(draft, state)
+    state = confirm_page_complete(draft, state, 1, reviewer_id="reviewer")
+    with pytest.raises(AIReviewError, match="row_values_not_human_confirmed"):
+        assert_review_ready_for_export(draft, state)
+
+    state = record_row_decision(draft, state, row.id, disposition="confirmed", reviewer_id="reviewer")
+    assert state.decisions[row.id].values == saved_values
+    assert state.decisions[row.id].human_confirmed is True
+    assert_review_ready_for_export(draft, state)
+
+
 def test_page_only_review_issue_is_resolvable_and_blocks_review_guard_until_explicitly_cleared():
     from averon_import.services.ai_first.contracts import AIReviewIssue
 
@@ -255,6 +275,33 @@ def test_page_only_review_issue_is_resolvable_and_blocks_review_guard_until_expl
         assert_review_ready_for_export(draft, state)
     state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Проверено вручную")
     assert_review_ready_for_export(draft, state) is None
+
+
+def test_bulk_review_actions_fail_closed_on_unresolved_or_untracked_visual_conflicts():
+    from averon_import.services.ai_first.contracts import AIReviewIssue
+
+    draft = _draft(_payload())
+    row = _all_rows(draft)[0]
+    table_id = draft.pages[0].tables[0].id
+    issue = AIReviewIssue(
+        id="bulk-table-note", source_document_id=draft.source_document_id,
+        code="continuation_unverified", severity="review", page_number=1,
+        record_ids=[table_id], detail="synthetic open issue",
+    )
+    draft.pages[0].issues.append(issue)
+    state = new_review_state(draft)
+    with pytest.raises(AIReviewError, match="bulk_selection_has_open_issues"):
+        assert_no_open_review_conflicts(draft, state, [row.id])
+    state = resolve_review_issue(draft, state, issue.id, reviewer_id="reviewer", detail="Сверено")
+    assert_no_open_review_conflicts(draft, state, [row.id])
+
+    uncertain_draft = _draft(_payload(rows=[_row(0, "1", "Synthetic item")]))
+    cell = uncertain_draft.pages[0].tables[0].rows[0].raw_cells[0]
+    uncertain_draft.pages[0].tables[0].rows[0].raw_cells[0] = cell.model_copy(update={"handwritten":True})
+    uncertain_row = _all_rows(uncertain_draft)[0]
+    uncertain_state = new_review_state(uncertain_draft)
+    with pytest.raises(AIReviewError, match="bulk_selection_has_open_issues"):
+        assert_no_open_review_conflicts(uncertain_draft, uncertain_state, [uncertain_row.id])
 
 
 def test_review_guard_requires_human_role_and_keeps_model_role_unverified():

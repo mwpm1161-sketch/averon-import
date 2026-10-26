@@ -140,7 +140,7 @@ from averon_import.services.ai_first.orchestration import (
 )
 from averon_import.services.ai_first.qwen_vision_adapter import QwenVisionQuotaRegistry
 from averon_import.services.ai_first.review import (
-    AIReviewError, assert_review_ready_for_export, confirm_page_complete, new_review_state,
+    AIReviewError, assert_no_open_review_conflicts, assert_review_ready_for_export, confirm_page_complete, new_review_state,
     reconcile_reprocessed_pages, record_row_decision, record_row_role_classification,
     record_structure_change, resolve_review_issue,
 )
@@ -2029,6 +2029,7 @@ class AIFirstRowDecisionRequest(BaseModel):
     record_id: StrictStr
     disposition: Literal["confirmed", "corrected", "excluded"]
     values: dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    confirmed: StrictBool = True
 
     @model_validator(mode="after")
     def bounded_values(self):
@@ -2051,6 +2052,13 @@ class AIFirstBulkConfirmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
+
+
+class AIFirstBulkRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
+    role: Literal["standalone_item", "header", "column_numbering", "section", "continuation", "note"]
 
 
 def require_ai_first_enabled():
@@ -2377,7 +2385,7 @@ def decide_ai_first_row(document_id: str, request: AIFirstRowDecisionRequest, us
     try:
         return _mutate_ai_first_state(document_id, lambda draft, state: record_row_decision(
             draft, state, request.record_id, disposition=request.disposition,
-            reviewer_id=_job_owner_id(user), values=dict(request.values),
+            reviewer_id=_job_owner_id(user), values=dict(request.values), human_confirmed=request.confirmed,
         ))
     except HTTPException:
         raise
@@ -2402,10 +2410,29 @@ def bulk_confirm_ai_first_rows(document_id: str, request: AIFirstBulkConfirmRequ
     if len(set(request.record_ids)) != len(request.record_ids):
         raise HTTPException(400, "В списке есть повторяющиеся строки.")
     def apply(draft, state):
+        assert_no_open_review_conflicts(draft, state, request.record_ids)
         current = state
         for record_id in request.record_ids:
             current = record_row_decision(
                 draft, current, record_id, disposition="confirmed", reviewer_id=_job_owner_id(user),
+            )
+        return current
+    return _mutate_ai_first_state(document_id, apply)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/bulk-role",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def bulk_classify_ai_first_rows(document_id: str, request: AIFirstBulkRoleRequest, user: CurrentUser = Depends(require_authenticated)):
+    if len(set(request.record_ids)) != len(request.record_ids):
+        raise HTTPException(400, "В списке есть повторяющиеся строки.")
+    def apply(draft, state):
+        assert_no_open_review_conflicts(draft, state, request.record_ids)
+        current = state
+        for record_id in request.record_ids:
+            current = record_row_role_classification(
+                draft, current, record_id, role=request.role, reviewer_id=_job_owner_id(user),
             )
         return current
     return _mutate_ai_first_state(document_id, apply)
