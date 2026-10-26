@@ -131,7 +131,7 @@ from averon_import.services.ai_first.local_workflow import (
 )
 from averon_import.services.ai_first.pilot_export import (
     MAX_PILOT_EXPORT_PAGES, XLSX_MIME as AI_FIRST_PILOT_XLSX_MIME,
-    PilotExportError, build_ai_first_pilot_xlsx,
+    PilotExportError, build_ai_first_pilot_xlsx, preview_ai_first_pilot_export,
 )
 from averon_import.services.ai_first.pdf_locator import locate_ai_first_pdf_bbox
 from averon_import.services.ai_first.orchestration import (
@@ -2525,6 +2525,31 @@ def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/pilot-export/preview",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def preview_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
+    """Return content-free pilot counts using the same backend admission rules as XLSX."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        _store, draft, review, report = _ai_first_read_state(workspace)
+        metadata = workspace_service.read_json(workspace.metadata_path) or {}
+        try:
+            return preview_ai_first_pilot_export(
+                draft, review, report, page_numbers=request.page_numbers,
+                document_name=str(metadata.get("filename") or "document.pdf"),
+            )
+        except PilotExportError as exc:
+            raise HTTPException(
+                409,
+                detail={"code": str(exc), "message": "Тестовую выгрузку не удалось проверить. Перепроверьте выбранные страницы."},
+            ) from None
 
 
 @app.get(

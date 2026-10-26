@@ -283,6 +283,51 @@ function aiFirstReportPages(data) {
   return new Map((data?.pages || []).map((page) => [page.page_number, page]));
 }
 
+const AI_FIRST_PDF_MIN_ZOOM = 0.2;
+const AI_FIRST_PDF_MAX_ZOOM = 2.4;
+const AI_FIRST_PDF_ZOOM_STEP = 0.2;
+
+function setAIFirstPdfZoom(value, {fitWidth = false} = {}) {
+  state.aiFirst.pdfFitWidth = fitWidth;
+  state.aiFirst.pdfZoom = Math.max(AI_FIRST_PDF_MIN_ZOOM, Math.min(AI_FIRST_PDF_MAX_ZOOM, Number(value) || 1));
+  renderAIFirstPdfZoom();
+}
+
+function renderAIFirstPdfZoom() {
+  const image = document.querySelector("#ai-first-pdf-image");
+  const stage = document.querySelector(".ai-first-pdf-stage");
+  const wrap = document.querySelector(".ai-first-pdf-image-wrap");
+  const label = document.querySelector("#ai-first-zoom-label");
+  if (!image?.naturalWidth || !stage || !wrap || !label) return;
+  state.aiFirst.pdfFitWidth ??= true;
+  state.aiFirst.pdfZoom ??= 1;
+  let zoom = state.aiFirst.pdfZoom;
+  if (state.aiFirst.pdfFitWidth) {
+    const style = window.getComputedStyle(stage);
+    const padding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+    const available = Math.max(1, stage.clientWidth - padding);
+    zoom = Math.max(AI_FIRST_PDF_MIN_ZOOM, Math.min(AI_FIRST_PDF_MAX_ZOOM, available / image.naturalWidth));
+  }
+  image.style.width = `${Math.max(1, Math.round(image.naturalWidth * zoom))}px`;
+  image.style.height = "auto";
+  wrap.style.width = image.style.width;
+  label.textContent = state.aiFirst.pdfFitWidth ? "По ширине" : `${Math.round(zoom * 100)}%`;
+}
+
+function nudgeAIFirstPdfZoom(direction) {
+  const image = document.querySelector("#ai-first-pdf-image");
+  let current = state.aiFirst.pdfZoom || 1;
+  if (state.aiFirst.pdfFitWidth && image?.naturalWidth) {
+    const stage = document.querySelector(".ai-first-pdf-stage");
+    if (stage) {
+      const style = window.getComputedStyle(stage);
+      const padding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+      current = Math.max(AI_FIRST_PDF_MIN_ZOOM, Math.min(AI_FIRST_PDF_MAX_ZOOM, (stage.clientWidth - padding) / image.naturalWidth));
+    }
+  }
+  setAIFirstPdfZoom(current + direction * AI_FIRST_PDF_ZOOM_STEP);
+}
+
 function showAIFirstPage(pageNumber) {
   const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
   if (!pageNumbers.includes(pageNumber)) return;
@@ -430,6 +475,7 @@ function retryAIFirstPages(pageNumbers) {
 function renderAIFirstReview() {
   const data = state.aiFirst.data;
   if (!data?.draft || !state.document) return;
+  state.aiFirst.reviewGeneration = (state.aiFirst.reviewGeneration || 0) + 1;
   const draft = data.draft, review = data.review;
   state.aiFirst.exportPages ||= new Set();
   const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
@@ -479,7 +525,11 @@ function renderAIFirstReview() {
     const confirmed = (review.confirmed_complete_pages || []).includes(number);
     const retryable = report && (report.state !== "pending" || report.safe_error_code) && report.state !== "completed" && !["image_pixel_limit","image_byte_limit","page_dimensions_invalid"].includes(report.safe_error_code);
     const exportChecked = state.aiFirst.exportPages.has(number) ? "checked" : "";
-    return `<div class="ai-first-page-status"><button class="button ghost" type="button" data-ai-first-show-page="${number}">Страница ${number} · ${label}</button><span>${escapeHtml(detail)}${confirmed ? " · полнота подтверждена" : ""}</span>${complete && !confirmed ? `<button class="button text" type="button" data-ai-first-complete-page="${number}">Подтвердить полноту</button>` : ""}${retryable ? `<button class="button text" type="button" data-ai-first-retry-one="${number}">Повторить</button>` : ""}${complete ? `<label class="ai-first-export-page"><input type="checkbox" data-ai-first-export-page="${number}" ${exportChecked}> В тестовый XLSX</label>` : ""}</div>`;
+    const exportReason = complete ? "" : report?.state === "pending" && !report.safe_error_code
+      ? "Сначала обработайте страницу."
+      : "Страница недоступна для выгрузки до успешного завершения обработки.";
+    const exportControl = `<label class="ai-first-export-page"><input type="checkbox" data-ai-first-export-page="${number}" aria-describedby="ai-first-export-reason-${number}" ${exportChecked} ${complete ? "" : "disabled"}> В тестовый XLSX</label><small class="ai-first-export-disabled-reason" id="ai-first-export-reason-${number}" ${complete ? "hidden" : ""}>${escapeHtml(exportReason)}</small>`;
+    return `<div class="ai-first-page-status"><button class="button ghost" type="button" data-ai-first-show-page="${number}">Страница ${number} · ${label}</button><span>${escapeHtml(detail)}${confirmed ? " · полнота подтверждена" : ""}</span>${complete && !confirmed ? `<button class="button text" type="button" data-ai-first-complete-page="${number}">Подтвердить полноту</button>` : ""}${retryable ? `<button class="button text" type="button" data-ai-first-retry-one="${number}">Повторить</button>` : ""}${exportControl}</div>`;
   }).join("");
   document.querySelector("#ai-first-page-details-label").textContent = `Страницы: ${processedPages} обработано из ${state.document.page_count} · ${confirmedPages} подтверждено${failedPages ? ` · ${failedPages} требуют внимания` : ""}`;
   document.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", () => showAIFirstPage(Number(button.dataset.aiFirstShowPage))));
@@ -506,11 +556,64 @@ function updateAIFirstExportControls() {
   const label = document.querySelector("#ai-first-export-note");
   if (!button || !label) return;
   state.aiFirst.exportPages ||= new Set();
-  button.disabled = state.aiFirst.exportPages.size === 0;
   const selected = [...state.aiFirst.exportPages].sort((a,b)=>a-b);
-  label.textContent = selected.length
-    ? `В тестовый XLSX выбраны страницы ${selected.join(", ")}. Охват документа будет явно отмечен; файл не является коммерческой сметой.`
-    : "Выберите от одной до трёх обработанных страниц в сводке. Неподтверждённые строки останутся на отдельном листе; файл не является коммерческой сметой.";
+  if (!selected.length) {
+    state.aiFirst.exportPreviewRequestId = (state.aiFirst.exportPreviewRequestId || 0) + 1;
+    state.aiFirst.exportPreview = null;
+    state.aiFirst.exportPreviewLoadingKey = null;
+    button.disabled = true;
+    label.textContent = "Выберите от одной до трёх успешно обработанных страниц. Недоступные страницы отмечены причиной; файл не является коммерческой сметой.";
+    return;
+  }
+  if (selected.length > 3) {
+    button.disabled = true;
+    label.textContent = "Для тестового XLSX выберите не более трёх страниц.";
+    return;
+  }
+  const scope = selected.join(",");
+  const generation = state.aiFirst.reviewGeneration || 0;
+  const key = `${scope}|${generation}`;
+  if (state.aiFirst.exportPreview?.key === key) {
+    button.disabled = false;
+    const preview = state.aiFirst.exportPreview.data;
+    label.textContent = `Сервер допускает ${preview.verified_position_count} проверенных самостоятельных позиций из ${preview.recognized_row_count} распознанных строк на страницах ${scope}. Охват документа будет отмечен как частичный, если выбраны не все страницы. Это тестовый файл.`;
+    return;
+  }
+  if (state.aiFirst.exportPreviewErrorKey === key) {
+    button.disabled = true;
+    label.textContent = "Не удалось проверить состав тестового XLSX. Повторите проверку или откройте документ заново.";
+    return;
+  }
+  if (state.aiFirst.exportPreviewLoadingKey === key) return;
+  void loadAIFirstPilotExportPreview(selected, key);
+}
+
+async function loadAIFirstPilotExportPreview(pageNumbers, key) {
+  const button = document.querySelector("#ai-first-export-pilot");
+  const label = document.querySelector("#ai-first-export-note");
+  if (!button || !label) return;
+  const requestId = (state.aiFirst.exportPreviewRequestId || 0) + 1;
+  state.aiFirst.exportPreviewRequestId = requestId;
+  state.aiFirst.exportPreviewLoadingKey = key;
+  button.disabled = true;
+  label.textContent = "Проверяем по серверным правилам, сколько позиций попадёт в тестовый XLSX…";
+  try {
+    const data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/pilot-export/preview`, {
+      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({page_numbers:pageNumbers}),
+    });
+    const currentPages = [...(state.aiFirst.exportPages || [])].sort((a,b)=>a-b).join(",");
+    const currentKey = `${currentPages}|${state.aiFirst.reviewGeneration || 0}`;
+    if (requestId !== state.aiFirst.exportPreviewRequestId || key !== currentKey) return;
+    state.aiFirst.exportPreview = {key,data};
+    state.aiFirst.exportPreviewErrorKey = null;
+    state.aiFirst.exportPreviewLoadingKey = null;
+    updateAIFirstExportControls();
+  } catch (_) {
+    if (requestId !== state.aiFirst.exportPreviewRequestId) return;
+    state.aiFirst.exportPreviewErrorKey = key;
+    state.aiFirst.exportPreviewLoadingKey = null;
+    updateAIFirstExportControls();
+  }
 }
 
 function aiFirstColumnList(table) {
@@ -1023,7 +1126,7 @@ async function downloadAIFirstPilotXlsx() {
   } catch (error) {
     toast(error.message || "Не удалось подготовить тестовый XLSX.", "error");
   } finally {
-    button.disabled = pages.length === 0;
+    updateAIFirstExportControls();
   }
 }
 
@@ -1043,6 +1146,12 @@ function installAIFirstUIEvents() {
     document.querySelector("#ai-first-context-count").textContent = `${document.querySelector("#ai-first-context").value.length} / 1000`;
   });
   document.querySelector("#ai-first-live-confirm").addEventListener("change", updateAIFirstModeControls);
+  document.querySelector("#ai-first-pdf-image").addEventListener("load", renderAIFirstPdfZoom);
+  document.querySelector("#ai-first-zoom-out").addEventListener("click", () => nudgeAIFirstPdfZoom(-1));
+  document.querySelector("#ai-first-zoom-in").addEventListener("click", () => nudgeAIFirstPdfZoom(1));
+  document.querySelector("#ai-first-zoom-fit").addEventListener("click", () => setAIFirstPdfZoom(state.aiFirst.pdfZoom || 1, {fitWidth:true}));
+  document.querySelector("#ai-first-zoom-100").addEventListener("click", () => setAIFirstPdfZoom(1));
+  window.addEventListener("resize", renderAIFirstPdfZoom);
   document.querySelector("#cancel-ai-first-button").addEventListener("click", () => void cancelAIFirstRecognition());
   document.querySelector("#ai-first-back-to-pages").addEventListener("click", () => { setView("pages"); renderAIFirstResumeControls(); });
   document.querySelector("#ai-first-save-review").addEventListener("click", () => void saveAIFirstReview());

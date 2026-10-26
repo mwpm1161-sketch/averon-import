@@ -337,6 +337,92 @@ def _review_status(row: Mapping[str, Any], complete_page: bool, processing_state
     return DISPOSITION_LABELS.get(decision.disposition, "Проверена")
 
 
+def _prepare_pilot_export_rows(
+    draft: AIDocumentDraft,
+    review: AIReviewState,
+    report: Mapping[str, Any],
+    page_numbers: Sequence[int],
+    document_name: str,
+) -> dict[str, Any]:
+    if not page_numbers or len(page_numbers) > MAX_PILOT_EXPORT_PAGES:
+        raise PilotExportError("invalid_page_scope")
+    if any(type(number) is not int for number in page_numbers) or len(set(page_numbers)) != len(page_numbers):
+        raise PilotExportError("invalid_page_scope")
+    selected = sorted(page_numbers)
+    expected = set(draft.expected_page_numbers)
+    if not set(selected) <= expected:
+        raise PilotExportError("page_outside_document")
+    if draft.source_document_id != review.source_document_id or draft.revision_id != review.revision_id:
+        raise PilotExportError("review_state_revision_mismatch")
+
+    page_count = len(draft.expected_page_numbers)
+    report_states = _page_report_states(report)
+    confirmed_pages = set(review.confirmed_complete_pages)
+    pages_by_number = {page.page_number: page for page in draft.pages}
+    issue_index = _issue_index(draft)
+    all_rows = [row for row in _rows_for_document(draft, review) if row["page"] in selected]
+    selected_rows: list[dict[str, Any]] = []
+    for row in all_rows:
+        grouped = _values_by_field(row)
+        row["ambiguous_field_mapping"] = any(len(values) > 1 for values in grouped.values())
+        row["processing_state"] = report_states.get(int(row["page"]), "unknown")
+        row["page_confirmed"] = int(row["page"]) in confirmed_pages
+        row["open_issue"] = _row_issue_open(row, issue_index, review)
+        row["review_status"] = _review_status(row, row["page_confirmed"], row["processing_state"], row["open_issue"])
+        page = pages_by_number.get(int(row["page"]))
+        row["verified_position"] = bool(
+            row["active"] and not row["superseded"] and row["role_active"]
+            and row["role"] == "standalone_item"
+            and row["decision"] is not None and row["decision"].active
+            and row["decision"].disposition in {"confirmed", "corrected"}
+            and row["decision"].human_confirmed
+            and row["page_confirmed"] and row["processing_state"] == "completed"
+            and page is not None and page.status == "extracted" and not row["open_issue"]
+            and not row["ambiguous_field_mapping"]
+        )
+        if row["verified_position"]:
+            selected_rows.append(row)
+    return {
+        "selected": selected,
+        "page_count": page_count,
+        "filename": _safe_filename(document_name),
+        "report_states": report_states,
+        "confirmed_pages": confirmed_pages,
+        "pages_by_number": pages_by_number,
+        "issue_index": issue_index,
+        "all_rows": all_rows,
+        "selected_rows": selected_rows,
+    }
+
+
+def preview_ai_first_pilot_export(
+    draft: AIDocumentDraft,
+    review: AIReviewState,
+    report: Mapping[str, Any],
+    *,
+    page_numbers: Sequence[int],
+    document_name: str,
+) -> dict[str, Any]:
+    """Return content-free, backend-derived counts for a selected test fragment."""
+    prepared = _prepare_pilot_export_rows(draft, review, report, page_numbers, document_name)
+    all_rows = prepared["all_rows"]
+    selected_rows = prepared["selected_rows"]
+    return {
+        "page_numbers": prepared["selected"],
+        "document_page_count": prepared["page_count"],
+        "recognized_row_count": len(all_rows),
+        "verified_position_count": len(selected_rows),
+        "pages": [
+            {
+                "page_number": number,
+                "recognized_row_count": sum(row["page"] == number for row in all_rows),
+                "verified_position_count": sum(row["page"] == number for row in selected_rows),
+            }
+            for number in prepared["selected"]
+        ],
+    }
+
+
 def _write_sheet(
     sheet, title: str, document_name: str, document_id: str,
     selected_pages: Sequence[int], page_count: int,
@@ -448,45 +534,17 @@ def build_ai_first_pilot_xlsx(
     document_name: str,
 ) -> bytes:
     """Build a local, explicitly test-marked workbook from saved review state."""
-    if not page_numbers or len(page_numbers) > MAX_PILOT_EXPORT_PAGES:
-        raise PilotExportError("invalid_page_scope")
-    if any(type(number) is not int for number in page_numbers) or len(set(page_numbers)) != len(page_numbers):
-        raise PilotExportError("invalid_page_scope")
-    selected = sorted(page_numbers)
+    prepared = _prepare_pilot_export_rows(draft, review, report, page_numbers, document_name)
+    selected = prepared["selected"]
+    page_count = prepared["page_count"]
     expected = set(draft.expected_page_numbers)
-    if not set(selected) <= expected:
-        raise PilotExportError("page_outside_document")
-    if draft.source_document_id != review.source_document_id or draft.revision_id != review.revision_id:
-        raise PilotExportError("review_state_revision_mismatch")
-
-    page_count = len(draft.expected_page_numbers)
-    filename = _safe_filename(document_name)
-    report_states = _page_report_states(report)
-    confirmed_pages = set(review.confirmed_complete_pages)
-    pages_by_number = {page.page_number: page for page in draft.pages}
-    issue_index = _issue_index(draft)
-    all_rows = [row for row in _rows_for_document(draft, review) if row["page"] in selected]
-    selected_rows: list[dict[str, Any]] = []
-    for row in all_rows:
-        grouped = _values_by_field(row)
-        row["ambiguous_field_mapping"] = any(len(values) > 1 for values in grouped.values())
-        row["processing_state"] = report_states.get(int(row["page"]), "unknown")
-        row["page_confirmed"] = int(row["page"]) in confirmed_pages
-        row["open_issue"] = _row_issue_open(row, issue_index, review)
-        row["review_status"] = _review_status(row, row["page_confirmed"], row["processing_state"], row["open_issue"])
-        page = pages_by_number.get(int(row["page"]))
-        row["verified_position"] = bool(
-            row["active"] and not row["superseded"] and row["role_active"]
-            and row["role"] == "standalone_item"
-            and row["decision"] is not None and row["decision"].active
-            and row["decision"].disposition in {"confirmed", "corrected"}
-            and row["decision"].human_confirmed
-            and row["page_confirmed"] and row["processing_state"] == "completed"
-            and page is not None and page.status == "extracted" and not row["open_issue"]
-            and not row["ambiguous_field_mapping"]
-        )
-        if row["verified_position"]:
-            selected_rows.append(row)
+    filename = prepared["filename"]
+    report_states = prepared["report_states"]
+    confirmed_pages = prepared["confirmed_pages"]
+    pages_by_number = prepared["pages_by_number"]
+    issue_index = prepared["issue_index"]
+    all_rows = prepared["all_rows"]
+    selected_rows = prepared["selected_rows"]
 
     workbook = Workbook()
     positions = workbook.active
@@ -633,4 +691,4 @@ def build_ai_first_pilot_xlsx(
     return stream.getvalue()
 
 
-__all__ = ["MAX_PILOT_EXPORT_PAGES", "XLSX_MIME", "PilotExportError", "build_ai_first_pilot_xlsx"]
+__all__ = ["MAX_PILOT_EXPORT_PAGES", "XLSX_MIME", "PilotExportError", "build_ai_first_pilot_xlsx", "preview_ai_first_pilot_export"]

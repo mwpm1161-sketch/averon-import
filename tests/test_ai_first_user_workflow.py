@@ -286,6 +286,13 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
     assert client.post(f"{path}/review/row", json={"record_id":second_id,"disposition":"confirmed"}).status_code == 200
     assert client.post(f"{path}/review/complete-page", json={"page_number":1}).status_code == 200
 
+    preview = client.post(f"{path}/pilot-export/preview", json={"page_numbers":[1]})
+    assert preview.status_code == 200, preview.text
+    preview_data = preview.json()
+    assert preview_data["verified_position_count"] == 1
+    assert preview_data["recognized_row_count"] == 2
+    assert preview_data["pages"] == [{"page_number":1,"recognized_row_count":2,"verified_position_count":1}]
+
     response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
     assert response.status_code == 200, response.text
     assert not workspace.result_path.exists()
@@ -294,6 +301,7 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
     assert workbook["Проверенные позиции"].max_row == 5
     assert workbook["Все распознанные строки"].max_row == 6
     assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in workbook["Проверенные позиции"]["A2"].value
+    assert preview_data["verified_position_count"] == workbook["Проверенные позиции"].max_row - 4
 
 
 def test_ai_first_locator_returns_only_safe_no_match_status_for_fake_page(ai_first_client):
@@ -417,6 +425,7 @@ def test_ai_first_server_routes_are_hidden_when_experiment_flag_is_disabled(ai_f
         client.post(f"{base}/review/resolve-issue", json={"issue_id":"issue","detail":"checked"}),
         client.post(f"{base}/review/save"),
         client.post(f"{base}/pilot-export", json={"page_numbers":[1]}),
+        client.post(f"{base}/pilot-export/preview", json={"page_numbers":[1]}),
         client.get(f"{base}/locator?record_id=row"),
         client.post("/api/jobs/not-a-job/cancel"),
     ]
