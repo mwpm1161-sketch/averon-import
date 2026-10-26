@@ -98,8 +98,12 @@ const context = {
   escapeHtml:value => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"),
   documentPageImageUrl:(id, page, scale) => `/synthetic/${id}/${page}/${scale}`,
   apiMode:"success",
+  confirmAnswer:true,
+  confirmMessages:[],
+  reviewPosts:[],
   api:async (url, options = {}) => {
     if (options.method === "POST") {
+      context.reviewPosts.push({url,body:JSON.parse(options.body || "{}")});
       if (context.apiMode === "post-fail") throw new Error("synthetic server rejection");
       return {};
     }
@@ -108,7 +112,7 @@ const context = {
   },
   aiFirstRowInputSnapshot:() => [],
   toast:() => {},
-  confirm:() => true,
+  confirm:message => { context.confirmMessages.push(message); return context.confirmAnswer; },
 };
 context.reviewRenderCount = 0;
 context.renderAIFirstReview = () => { context.reviewRenderCount += 1; };
@@ -188,6 +192,32 @@ console.log("PASS: AI-first reuses the existing PDF highlight renderer and rejec
 const reviewSnippet = sourceBetween("async function postAIFirstReview", "async function cancelAIFirstRecognition");
 vm.runInNewContext(`${reviewSnippet}; globalThis.aiFirstRowInputSnapshot=() => []; globalThis.submitAddRow=postAIFirstReview; globalThis.confirmSelected=confirmSelectedAIFirstRows;`, context);
 
+const completenessSnippet = [
+  sourceBetween("function aiFirstDocumentEntries", "function renderAIFirstTables"),
+  sourceBetween("async function confirmAIFirstPageCompleteness", "async function confirmSelectedAIFirstRows"),
+].join("\n");
+vm.runInNewContext(`${completenessSnippet}; globalThis.confirmPageCompleteness=confirmAIFirstPageCompleteness;`, context);
+assert(source.includes("void confirmAIFirstPageCompleteness(Number(button.dataset.aiFirstCompletePage))"), "page summary uses the unresolved-role warning");
+assert(source.includes("await confirmAIFirstPageCompleteness(state.aiFirst.page)"), "main page action uses the unresolved-role warning");
+async function verifyCompletenessWarning() {
+  state.aiFirst.data.draft.pages[0].tables[0].rows = [{id:"unclassified-row",page_number:1,index:0,raw_cells:[]}];
+  state.aiFirst.data.review.row_roles = {};
+  context.reviewPosts.length = 0;
+  context.confirmMessages.length = 0;
+  context.confirmAnswer = false;
+  await context.confirmPageCompleteness(1);
+  assert.equal(context.reviewPosts.length, 0, "canceling the unresolved-role warning does not confirm page completeness");
+  assert(context.confirmMessages[0].includes("1 строк без подтверждённой человеком роли"), "warning reports the number of unclassified rows");
+  assert(context.confirmMessages[0].includes("не станут позициями автоматически"), "warning explains that rows are retained without automatic classification");
+  context.confirmAnswer = true;
+  await context.confirmPageCompleteness(1);
+  assert.equal(context.reviewPosts.length, 1, "only explicit acknowledgment submits page completeness");
+  assert(context.reviewPosts[0].url.endsWith("/review/complete-page"), "acknowledgment submits only page completeness");
+  assert.equal(context.reviewPosts[0].body.page_number, 1);
+  assert.deepEqual(state.aiFirst.data.review.row_roles, {}, "page completeness never assigns a row role");
+  console.log("PASS: page completeness warns about unresolved row roles and requires explicit acknowledgment");
+}
+
 async function verifySaveFailureBehavior() {
   const form = elements.get("#ai-first-add-row-form");
   const setField = (columnKey, value) => {
@@ -229,4 +259,4 @@ async function verifySaveFailureBehavior() {
   console.log("PASS: add-row values clear only after save; API rejection preserves retry values and bulk selection");
 }
 
-void verifySaveFailureBehavior();
+void verifyCompletenessWarning().then(verifySaveFailureBehavior);

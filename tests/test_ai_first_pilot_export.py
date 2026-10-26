@@ -19,6 +19,12 @@ from averon_import.services.ai_first.review import (
 
 
 HEADERS = ["Поз.", "Наименование", "Марка", "Производитель", "Артикул", "Ед. изм.", "Количество", "Примечание"]
+PAGE16_HEADERS = [
+    "Позиция", "Наименование и техническая характеристика",
+    "Тип, марка, обозначение\nдокумента, опросного\nлиста",
+    "Код\nоборудования,\nматериала\nизделия", "Завод-\nизготовитель",
+    "Единица\nизмерения", "Кол-во", "Масса\nединицы,\nкг.", "Примечание",
+]
 
 
 def _row(page_number: int, table_id: str, row_index: int, values: list[str], *, kind: str = "item") -> AIRow:
@@ -86,6 +92,32 @@ def _fixture(*, issue: bool = False):
     return draft, review, report, parent, section, component
 
 
+def _schema_fixture(headers: list[str], values: list[str]):
+    draft, review, report, parent, *_ = _fixture()
+    table_id = "p1-t1"
+    row_id = parent.id
+    columns = [AIColumn(
+        id=f"{table_id}-c{index}", source_document_id="synthetic-doc",
+        page_number=1, table_id=table_id, index=index, raw_header=header,
+    ) for index, header in enumerate(headers)]
+    row = AIRow(
+        id=row_id, source_document_id="synthetic-doc", page_number=1,
+        table_id=table_id, index=0, model_kind="item",
+        raw_cells=[AICell(
+            id=f"{row_id}-c{index}", source_document_id="synthetic-doc",
+            page_number=1, table_id=table_id, row_id=row_id,
+            column_index=index, raw_value=value,
+        ) for index, value in enumerate(values)],
+    )
+    table = AITable(
+        id=table_id, source_document_id="synthetic-doc", page_number=1,
+        index=0, columns=columns, rows=[row],
+    )
+    page = draft.pages[0].model_copy(update={"tables": [table], "issues": []})
+    draft = draft.model_copy(update={"pages": [page], "issues": []})
+    return draft, review, report, row
+
+
 def _sheet(workbook_bytes: bytes, name: str):
     book = load_workbook(BytesIO(workbook_bytes), data_only=False)
     return book[name]
@@ -110,6 +142,13 @@ def test_pilot_xlsx_separates_verified_standalone_rows_and_preserves_all_source_
     assert values[headers["Статус проверки"] - 1] == "Исправлена и подтверждена"
     assert positions["A1"].value.startswith("ТЕСТ —")
     assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in positions["A2"].value
+    source = book["P001-T001"]
+    assert source.max_column == 6 + len(HEADERS) * 2
+    assert [source.cell(5, 7 + index * 2).value or "" for index in range(len(HEADERS))] == HEADERS
+    assert source.cell(6, 7 + 6 * 2).value == "2"
+    assert source.cell(6, 8 + 6 * 2).value == "3"
+    assert source.cell(6, 7 + 1 * 2).value == "Синтетический насос"
+    assert source.cell(6, 8 + 1 * 2).value == "Синтетический насос"
 
     all_headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
     records = {
@@ -121,9 +160,10 @@ def test_pilot_xlsx_separates_verified_standalone_rows_and_preserves_all_source_
     assert all_rows.cell(component_row, all_headers["Роль Human Review"]).value == "Компонент комплекта"
     section_row = records[section.id]
     assert all_rows.cell(section_row, all_headers["Роль Human Review"]).value == "Раздел"
+    assert all_rows.cell(records[parent.id], all_headers["Лист исходной таблицы"]).value == "P001-T001"
+    assert all_rows.cell(records[parent.id], all_headers["Строка на листе исходной таблицы"]).value == "6"
+    assert all_rows.cell(records[parent.id], all_headers["Лист исходной таблицы"]).hyperlink.target == "#'P001-T001'!A6"
     source_detail = json.loads(all_rows.cell(records[parent.id], all_headers["Исходная строка и таблица (JSON)"]).value)
-    source_values = json.loads(all_rows.cell(records[parent.id], all_headers["Исходные значения (JSON)"]).value)
-    assert source_values[6]["value"] == "2"
     assert len(source_detail["row"]["raw_cell_ids"]) == len(HEADERS)
     assert source_detail["full_raw_payload_sheet"] == "Исходная структура"
     assert "Исходная структура" in book.sheetnames
@@ -189,9 +229,10 @@ def test_invalidated_role_change_keeps_saved_values_visible_but_not_verified():
     all_rows = book["Все распознанные строки"]
     headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
     parent_row = next(row for row in range(5, all_rows.max_row + 1) if all_rows.cell(row, headers["ID строки"]).value == parent.id)
-    current = json.loads(all_rows.cell(parent_row, headers["Значения после проверки (JSON)"]).value)
     saved = json.loads(all_rows.cell(parent_row, headers["Последние сохранённые значения Human Review (JSON)"]).value)
-    assert current[6]["value"] == "2"
+    source = book["P001-T001"]
+    assert source.cell(6, 7 + 6 * 2).value == "2"
+    assert source.cell(6, 8 + 6 * 2).value == "3"
     assert saved["cell:6"] == "3"
     assert json.loads(all_rows.cell(parent_row, headers["Последнее решение Human Review (JSON)"]).value)["invalidation_reason"] == "role_change"
 
@@ -245,11 +286,10 @@ def test_ocr_values_are_written_as_text_and_not_excel_formulas():
     row.raw_cells[1] = row.raw_cells[1].model_copy(update={"raw_value": "=HYPERLINK(\"https://example.invalid\",\"click\")"})
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
-    all_rows = book["Все распознанные строки"]
-    headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
-    values = json.loads(all_rows.cell(5, headers["Исходные значения (JSON)"]).value)
-    assert values[1]["value"].startswith("=HYPERLINK")
-    assert all_rows.cell(5, headers["Исходные значения (JSON)"]).data_type == "s"
+    source = book["P001-T001"]
+    source_cell = source.cell(6, 7 + 1 * 2)
+    assert source_cell.value.startswith("=HYPERLINK")
+    assert source_cell.data_type == "s"
 
     positions = book["Проверенные позиции"]
     position_headers = {positions.cell(4, column).value: column for column in range(1, positions.max_column + 1)}
@@ -282,3 +322,120 @@ def test_large_model_payload_is_chunked_without_breaking_row_review_export():
     chunks = [source.cell(row, 4).value for row in range(5, source.max_row + 1)]
     assert all(len(chunk) <= 30000 for chunk in chunks)
     assert "synthetic_payload" in "".join(chunks)
+
+
+def test_page16_nine_column_shape_remains_visible_without_template_mapping():
+    values = [f"SYNTHETIC-VALUE-{index + 1}" for index in range(9)]
+    draft, review, report, _row = _schema_fixture(PAGE16_HEADERS, values)
+    content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic-page16.pdf")
+    book = load_workbook(BytesIO(content), data_only=False)
+    source = book["P001-T001"]
+    assert [source.cell(5, 7 + index * 2).value or "" for index in range(9)] == PAGE16_HEADERS
+    assert [source.cell(6, 7 + index * 2).value for index in range(9)] == values
+    assert source.cell(6, 7 + 2 * 2).value == "SYNTHETIC-VALUE-3"
+    # The compound source field remains whole, rather than being guessed into fields.
+    assert source.cell(5, 7 + 2 * 2).value == PAGE16_HEADERS[2]
+    assert source.cell(6, 7 + 2 * 2).value == values[2]
+    positions = book["Проверенные позиции"]
+    assert positions.max_row == 5
+    position_headers = {positions.cell(4, column).value: column for column in range(1, positions.max_column + 1)}
+    assert positions.cell(5, position_headers["Наименование — исходно"]).value in (None, "")  # no guessed canonical name
+
+
+def test_unknown_headers_are_exported_as_ordinary_cells():
+    headers = ["Диаметр наружный (условн.)", "Код позиции заказчика", "Группа / узел"]
+    values = ["SYN-D-14", "SYN-C-02", "SYN-G-1"]
+    draft, review, report, _row = _schema_fixture(headers, values)
+    book = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="unknown-headers.pdf",
+    )), data_only=False)
+    sheet = book["P001-T001"]
+    assert [sheet.cell(5, 7 + index * 2).value for index in range(3)] == headers
+    assert [sheet.cell(6, 7 + index * 2).value for index in range(3)] == values
+
+
+def test_cell_without_column_descriptor_is_still_visible_by_source_index():
+    draft, review, report, parent, *_ = _fixture()
+    parent.raw_cells.append(AICell(
+        id=f"{parent.id}-undeclared-c8", source_document_id="synthetic-doc",
+        page_number=1, table_id=parent.table_id, row_id=parent.id,
+        column_index=8, raw_value="SYN-UNDECLARED-CELL",
+    ))
+    book = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="missing-column-metadata.pdf",
+    )), data_only=False)
+    sheet = book["P001-T001"]
+    assert sheet.cell(4, 23).value.startswith("Индекс 8 · исходно · [без заголовка]")
+    assert sheet.cell(5, 23).value in (None, "")
+    assert sheet.cell(6, 23).value == "SYN-UNDECLARED-CELL"
+
+
+def test_blank_and_repeated_headers_keep_source_indexes_and_exact_values():
+    headers = ["", "Повтор", "Повтор", "   "]
+    values = ["SYN-EMPTY", "SYN-A", "SYN-B", "SYN-SPACE"]
+    draft, review, report, _row = _schema_fixture(headers, values)
+    book = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="duplicate-headers.pdf",
+    )), data_only=False)
+    sheet = book["P001-T001"]
+    visible_column_labels = [sheet.cell(4, 7 + index * 2).value for index in range(4)]
+    assert visible_column_labels[0].startswith("Индекс 0 · исходно · [без заголовка]")
+    assert visible_column_labels[1].startswith("Индекс 1 · исходно · Повтор")
+    assert visible_column_labels[2].startswith("Индекс 2 · исходно · Повтор")
+    assert [sheet.cell(5, 7 + index * 2).value or "" for index in range(4)] == headers
+    assert [sheet.cell(6, 7 + index * 2).value for index in range(4)] == values
+
+
+def test_different_table_shapes_on_separate_pages_use_separate_sheets():
+    draft, review, _report, *_ = _fixture()
+    headers = ["Неизвестный столбец", "Другой столбец"]
+    table_id, row_id = "p2-t1", "p2-r0"
+    columns = [AIColumn(
+        id=f"{table_id}-c{index}", source_document_id="synthetic-doc",
+        page_number=2, table_id=table_id, index=index, raw_header=header,
+    ) for index, header in enumerate(headers)]
+    row = AIRow(
+        id=row_id, source_document_id="synthetic-doc", page_number=2,
+        table_id=table_id, index=0, model_kind="item",
+        raw_cells=[AICell(
+            id=f"{row_id}-c{index}", source_document_id="synthetic-doc",
+            page_number=2, table_id=table_id, row_id=row_id,
+            column_index=index, raw_value=value,
+        ) for index, value in enumerate(["SYN-P2-A", "SYN-P2-B"])],
+    )
+    table = AITable(id=table_id, source_document_id="synthetic-doc", page_number=2, index=0, columns=columns, rows=[row])
+    page2 = AIPageExtraction(
+        source_document_id="synthetic-doc", page_number=2,
+        extraction_fingerprint="page-fingerprint-2", status="extracted", tables=[table],
+    )
+    draft = draft.model_copy(update={"pages": [draft.pages[0], page2], "expected_page_numbers": [1, 2, 3]})
+    report = {"pages": [{"page_number": 1, "state": "completed"}, {"page_number": 2, "state": "completed"}]}
+    book = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1, 2], document_name="different-tables.pdf",
+    )), data_only=False)
+    assert "P001-T001" in book.sheetnames and "P002-T001" in book.sheetnames
+    assert book["P001-T001"].max_column == 6 + len(HEADERS) * 2
+    assert book["P002-T001"].max_column == 6 + len(headers) * 2
+    assert [book["P002-T001"].cell(6, 7 + index * 2).value for index in range(2)] == ["SYN-P2-A", "SYN-P2-B"]
+
+
+def test_unresolved_table_level_continuation_issue_blocks_confirmed_positions():
+    from averon_import.services.ai_first.contracts import AIReviewIssue
+
+    draft, review, report, parent, *_ = _fixture()
+    issue = AIReviewIssue(
+        id="table-continuation", source_document_id="synthetic-doc", code="continuation_unverified",
+        severity="review", page_number=1, record_ids=[parent.table_id], detail="synthetic continuation review",
+    )
+    draft = draft.model_copy(update={"issues": [issue]})
+    content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="table-issue.pdf")
+    book = load_workbook(BytesIO(content), data_only=False)
+    assert book["Проверенные позиции"].max_row == 4
+    summary = book["Все распознанные строки"]
+    headers = {summary.cell(4, column).value: column for column in range(1, summary.max_column + 1)}
+    parent_row = next(row for row in range(5, summary.max_row + 1) if summary.cell(row, headers["ID строки"]).value == parent.id)
+    assert summary.cell(parent_row, headers["Статус проверки"]).value == "Есть неразрешённое замечание"
+
+    review = resolve_review_issue(draft, review, issue.id, reviewer_id="synthetic-reviewer", detail="Проверено вручную")
+    content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="table-issue.pdf")
+    assert load_workbook(BytesIO(content), data_only=False)["Проверенные позиции"].max_row == 5

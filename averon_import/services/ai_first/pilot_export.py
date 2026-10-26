@@ -21,6 +21,7 @@ from averon_import.services.ai_first.contracts import AIDocumentDraft, AIReviewS
 
 MAX_PILOT_EXPORT_PAGES = 3
 MAX_EXCEL_CELL_CHARS = 32767
+MAX_EXCEL_COLUMNS = 16384
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 ROLE_LABELS = {
@@ -138,7 +139,9 @@ def _rows_for_document(draft: AIDocumentDraft, review: AIReviewState) -> list[di
     result: list[dict[str, Any]] = []
     for page in draft.pages:
         for table in page.tables:
-            columns = {item.index: item.raw_header or f"Столбец {item.index + 1}" for item in table.columns}
+            # Keep the exact (including blank) source header. A display fallback
+            # would erase the distinction between an empty header and a real one.
+            columns = {item.index: item.raw_header or "" for item in table.columns}
             for row in table.rows:
                 cells = sorted(row.raw_cells, key=lambda item: item.column_index)
                 role = role_records.get(row.id)
@@ -166,7 +169,7 @@ def _rows_for_document(draft: AIDocumentDraft, review: AIReviewState) -> list[di
                         for cell in cells
                     ],
                     "current_values": [
-                        {"column_index": cell.column_index, "header": columns.get(cell.column_index, f"Столбец {cell.column_index + 1}"), "value": (decision.values.get(f"cell:{cell.column_index}", cell.raw_value or "") if decision and decision.active else cell.raw_value or "")}
+                        {"column_index": cell.column_index, "header": columns.get(cell.column_index, ""), "value": (decision.values.get(f"cell:{cell.column_index}", cell.raw_value or "") if decision and (decision.active or decision.invalidation_reason == "role_change") else cell.raw_value or "")}
                         for cell in cells
                     ],
                     "last_saved_values": dict(decision.values) if decision else {},
@@ -239,7 +242,7 @@ def _rows_for_document(draft: AIDocumentDraft, review: AIReviewState) -> list[di
             "columns": {item["column_index"]: item["header"] for item in values},
             "source_values": values,
             "current_values": [
-                {**item, "value": (decision.values.get(f"cell:{item['column_index']}", item["value"]) if decision and decision.active else item["value"])}
+                {**item, "value": (decision.values.get(f"cell:{item['column_index']}", item["value"]) if decision and (decision.active or decision.invalidation_reason == "role_change") else item["value"])}
                 for item in values
             ],
             "last_saved_values": dict(decision.values) if decision else {},
@@ -270,6 +273,9 @@ def _page_report_errors(report: Mapping[str, Any]) -> dict[int, str]:
 def _row_issue_open(row: Mapping[str, Any], issue_index: Mapping[int, list[Any]], review: AIReviewState) -> bool:
     record_id = str(row["id"])
     evidence_ids = {record_id}
+    table_id = row.get("table_id")
+    if table_id:
+        evidence_ids.add(str(table_id))
     evidence_ids.update(cell.id for cell in row.get("cells", []))
     for issue in issue_index.get(int(row["page"]), []):
         if issue.severity not in {"review", "blocking"} or issue.id in review.resolved_issue_ids:
@@ -330,6 +336,7 @@ def _write_sheet(
     sheet, title: str, document_name: str, document_id: str,
     selected_pages: Sequence[int], page_count: int,
     header: Sequence[str], rows: Iterable[Sequence[object]], widths: Sequence[int] | None = None,
+    detail_header: Sequence[object] | None = None,
 ) -> None:
     coverage = "Полный охват страниц документа" if set(selected_pages) == set(range(1, page_count + 1)) else "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА"
     sheet.sheet_view.showGridLines = False
@@ -337,6 +344,8 @@ def _write_sheet(
     sheet.append([f"Документ: {document_name} · ID {document_id} · страницы {', '.join(map(str, selected_pages))} из {page_count} · {coverage}"])
     sheet.append([title])
     sheet.append([_bounded(value) for value in header])
+    if detail_header is not None:
+        sheet.append([_bounded(value) for value in detail_header])
     for values in rows:
         # openpyxl truncates long strings during append, so reject before it can
         # silently alter OCR content.
@@ -356,15 +365,73 @@ def _write_sheet(
             elif cell.row == 4:
                 cell.fill = PatternFill("solid", fgColor="1D4ED8")
                 cell.font = Font(bold=True, color="FFFFFF")
-    sheet.freeze_panes = "A5"
-    if sheet.max_row >= 4 and sheet.max_column:
+            elif detail_header is not None and cell.row == 5:
+                cell.fill = PatternFill("solid", fgColor="DBEAFE")
+                cell.font = Font(bold=True, color="1E3A8A")
+    sheet.freeze_panes = "A6" if detail_header is not None else "A5"
+    if detail_header is None and sheet.max_row >= 4 and sheet.max_column:
         sheet.auto_filter.ref = f"A4:{get_column_letter(sheet.max_column)}{sheet.max_row}"
     if widths:
         for index, width in enumerate(widths, start=1):
             sheet.column_dimensions[get_column_letter(index)].width = width
     else:
         for index in range(1, sheet.max_column + 1):
-            sheet.column_dimensions[get_column_letter(index)].width = min(42, max(14, len(str(sheet.cell(4, index).value or "")) + 2))
+            heading = sheet.cell(4, index).value or ""
+            source_heading = sheet.cell(5, index).value or "" if detail_header is not None else ""
+            sheet.column_dimensions[get_column_letter(index)].width = min(42, max(14, len(str(heading)) + 2, min(40, len(str(source_heading)) + 2)))
+
+
+def _source_sheet_name(page_number: int, table_index: int | str) -> str:
+    suffix = "manual" if table_index == "manual" else f"T{int(table_index):03d}"
+    return f"P{int(page_number):03d}-{suffix}"[:31]
+
+
+def _source_table_sheet(
+    workbook: Workbook,
+    *,
+    name: str,
+    title: str,
+    filename: str,
+    document_id: str,
+    selected: Sequence[int],
+    page_count: int,
+    columns: Sequence[tuple[int, str]],
+    rows: Sequence[dict[str, Any]],
+) -> dict[str, int]:
+    """Write one source table with exact headers and visible raw/reviewed cells."""
+    if len(columns) * 2 + 6 > MAX_EXCEL_COLUMNS:
+        raise PilotExportError("export_column_limit_exceeded")
+    sheet = workbook.create_sheet(name)
+    fixed = ["Строка источника", "ID строки", "Тип по модели", "Роль Human Review", "Статус роли", "Статус проверки"]
+    header = list(fixed)
+    detail_header: list[object] = ["", "", "", "", "", ""]
+    for index, source_header in columns:
+        label = source_header if source_header else "[без заголовка]"
+        header.extend([f"Индекс {index} · исходно · {label}", f"Индекс {index} · проверено · {label}"])
+        # Repeated/blank labels are retained verbatim in the next visible row;
+        # column indexes in row 4 keep their identities distinct.
+        detail_header.extend([source_header, source_header])
+    data: list[list[object]] = []
+    location: dict[str, int] = {}
+    for offset, row in enumerate(rows, start=6):
+        location[str(row["id"])] = offset
+        source_values = {int(item["column_index"]): item["value"] for item in row["source_values"]}
+        current_values = {int(item["column_index"]): item["value"] for item in row["current_values"]}
+        role = ROLE_LABELS.get(row["role"], "Не определена") if row["role_active"] else "Не подтверждена человеком"
+        values: list[object] = [
+            "Ручная" if row.get("manual") else row.get("row_index", ""),
+            row["id"], row["model_kind"], role,
+            "Подтверждена человеком" if row["role_active"] else "Не подтверждена",
+            row["review_status"],
+        ]
+        for index, _source_header in columns:
+            values.extend([source_values.get(index, ""), current_values.get(index, source_values.get(index, ""))])
+        data.append(values)
+    _write_sheet(
+        sheet, title, filename, document_id, selected, page_count,
+        header, data, detail_header=detail_header,
+    )
+    return location
 
 
 def build_ai_first_pilot_xlsx(
@@ -418,10 +485,55 @@ def build_ai_first_pilot_xlsx(
     workbook = Workbook()
     positions = workbook.active
     positions.title = "Проверенные позиции"
+    source_locations: dict[str, tuple[str, int]] = {}
+    # Keep each physical table on its own worksheet. Heterogeneous tables never
+    # share a synthetic set of columns, and source identity is page/table/index.
+    for page_number in selected:
+        page = pages_by_number.get(page_number)
+        if page is None:
+            continue
+        ordered_tables = sorted(page.tables, key=lambda table: (table.index, table.id))
+        for table_ordinal, table in enumerate(ordered_tables, start=1):
+            name = _source_sheet_name(page_number, table_ordinal)
+            table_rows = sorted(
+                (row for row in all_rows if not row["manual"] and row["table_id"] == table.id),
+                key=lambda row: row["row_index"],
+            )
+            source_headers = {column.index: column.raw_header or "" for column in table.columns}
+            # Preserve a cell even if a malformed/incomplete extraction omitted
+            # its column descriptor; identify it by source index and blank header.
+            for row in table_rows:
+                for item in row["source_values"]:
+                    source_headers.setdefault(int(item["column_index"]), "")
+            columns = sorted(source_headers.items())
+            locations = _source_table_sheet(
+                workbook, name=name, title=f"Исходные и проверенные значения · страница {page_number}, таблица {table.index + 1} · ID {table.id}",
+                filename=filename, document_id=draft.source_document_id, selected=selected, page_count=page_count,
+                columns=columns, rows=table_rows,
+            )
+            source_locations.update({record_id: (name, row_number) for record_id, row_number in locations.items()})
+
+    # Manual rows have their own per-page sheet, separate from model tables.
+    for page_number in selected:
+        manual_rows = [row for row in all_rows if row["manual"] and row["page"] == page_number]
+        if not manual_rows:
+            continue
+        by_index: dict[int, str] = {}
+        for row in manual_rows:
+            for item in row["source_values"]:
+                by_index.setdefault(int(item["column_index"]), str(item["header"] or ""))
+        name = _source_sheet_name(page_number, "manual")
+        locations = _source_table_sheet(
+            workbook, name=name, title=f"Ручные строки · страница {page_number}",
+            filename=filename, document_id=draft.source_document_id, selected=selected, page_count=page_count,
+            columns=sorted(by_index.items()), rows=manual_rows,
+        )
+        source_locations.update({record_id: (name, row_number) for record_id, row_number in locations.items()})
+
     position_header = ["ТЕСТ", "Документ", "ID документа", "Страница", "Таблица", "Строка источника", "Статус проверки", "Роль", "Родитель компонента"]
     for field, label in CANONICAL_FIELDS:
         position_header.extend([f"{label} — исходно", f"{label} — проверено"])
-    position_header.extend(["Остальные исходные и проверенные колонки (JSON)", "Исходная строка и таблица (JSON)", "ID строки"])
+    position_header.extend(["Лист исходной таблицы", "Строка на листе исходной таблицы", "ID строки"])
     position_rows = []
     for row in selected_rows:
         grouped = _values_by_field(row)
@@ -432,16 +544,8 @@ def build_ai_first_pilot_xlsx(
                 values.extend([mapped[0]["raw"], mapped[0]["current"]])
             else:
                 values.extend(["" if not mapped else "Неоднозначное сопоставление", "" if not mapped else "Неоднозначное сопоставление"])
-        mapped_indices = {
-            item["column_index"] for item in row["source_values"]
-            if _canonical_field(row["columns"].get(item["column_index"], item["header"]))
-        }
-        values.append(_json_text([
-            {"column_index": item["column_index"], "header": item["header"], "raw": item["value"],
-             "current": next((current["value"] for current in row["current_values"] if current["column_index"] == item["column_index"]), item["value"])}
-            for item in row["source_values"] if item["column_index"] not in mapped_indices
-        ]))
-        values.extend([_json_text(row["evidence"]), row["id"]])
+        source_sheet, source_row = source_locations.get(row["id"], ("", ""))
+        values.extend([source_sheet, source_row, row["id"]])
         position_rows.append(values)
     _write_sheet(positions, "Подтверждённые самостоятельные позиции", filename, draft.source_document_id, selected, page_count, position_header, position_rows)
 
@@ -449,24 +553,36 @@ def build_ai_first_pilot_xlsx(
     all_header = [
         "ТЕСТ", "Документ", "ID документа", "Страница", "Таблица", "Строка источника", "Тип по модели",
         "Роль Human Review", "Родитель компонента", "Статус проверки", "Статус обработки страницы",
-        "Полнота страницы подтверждена", "Решение по значениям", "Исходные значения (JSON)",
-        "Значения после проверки (JSON)", "Последние сохранённые значения Human Review (JSON)",
+        "Полнота страницы подтверждена", "Решение по значениям", "Лист исходной таблицы",
+        "Строка на листе исходной таблицы", "Последние сохранённые значения Human Review (JSON)",
         "Последнее решение Human Review (JSON)", "Исходная строка и таблица (JSON)", "ID строки",
     ]
     all_data = []
     for row in all_rows:
         decision = row["decision"]
+        source_sheet, source_row = source_locations.get(row["id"], ("", ""))
         all_data.append([
             "ТЕСТ", filename, draft.source_document_id, row["page"], row["table_index"], row["row_index"], row["model_kind"],
             ROLE_LABELS.get(row["role"], "Не определена") if row["role_active"] else "Не подтверждена человеком",
             row["parent_record_id"], row["review_status"], row["processing_state"],
             "Да" if row["page_confirmed"] else "Нет", DISPOSITION_LABELS.get(decision.disposition, "") if decision and decision.active else "Нет активного решения",
-            _json_text(row["source_values"]), _json_text(row["current_values"]),
-            _json_text(row["last_saved_values"]),
+            source_sheet, source_row, _json_text(row["last_saved_values"]),
             _json_text(decision.model_dump(mode="json") if decision else {}),
             _json_text(row["evidence"]), row["id"],
         ])
     _write_sheet(all_sheet, "Все распознанные и добавленные строки выбранных страниц", filename, draft.source_document_id, selected, page_count, all_header, all_data)
+    for sheet, source_column_name, row_column_name in (
+        (positions, "Лист исходной таблицы", "Строка на листе исходной таблицы"),
+        (all_sheet, "Лист исходной таблицы", "Строка на листе исходной таблицы"),
+    ):
+        headers = {sheet.cell(4, column).value: column for column in range(1, sheet.max_column + 1)}
+        for row_number in range(5, sheet.max_row + 1):
+            target_name = sheet.cell(row_number, headers[source_column_name]).value
+            target_row = sheet.cell(row_number, headers[row_column_name]).value
+            if target_name and target_row:
+                link = sheet.cell(row_number, headers[source_column_name])
+                link.hyperlink = f"#'{target_name}'!A{target_row}"
+                link.style = "Hyperlink"
 
     coverage_sheet = workbook.create_sheet("Охват страниц")
     page_errors = _page_report_errors(report)

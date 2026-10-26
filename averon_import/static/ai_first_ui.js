@@ -367,7 +367,7 @@ function renderAIFirstReview() {
   }).join("");
   document.querySelector("#ai-first-page-details-label").textContent = `Страницы: ${processedPages} обработано из ${state.document.page_count} · ${confirmedPages} подтверждено${failedPages ? ` · ${failedPages} требуют внимания` : ""}`;
   document.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", () => showAIFirstPage(Number(button.dataset.aiFirstShowPage))));
-  document.querySelectorAll("[data-ai-first-complete-page]").forEach((button) => button.addEventListener("click", () => void postAIFirstReview("complete-page", {page_number:Number(button.dataset.aiFirstCompletePage)})));
+  document.querySelectorAll("[data-ai-first-complete-page]").forEach((button) => button.addEventListener("click", () => void confirmAIFirstPageCompleteness(Number(button.dataset.aiFirstCompletePage))));
   document.querySelectorAll("[data-ai-first-retry-one]").forEach((button) => button.addEventListener("click", () => retryAIFirstPages([Number(button.dataset.aiFirstRetryOne)])));
   document.querySelectorAll("[data-ai-first-export-page]").forEach((input) => input.addEventListener("change", () => {
     const pageNumber = Number(input.dataset.aiFirstExportPage);
@@ -422,6 +422,17 @@ function aiFirstDocumentEntries(draft, review) {
     entries.push({row,page,table,columns:aiFirstColumnList(table),manual:true});
   }
   return entries;
+}
+
+function aiFirstRowsWithoutReviewedRole(pageNumber) {
+  const data = state.aiFirst.data;
+  if (!data?.draft) return [];
+  const roles = data.review?.row_roles || {};
+  return aiFirstDocumentEntries(data.draft, data.review).filter((entry) => {
+    const page = Number(entry.page?.page_number || entry.row.page_number);
+    const role = roles[entry.row.id];
+    return page === Number(pageNumber) && (!role?.active || role.role === "unknown");
+  });
 }
 
 function renderAIFirstTables(entries) {
@@ -572,6 +583,14 @@ async function postAIFirstReview(action, body) {
   }
 }
 
+async function confirmAIFirstPageCompleteness(pageNumber) {
+  const unresolvedRows = aiFirstRowsWithoutReviewedRole(pageNumber);
+  if (unresolvedRows.length && !confirm(
+    `На странице ${pageNumber} осталось ${unresolvedRows.length} строк без подтверждённой человеком роли. Они сохранятся в исходных строках и не станут позициями автоматически. Подтвердить полноту проверки страницы?`
+  )) return {saved:false,refreshed:false};
+  return postAIFirstReview("complete-page", {page_number:Number(pageNumber)});
+}
+
 async function confirmSelectedAIFirstRows() {
   const recordIds = [...state.aiFirst.selectedRows];
   if (!recordIds.length) return;
@@ -692,7 +711,7 @@ function installAIFirstUIEvents() {
   document.querySelector("#ai-first-confirm-selected").addEventListener("click", () => void confirmSelectedAIFirstRows());
   document.querySelector("#ai-first-export-pilot").addEventListener("click", () => void downloadAIFirstPilotXlsx());
   document.querySelector("#ai-first-confirm-page").addEventListener("click", async () => {
-    await postAIFirstReview("complete-page", {page_number:state.aiFirst.page});
+    await confirmAIFirstPageCompleteness(state.aiFirst.page);
   });
   document.querySelector("#ai-first-add-row").addEventListener("click", () => {
     state.aiFirst.addRowOpen = !state.aiFirst.addRowOpen;
