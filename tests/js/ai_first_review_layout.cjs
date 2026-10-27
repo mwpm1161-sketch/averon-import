@@ -62,6 +62,23 @@ assert.equal(tableRoot.scrollTop,183,"vertical position is restored after redraw
 assert.deepEqual(tableInput.selection,[4,9],"caret selection is preserved");
 assert.equal(tableInput.focused.preventScroll,true,"focus restoration does not jump the table scroll position");
 
+const inspectorInput = {
+  dataset:{aiFirstInspectorCell:"row-1",columnIndex:"8"},value:"corrected",selectionStart:3,selectionEnd:7,focused:null,
+  focus(options) { this.focused=options; },setSelectionRange(start,end) { this.selection=[start,end]; },
+};
+const inspectorRoot = {scrollTop:97,querySelector:selector=>selector.includes("data-ai-first-inspector-cell") ? inspectorInput : null};
+context.document.querySelector = selector => selector === "#ai-first-table-scroll" ? tableRoot : selector === "#ai-first-row-inspector" ? inspectorRoot : null;
+context.document.activeElement = inspectorInput;
+const editorView = context.captureView();
+assert.equal(editorView.focus.type,"inspector-cell","the active row editor field is captured before redraw");
+assert.equal(editorView.focus.column,"8","the editor column identity is preserved");
+assert.equal(editorView.inspectorScrollTop,97,"the editor vertical position is captured");
+inspectorRoot.scrollTop=0;
+context.restoreView(editorView);
+assert.equal(inspectorRoot.scrollTop,97,"the editor vertical position is restored");
+assert.deepEqual(inspectorInput.selection,[3,7],"the editor caret is restored after redraw");
+assert.equal(inspectorInput.focused.preventScroll,true,"editor focus restoration does not jump the table scroll position");
+
 const pendingRoot = {
   querySelectorAll:selector=>selector === "[data-ai-first-cell]" ? [{dataset:{aiFirstCell:"row-1"},value:"edited"}] : [],
   querySelector:selector=>selector.includes("data-ai-first-parent-row") ? {value:"row-parent"} : null,
@@ -92,6 +109,8 @@ assert(source.includes("const headers = columns.map"),"every source column is st
 assert(source.includes("const cells = columns.map"),"each source cell remains available in the table");
 assert.match(css,/\.ai-first-table-scroll\s*\{[^}]*min-width:0[^}]*overflow:auto/s,"horizontal scroll container may shrink inside the split pane");
 assert.match(css,/\.ai-first-table\s*\{[^}]*width:max-content[^}]*min-width:100%/s,"wide source columns remain intact and scrollable");
+assert.match(css,/\.ai-first-row-inspector:not\(\[hidden\]\)\s*\{[^}]*position:absolute/s,"the selected-row editor overlays the table pane instead of shrinking it");
+assert.match(css,/\.ai-first-inspector-values\s*\{[^}]*max-height:none[^}]*overflow:visible/s,"row fields share the editor scroll instead of a nested micro-scroll");
 assert.match(css,/@media \(max-width:760px\)[\s\S]*\.ai-first-review-workspace/,"layout adapts to a narrow screen");
 
 const inspector = sourceBetween("function renderAIFirstRowInspector", "function selectAIFirstRow");
@@ -100,5 +119,8 @@ for (const action of ["data-ai-first-save-row", "data-ai-first-save-role", "data
 }
 assert(inspector.includes("if (rolePending)"),"confirmation requires saving a changed role first");
 assert(inspector.includes("if (aiFirstRowInputSnapshot(recordId).some"),"exclusion cannot discard unsaved cell edits");
+assert(inspector.includes("Несохранённые правки останутся в строке таблицы"),"closing warns that pending edits remain visible but unsaved");
+assert(source.includes("data-ai-first-inspector-cell"),"the selected-row editor exposes editable source-column fields");
+assert(source.includes("installAIFirstUnsavedNavigationGuard"),"page refresh warns before discarding pending edits");
 
 console.log("PASS: AI-first horizontal/vertical scroll and focus restoration, pending edits across page changes, source-column retention and compact inspector safeguards");

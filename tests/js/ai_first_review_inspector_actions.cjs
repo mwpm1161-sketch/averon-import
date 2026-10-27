@@ -47,6 +47,7 @@ const data = {
 const state = {document:{document_id:"doc-1"},aiFirst:{data,inspectorRowId:"row-1",renderedEntries:new Map([["row-1",entry]]),pendingRowValues:{"row-1":{"cell:0":"Исправленное значение"}},pendingRowRoles:{},pendingIssueNotes:{}}};
 const posted = [];
 let toasts = [];
+let failNextPost = false;
 const context = {
   state,
   CSS:{escape:value=>String(value)},
@@ -73,6 +74,7 @@ const context = {
     if (options.method === "POST") {
       const body=JSON.parse(options.body);
       posted.push({url,body});
+      if (failNextPost) { failNextPost=false; throw new Error("offline mock failure"); }
       if (url.endsWith("/row")) data.review.decisions[body.record_id]={active:true,disposition:body.disposition,human_confirmed:false,values:body.values};
       if (url.endsWith("/row-role")) data.review.row_roles[body.record_id]={active:true,role:body.role,parent_record_id:body.parent_record_id,source_document_id:"doc-1",page_number:1,page_extraction_fingerprint:"fp-1",table_id:"table-1"};
       return {};
@@ -107,6 +109,16 @@ async function run() {
   assert.equal(state.aiFirst.pendingRowRoles["row-1"],undefined,"a successful role action clears the role payload");
   assert.equal(state.aiFirst.pendingRowValues["row-1"]["cell:0"],"a separate pending correction","a role action cannot clear pending cell values");
 
+  tableInput.value="retry correction";
+  state.aiFirst.pendingRowValues["row-1"]={"cell:0":"retry correction"};
+  state.aiFirst.pendingRowRoles["row-1"]={role:"standalone_item",parent_record_id:null};
+  failNextPost=true;
+  const failedSave=await context.saveReview("row-role",{record_id:"row-1",role:"standalone_item",parent_record_id:null});
+  assert.equal(failedSave.saved,false,"a rejected API call remains a failed save");
+  assert.equal(tableInput.value,"retry correction","the editor's table-backed value survives API rejection");
+  assert.equal(state.aiFirst.pendingRowValues["row-1"]["cell:0"],"retry correction","pending value remains available for retry");
+  assert.equal(state.aiFirst.pendingRowRoles["row-1"].role,"standalone_item","pending role remains available for retry");
+
   const pill = new Control(), rowLabel = new Control(), heading = new Control();
   const cellClassSet = new Set();
   const cell = {closest:()=>({classList:{remove:(...names)=>names.forEach(name=>cellClassSet.delete(name)),add:name=>cellClassSet.add(name)}})};
@@ -119,7 +131,7 @@ async function run() {
   context.aiFirstRowStatusLabel=review=>review.label;
   context.aiFirstDecision=()=>null;
   context.renderAIFirstReviewFooter=()=>{};
-  vm.runInNewContext(`${sourceBetween("function updateAIFirstRenderedRowState", "function aiFirstProcessingMessage")}; globalThis.updateRendered=updateAIFirstRenderedRowState;`,context);
+  vm.runInNewContext(`${sourceBetween("function aiFirstStatusPillLabel", "function updateAIFirstRenderedRowState")}; ${sourceBetween("function updateAIFirstRenderedRowState", "function aiFirstProcessingMessage")}; globalThis.updateRendered=updateAIFirstRenderedRowState;`,context);
   for (const [status,label] of [["unsaved","Не сохранено"],["attention","Внимание"],["checked","Проверено"]]) {
     context.currentReviewState={status,label:`Состояние ${label}`};
     context.updateRendered("row-1");
@@ -127,6 +139,12 @@ async function run() {
     assert(pill.className.includes(`--${status}`),`status pill class refreshes to ${status}`);
     assert(rowElement.className.includes(`ai-first-row--${status}`),`row class refreshes to ${status}`);
   }
+  const rolePendingReview={status:"attention",label:"Роль не подтверждена",decisionCurrent:true,roleVerified:false,pageReady:true,evidenceIssueExists:true,openIssues:[]};
+  const labelSource=sourceBetween("function aiFirstRowStatusLabel", "function updateAIFirstRenderedRowState");
+  vm.runInNewContext(`${labelSource}; globalThis.rowStatus=aiFirstRowStatusLabel; globalThis.pillStatus=aiFirstStatusPillLabel;`,context);
+  assert.equal(context.rowStatus(rolePendingReview),"Значения проверены · тип строки не подтверждён","confirmed values remain explicit when the role is unconfirmed");
+  assert.equal(context.pillStatus(rolePendingReview),"Тип не подтверждён","the warning pill names its reason instead of obscuring confirmed values");
+  assert.equal(rolePendingReview.status,"attention","the display wording does not change the existing business status");
   console.log("PASS: real inspector save handlers preserve pending role/value edits across sequential API writes; row status pill tracks edits, role state and confirmation");
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});
