@@ -2513,9 +2513,10 @@ def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
         except PilotExportError as exc:
             code = str(exc)
             message = (
-                "Тестовый XLSX не создан: текст одной ячейки превышает лимит Excel в 32 767 символов. "
-                "Исходный текст не сокращён; исправьте или разделите длинное значение и повторите выгрузку."
-                if code == "export_cell_limit_exceeded"
+                "Тестовый XLSX не создан из-за технического ограничения размера Excel. "
+                "Исходные данные сохранены без изменений; исправление только проверенного значения не удалит исходный OCR-текст из выгрузки. "
+                "Попробуйте выгрузить меньший фрагмент страниц."
+                if code in {"export_cell_limit_exceeded", "export_long_text_overflow_exceeded"}
                 else "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и локальные данные."
             )
             raise HTTPException(

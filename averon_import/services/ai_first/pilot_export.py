@@ -22,6 +22,9 @@ from averon_import.services.ai_first.contracts import AIDocumentDraft, AIReviewS
 MAX_PILOT_EXPORT_PAGES = 3
 MAX_EXCEL_CELL_CHARS = 32767
 MAX_EXCEL_COLUMNS = 16384
+MAX_EXCEL_ROWS = 1_048_576
+LONG_TEXT_CHUNK_CHARS = 30000
+LONG_TEXT_SHEET_NAME = "Длинные значения"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 ROLE_LABELS = {
@@ -84,17 +87,59 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _bounded(value: object) -> str:
-    text = "" if value is None else str(value)
-    if len(text) > MAX_EXCEL_CELL_CHARS:
-        raise PilotExportError("export_cell_limit_exceeded")
-    return text
+def _append_export_row(sheet, values: Sequence[object], long_values: list[dict[str, Any]] | None) -> None:
+    """Append text safely, spilling oversized values into an exact-recovery sheet."""
+    row_values: list[str] = []
+    pending: list[tuple[dict[str, Any], int]] = []
+    for column_number, value in enumerate(values, start=1):
+        text = "" if value is None else str(value)
+        if len(text) <= MAX_EXCEL_CELL_CHARS:
+            row_values.append(text)
+            continue
+        if long_values is None:
+            raise PilotExportError("export_cell_limit_exceeded")
+
+        chunks = [text[index:index + LONG_TEXT_CHUNK_CHARS] for index in range(0, len(text), LONG_TEXT_CHUNK_CHARS)]
+        first_chunk_row = 5 + sum(len(item["chunks"]) for item in long_values)
+        if first_chunk_row + len(chunks) - 1 > MAX_EXCEL_ROWS:
+            raise PilotExportError("export_long_text_overflow_exceeded")
+        reference = len(long_values) + 1
+        item = {
+            "reference": reference,
+            "source_sheet": sheet.title,
+            "source_cell": None,
+            "chunks": chunks,
+            "first_chunk_row": first_chunk_row,
+            "cell": None,
+        }
+        long_values.append(item)
+        pending.append((item, column_number))
+        row_values.append(f"Длинный текст · запись {reference} на листе «{LONG_TEXT_SHEET_NAME}»")
+
+    sheet.append(row_values)
+    for item, column_number in pending:
+        cell = sheet.cell(sheet.max_row, column_number)
+        item["source_cell"] = cell.coordinate
+        item["cell"] = cell
 
 
 def _safe_filename(value: object) -> str:
     # The workbook is downloaded by the authenticated local user; never expose a path.
     text = str(value or "document.pdf").replace("\\", "/").split("/")[-1]
     return text[:255] or "document.pdf"
+
+
+def _recognition_source_label(report: Mapping[str, Any]) -> str:
+    adapter = report.get("adapter") if isinstance(report, Mapping) else None
+    if not isinstance(adapter, Mapping):
+        return "Источник распознавания не определён"
+    provider_id = adapter.get("provider_id")
+    model_id = adapter.get("model_id")
+    if provider_id == "yandex_ai_studio" and model_id == "qwen_vision":
+        return "Qwen Vision"
+    if provider_id == "offline_synthetic" and model_id == "fake_vision":
+        return "Синтетический тест"
+    return "Источник распознавания не определён"
 
 
 def _issue_index(draft: AIDocumentDraft) -> dict[int, list[Any]]:
@@ -434,19 +479,19 @@ def _write_sheet(
     selected_pages: Sequence[int], page_count: int,
     header: Sequence[str], rows: Iterable[Sequence[object]], widths: Sequence[int] | None = None,
     detail_header: Sequence[object] | None = None,
+    *, source_label: str = "Источник распознавания не определён",
+    long_values: list[dict[str, Any]] | None = None,
 ) -> None:
     coverage = "Полный охват страниц документа" if set(selected_pages) == set(range(1, page_count + 1)) else "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА"
     sheet.sheet_view.showGridLines = False
-    sheet.append(["ТЕСТ — AI-first Qwen Vision. Не является коммерческой сметой."])
-    sheet.append([f"Документ: {document_name} · ID {document_id} · страницы {', '.join(map(str, selected_pages))} из {page_count} · {coverage}"])
-    sheet.append([title])
-    sheet.append([_bounded(value) for value in header])
+    _append_export_row(sheet, [f"ТЕСТ — AI-first {source_label}. Не является коммерческой сметой."], long_values)
+    _append_export_row(sheet, [f"Документ: {document_name} · ID {document_id} · страницы {', '.join(map(str, selected_pages))} из {page_count} · {coverage}"], long_values)
+    _append_export_row(sheet, [title], long_values)
+    _append_export_row(sheet, header, long_values)
     if detail_header is not None:
-        sheet.append([_bounded(value) for value in detail_header])
+        _append_export_row(sheet, detail_header, long_values)
     for values in rows:
-        # openpyxl truncates long strings during append, so reject before it can
-        # silently alter OCR content.
-        sheet.append([_bounded(value) for value in values])
+        _append_export_row(sheet, values, long_values)
     for row in sheet.iter_rows():
         for cell in row:
             if cell.value is not None:
@@ -494,6 +539,8 @@ def _source_table_sheet(
     page_count: int,
     columns: Sequence[tuple[int, str]],
     rows: Sequence[dict[str, Any]],
+    source_label: str,
+    long_values: list[dict[str, Any]],
 ) -> dict[str, int]:
     """Write one source table with exact headers and visible raw/reviewed cells."""
     if len(columns) * 2 + 6 > MAX_EXCEL_COLUMNS:
@@ -527,6 +574,7 @@ def _source_table_sheet(
     _write_sheet(
         sheet, title, filename, document_id, selected, page_count,
         header, data, detail_header=detail_header,
+        source_label=source_label, long_values=long_values,
     )
     return location
 
@@ -551,6 +599,8 @@ def build_ai_first_pilot_xlsx(
     issue_index = prepared["issue_index"]
     all_rows = prepared["all_rows"]
     selected_rows = prepared["selected_rows"]
+    source_label = _recognition_source_label(report)
+    long_values: list[dict[str, Any]] = []
 
     workbook = Workbook()
     positions = workbook.active
@@ -579,7 +629,7 @@ def build_ai_first_pilot_xlsx(
             locations = _source_table_sheet(
                 workbook, name=name, title=f"Исходные и проверенные значения · страница {page_number}, таблица {table.index + 1} · ID {table.id}",
                 filename=filename, document_id=draft.source_document_id, selected=selected, page_count=page_count,
-                columns=columns, rows=table_rows,
+                columns=columns, rows=table_rows, source_label=source_label, long_values=long_values,
             )
             source_locations.update({record_id: (name, row_number) for record_id, row_number in locations.items()})
 
@@ -597,6 +647,7 @@ def build_ai_first_pilot_xlsx(
             workbook, name=name, title=f"Ручные строки · страница {page_number}",
             filename=filename, document_id=draft.source_document_id, selected=selected, page_count=page_count,
             columns=sorted(by_index.items()), rows=manual_rows,
+            source_label=source_label, long_values=long_values,
         )
         source_locations.update({record_id: (name, row_number) for record_id, row_number in locations.items()})
 
@@ -617,7 +668,11 @@ def build_ai_first_pilot_xlsx(
         source_sheet, source_row = source_locations.get(row["id"], ("", ""))
         values.extend([source_sheet, source_row, row["id"]])
         position_rows.append(values)
-    _write_sheet(positions, "Подтверждённые самостоятельные позиции", filename, draft.source_document_id, selected, page_count, position_header, position_rows)
+    _write_sheet(
+        positions, "Подтверждённые самостоятельные позиции", filename, draft.source_document_id,
+        selected, page_count, position_header, position_rows,
+        source_label=source_label, long_values=long_values,
+    )
 
     all_sheet = workbook.create_sheet("Все распознанные строки")
     all_header = [
@@ -640,7 +695,11 @@ def build_ai_first_pilot_xlsx(
             _json_text(decision.model_dump(mode="json") if decision else {}),
             _json_text(row["evidence"]), row["id"],
         ])
-    _write_sheet(all_sheet, "Все распознанные и добавленные строки выбранных страниц", filename, draft.source_document_id, selected, page_count, all_header, all_data)
+    _write_sheet(
+        all_sheet, "Все распознанные и добавленные строки выбранных страниц", filename,
+        draft.source_document_id, selected, page_count, all_header, all_data,
+        source_label=source_label, long_values=long_values,
+    )
     for sheet, source_column_name, row_column_name in (
         (positions, "Лист исходной таблицы", "Строка на листе исходной таблицы"),
         (all_sheet, "Лист исходной таблицы", "Строка на листе исходной таблицы"),
@@ -671,7 +730,11 @@ def build_ai_first_pilot_xlsx(
             sum(bool(row["verified_position"]) for row in page_rows), len(open_page_issues),
             "Полный" if set(selected) == expected else "Частичный",
         ])
-    _write_sheet(coverage_sheet, "Состояние обработки выбранного фрагмента", filename, draft.source_document_id, selected, page_count, coverage_header, coverage_data)
+    _write_sheet(
+        coverage_sheet, "Состояние обработки выбранного фрагмента", filename,
+        draft.source_document_id, selected, page_count, coverage_header, coverage_data,
+        source_label=source_label, long_values=long_values,
+    )
 
     source_sheet = workbook.create_sheet("Исходная структура")
     source_header = ["Страница", "Часть", "Всего частей", "JSON исходного результата (объединить части по порядку без разделителей)"]
@@ -685,9 +748,33 @@ def build_ai_first_pilot_xlsx(
         source_rows.extend([
             page_number, index + 1, len(chunks), chunk,
         ] for index, chunk in enumerate(chunks))
-    _write_sheet(source_sheet, "Полная исходная структура выбранных страниц", filename, draft.source_document_id, selected, page_count, source_header, source_rows, widths=[12, 12, 14, 100])
+    _write_sheet(
+        source_sheet, "Полная исходная структура выбранных страниц", filename,
+        draft.source_document_id, selected, page_count, source_header, source_rows,
+        widths=[12, 12, 14, 100], source_label=source_label, long_values=long_values,
+    )
 
-    workbook.properties.title = "ТЕСТ — AI-first Qwen Vision"
+    if long_values:
+        long_sheet = workbook.create_sheet(LONG_TEXT_SHEET_NAME)
+        long_rows: list[list[object]] = []
+        for item in long_values:
+            part_count = len(item["chunks"])
+            long_rows.extend([
+                item["reference"], item["source_sheet"], item["source_cell"], part_number, part_count, chunk,
+            ] for part_number, chunk in enumerate(item["chunks"], start=1))
+        _write_sheet(
+            long_sheet,
+            "Исходный текст по частям; соединяйте части записи без разделителей по порядку",
+            filename, draft.source_document_id, selected, page_count,
+            ["Запись", "Лист источника", "Ячейка источника", "Часть", "Всего частей", "Исходный текст · часть"],
+            long_rows, widths=[12, 24, 18, 12, 16, 100], source_label=source_label,
+        )
+        for item in long_values:
+            source_cell = item["cell"]
+            source_cell.hyperlink = f"#'{LONG_TEXT_SHEET_NAME}'!A{item['first_chunk_row']}"
+            source_cell.style = "Hyperlink"
+
+    workbook.properties.title = f"ТЕСТ — AI-first {source_label}"
     workbook.properties.subject = "Локальная пилотная выгрузка проверяемого фрагмента; не коммерческая смета"
     stream = BytesIO()
     try:

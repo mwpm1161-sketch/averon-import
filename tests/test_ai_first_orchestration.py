@@ -440,10 +440,11 @@ def test_rpm_and_tpm_gate_request_starts(tmp_path):
     pdf = make_pdf(tmp_path / "rate-limit.pdf", 3)
     adapter = SyntheticAdapter()
     config = make_config(requests_per_minute=1, tokens_per_minute=20)
-    report = run_job(tmp_path, pdf, adapter, config=config, rate_window_s=0.05)
+    # Keep the compressed window comfortably above checkpoint I/O and scheduler jitter.
+    report = run_job(tmp_path, pdf, adapter, config=config, rate_window_s=0.5)
     assert report.status == "completed"
     assert len(adapter.started_at) == 3
-    assert all(right - left >= 0.04 for left, right in zip(adapter.started_at, adapter.started_at[1:]))
+    assert all(right - left >= 0.4 for left, right in zip(adapter.started_at, adapter.started_at[1:]))
 
 
 @pytest.mark.parametrize(("rpm", "tpm"), [(1, 100), (60, 20)])

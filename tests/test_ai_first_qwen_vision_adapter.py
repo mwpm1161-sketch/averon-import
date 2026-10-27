@@ -116,9 +116,10 @@ def _response(
 
 
 class FakeTransport:
-    def __init__(self, handler=None, *, delay_s=0.0):
+    def __init__(self, handler=None, *, delay_s=0.0, request_barrier=None):
         self.handler = handler
         self.delay_s = delay_s
+        self.request_barrier = request_barrier
         self.calls = []
         self.started_pages = []
         self.started_at = []
@@ -143,6 +144,8 @@ class FakeTransport:
             self.max_active = max(self.max_active, self.active)
             self.started_event.set()
         try:
+            if self.request_barrier is not None:
+                self.request_barrier.wait(timeout=3)
             if self.delay_s:
                 time.sleep(self.delay_s)
             if self.handler is None:
@@ -241,7 +244,7 @@ def _make_orchestrator(pdf, adapter, config, checkpoint_dir, *, progress=None, r
 
 def test_thirty_page_pdf_runs_offline_at_parallelism_three_and_keeps_order(tmp_path):
     pdf = _make_pdf(tmp_path / "synthetic-30.pdf", 30)
-    transport = FakeTransport(delay_s=0.01)
+    transport = FakeTransport(request_barrier=threading.Barrier(3))
     adapter = _adapter(transport)
     config = _orchestration_config()
     report = asyncio.run(_make_orchestrator(pdf, adapter, config, tmp_path / "checkpoint").run(pdf))

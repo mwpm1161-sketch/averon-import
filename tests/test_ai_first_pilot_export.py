@@ -85,10 +85,13 @@ def _fixture(*, issue: bool = False):
             severity="review", page_number=1, record_ids=[parent.id], detail="synthetic fixture",
         )]})
     review = confirm_page_complete(draft, review, 1, reviewer_id="synthetic-reviewer")
-    report = {"pages": [
-        {"page_number": 1, "state": "completed"},
-        {"page_number": 2, "state": "pending"},
-    ]}
+    report = {
+        "adapter": {"provider_id": "offline_synthetic", "model_id": "fake_vision"},
+        "pages": [
+            {"page_number": 1, "state": "completed"},
+            {"page_number": 2, "state": "pending"},
+        ],
+    }
     return draft, review, report, parent, section, component
 
 
@@ -298,12 +301,68 @@ def test_ocr_values_are_written_as_text_and_not_excel_formulas():
     assert positions.cell(5, name_column).data_type == "s"
 
 
-def test_export_refuses_excel_cell_overflow_without_truncating_source_text():
+def test_32767_character_value_remains_in_ordinary_workbook_cell():
+    draft, review, report, parent, *_ = _fixture()
+    value = "я" * 32767
+    parent.raw_cells[1] = parent.raw_cells[1].model_copy(update={"raw_value": value})
+    content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
+    workbook = load_workbook(BytesIO(content), data_only=False)
+    assert "Длинные значения" not in workbook.sheetnames
+    source_sheet = workbook["P001-T001"]
+    assert any(cell.value == value for row in source_sheet.iter_rows() for cell in row)
+    assert all(cell.data_type == "s" for row in source_sheet.iter_rows() for cell in row if cell.value == value)
+
+
+def test_32768_character_value_is_losslessly_chunked_as_text():
+    draft, review, report, parent, *_ = _fixture()
+    value = "=" + "x" * 32767
+    assert len(value) == 32768
+    parent.raw_cells[1] = parent.raw_cells[1].model_copy(update={"raw_value": value})
+    content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
+    workbook = load_workbook(BytesIO(content), data_only=False)
+    assert "Длинные значения" in workbook.sheetnames
+
+    source_sheet = workbook["P001-T001"]
+    marker = next(
+        cell for row in source_sheet.iter_rows() for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("Длинный текст · запись ")
+    )
+    assert marker.hyperlink is not None
+    assert marker.data_type == "s"
+
+    long_sheet = workbook["Длинные значения"]
+    parts = [
+        row for row in long_sheet.iter_rows(min_row=5, values_only=True)
+        if row[1] == "P001-T001" and row[2] == marker.coordinate
+    ]
+    parts.sort(key=lambda row: row[3])
+    assert parts
+    assert [int(row[3]) for row in parts] == list(range(1, len(parts) + 1))
+    assert all(int(row[4]) == len(parts) for row in parts)
+    assert "".join(row[5] for row in parts) == value
+    assert all(len(row[5]) <= 32767 for row in parts)
+    assert all(long_sheet.cell(row_number, 6).data_type == "s" for row_number in range(5, long_sheet.max_row + 1))
+    assert not any(cell.data_type == "f" for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row)
+
+
+def test_export_source_label_comes_from_saved_adapter_or_falls_back_neutrally():
     draft, review, report, *_ = _fixture()
-    row = draft.pages[0].tables[0].rows[0]
-    row.raw_cells[1] = row.raw_cells[1].model_copy(update={"raw_value":"x" * 32768})
-    with pytest.raises(PilotExportError, match="export_cell_limit_exceeded"):
-        build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
+    synthetic = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
+    )), data_only=False)
+    assert synthetic["Проверенные позиции"]["A1"].value.startswith("ТЕСТ — AI-first Синтетический тест.")
+
+    report["adapter"] = {"provider_id": "yandex_ai_studio", "model_id": "qwen_vision"}
+    qwen = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
+    )), data_only=False)
+    assert qwen["Проверенные позиции"]["A1"].value.startswith("ТЕСТ — AI-first Qwen Vision.")
+
+    report["adapter"] = {"provider_id": "unrecognized", "model_id": "unknown"}
+    unknown = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
+    )), data_only=False)
+    assert unknown["Проверенные позиции"]["A1"].value.startswith("ТЕСТ — AI-first Источник распознавания не определён.")
 
 
 def test_large_model_payload_is_chunked_without_breaking_row_review_export():

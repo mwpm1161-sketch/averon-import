@@ -311,14 +311,15 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
     assert preview_data["verified_position_count"] == workbook["Проверенные позиции"].max_row - 4
 
 
-def test_pilot_export_reports_excel_cell_limit_after_admission_preview(ai_first_client):
+def test_pilot_export_chunks_long_source_text_after_admission_preview(ai_first_client):
     main, client = ai_first_client
     workspace = _make_document(main, 1)
     _start_fake(client, workspace.document_id)
     path = f"/api/documents/{workspace.document_id}/ai-first"
     store, draft, _review, _report = main._ai_first_read_state(workspace)
+    original_value = "=" + "x" * 32767
     row = draft.pages[0].tables[0].rows[0]
-    row.raw_cells[0] = row.raw_cells[0].model_copy(update={"raw_value":"x" * 32768})
+    row.raw_cells[0] = row.raw_cells[0].model_copy(update={"raw_value": original_value})
     store.write("transcription.json", draft.model_dump(mode="json"))
 
     preview = client.post(f"{path}/pilot-export/preview", json={"page_numbers":[1]})
@@ -326,10 +327,42 @@ def test_pilot_export_reports_excel_cell_limit_after_admission_preview(ai_first_
     assert preview.json()["total_row_count"] == 2
 
     response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
+    assert response.status_code == 200, response.text
+    workbook = load_workbook(BytesIO(response.content), data_only=False)
+    assert "Длинные значения" in workbook.sheetnames
+    source_sheet = workbook["P001-T001"]
+    marker = next(
+        cell for row in source_sheet.iter_rows() for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("Длинный текст · запись ")
+    )
+    parts = [
+        row for row in workbook["Длинные значения"].iter_rows(min_row=5, values_only=True)
+        if row[1] == "P001-T001" and row[2] == marker.coordinate
+    ]
+    parts.sort(key=lambda row: row[3])
+    assert "".join(row[5] for row in parts) == original_value
+    assert all(cell.data_type != "f" for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row)
+
+
+@pytest.mark.parametrize("error_code", ["export_cell_limit_exceeded", "export_long_text_overflow_exceeded"])
+def test_pilot_export_refusal_explains_source_value_remains_in_export(ai_first_client, monkeypatch, error_code):
+    from averon_import.services.ai_first.pilot_export import PilotExportError
+
+    main, client = ai_first_client
+    workspace = _make_document(main, 1)
+    _start_fake(client, workspace.document_id)
+    path = f"/api/documents/{workspace.document_id}/ai-first"
+
+    def reject_export(*args, **kwargs):
+        raise PilotExportError(error_code)
+
+    monkeypatch.setattr(main, "build_ai_first_pilot_xlsx", reject_export)
+    response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "export_cell_limit_exceeded"
-    assert "32 767" in response.json()["detail"]["message"]
-    assert "не сокращён" in response.json()["detail"]["message"]
+    detail = response.json()["detail"]
+    assert detail["code"] == error_code
+    assert "исходный OCR-текст" in detail["message"]
+    assert "исправление только проверенного значения не удалит" in detail["message"]
 
 
 def test_ai_first_locator_returns_only_safe_no_match_status_for_fake_page(ai_first_client):
