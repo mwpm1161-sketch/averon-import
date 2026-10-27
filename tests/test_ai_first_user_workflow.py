@@ -304,11 +304,11 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
     assert response.status_code == 200, response.text
     assert not workspace.result_path.exists()
     workbook = load_workbook(BytesIO(response.content), data_only=False)
-    assert {"Проверенные позиции", "Все распознанные строки", "Охват страниц", "Исходная структура"} <= set(workbook.sheetnames)
-    assert workbook["Проверенные позиции"].max_row == 5
+    assert {"Спецификация", "Все распознанные строки", "Охват страниц", "Исходная структура"} <= set(workbook.sheetnames)
+    assert workbook["Спецификация"].max_row == 5
     assert workbook["Все распознанные строки"].max_row == 7
-    assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in workbook["Проверенные позиции"]["A2"].value
-    assert preview_data["verified_position_count"] == workbook["Проверенные позиции"].max_row - 4
+    assert workbook["Спецификация"]["A1"].value == "Тестовая выгрузка · Частичный охват"
+    assert preview_data["verified_position_count"] == workbook["Спецификация"].max_row - 4
 
 
 def test_pilot_export_chunks_long_source_text_after_admission_preview(ai_first_client):

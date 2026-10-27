@@ -13,7 +13,7 @@ import re
 from typing import Any, Iterable, Mapping, Sequence
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from averon_import.services.ai_first.contracts import AIDocumentDraft, AIReviewState
@@ -484,7 +484,7 @@ def _write_sheet(
 ) -> None:
     coverage = "Полный охват страниц документа" if set(selected_pages) == set(range(1, page_count + 1)) else "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА"
     sheet.sheet_view.showGridLines = False
-    _append_export_row(sheet, [f"ТЕСТ — AI-first {source_label}. Не является коммерческой сметой."], long_values)
+    _append_export_row(sheet, [f"Служебный лист · AI-first · {source_label}"], long_values)
     _append_export_row(sheet, [f"Документ: {document_name} · ID {document_id} · страницы {', '.join(map(str, selected_pages))} из {page_count} · {coverage}"], long_values)
     _append_export_row(sheet, [title], long_values)
     _append_export_row(sheet, header, long_values)
@@ -492,6 +492,7 @@ def _write_sheet(
         _append_export_row(sheet, detail_header, long_values)
     for values in rows:
         _append_export_row(sheet, values, long_values)
+    thin_border = Border(bottom=Side(style="hair", color="D7E0E7"))
     for row in sheet.iter_rows():
         for cell in row:
             if cell.value is not None:
@@ -502,14 +503,22 @@ def _write_sheet(
                 cell.data_type = "s"  # OCR text can never become an Excel formula.
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             if cell.row == 1:
-                cell.fill = PatternFill("solid", fgColor="FDE68A")
-                cell.font = Font(bold=True, color="7C2D12")
+                cell.fill = PatternFill("solid", fgColor="EEF3F6")
+                cell.font = Font(name="Aptos", size=10, bold=True, color="425466")
+            elif cell.row == 3:
+                cell.font = Font(name="Aptos", size=12, bold=True, color="263746")
             elif cell.row == 4:
                 cell.fill = PatternFill("solid", fgColor="1D4ED8")
-                cell.font = Font(bold=True, color="FFFFFF")
+                cell.font = Font(name="Aptos", size=10, bold=True, color="FFFFFF")
             elif detail_header is not None and cell.row == 5:
                 cell.fill = PatternFill("solid", fgColor="DBEAFE")
-                cell.font = Font(bold=True, color="1E3A8A")
+                cell.font = Font(name="Aptos", size=9, bold=True, color="1E3A8A")
+            else:
+                cell.font = Font(name="Aptos", size=9, color="263746")
+            if cell.row >= (6 if detail_header is not None else 5):
+                cell.border = thin_border
+        if row[0].row >= (6 if detail_header is not None else 5):
+            sheet.row_dimensions[row[0].row].height = 42
     sheet.freeze_panes = "A6" if detail_header is not None else "A5"
     if detail_header is None and sheet.max_row >= 4 and sheet.max_column:
         sheet.auto_filter.ref = f"A4:{get_column_letter(sheet.max_column)}{sheet.max_row}"
@@ -521,6 +530,106 @@ def _write_sheet(
             heading = sheet.cell(4, index).value or ""
             source_heading = sheet.cell(5, index).value or "" if detail_header is not None else ""
             sheet.column_dimensions[get_column_letter(index)].width = min(42, max(14, len(str(heading)) + 2, min(40, len(str(source_heading)) + 2)))
+
+
+def _specification_width(header: object, values: Sequence[object]) -> int:
+    header_lines = str(header or "").splitlines() or [""]
+    longest = max((len(line) for line in header_lines), default=0)
+    for value in values[:50]:
+        lines = str(value or "").splitlines() or [""]
+        longest = max(longest, min(max(map(len, lines), default=0), 52))
+    return min(48, max(13, longest + 3))
+
+
+def _write_specification_sheet(
+    sheet,
+    *,
+    columns: Sequence[tuple[int, str]],
+    rows: Sequence[dict[str, Any]],
+    title: str,
+    metadata: str,
+    scope_label: str,
+    show_scope_mark: bool,
+    long_values: list[dict[str, Any]],
+) -> None:
+    """Write only admitted rows using their exact source-table columns."""
+    if len(columns) > MAX_EXCEL_COLUMNS:
+        raise PilotExportError("export_column_limit_exceeded")
+    sheet.sheet_view.showGridLines = False
+    sheet.sheet_properties.tabColor = "39766A" if show_scope_mark else "6F9B90"
+    column_count = max(len(columns), 1)
+    _append_export_row(sheet, [scope_label if show_scope_mark else "Дополнительная таблица · тестовый режим"], long_values)
+    _append_export_row(sheet, [metadata], long_values)
+    _append_export_row(sheet, [title], long_values)
+    _append_export_row(sheet, [header for _, header in columns] if columns else [""], long_values)
+
+    for row in rows:
+        current = {int(item["column_index"]): item["value"] for item in row["current_values"]}
+        _append_export_row(sheet, [current.get(index, "") for index, _ in columns] if columns else [""], long_values)
+    if not rows:
+        _append_export_row(sheet, ["Нет позиций, допущенных в проверенную спецификацию."] + [""] * (column_count - 1), long_values)
+
+    rule = Side(style="thin", color="DCE4E8")
+    body_font = Font(name="Aptos", size=10, color="253746")
+    for row in sheet.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.value = str(cell.value)
+                cell.data_type = "s"
+            cell.border = Border(bottom=rule)
+            cell.alignment = Alignment(
+                vertical="center" if cell.row <= 3 else "top",
+                wrap_text=cell.row >= 4,
+            )
+            cell.font = body_font
+            if cell.row == 1:
+                cell.fill = PatternFill("solid", fgColor="EAF2F0")
+                cell.font = Font(name="Aptos", size=10, bold=True, color="275C53")
+            elif cell.row == 2:
+                cell.font = Font(name="Aptos", size=9, color="5D6B75")
+            elif cell.row == 3:
+                cell.font = Font(name="Aptos", size=12, bold=True, color="263746")
+            elif cell.row == 4:
+                cell.fill = PatternFill("solid", fgColor="315F72")
+                cell.font = Font(name="Aptos", size=10, bold=True, color="FFFFFF")
+            elif cell.row == 5 and not rows:
+                cell.fill = PatternFill("solid", fgColor="F2F5F6")
+                cell.font = Font(name="Aptos", size=10, italic=True, color="52616B")
+            elif cell.row >= 5:
+                cell.font = body_font
+
+    sheet.row_dimensions[1].height = 23
+    sheet.row_dimensions[2].height = 20
+    sheet.row_dimensions[3].height = 24
+    header_lines = max((len(str(header or "").splitlines()) for _, header in columns), default=1)
+    sheet.row_dimensions[4].height = min(58, max(32, 16 * header_lines + 8))
+    for index, (source_index, header) in enumerate(columns, start=1):
+        sample_values = [
+            next((item["value"] for item in row["current_values"] if int(item["column_index"]) == source_index), "")
+            for row in rows
+        ]
+        sheet.column_dimensions[get_column_letter(index)].width = _specification_width(header, sample_values)
+    if not columns:
+        sheet.column_dimensions["A"].width = 24
+    if not rows:
+        sheet.row_dimensions[5].height = 28
+    else:
+        for row_number, row in enumerate(rows, start=5):
+            current = {int(item["column_index"]): item["value"] for item in row["current_values"]}
+            max_lines = 1
+            for index, _ in columns:
+                width = sheet.column_dimensions[get_column_letter(index + 1)].width or 13
+                text = str(current.get(index, "") or "")
+                lines = sum(max(1, (len(part) + int(width) - 1) // int(width)) for part in text.splitlines() or [""])
+                max_lines = max(max_lines, lines)
+            sheet.row_dimensions[row_number].height = min(72, max(28, 14 * max_lines + 6))
+    sheet.freeze_panes = "A5"
+    sheet.print_title_rows = "1:4"
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    sheet.page_setup.fitToWidth = 1
+    sheet.page_setup.fitToHeight = 0
+    last_data_row = max(4, 4 + len(rows))
+    sheet.auto_filter.ref = f"A4:{get_column_letter(column_count)}{last_data_row}"
 
 
 def _source_sheet_name(page_number: int, table_index: int | str) -> str:
@@ -604,7 +713,97 @@ def build_ai_first_pilot_xlsx(
 
     workbook = Workbook()
     positions = workbook.active
-    positions.title = "Проверенные позиции"
+    positions.title = "Спецификация"
+    scope_label = "Тестовая выгрузка · Полный охват" if set(selected) == expected else "Тестовая выгрузка · Частичный охват"
+    specification_groups: list[dict[str, Any]] = []
+
+    # The user-facing specification keeps each physical table's own schema.
+    # Only rows admitted by the existing Human Review checks are shown here.
+    for page_number in selected:
+        page = pages_by_number.get(page_number)
+        if page is None:
+            continue
+        for table in sorted(page.tables, key=lambda item: (item.index, item.id)):
+            table_rows = sorted(
+                (row for row in selected_rows if not row["manual"] and row["table_id"] == table.id),
+                key=lambda row: row["row_index"],
+            )
+            if not table_rows:
+                continue
+            source_headers = {column.index: column.raw_header or "" for column in table.columns}
+            for row in table_rows:
+                for item in row["current_values"]:
+                    source_headers.setdefault(int(item["column_index"]), "")
+            specification_groups.append({
+                "page": page_number, "table_index": table.index + 1,
+                "columns": sorted(source_headers.items()), "rows": table_rows,
+            })
+
+    for page_number in selected:
+        manual_rows = sorted(
+            (row for row in selected_rows if row["manual"] and row["page"] == page_number),
+            key=lambda row: row["row_index"],
+        )
+        if not manual_rows:
+            continue
+        headers: dict[int, str] = {}
+        for row in manual_rows:
+            for item in row["source_values"]:
+                headers.setdefault(int(item["column_index"]), str(item["header"] or ""))
+        specification_groups.append({"page": page_number, "table_index": None, "columns": sorted(headers.items()), "rows": manual_rows})
+
+    if not specification_groups:
+        # Keep a useful, clearly empty first sheet without inventing data or
+        # promoting unresolved rows into the verified specification.
+        for page_number in selected:
+            page = pages_by_number.get(page_number)
+            if page and page.tables:
+                table = sorted(page.tables, key=lambda item: (item.index, item.id))[0]
+                headers = {column.index: column.raw_header or "" for column in table.columns}
+                for row in all_rows:
+                    if not row["manual"] and row["table_id"] == table.id:
+                        for item in row["source_values"]:
+                            headers.setdefault(int(item["column_index"]), "")
+                specification_groups.append({"page": page_number, "table_index": table.index + 1, "columns": sorted(headers.items()), "rows": []})
+                break
+        if not specification_groups and all_rows:
+            row = all_rows[0]
+            headers = {int(item["column_index"]): str(item["header"] or "") for item in row["source_values"]}
+            specification_groups.append({"page": row["page"], "table_index": None, "columns": sorted(headers.items()), "rows": []})
+
+    for ordinal, group in enumerate(specification_groups, start=1):
+        sheet = positions if ordinal == 1 else workbook.create_sheet(f"Спецификация {ordinal}")
+        if ordinal == 1:
+            metadata = f"Документ: {filename} · страница {group['page']}"
+            if group["table_index"] is not None:
+                metadata += f" · таблица {group['table_index']}"
+            title = "Подтверждённые значения по исходной таблице"
+        else:
+            metadata = f"Продолжение · {filename} · страница {group['page']}"
+            if group["table_index"] is not None:
+                metadata += f" · таблица {group['table_index']}"
+            title = "Подтверждённые значения по отдельной исходной таблице"
+        _write_specification_sheet(
+            sheet, columns=group["columns"], rows=group["rows"], title=title,
+            metadata=metadata, scope_label=scope_label, show_scope_mark=(ordinal == 1),
+            long_values=long_values,
+        )
+
+    information = workbook.create_sheet("Информация")
+    information_rows = [
+        ["Назначение", "Тестовая выгрузка для оценки AI-first распознавания; не коммерческая смета."],
+        ["Охват", f"Страницы {', '.join(map(str, selected))} из {page_count}; {'полный' if set(selected) == expected else 'частичный'} охват документа."],
+        ["Лист «Спецификация»", f"{len(selected_rows)} строк, прошедших прежние условия Human Review для проверенных самостоятельных позиций."],
+        ["Другие строки", "Заголовки, разделы, компоненты, неизвестные роли и неподтверждённые строки сохранены в листах аудита и исходной структуры; роли не переопределялись."],
+        ["Исправления", "На листах аудита отдельно сохранены исходные OCR-значения и текущие значения Human Review."],
+        ["Ограничения", "Экспорт не меняет допуск строк, подтверждение полноты страниц или ограничения коммерческого экспорта и sourcing."],
+    ]
+    _write_sheet(
+        information, "Информация о тестовой выгрузке", filename, draft.source_document_id,
+        selected, page_count, ["Раздел", "Сведения"], information_rows,
+        widths=[30, 100], source_label=source_label, long_values=long_values,
+    )
+
     source_locations: dict[str, tuple[str, int]] = {}
     # Keep each physical table on its own worksheet. Heterogeneous tables never
     # share a synthetic set of columns, and source identity is page/table/index.
@@ -651,29 +850,6 @@ def build_ai_first_pilot_xlsx(
         )
         source_locations.update({record_id: (name, row_number) for record_id, row_number in locations.items()})
 
-    position_header = ["ТЕСТ", "Документ", "ID документа", "Страница", "Таблица", "Строка источника", "Статус проверки", "Роль", "Родитель компонента"]
-    for field, label in CANONICAL_FIELDS:
-        position_header.extend([f"{label} — исходно", f"{label} — проверено"])
-    position_header.extend(["Лист исходной таблицы", "Строка на листе исходной таблицы", "ID строки"])
-    position_rows = []
-    for row in selected_rows:
-        grouped = _values_by_field(row)
-        values: list[object] = ["ТЕСТ", filename, draft.source_document_id, row["page"], row["table_index"], row["row_index"], row["review_status"], ROLE_LABELS.get(row["role"], row["role"]), row["parent_record_id"]]
-        for field, _label in CANONICAL_FIELDS:
-            mapped = grouped.get(field, [])
-            if len(mapped) == 1:
-                values.extend([mapped[0]["raw"], mapped[0]["current"]])
-            else:
-                values.extend(["" if not mapped else "Неоднозначное сопоставление", "" if not mapped else "Неоднозначное сопоставление"])
-        source_sheet, source_row = source_locations.get(row["id"], ("", ""))
-        values.extend([source_sheet, source_row, row["id"]])
-        position_rows.append(values)
-    _write_sheet(
-        positions, "Подтверждённые самостоятельные позиции", filename, draft.source_document_id,
-        selected, page_count, position_header, position_rows,
-        source_label=source_label, long_values=long_values,
-    )
-
     all_sheet = workbook.create_sheet("Все распознанные строки")
     all_header = [
         "ТЕСТ", "Документ", "ID документа", "Страница", "Таблица", "Строка источника", "Тип по модели",
@@ -700,18 +876,14 @@ def build_ai_first_pilot_xlsx(
         draft.source_document_id, selected, page_count, all_header, all_data,
         source_label=source_label, long_values=long_values,
     )
-    for sheet, source_column_name, row_column_name in (
-        (positions, "Лист исходной таблицы", "Строка на листе исходной таблицы"),
-        (all_sheet, "Лист исходной таблицы", "Строка на листе исходной таблицы"),
-    ):
-        headers = {sheet.cell(4, column).value: column for column in range(1, sheet.max_column + 1)}
-        for row_number in range(5, sheet.max_row + 1):
-            target_name = sheet.cell(row_number, headers[source_column_name]).value
-            target_row = sheet.cell(row_number, headers[row_column_name]).value
-            if target_name and target_row:
-                link = sheet.cell(row_number, headers[source_column_name])
-                link.hyperlink = f"#'{target_name}'!A{target_row}"
-                link.style = "Hyperlink"
+    all_headers = {all_sheet.cell(4, column).value: column for column in range(1, all_sheet.max_column + 1)}
+    for row_number in range(5, all_sheet.max_row + 1):
+        target_name = all_sheet.cell(row_number, all_headers["Лист исходной таблицы"]).value
+        target_row = all_sheet.cell(row_number, all_headers["Строка на листе исходной таблицы"]).value
+        if target_name and target_row:
+            link = all_sheet.cell(row_number, all_headers["Лист исходной таблицы"])
+            link.hyperlink = f"#'{target_name}'!A{target_row}"
+            link.style = "Hyperlink"
 
     coverage_sheet = workbook.create_sheet("Охват страниц")
     page_errors = _page_report_errors(report)

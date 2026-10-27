@@ -132,19 +132,24 @@ def test_pilot_xlsx_separates_verified_standalone_rows_and_preserves_all_source_
         draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
     )
     book = load_workbook(BytesIO(content), data_only=False)
-    positions = book["Проверенные позиции"]
+    positions = book["Спецификация"]
     all_rows = book["Все распознанные строки"]
 
-    assert positions.max_row == 5  # three workbook headings plus one verified row
-    headers = {positions.cell(4, column).value: column for column in range(1, positions.max_column + 1)}
-    values = [positions.cell(5, column).value for column in range(1, positions.max_column + 1)]
-    assert values[headers["Количество — исходно"] - 1] == "2"
-    assert values[headers["Количество — проверено"] - 1] == "3"
-    assert values[headers["Наименование — исходно"] - 1] == "Синтетический насос"
-    assert values[headers["Наименование — проверено"] - 1] == "Синтетический насос"
-    assert values[headers["Статус проверки"] - 1] == "Исправлена и подтверждена"
-    assert positions["A1"].value.startswith("ТЕСТ —")
-    assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in positions["A2"].value
+    assert book.sheetnames[0] == "Спецификация"
+    assert positions.max_row == 5  # compact metadata, source headers, one admitted row
+    assert positions.max_column == len(HEADERS)
+    assert [positions.cell(4, column).value for column in range(1, positions.max_column + 1)] == HEADERS
+    assert [positions.cell(5, column).value for column in range(1, positions.max_column + 1)] == [
+        "1", "Синтетический насос", "М-1", "Примерный завод", "SYN-1", "шт.", "3", "Исходная заметка",
+    ]
+    assert positions["A1"].value == "Тестовая выгрузка · Частичный охват"
+    assert positions.freeze_panes == "A5"
+    assert positions.auto_filter.ref == "A4:H5"
+    assert "UUID" not in " ".join(str(positions.cell(4, column).value or "") for column in range(1, positions.max_column + 1))
+    assert "ID строки" not in " ".join(str(positions.cell(4, column).value or "") for column in range(1, positions.max_column + 1))
+    information = book["Информация"]
+    info_text = " ".join(str(cell.value or "") for row in information.iter_rows() for cell in row)
+    assert "не коммерческая смета" in info_text
     source = book["P001-T001"]
     assert source.max_column == 6 + len(HEADERS) * 2
     assert [source.cell(5, 7 + index * 2).value or "" for index in range(len(HEADERS))] == HEADERS
@@ -180,7 +185,7 @@ def test_unclassified_rows_and_unresolved_issues_never_enter_verified_positions(
     # An unresolved row-level issue keeps even a manually confirmed row out.
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
-    assert book["Проверенные позиции"].max_row == 4
+    assert book["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
     all_rows = book["Все распознанные строки"]
     headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
     parent_row = next(row for row in range(5, all_rows.max_row + 1) if all_rows.cell(row, headers["ID строки"]).value == parent.id)
@@ -204,7 +209,7 @@ def test_resolved_row_level_visual_issue_can_be_human_verified():
     review = resolve_review_issue(draft, review, issue.id, reviewer_id="synthetic-reviewer", detail="Сверено с PDF")
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
     workbook = load_workbook(BytesIO(content), data_only=False)
-    assert workbook["Проверенные позиции"].max_row == 5
+    assert workbook["Спецификация"].max_row == 5
 
 
 def test_role_without_human_decision_is_exported_as_unverified_only():
@@ -213,7 +218,7 @@ def test_role_without_human_decision_is_exported_as_unverified_only():
     review.decisions[parent.id] = review.decisions[parent.id].model_copy(update={"active": False})
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
-    assert book["Проверенные позиции"].max_row == 4
+    assert book["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
     all_rows = book["Все распознанные строки"]
     headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
     parent_row = next(row for row in range(5, all_rows.max_row + 1) if all_rows.cell(row, headers["ID строки"]).value == parent.id)
@@ -228,7 +233,7 @@ def test_invalidated_role_change_keeps_saved_values_visible_but_not_verified():
     })
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
-    assert book["Проверенные позиции"].max_row == 4
+    assert book["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
     all_rows = book["Все распознанные строки"]
     headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
     parent_row = next(row for row in range(5, all_rows.max_row + 1) if all_rows.cell(row, headers["ID строки"]).value == parent.id)
@@ -262,10 +267,10 @@ def test_selected_page_export_does_not_require_all_28_document_pages():
         draft, review, report, page_numbers=[1], document_name="synthetic-28-pages.pdf",
     )
     workbook = load_workbook(BytesIO(content), data_only=False)
-    positions = workbook["Проверенные позиции"]
+    positions = workbook["Спецификация"]
     coverage = workbook["Охват страниц"]
     assert positions.max_row == 5
-    assert "ЧАСТИЧНЫЙ ОХВАТ ДОКУМЕНТА" in positions["A2"].value
+    assert positions["A1"].value == "Тестовая выгрузка · Частичный охват"
     assert coverage.max_row == 5
     assert coverage.cell(5, 1).value == "1"
 
@@ -276,7 +281,7 @@ def test_ambiguous_duplicate_column_headers_do_not_enter_verified_positions():
     table.columns[7] = table.columns[7].model_copy(update={"raw_header":"Количество"})
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="synthetic.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
-    assert book["Проверенные позиции"].max_row == 4
+    assert book["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
     all_rows = book["Все распознанные строки"]
     headers = {all_rows.cell(4, column).value: column for column in range(1, all_rows.max_column + 1)}
     parent_row = next(row for row in range(5, all_rows.max_row + 1) if all_rows.cell(row, headers["ID строки"]).value == parent.id)
@@ -294,9 +299,8 @@ def test_ocr_values_are_written_as_text_and_not_excel_formulas():
     assert source_cell.value.startswith("=HYPERLINK")
     assert source_cell.data_type == "s"
 
-    positions = book["Проверенные позиции"]
-    position_headers = {positions.cell(4, column).value: column for column in range(1, positions.max_column + 1)}
-    name_column = position_headers["Наименование — исходно"]
+    positions = book["Спецификация"]
+    name_column = HEADERS.index("Наименование") + 1
     assert positions.cell(5, name_column).value.startswith("=HYPERLINK")
     assert positions.cell(5, name_column).data_type == "s"
 
@@ -350,19 +354,19 @@ def test_export_source_label_comes_from_saved_adapter_or_falls_back_neutrally():
     synthetic = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
         draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
     )), data_only=False)
-    assert synthetic["Проверенные позиции"]["A1"].value.startswith("ТЕСТ — AI-first Синтетический тест.")
+    assert "Синтетический тест" in synthetic["Информация"]["A1"].value
 
     report["adapter"] = {"provider_id": "yandex_ai_studio", "model_id": "qwen_vision"}
     qwen = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
         draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
     )), data_only=False)
-    assert qwen["Проверенные позиции"]["A1"].value.startswith("ТЕСТ — AI-first Qwen Vision.")
+    assert "Qwen Vision" in qwen["Информация"]["A1"].value
 
     report["adapter"] = {"provider_id": "unrecognized", "model_id": "unknown"}
     unknown = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
         draft, review, report, page_numbers=[1], document_name="synthetic.pdf",
     )), data_only=False)
-    assert unknown["Проверенные позиции"]["A1"].value.startswith("ТЕСТ — AI-first Источник распознавания не определён.")
+    assert "Источник распознавания не определён" in unknown["Информация"]["A1"].value
 
 
 def test_large_model_payload_is_chunked_without_breaking_row_review_export():
@@ -395,10 +399,89 @@ def test_page16_nine_column_shape_remains_visible_without_template_mapping():
     # The compound source field remains whole, rather than being guessed into fields.
     assert source.cell(5, 7 + 2 * 2).value == PAGE16_HEADERS[2]
     assert source.cell(6, 7 + 2 * 2).value == values[2]
-    positions = book["Проверенные позиции"]
-    assert positions.max_row == 5
-    position_headers = {positions.cell(4, column).value: column for column in range(1, positions.max_column + 1)}
-    assert positions.cell(5, position_headers["Наименование — исходно"]).value in (None, "")  # no guessed canonical name
+    positions = book["Спецификация"]
+    assert positions.max_column == 9
+    assert [positions.cell(4, column).value for column in range(1, 10)] == PAGE16_HEADERS
+    assert positions.cell(5, 2).value == "SYNTHETIC-VALUE-2"
+    assert positions.cell(5, 3).value == "SYNTHETIC-VALUE-3"
+
+
+def test_page16_nine_column_export_has_twenty_three_verified_rows_and_preserves_audit():
+    table_id = "synthetic-page16-table"
+    values_by_row = [
+        [str(index + 1), f"Synthetic item {index + 1:02d}", f"Type / mark {index + 1:02d}",
+         f"Synthetic maker {index + 1:02d}", f"SYN-ART-{index + 1:03d}", "pcs", str(index + 2),
+         f"{index + 1}.25", f"Synthetic note {index + 1:02d}"]
+        for index in range(23)
+    ]
+    rows = [_row(1, table_id, index, values) for index, values in enumerate(values_by_row)]
+    rows.extend([
+        _row(1, table_id, 23, ["", "Section A", "", "", "", "", "", "", ""], kind="section"),
+        _row(1, table_id, 24, ["23.1", "Synthetic component", "Type C", "Maker C", "SYN-C", "pcs", "1", "0.5", "Part of set"], kind="component"),
+    ])
+    columns = [AIColumn(
+        id=f"{table_id}-column-{index}", source_document_id="synthetic-doc",
+        page_number=1, table_id=table_id, index=index, raw_header=header,
+    ) for index, header in enumerate(PAGE16_HEADERS)]
+    table = AITable(id=table_id, source_document_id="synthetic-doc", page_number=1, index=0, columns=columns, rows=rows)
+    page = AIPageExtraction(
+        source_document_id="synthetic-doc", page_number=1,
+        extraction_fingerprint="synthetic-page16-fingerprint", status="extracted", tables=[table],
+    )
+    draft = AIDocumentDraft(
+        source_document_id="synthetic-doc", revision_id="synthetic-page16-revision",
+        pages=[page], expected_page_numbers=list(range(1, 29)),
+    )
+    review = new_review_state(draft)
+    for row in rows:
+        role = "standalone_item" if row.index < 23 else ("section" if row.index == 23 else "component")
+        review = record_row_role_classification(
+            draft, review, row.id, role=role,
+            parent_record_id=rows[0].id if role == "component" else None,
+            reviewer_id="synthetic-reviewer",
+        )
+        review = record_row_decision(
+            draft, review, row.id, disposition="confirmed", reviewer_id="synthetic-reviewer",
+        )
+    review = confirm_page_complete(draft, review, 1, reviewer_id="synthetic-reviewer")
+    report = {
+        "adapter": {"provider_id": "offline_synthetic", "model_id": "fake_vision"},
+        "pages": [
+            {"page_number": 1, "state": "completed"},
+            *[{"page_number": number, "state": "pending"} for number in range(2, 29)],
+        ],
+    }
+
+    workbook = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1], document_name="synthetic-page16.pdf",
+    )), data_only=False)
+    specification = workbook["Спецификация"]
+    assert workbook.sheetnames[0] == "Спецификация"
+    assert specification.max_column == 9
+    assert specification.max_row == 27
+    assert [specification.cell(4, column).value for column in range(1, 10)] == PAGE16_HEADERS
+    assert [specification.cell(5, column).value for column in range(1, 10)] == values_by_row[0]
+    assert [specification.cell(27, column).value for column in range(1, 10)] == values_by_row[22]
+    assert all(specification.cell(row, 2).value for row in range(5, 28))
+    assert specification["A1"].value == "Тестовая выгрузка · Частичный охват"
+    assert specification.freeze_panes == "A5"
+    assert specification.auto_filter.ref == "A4:I27"
+    assert all(cell.data_type != "f" for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row)
+    source = workbook["P001-T001"]
+    assert source.max_column == 6 + 9 * 2
+    assert source.max_row == 30
+    assert source.cell(29, 4).value == "Раздел"
+    assert source.cell(30, 4).value == "Компонент комплекта"
+    assert source.cell(30, 7 + 8 * 2).value == "Part of set"
+    complete_source_values = values_by_row + [
+        ["", "Section A", "", "", "", "", "", "", ""],
+        ["23.1", "Synthetic component", "Type C", "Maker C", "SYN-C", "pcs", "1", "0.5", "Part of set"],
+    ]
+    assert [
+        [(source.cell(6 + row_index, 7 + column_index * 2).value or "") for column_index in range(9)]
+        for row_index in range(25)
+    ] == complete_source_values
+    assert "Исходная структура" in workbook.sheetnames
 
 
 def test_unknown_headers_are_exported_as_ordinary_cells():
@@ -411,6 +494,9 @@ def test_unknown_headers_are_exported_as_ordinary_cells():
     sheet = book["P001-T001"]
     assert [sheet.cell(5, 7 + index * 2).value for index in range(3)] == headers
     assert [sheet.cell(6, 7 + index * 2).value for index in range(3)] == values
+    specification = book["Спецификация"]
+    assert [specification.cell(4, index).value for index in range(1, 4)] == headers
+    assert [specification.cell(5, index).value for index in range(1, 4)] == values
 
 
 def test_cell_without_column_descriptor_is_still_visible_by_source_index():
@@ -443,6 +529,9 @@ def test_blank_and_repeated_headers_keep_source_indexes_and_exact_values():
     assert visible_column_labels[2].startswith("Индекс 2 · исходно · Повтор")
     assert [sheet.cell(5, 7 + index * 2).value or "" for index in range(4)] == headers
     assert [sheet.cell(6, 7 + index * 2).value for index in range(4)] == values
+    specification = book["Спецификация"]
+    assert [specification.cell(4, index).value or "" for index in range(1, 5)] == headers
+    assert [specification.cell(5, index).value for index in range(1, 5)] == values
 
 
 def test_different_table_shapes_on_separate_pages_use_separate_sheets():
@@ -477,6 +566,19 @@ def test_different_table_shapes_on_separate_pages_use_separate_sheets():
     assert book["P002-T001"].max_column == 6 + len(headers) * 2
     assert [book["P002-T001"].cell(6, 7 + index * 2).value for index in range(2)] == ["SYN-P2-A", "SYN-P2-B"]
 
+    review = record_row_role_classification(
+        draft, review, row.id, role="standalone_item", reviewer_id="synthetic-reviewer",
+    )
+    review = record_row_decision(draft, review, row.id, disposition="confirmed", reviewer_id="synthetic-reviewer")
+    review = confirm_page_complete(draft, review, 2, reviewer_id="synthetic-reviewer")
+    workbook = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
+        draft, review, report, page_numbers=[1, 2], document_name="different-tables.pdf",
+    )), data_only=False)
+    assert workbook.sheetnames[:2] == ["Спецификация", "Спецификация 2"]
+    assert [workbook["Спецификация"].cell(4, column).value for column in range(1, len(HEADERS) + 1)] == HEADERS
+    assert [workbook["Спецификация 2"].cell(4, column).value for column in range(1, len(headers) + 1)] == headers
+    assert [workbook["Спецификация 2"].cell(5, column).value for column in range(1, len(headers) + 1)] == ["SYN-P2-A", "SYN-P2-B"]
+
 
 def test_unresolved_table_level_continuation_issue_blocks_confirmed_positions():
     from averon_import.services.ai_first.contracts import AIReviewIssue
@@ -490,7 +592,7 @@ def test_unresolved_table_level_continuation_issue_blocks_confirmed_positions():
     draft.pages[0].issues.append(issue)
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="table-issue.pdf")
     book = load_workbook(BytesIO(content), data_only=False)
-    assert book["Проверенные позиции"].max_row == 4
+    assert book["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
     summary = book["Все распознанные строки"]
     headers = {summary.cell(4, column).value: column for column in range(1, summary.max_column + 1)}
     parent_row = next(row for row in range(5, summary.max_row + 1) if summary.cell(row, headers["ID строки"]).value == parent.id)
@@ -498,7 +600,7 @@ def test_unresolved_table_level_continuation_issue_blocks_confirmed_positions():
 
     review = resolve_review_issue(draft, review, issue.id, reviewer_id="synthetic-reviewer", detail="Проверено вручную")
     content = build_ai_first_pilot_xlsx(draft, review, report, page_numbers=[1], document_name="table-issue.pdf")
-    assert load_workbook(BytesIO(content), data_only=False)["Проверенные позиции"].max_row == 5
+    assert load_workbook(BytesIO(content), data_only=False)["Спецификация"].max_row == 5
 
 
 def test_saved_correction_is_visible_but_not_in_confirmed_positions_until_confirmed():
@@ -511,7 +613,7 @@ def test_saved_correction_is_visible_but_not_in_confirmed_positions_until_confir
     workbook = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
         draft, review, report, page_numbers=[1], document_name="saved-correction.pdf",
     )), data_only=False)
-    assert workbook["Проверенные позиции"].max_row == 4
+    assert workbook["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
     summary = workbook["Все распознанные строки"]
     headers = {summary.cell(4, column).value: column for column in range(1, summary.max_column + 1)}
     exported_parent = next(row for row in range(5, summary.max_row + 1) if summary.cell(row, headers["ID строки"]).value == parent.id)
@@ -522,4 +624,4 @@ def test_saved_correction_is_visible_but_not_in_confirmed_positions_until_confir
     workbook = load_workbook(BytesIO(build_ai_first_pilot_xlsx(
         draft, review, report, page_numbers=[1], document_name="saved-correction.pdf",
     )), data_only=False)
-    assert workbook["Проверенные позиции"].max_row == 5
+    assert workbook["Спецификация"].max_row == 5
