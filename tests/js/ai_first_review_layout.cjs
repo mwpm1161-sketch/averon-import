@@ -109,6 +109,17 @@ assert(source.includes("const headers = columns.map"),"every source column is st
 assert(source.includes("const cells = columns.map"),"each source cell remains available in the table");
 assert.match(css,/\.ai-first-table-scroll\s*\{[^}]*min-width:0[^}]*overflow:auto/s,"horizontal scroll container may shrink inside the split pane");
 assert.match(css,/\.ai-first-table\s*\{[^}]*width:max-content[^}]*min-width:100%/s,"wide source columns remain intact and scrollable");
+assert.match(css,/\.ai-first-table\s*\{[^}]*--ai-first-selector-column-width:42px[^}]*border-collapse:separate[^}]*border-spacing:0/s,"AI-first table uses a deterministic selector-column width and stable cell geometry");
+assert.match(css,/\.ai-first-table th\.selector,\.ai-first-table td\.selector\s*\{[^}]*position:sticky;[^}]*left:0;[^}]*box-sizing:border-box;[^}]*width:var\(--ai-first-selector-column-width\)/s,"row selectors stay pinned at an exact opaque 42px width");
+assert.match(css,/\.ai-first-table th\.selector,\.ai-first-table td\.selector\s*\{[^}]*background-color:#fafbfc;[^}]*background-clip:padding-box/s,"sticky selector cells have an opaque background that covers scrolled content");
+assert.match(css,/\.ai-first-table th:nth-child\(2\),\.ai-first-table td:nth-child\(2\)\s*\{[^}]*position:sticky;[^}]*left:var\(--ai-first-selector-column-width\)/s,"the row-label column starts exactly after the selector column");
+assert.match(css,/\.ai-first-table th:nth-child\(2\),\.ai-first-table td:nth-child\(2\)\s*\{[^}]*background-color:#fff;[^}]*background-clip:padding-box/s,"sticky row labels have an opaque background that covers scrolled content");
+assert.match(css,/\.ai-first-table td\.selector\s*\{[^}]*z-index:5/s,"sticky selector cells paint above scrolled source cells");
+assert.match(css,/\.ai-first-table td:nth-child\(2\)\s*\{[^}]*z-index:6/s,"sticky row labels have a stable body stacking layer");
+assert.match(css,/\.ai-first-table th\.selector\s*\{[^}]*z-index:11/s,"the selector header is the top-left table corner layer");
+assert.match(css,/\.ai-first-table th:nth-child\(2\)\s*\{[^}]*z-index:10/s,"the row-label header layers below the selector corner and above other headers");
+assert.match(css,/\.ai-first-table tr\.is-excluded\s*\{[^}]*opacity:1/s,"excluded rows do not make sticky backgrounds translucent");
+assert.match(css,/\.ai-first-table-scroll\s*\{[^}]*isolation:isolate/s,"the scroll viewport contains sticky-column stacking contexts");
 assert.match(css,/\.ai-first-row-inspector:not\(\[hidden\]\)\s*\{[^}]*position:absolute/s,"the selected-row editor overlays the table pane instead of shrinking it");
 assert.match(css,/\.ai-first-inspector-values\s*\{[^}]*max-height:none[^}]*overflow:visible/s,"row fields share the editor scroll instead of a nested micro-scroll");
 assert.match(css,/@media \(max-width:760px\)[\s\S]*\.ai-first-review-workspace/,"layout adapts to a narrow screen");
