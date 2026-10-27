@@ -308,15 +308,20 @@
 
       <section id="ai-first-review-view" class="view review-view ai-first-review-view">
         <div class="ai-first-review-toolbar">
-          <div><span class="eyebrow">Проверка распознавания</span><h2>Сверьте позиции с PDF</h2><p id="ai-first-review-status" role="status" aria-live="polite"></p></div>
+          <div><span class="eyebrow">AI-first · проверка</span><h2>Проверка распознавания</h2><p id="ai-first-review-status" role="status" aria-live="polite"></p></div>
           <div class="ai-first-review-actions">
             <button class="button ghost" type="button" id="ai-first-back-to-pages">К страницам</button>
             <button class="button secondary" type="button" id="ai-first-add-row">+ Добавить позицию</button>
-            <button class="button secondary" type="button" id="ai-first-export-pilot" disabled>Скачать тестовый XLSX</button>
             <button class="button primary" type="button" id="ai-first-save-review">Сохранить черновик проверки</button>
+            <button class="button secondary" type="button" id="ai-first-export-pilot" disabled title="Только успешно обработанные страницы; файл будет помечен ТЕСТ">Скачать тестовый XLSX</button>
           </div>
         </div>
-        <p class="ai-first-workflow-hint">Порядок работы: сверьте строки с PDF → исправьте и сохраните ячейки → подтвердите проверенные строки и полноту страниц → сохраните черновик. У строки отдельно показаны состояние значений и допуск к тестовому XLSX: открытые замечания, неподтверждённая роль и устаревшее решение не получают зелёный статус.</p>
+        <div id="ai-first-export-feedback" class="ai-first-export-feedback" hidden>
+          <div><b id="ai-first-export-feedback-title">Тестовая выгрузка</b><p id="ai-first-export-note"></p></div>
+          <details><summary>Что важно знать</summary><p>В XLSX попадут выбранные обработанные страницы; неполный охват будет отмечен. Книга сохраняет исходные строки, а лист проверенных позиций включает только допущенные решения. Файл помечен «ТЕСТ» и не предназначен для коммерческого использования; sourcing не запускается. Предварительная проверка допуска не заменяет технические проверки самого экспорта.</p></details>
+          <button class="button text" type="button" id="ai-first-retry-export-preview" hidden>Повторить проверку</button>
+        </div>
+        <details class="ai-first-help"><summary>Как работать с проверкой</summary><p>Сверьте строку с PDF, внесите правки в исходные колонки и сохраните их. Затем назначьте роль и подтвердите значения. Отдельно подтвердите полноту каждой проверенной страницы.</p></details>
         <div class="summary-row ai-first-review-summary" id="ai-first-review-summary"></div>
         <details class="ai-first-page-details" id="ai-first-page-details">
           <summary id="ai-first-page-details-label">Страницы документа</summary>
@@ -328,12 +333,13 @@
             <div class="pdf-stage ai-first-pdf-stage"><div class="pdf-image-wrap ai-first-pdf-image-wrap"><img id="ai-first-pdf-image" alt="Исходная страница документа"><div id="ai-first-row-highlight" class="row-highlight" hidden></div></div></div>
           </div>
           <div class="table-pane ai-first-table-panel" aria-label="Распознанная спецификация">
-            <div class="panel-heading ai-first-table-heading"><div><h3>Распознанные строки документа</h3><p>Нажмите строку, чтобы открыть страницу источника. Роль строки задаётся вручную; исходный текст хранится отдельно от правок.</p></div><button class="button ghost" type="button" id="ai-first-confirm-page">Подтвердить полноту страницы</button></div>
+            <div class="panel-heading ai-first-table-heading"><div><h3>Все строки · страница <span id="ai-first-table-page-number">1</span></h3><p>Выберите строку для проверки. Исходные колонки сохранены полностью.</p></div><button class="button ghost" type="button" id="ai-first-confirm-page">Подтвердить полноту страницы</button></div>
             <div id="ai-first-page-issues" class="ai-first-issues"></div>
             <div id="ai-first-add-row-form"></div>
+            <div id="ai-first-review-controls" class="ai-first-review-controls"></div>
+            <section id="ai-first-row-inspector" class="ai-first-row-inspector" hidden aria-label="Проверка выбранной строки"></section>
             <div class="table-scroll ai-first-table-scroll" id="ai-first-table-scroll"></div>
-            <p class="ai-first-export-note" id="ai-first-export-note">Выберите 1–3 обработанные страницы для тестового XLSX. Проверенные самостоятельные позиции будут отделены от всех остальных строк. Файл помечен «ТЕСТ» и не является коммерческой сметой.</p>
-            <button class="button text" type="button" id="ai-first-retry-export-preview" hidden>Повторить проверку допуска</button>
+            <div id="ai-first-review-footer" class="ai-first-review-footer" role="status" aria-live="polite"></div>
           </div>
         </div>
       </section>

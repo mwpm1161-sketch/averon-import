@@ -184,8 +184,8 @@ function aiFirstRowReviewState(entry) {
   const pendingValues = state.aiFirst.pendingRowValues?.[row.id];
   const unsaved = !manual && (Object.keys(pendingValues || {}).length > 0
     || aiFirstRowInputSnapshot(row.id).some((item) => item.value !== item.baseline));
-  const roleInput = document.querySelector(`#ai-first-table-scroll [data-ai-first-row-role="${CSS.escape(row.id)}"]`);
-  const parentInput = document.querySelector(`#ai-first-table-scroll [data-ai-first-parent-row="${CSS.escape(row.id)}"]`);
+  const roleInput = document.querySelector(`#ai-first-row-inspector [data-ai-first-row-role="${CSS.escape(row.id)}"]`);
+  const parentInput = document.querySelector(`#ai-first-row-inspector [data-ai-first-parent-row="${CSS.escape(row.id)}"]`);
   const roleBaseline = role?.active ? role.role : "unknown";
   const pendingRole = state.aiFirst.pendingRowRoles?.[row.id];
   const roleUnsaved = Boolean(pendingRole || (roleInput && (roleInput.value !== roleBaseline
@@ -234,10 +234,14 @@ function updateAIFirstRenderedRowState(recordId) {
   if (!entry) return;
   const reviewState = aiFirstRowReviewState(entry);
   const excluded = aiFirstDecision(recordId)?.active && aiFirstDecision(recordId)?.disposition === "excluded";
-  rowElement.className = `ai-first-row--${reviewState.status} ${excluded ? "is-excluded" : ""} ${Number(rowElement.dataset.pageNumber) === state.aiFirst.page ? "active" : ""}`;
+  rowElement.className = `ai-first-row--${reviewState.status} ${excluded ? "is-excluded" : ""} ${recordId === state.aiFirst.inspectorRowId ? "active" : ""}`;
   rowElement.dataset.reviewState = reviewState.status;
   const label = rowElement.querySelector("[data-ai-first-row-status]");
   if (label) label.textContent = aiFirstRowStatusLabel(reviewState);
+  if (recordId === state.aiFirst.inspectorRowId) {
+    const inspectorStatus = document.querySelector("#ai-first-row-inspector .ai-first-inspector-heading h4");
+    if (inspectorStatus) inspectorStatus.textContent = aiFirstRowStatusLabel(reviewState);
+  }
   for (const input of rowElement.querySelectorAll("[data-ai-first-cell]")) {
     const cell = input.closest("td");
     if (!cell) continue;
@@ -246,6 +250,7 @@ function updateAIFirstRenderedRowState(recordId) {
     else if (reviewState.status === "checked") cell.classList.add("ai-first-cell--checked");
     else if (reviewState.status === "unsaved") cell.classList.add("ai-first-cell--unsaved");
   }
+  renderAIFirstReviewFooter(aiFirstDocumentEntries(state.aiFirst.data.draft, state.aiFirst.data.review));
 }
 
 function aiFirstProcessingMessage(code) {
@@ -340,13 +345,15 @@ function showAIFirstPage(pageNumber) {
   const selector = document.querySelector("#ai-first-page-select");
   selector.value = String(pageNumber);
   document.querySelector("#ai-first-pdf-page-label").textContent = `Страница ${pageNumber}`;
+  const tablePage = document.querySelector("#ai-first-table-page-number");
+  if (tablePage) tablePage.textContent = String(pageNumber);
   document.querySelector("#ai-first-pdf-image").src = documentPageImageUrl(state.document.document_id, pageNumber, 200);
   document.querySelector("#ai-first-prev-page").disabled = pageNumber <= 1;
   document.querySelector("#ai-first-next-page").disabled = pageNumber >= pageNumbers.length;
   const page = aiFirstPageRecord(pageNumber), report = aiFirstReportPages(state.aiFirst.data).get(pageNumber);
   const ready = report?.state === "completed" && ["extracted", "no_specification"].includes(page?.status);
   document.querySelector("#ai-first-confirm-page").disabled = !ready || (state.aiFirst.data.review.confirmed_complete_pages || []).includes(pageNumber);
-  document.querySelectorAll("[data-ai-first-row]").forEach((row) => row.classList.toggle("active", Number(row.dataset.pageNumber) === pageNumber));
+  document.querySelectorAll("[data-ai-first-row]").forEach((row) => row.classList.toggle("active", row.dataset.aiFirstRow === state.aiFirst.inspectorRowId));
   renderAIFirstPageIssues(pageNumber);
   renderAIFirstAddRowForm();
   if (changedPage && state.aiFirst.data?.draft) renderAIFirstTables(aiFirstDocumentEntries(state.aiFirst.data.draft, state.aiFirst.data.review));
@@ -486,7 +493,6 @@ function renderAIFirstReview() {
   state.aiFirst.exportPages = new Set([...(state.aiFirst.exportPages || [])].filter((number) => exportablePages.has(number)));
   const entries = aiFirstDocumentEntries(draft, review);
   const totalRows = entries.length;
-  const reviewedRows = entries.filter((entry) => review.decisions?.[entry.row.id]?.active).length;
   const humanRoles = review.row_roles || {};
   const subjectRows = entries.filter((entry) => {
     const role = humanRoles[entry.row.id];
@@ -497,18 +503,15 @@ function renderAIFirstReview() {
     return role?.active && role.role === "standalone_item" && decision?.active
       && decision.human_confirmed !== false && ["confirmed", "corrected"].includes(decision.disposition);
   }).length;
-  const unresolved = (draft.issues || []).filter((issue) => issue.code !== "page_extraction_failed" && ["review", "blocking"].includes(issue.severity) && !(review.resolved_issue_ids || []).includes(issue.id)).length;
   const confirmedPages = (review.confirmed_complete_pages || []).length;
   const processedPages = pageNumbers.filter((number) => pageReports.get(number)?.state === "completed" && ["extracted","no_specification"].includes(aiFirstPageRecord(number)?.status)).length;
   const failedPages = (data.pages || []).filter((item) => item.state !== "completed" && (item.state !== "pending" || item.safe_error_code)).length;
-  document.querySelector("#ai-first-review-status").textContent = `${processedPages} из ${state.document.page_count} страниц обработано · ${totalRows} строк распознано · изменения сохраняются локально`;
+  document.querySelector("#ai-first-review-status").textContent = `${processedPages} из ${state.document.page_count} страниц обработано · ${totalRows} строк распознано`;
   const summaries = [
     ["Строк распознано", totalRows, ""],
     ["Предметных строк", subjectRows, ""],
     ["Подтверждённые самостоятельные позиции", confirmedItems, ""],
-    ["Решения сохранены", reviewedRows, reviewedRows < totalRows ? "warning" : ""],
-    ["Страницы обработаны", `${processedPages} / ${state.document.page_count}`, processedPages < state.document.page_count ? "warning" : ""],
-    ["Полнота подтверждена", `${confirmedPages} / ${state.document.page_count}`, confirmedPages < state.document.page_count ? "warning" : ""],
+    ["Страницы · полнота", `${processedPages}/${state.document.page_count} · ${confirmedPages} подтверждено`, processedPages < state.document.page_count || confirmedPages < state.document.page_count ? "warning" : ""],
   ];
   document.querySelector("#ai-first-review-summary").innerHTML = summaries.map(([label,value,kind]) => `<div class="summary-card ${kind}"><small>${label}</small><b>${value}</b></div>`).join("");
   const selector = document.querySelector("#ai-first-page-select");
@@ -546,14 +549,37 @@ function renderAIFirstReview() {
     updateAIFirstExportControls();
   }));
   renderAIFirstTables(entries);
-  document.querySelector("#ai-first-export-note").textContent = "Тестовый XLSX содержит отдельный лист подтверждённых самостоятельных позиций и полный лист распознанных строк. Он не является коммерческой сметой и не запускает sourcing.";
+  renderAIFirstReviewFooter(entries);
   updateAIFirstExportControls();
   showAIFirstPage(state.aiFirst.page);
+}
+
+function renderAIFirstReviewFooter(entries) {
+  const root = document.querySelector("#ai-first-review-footer");
+  if (!root) return;
+  const pageEntries = entries.filter((entry) => Number(entry.page?.page_number || entry.row.page_number) === state.aiFirst.page);
+  const renderedStates = [...document.querySelectorAll("#ai-first-table-scroll tr[data-ai-first-row]")].map((row) => row.dataset.reviewState);
+  const states = renderedStates.length ? renderedStates : pageEntries.map((entry) => aiFirstRowReviewState(entry).status);
+  const checked = states.filter((status) => status === "checked").length;
+  const attention = states.filter((status) => status === "attention").length;
+  const unsaved = states.filter((status) => status === "unsaved").length;
+  const page = aiFirstPageRecord(state.aiFirst.page);
+  const report = aiFirstReportPages(state.aiFirst.data).get(state.aiFirst.page);
+  const complete = (state.aiFirst.data?.review?.confirmed_complete_pages || []).includes(state.aiFirst.page);
+  let next = "Выберите строку и сверьте её с PDF.";
+  if (unsaved) next = "Сохраните правки в выбранных строках.";
+  else if (attention) next = "Откройте строку с замечанием и выполните проверку.";
+  else if (page?.status === "extracted" && !complete) next = "Подтвердите полноту этой страницы.";
+  else if (page?.status === "no_specification" && !complete) next = "Сверьте страницу с PDF и подтвердите, что позиций нет.";
+  else if (report && report.state !== "completed") next = "Обработка страницы не завершена; изучите причину в сводке страниц.";
+  else if (state.aiFirst.exportPages?.size) next = "Проверьте сводку тестового XLSX и скачайте файл.";
+  root.innerHTML = `<span>Проверено <b>${checked}</b></span><span>Внимание <b>${attention}</b></span><span>Несохранено <b>${unsaved}</b></span><span class="ai-first-next-action">Далее: ${escapeHtml(next)}</span>`;
 }
 
 function updateAIFirstExportControls() {
   const button = document.querySelector("#ai-first-export-pilot");
   const label = document.querySelector("#ai-first-export-note");
+  const feedback = document.querySelector("#ai-first-export-feedback");
   const retryButton = document.querySelector("#ai-first-retry-export-preview");
   if (!button || !label) return;
   state.aiFirst.exportPages ||= new Set();
@@ -572,28 +598,34 @@ function updateAIFirstExportControls() {
   if (retryButton) retryButton.hidden = true;
   if (!selected.length) {
     button.disabled = true;
-    label.textContent = "Выберите от одной до трёх успешно обработанных страниц. Недоступные страницы отмечены причиной; файл не является коммерческой сметой.";
+    if (feedback) feedback.hidden = true;
+    label.textContent = "";
     return;
   }
+  if (feedback) feedback.hidden = false;
   if (selected.length > 3) {
     button.disabled = true;
-    label.textContent = "Для тестового XLSX выберите не более трёх страниц.";
+    label.textContent = "Выберите не более трёх страниц.";
     return;
   }
   if (state.aiFirst.exportPreview?.key === key) {
     button.disabled = false;
     const preview = state.aiFirst.exportPreview.data;
     const lastFailure = state.aiFirst.exportDownloadError ? ` Последняя попытка экспорта: ${state.aiFirst.exportDownloadError}` : "";
-    label.textContent = `Предварительно допущено ${preview.verified_position_count} самостоятельных позиций; в выгрузке всего ${preview.total_row_count} строк: распознано OCR — ${preview.ocr_row_count}, добавлено вручную — ${preview.manual_row_count}. Это только проверка допуска: экспорт дополнительно проверяет ограничения Excel и может отказать.${lastFailure} Охват документа будет отмечен как частичный, если выбраны не все страницы. Это тестовый файл.`;
+    label.textContent = `К проверенным позициям допущено ${preview.verified_position_count}; строк в файле — ${preview.total_row_count} (OCR ${preview.ocr_row_count}, вручную ${preview.manual_row_count}). Предварительная проверка допуска не гарантирует создание файла: XLSX дополнительно проверяется на ограничения Excel.${lastFailure} Выбранные страницы будут отмечены как частичный охват; файл помечен «ТЕСТ» и не предназначен для коммерческого использования.`;
     return;
   }
   if (state.aiFirst.exportPreviewErrorKey === key) {
     button.disabled = true;
-    label.textContent = "Не удалось проверить допуск строк. Повторите проверку; скачать книгу пока нельзя.";
+    label.textContent = "Не удалось проверить строки. Скачивание заблокировано до успешной повторной проверки.";
     if (retryButton) retryButton.hidden = false;
     return;
   }
-  if (state.aiFirst.exportPreviewLoadingKey === key) return;
+  if (state.aiFirst.exportPreviewLoadingKey === key) {
+    button.disabled = true;
+    label.textContent = "Проверяем выбранные строки перед выгрузкой…";
+    return;
+  }
   void loadAIFirstPilotExportPreview(selected, key);
 }
 
@@ -623,7 +655,7 @@ async function loadAIFirstPilotExportPreview(pageNumbers, key) {
   const retryButton = document.querySelector("#ai-first-retry-export-preview");
   if (retryButton) retryButton.hidden = true;
   button.disabled = true;
-  label.textContent = "Проверяем по серверным правилам, сколько позиций попадёт в тестовый XLSX…";
+  label.textContent = "Проверяем выбранные строки…";
   try {
     const data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first/pilot-export/preview`, {
       method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({page_numbers:pageNumbers}),
@@ -695,9 +727,9 @@ function captureAIFirstPendingEdits() {
     if (changed.length) state.aiFirst.pendingRowValues[id] = aiFirstRowValues(changed);
     else delete state.aiFirst.pendingRowValues[id];
   }
-  for (const select of root.querySelectorAll("[data-ai-first-row-role]")) {
+  for (const select of document.querySelectorAll("#ai-first-row-inspector [data-ai-first-row-role]")) {
     const id = select.dataset.aiFirstRowRole, role = state.aiFirst.data?.review?.row_roles?.[id];
-    const roleValue = select.value, parentValue = root.querySelector(`[data-ai-first-parent-row="${CSS.escape(id)}"]`)?.value || "";
+    const roleValue = select.value, parentValue = document.querySelector(`#ai-first-row-inspector [data-ai-first-parent-row="${CSS.escape(id)}"]`)?.value || "";
     if (roleValue !== (role?.active ? role.role : "unknown")
         || (roleValue === "component" && parentValue !== (role?.active ? role.parent_record_id || "" : ""))) {
       state.aiFirst.pendingRowRoles[id] = {role:roleValue,parent_record_id:roleValue === "component" ? parentValue : null};
@@ -708,10 +740,6 @@ function captureAIFirstPendingEdits() {
     if (input.value.trim()) state.aiFirst.pendingIssueNotes[id] = input.value;
     else delete state.aiFirst.pendingIssueNotes[id];
   }
-  for (const panel of root.querySelectorAll("[data-ai-first-row-panel]")) {
-    if (panel.open) state.aiFirst.openRowPanels.add(panel.dataset.aiFirstRowPanel);
-    else state.aiFirst.openRowPanels.delete(panel.dataset.aiFirstRowPanel);
-  }
 }
 
 function captureAIFirstViewState() {
@@ -719,6 +747,7 @@ function captureAIFirstViewState() {
   const active = document.activeElement, dataset = active?.dataset || {};
   let focus = null;
   if (dataset.aiFirstCell) focus = {type:"cell",id:dataset.aiFirstCell,column:dataset.columnIndex};
+  else if (dataset.aiFirstOpenRow) focus = {type:"open-row",id:dataset.aiFirstOpenRow};
   else if (dataset.aiFirstRowRole) focus = {type:"role",id:dataset.aiFirstRowRole};
   else if (dataset.aiFirstParentRow) focus = {type:"parent",id:dataset.aiFirstParentRow};
   else if (dataset.aiFirstSelectRow) focus = {type:"select-row",id:dataset.aiFirstSelectRow};
@@ -727,24 +756,27 @@ function captureAIFirstViewState() {
   else if (dataset.aiFirstExcludeRow) focus = {type:"row-action",attribute:"exclude-row",id:dataset.aiFirstExcludeRow};
   else if (dataset.aiFirstSaveRole) focus = {type:"row-action",attribute:"save-role",id:dataset.aiFirstSaveRole};
   else if (["ai-first-search", "ai-first-review-filter", "ai-first-bulk-role", "ai-first-page-select"].includes(active?.id)) focus = {type:"id",id:active.id};
-  return {scrollTop:root?.scrollTop || 0,focus,selectionStart:active?.selectionStart,selectionEnd:active?.selectionEnd};
+  return {scrollTop:root?.scrollTop || 0,scrollLeft:root?.scrollLeft || 0,focus,selectionStart:active?.selectionStart,selectionEnd:active?.selectionEnd};
 }
 
 function restoreAIFirstViewState(view) {
   const root = document.querySelector("#ai-first-table-scroll");
   if (root) root.scrollTop = view?.scrollTop || 0;
+  if (root) root.scrollLeft = view?.scrollLeft || 0;
   if (!view?.focus) return;
   let target = null;
   if (view.focus.type === "cell") target = root?.querySelector(`[data-ai-first-cell="${CSS.escape(view.focus.id)}"][data-column-index="${CSS.escape(view.focus.column)}"]`);
-  else if (view.focus.type === "role") target = root?.querySelector(`[data-ai-first-row-role="${CSS.escape(view.focus.id)}"]`);
-  else if (view.focus.type === "parent") target = root?.querySelector(`[data-ai-first-parent-row="${CSS.escape(view.focus.id)}"]`);
+  else if (view.focus.type === "open-row") target = root?.querySelector(`[data-ai-first-open-row="${CSS.escape(view.focus.id)}"]`);
+  else if (view.focus.type === "role") target = document.querySelector(`#ai-first-row-inspector [data-ai-first-row-role="${CSS.escape(view.focus.id)}"]`);
+  else if (view.focus.type === "parent") target = document.querySelector(`#ai-first-row-inspector [data-ai-first-parent-row="${CSS.escape(view.focus.id)}"]`);
   else if (view.focus.type === "select-row") target = root?.querySelector(`[data-ai-first-select-row="${CSS.escape(view.focus.id)}"]`);
-  else if (view.focus.type === "row-action") target = root?.querySelector(`[data-ai-first-${view.focus.attribute}="${CSS.escape(view.focus.id)}"]`);
+  else if (view.focus.type === "row-action") target = document.querySelector(`#ai-first-row-inspector [data-ai-first-${view.focus.attribute}="${CSS.escape(view.focus.id)}"]`);
   else if (view.focus.type === "id") target = document.getElementById(view.focus.id);
-  target?.focus();
+  target?.focus({preventScroll:true});
   if (target && Number.isInteger(view.selectionStart) && typeof target.setSelectionRange === "function") {
     target.setSelectionRange(view.selectionStart, view.selectionEnd);
   }
+  if (root) { root.scrollTop = view?.scrollTop || 0; root.scrollLeft = view?.scrollLeft || 0; }
 }
 
 function aiFirstEntrySearchText(entry) {
@@ -763,7 +795,7 @@ function aiFirstVisibleSelectedIds() {
 }
 
 function updateAIFirstBulkControls() {
-  const root = document.querySelector("#ai-first-table-scroll");
+  const root = document.querySelector("#ai-first-review-controls");
   const visibleIds = aiFirstVisibleSelectedIds();
   const confirmButton = root?.querySelector("#ai-first-confirm-selected");
   const roleButton = root?.querySelector("[data-ai-first-bulk-role-submit]");
@@ -775,9 +807,10 @@ function updateAIFirstBulkControls() {
 
 function applyAIFirstReviewFilters() {
   const root = document.querySelector("#ai-first-table-scroll");
-  if (!root) return;
-  const query = (root.querySelector("#ai-first-search")?.value || "").trim().toLocaleLowerCase("ru-RU");
-  const filter = root.querySelector("#ai-first-review-filter")?.value || "all";
+  const controls = document.querySelector("#ai-first-review-controls");
+  if (!root || !controls) return;
+  const query = (controls.querySelector("#ai-first-search")?.value || "").trim().toLocaleLowerCase("ru-RU");
+  const filter = controls.querySelector("#ai-first-review-filter")?.value || "all";
   state.aiFirst.reviewSearch = query;
   state.aiFirst.reviewFilter = filter;
   for (const row of root.querySelectorAll("tr[data-ai-first-row]")) {
@@ -801,19 +834,163 @@ function applyAIFirstReviewFilters() {
   }
   const visible = [...root.querySelectorAll("tr[data-ai-first-row]")].filter((row) => !row.hidden).length;
   const total = root.querySelectorAll("tr[data-ai-first-row]").length;
-  const summary = root.querySelector("[data-ai-first-filter-summary]");
+  const summary = controls.querySelector("[data-ai-first-filter-summary]");
   if (summary) summary.textContent = `${visible} из ${total} строк на странице`;
   updateAIFirstBulkControls();
 }
 
+function renderAIFirstInspectorValues(entry) {
+  const target = document.querySelector("#ai-first-inspector-values");
+  if (!target || !entry) return;
+  const {row,columns,manual} = entry;
+  const snapshot = aiFirstRowInputSnapshot(row.id);
+  const sourceByIndex = new Map((row.raw_cells || []).map((cell) => [Number(cell.column_index), cell.raw_value || ""]));
+  if (manual) for (const [key,value] of Object.entries(row.values || {})) {
+    const match = /^cell:(\d+)$/.exec(key);
+    if (match) sourceByIndex.set(Number(match[1]), value || "");
+  }
+  target.innerHTML = columns.map((column) => {
+    const source = sourceByIndex.get(Number(column.index)) || "";
+    const current = snapshot.find((item) => item.key === `cell:${column.index}`)?.value ?? source;
+    const changed = current !== source;
+    return `<div class="ai-first-inspector-value"><b>${escapeHtml(column.label || `Колонка ${column.index + 1}`)}</b><span><small>Исходно</small>${escapeHtml(source || "—")}</span>${changed ? `<span class="ai-first-inspector-correction"><small>Исправление</small>${escapeHtml(current || "—")}</span>` : ""}</div>`;
+  }).join("");
+}
+
+function renderAIFirstRowInspector() {
+  const root = document.querySelector("#ai-first-row-inspector");
+  if (!root) return;
+  const recordId = state.aiFirst.inspectorRowId;
+  const entry = recordId && state.aiFirst.renderedEntries?.get(recordId);
+  if (!entry) { root.hidden = true; root.innerHTML = ""; return; }
+  const {row,page,table,manual} = entry;
+  const decision = aiFirstDecision(recordId);
+  const reviewState = aiFirstRowReviewState(entry);
+  const role = state.aiFirst.data?.review?.row_roles?.[recordId];
+  const pendingRole = state.aiFirst.pendingRowRoles?.[recordId];
+  const selectedRole = pendingRole?.role || (role?.active ? role.role : "unknown");
+  const pageNumber = Number(page?.page_number || row.page_number);
+  const rowNumber = manual ? "Ручная строка" : `Строка ${Number(row.index ?? 0) + 1}`;
+  const parentCandidates = [...(state.aiFirst.renderedEntries?.values() || [])].filter((candidate) => {
+    if (candidate.row.id === recordId || Number(candidate.page?.page_number || candidate.row.page_number) !== pageNumber) return false;
+    const tableId = table?.id || row.table_id;
+    if (tableId && candidate.table?.id && candidate.table.id !== tableId) return false;
+    const candidateRole = state.aiFirst.data?.review?.row_roles?.[candidate.row.id];
+    return candidateRole?.active && candidateRole.role === "standalone_item";
+  });
+  const parentValue = pendingRole?.parent_record_id || role?.parent_record_id || "";
+  const parentOptions = `<option value="">Выберите самостоятельную позицию</option>${parentCandidates.map((candidate) => `<option value="${escapeHtml(candidate.row.id)}" ${parentValue === candidate.row.id ? "selected" : ""}>Строка ${escapeHtml(candidate.manual ? "ручная" : String(Number(candidate.row.index ?? 0) + 1))}</option>`).join("")}`;
+  const roleOptions = [["unknown","Не определена"],["standalone_item","Самостоятельная позиция"],["component","Компонент комплекта"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
+  const openIssues = reviewState.openIssues || [];
+  const issueHtml = openIssues.length ? `<ul class="ai-first-inspector-issues">${openIssues.map((issue) => `<li><span>${escapeHtml(aiFirstIssueMessage(issue.code))}</span><button class="button text" type="button" data-ai-first-inspector-issue="${escapeHtml(issue.id)}">К замечанию</button></li>`).join("")}</ul>` : `<p class="ai-first-inspector-clear">Открытых замечаний по этой строке нет.</p>`;
+  const status = aiFirstRowStatusLabel(reviewState);
+  const excluded = decision?.active && decision.disposition === "excluded";
+  root.hidden = false;
+  root.innerHTML = `<header class="ai-first-inspector-heading"><div><small>Страница ${pageNumber} · ${escapeHtml(rowNumber)}</small><h4>${escapeHtml(status)}</h4></div><button class="button ghost" type="button" data-ai-first-close-inspector aria-label="Закрыть проверку строки">Закрыть</button></header><div id="ai-first-inspector-values" class="ai-first-inspector-values"></div><div class="ai-first-inspector-review"><div class="ai-first-inspector-role"><label>Роль строки<select class="select" data-ai-first-row-role="${escapeHtml(recordId)}">${roleOptions.map(([value,label]) => `<option value="${value}" ${selectedRole === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label data-ai-first-parent-wrap ${selectedRole === "component" ? "" : "hidden"}>Родительская позиция<select class="select" data-ai-first-parent-row="${escapeHtml(recordId)}">${parentOptions}</select></label></div><div><b>Замечания</b>${issueHtml}</div></div><div class="ai-first-inspector-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(recordId)}">Сохранить правки</button><button class="button secondary" type="button" data-ai-first-save-role="${escapeHtml(recordId)}">Сохранить роль</button><button class="button primary" type="button" data-ai-first-confirm-row="${escapeHtml(recordId)}">Подтвердить значения</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(recordId)}">${excluded ? "Вернуть в проверку" : "Исключить"}</button></div>`;
+  renderAIFirstInspectorValues(entry);
+  const roleInput = root.querySelector(`[data-ai-first-row-role="${CSS.escape(recordId)}"]`);
+  const parentInput = root.querySelector(`[data-ai-first-parent-row="${CSS.escape(recordId)}"]`);
+  roleInput?.addEventListener("change", () => {
+    if (parentInput) root.querySelector("[data-ai-first-parent-wrap]").hidden = roleInput.value !== "component";
+    state.aiFirst.pendingRowRoles ||= {};
+    const baselineRole = role?.active ? role.role : "unknown";
+    const baselineParent = role?.active ? role.parent_record_id || "" : "";
+    const nextParent = roleInput.value === "component" ? (parentInput?.value || "") : "";
+    if (roleInput.value === baselineRole && nextParent === baselineParent) delete state.aiFirst.pendingRowRoles[recordId];
+    else state.aiFirst.pendingRowRoles[recordId] = {role:roleInput.value,parent_record_id:roleInput.value === "component" ? nextParent : null};
+    updateAIFirstRenderedRowState(recordId);
+  });
+  parentInput?.addEventListener("change", () => {
+    state.aiFirst.pendingRowRoles ||= {};
+    const baselineRole = role?.active ? role.role : "unknown";
+    const baselineParent = role?.active ? role.parent_record_id || "" : "";
+    const nextRole = roleInput?.value || selectedRole;
+    if (nextRole === baselineRole && parentInput.value === baselineParent) delete state.aiFirst.pendingRowRoles[recordId];
+    else state.aiFirst.pendingRowRoles[recordId] = {role:nextRole,parent_record_id:parentInput.value};
+    updateAIFirstRenderedRowState(recordId);
+  });
+  root.querySelector("[data-ai-first-close-inspector]")?.addEventListener("click", () => {
+    captureAIFirstPendingEdits();
+    state.aiFirst.inspectorRowId = null;
+    renderAIFirstRowInspector();
+    document.querySelectorAll("#ai-first-table-scroll tr[data-ai-first-row]").forEach((item) => item.classList.remove("active"));
+  });
+  root.querySelectorAll("[data-ai-first-inspector-issue]").forEach((button) => button.addEventListener("click", () => {
+    const note = document.querySelector(`#ai-first-page-issues [data-ai-first-issue-note="${CSS.escape(button.dataset.aiFirstInspectorIssue)}"]`);
+    note?.scrollIntoView({block:"nearest"});
+    note?.focus({preventScroll:true});
+  }));
+  root.querySelector("[data-ai-first-save-row]")?.addEventListener("click", () => {
+    if (state.aiFirst.pendingRowRoles?.[recordId]) {
+      toast("Сначала сохраните или отмените выбранную роль.", "error");
+      return;
+    }
+    const values = Object.fromEntries(aiFirstRowInputSnapshot(recordId).map((item) => [item.key,item.value]));
+    void postAIFirstReview("row", {record_id:recordId,disposition:"corrected",confirmed:false,values});
+  });
+  root.querySelector("[data-ai-first-save-role]")?.addEventListener("click", () => {
+    const snapshot = aiFirstRowInputSnapshot(recordId);
+    if (snapshot.some((item) => item.value !== item.baseline)) {
+      toast("Сначала сохраните или отмените правки ячеек этой строки.", "error");
+      return;
+    }
+    const roleValue = roleInput?.value;
+    const parent = parentInput?.value || null;
+    if (roleValue === "component" && !parent) {
+      toast("Для компонента выберите самостоятельную позицию-родителя на этой странице.", "error");
+      return;
+    }
+    void postAIFirstReview("row-role", {record_id:recordId,role:roleValue,parent_record_id:roleValue === "component" ? parent : null});
+  });
+  root.querySelector("[data-ai-first-confirm-row]")?.addEventListener("click", () => {
+    const snapshot = aiFirstRowInputSnapshot(recordId);
+    const changed = snapshot.filter((item) => item.value !== item.baseline);
+    const rolePending = Boolean(state.aiFirst.pendingRowRoles?.[recordId]);
+    if (rolePending) { toast("Сначала сохраните выбранную роль строки.", "error"); return; }
+    const values = snapshot.map((item) => `${item.label}: ${item.value || "пусто"}`).join("\n");
+    const question = changed.length
+      ? `Сохранить несохранённые изменения и подтвердить эту строку?\n\n${changed.map((item) => `${item.label}: ${item.baseline || "пусто"} → ${item.value || "пусто"}`).join("\n")}`
+      : `Подтвердить показанные значения после сверки с PDF?\n\n${values}`;
+    if (!confirm(question)) return;
+    void postAIFirstReview("row", {record_id:recordId,...aiFirstRowConfirmationPayload(snapshot)});
+  });
+  root.querySelector("[data-ai-first-exclude-row]")?.addEventListener("click", () => {
+    if (aiFirstRowInputSnapshot(recordId).some((item) => item.value !== item.baseline) || state.aiFirst.pendingRowRoles?.[recordId]) {
+      toast("Сначала сохраните или отмените несохранённые правки и роль.", "error");
+      return;
+    }
+    const current = aiFirstDecision(recordId);
+    const disposition = current?.active && current.disposition === "excluded" ? "confirmed" : "excluded";
+    const snapshot = aiFirstRowInputSnapshot(recordId);
+    if (disposition === "excluded") {
+      if (!confirm("Исключить строку из проверенных позиций? Она останется в исходных распознанных данных и истории.")) return;
+      void postAIFirstReview("row", {record_id:recordId,disposition,values:{}});
+      return;
+    }
+    const values = aiFirstRowValues(snapshot), changed = Object.keys(current?.values || {}).length > 0;
+    if (!confirm("Вернуть строку в проверку со сохранёнными значениями? Сверьте их с PDF.")) return;
+    void postAIFirstReview("row", {record_id:recordId,disposition:changed ? "corrected" : "confirmed",confirmed:true,values});
+  });
+}
+
+function selectAIFirstRow(recordId, columnIndex = null) {
+  captureAIFirstPendingEdits();
+  state.aiFirst.inspectorRowId = recordId;
+  document.querySelectorAll("#ai-first-table-scroll tr[data-ai-first-row]").forEach((row) => row.classList.toggle("active", row.dataset.aiFirstRow === recordId));
+  renderAIFirstRowInspector();
+  renderAIFirstInspectorValues(state.aiFirst.renderedEntries?.get(recordId));
+  void locateAIFirstSource(recordId, columnIndex);
+}
+
 function renderAIFirstTables(entries) {
   const root = document.querySelector("#ai-first-table-scroll");
-  if (!root) return;
+  const controls = document.querySelector("#ai-first-review-controls");
+  if (!root || !controls) return;
   captureAIFirstPendingEdits();
   const view = captureAIFirstViewState();
   const pageEntries = entries.filter((entry) => Number(entry.page?.page_number || entry.row.page_number) === state.aiFirst.page);
   state.aiFirst.renderedEntries = new Map(pageEntries.map((entry) => [entry.row.id, entry]));
-  state.aiFirst.openRowPanels ||= new Set();
+  state.aiFirst.inspectorRowId ||= null;
   const byGroup = new Map();
   for (const entry of pageEntries) {
     const key = entry.manual ? `manual:${state.aiFirst.page}` : `table:${entry.table?.id || entry.row.table_id || "unknown"}`;
@@ -845,26 +1022,13 @@ function renderAIFirstTables(entries) {
         const needsAttention = reviewState.status === "attention" || (uncertain && !reviewState.decisionCurrent);
         return `<td class="${needsAttention ? "ai-first-cell--attention" : reviewState.status === "unsaved" ? "ai-first-cell--unsaved" : reviewState.status === "checked" ? "ai-first-cell--checked" : ""}"><input class="cell-input ai-first-cell-input" data-ai-first-cell="${escapeHtml(row.id)}" data-column-index="${sourceColumn.index}" aria-label="${escapeHtml(sourceColumn.label)}" maxlength="2000" value="${escapeHtml(shown)}">${sourceNote}${uncertain && !reviewState.decisionCurrent ? `<small class="critical-warning">Требует сверки${cell?.alternatives?.length ? ` · варианты: ${escapeHtml(cell.alternatives.join(" / "))}` : ""}</small>` : ""}</td>`;
       }).join("");
-      const role = state.aiFirst.data.review.row_roles?.[row.id];
-      const pendingRole = state.aiFirst.pendingRowRoles?.[row.id];
-      const selectedRole = pendingRole?.role || (role?.active ? role.role : "unknown");
       const rowPage = Number(page?.page_number || row.page_number);
-      const groupTableId = manual ? null : (group.table?.id || row.table_id);
-      const parentCandidates = pageEntries.filter((candidate) => {
-        if (candidate.row.id === row.id || Number(candidate.page?.page_number || candidate.row.page_number) !== rowPage) return false;
-        if (groupTableId && candidate.row.table_id && candidate.row.table_id !== groupTableId) return false;
-        const candidateRole = state.aiFirst.data.review.row_roles?.[candidate.row.id];
-        return candidateRole?.active && candidateRole.role === "standalone_item";
-      });
-      const parentOptions = `<option value="">Выберите самостоятельную позицию</option>${parentCandidates.map((candidate) => `<option value="${escapeHtml(candidate.row.id)}" ${(pendingRole?.parent_record_id || role?.parent_record_id) === candidate.row.id ? "selected" : ""}>Строка ${escapeHtml(candidate.manual ? "ручная" : String((candidate.row.index ?? 0) + 1))}</option>`).join("")}`;
-      const rowRoleOptions = [["unknown","Не определена"],["standalone_item","Самостоятельная позиция"],["component","Компонент комплекта"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
-      const roleControls = `<div class="ai-first-role-controls"><label>Роль строки<select class="select" data-ai-first-row-role="${escapeHtml(row.id)}">${rowRoleOptions.map(([value,label]) => `<option value="${value}" ${selectedRole === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><select class="select" data-ai-first-parent-row="${escapeHtml(row.id)}" ${selectedRole === "component" ? "" : "hidden"}>${parentOptions}</select><button class="button text" type="button" data-ai-first-save-role="${escapeHtml(row.id)}">Сохранить роль</button></div>`;
       const kindLabel = ({item:"Позиция",item_candidate:"Возможная позиция",header:"Заголовок",section:"Раздел",note:"Примечание"})[row.model_kind] || (manual ? "Ручная позиция" : "Строка документа");
       const rowLabel = manual ? "Ручная" : String((row.index ?? 0) + 1);
-      const open = state.aiFirst.openRowPanels.has(row.id) ? "open" : "";
-      const actionPanel = `<details class="ai-first-row-panel" data-ai-first-row-panel="${escapeHtml(row.id)}" ${open}><summary>Роль и действия</summary>${roleControls}<div class="ai-first-row-actions"><button class="button secondary" type="button" data-ai-first-save-row="${escapeHtml(row.id)}">Сохранить правки</button><button class="button ghost" type="button" data-ai-first-confirm-row="${escapeHtml(row.id)}">Подтвердить значения</button><button class="button text" type="button" data-ai-first-exclude-row="${escapeHtml(row.id)}">${excluded ? "Восстановить" : "Исключить"}</button></div></details>`;
       const searchable = aiFirstEntrySearchText(entry);
-      return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${rowPage}" data-review-state="${reviewState.status}" data-role="${escapeHtml(selectedRole)}" data-disposition="${escapeHtml(decision?.disposition || "")}" data-search-text="${escapeHtml(searchable)}" class="ai-first-row--${reviewState.status} ${excluded ? "is-excluded" : ""} active"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td>${rowLabel}<small class="ai-first-cell-source">${escapeHtml(kindLabel)} · <span data-ai-first-row-status>${escapeHtml(aiFirstRowStatusLabel(reviewState))}</span></small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${rowPage}">Стр. ${rowPage}</button></td>${cells}<td>${actionPanel}</td></tr>`;
+      const selectedRole = state.aiFirst.pendingRowRoles?.[row.id]?.role || state.aiFirst.data.review.row_roles?.[row.id]?.role || "unknown";
+      const statusPillLabel = reviewState.status === "checked" ? "Проверено" : reviewState.status === "unsaved" ? "Не сохранено" : excluded ? "Исключена" : reviewState.status === "neutral" ? "Роль назначена" : "Внимание";
+      return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${rowPage}" data-review-state="${reviewState.status}" data-role="${escapeHtml(selectedRole)}" data-disposition="${escapeHtml(decision?.disposition || "")}" data-search-text="${escapeHtml(searchable)}" class="ai-first-row--${reviewState.status} ${excluded ? "is-excluded" : ""} ${state.aiFirst.inspectorRowId === row.id ? "active" : ""}"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td><button class="button text ai-first-open-row" type="button" data-ai-first-open-row="${escapeHtml(row.id)}" aria-expanded="${state.aiFirst.inspectorRowId === row.id ? "true" : "false"}">${escapeHtml(rowLabel)} · Проверить</button><small class="ai-first-cell-source">${escapeHtml(kindLabel)} · <span data-ai-first-row-status>${escapeHtml(aiFirstRowStatusLabel(reviewState))}</span></small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${rowPage}">Стр. ${rowPage}</button></td>${cells}<td><span class="ai-first-status-pill ai-first-status-pill--${reviewState.status}">${statusPillLabel}</span></td></tr>`;
     }).join("");
     const title = group.manual ? "Добавленные вручную" : `Таблица ${Number(group.table?.index ?? 0) + 1}`;
     const count = group.entries.length;
@@ -872,100 +1036,49 @@ function renderAIFirstTables(entries) {
   }).join("");
   const options = `<option value="all">Все строки</option><option value="attention">Требуют внимания</option><option value="unassigned">Роль не назначена</option><option value="checked">Проверены</option><option value="corrected">Исправлены</option><option value="excluded">Исключены</option><option value="service">Служебные строки</option>`;
   const bulkRoles = [["standalone_item","Самостоятельная позиция"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
-  root.innerHTML = `<div class="ai-first-row-toolbar"><label class="ai-first-search-label">Поиск по строкам, наименованиям, маркам и артикулам<input class="input" id="ai-first-search" type="search" value="${escapeHtml(state.aiFirst.reviewSearch || "")}" placeholder="Например: артикул или марка"></label><label>Фильтр<select class="select" id="ai-first-review-filter">${options}</select></label><button class="button ghost" type="button" data-ai-first-next-attention>Следующая строка для проверки</button><span data-ai-first-filter-summary role="status" aria-live="polite"></span></div><div class="ai-first-bulk-toolbar"><label>Назначить выбранным<select class="select" id="ai-first-bulk-role">${bulkRoles.map(([value,label]) => `<option value="${value}">${label}</option>`).join("")}</select></label><button class="button secondary" id="ai-first-confirm-selected" type="button" disabled>Подтвердить выбранные</button><button class="button secondary" type="button" data-ai-first-bulk-role-submit disabled>Применить роль выбранным</button><span data-ai-first-selected-count>Выберите строки для группового действия</span></div>${groupHtml || `<div class="empty-table">На этой странице распознанных строк нет. Состояние и полноту страницы можно проверить в сводке.</div>`}`;
-  const filter = root.querySelector("#ai-first-review-filter");
+  root.innerHTML = groupHtml || `<div class="empty-table">На этой странице распознанных строк нет.</div>`;
+  controls.innerHTML = `<div class="ai-first-row-toolbar"><label class="ai-first-search-label">Поиск по строкам<input class="input" id="ai-first-search" type="search" value="${escapeHtml(state.aiFirst.reviewSearch || "")}" placeholder="Наименование, марка или артикул"></label><label>Показать<select class="select" id="ai-first-review-filter">${options}</select></label><button class="button ghost" type="button" data-ai-first-next-attention>Следующая для проверки</button><span data-ai-first-filter-summary role="status" aria-live="polite"></span></div><div class="ai-first-bulk-toolbar"><label>Роль выбранных<select class="select" id="ai-first-bulk-role">${bulkRoles.map(([value,label]) => `<option value="${value}">${label}</option>`).join("")}</select></label><button class="button secondary" id="ai-first-confirm-selected" type="button" disabled>Подтвердить выбранные</button><button class="button secondary" type="button" data-ai-first-bulk-role-submit disabled>Применить роль</button><span data-ai-first-selected-count>Выберите строки для группового действия</span></div>`;
+  const filter = controls.querySelector("#ai-first-review-filter");
   if (filter) filter.value = state.aiFirst.reviewFilter || "all";
-  root.querySelector("#ai-first-search")?.addEventListener("input", applyAIFirstReviewFilters);
+  controls.querySelector("#ai-first-search")?.addEventListener("input", applyAIFirstReviewFilters);
   filter?.addEventListener("change", applyAIFirstReviewFilters);
   root.querySelectorAll("[data-ai-first-select-row]").forEach((input) => input.addEventListener("change", () => {
     const id = input.dataset.aiFirstSelectRow;
     if (input.checked) state.aiFirst.selectedRows.add(id); else state.aiFirst.selectedRows.delete(id);
     updateAIFirstBulkControls();
   }));
-  root.querySelectorAll("[data-ai-first-save-row]").forEach((button) => button.addEventListener("click", () => {
-    const id = button.dataset.aiFirstSaveRow, values = {};
-    root.querySelectorAll("[data-ai-first-cell]").forEach((input) => { if (input.dataset.aiFirstCell === id) values[`cell:${input.dataset.columnIndex}`] = input.value; });
-    void postAIFirstReview("row", {record_id:id,disposition:"corrected",confirmed:false,values});
-  }));
-  root.querySelectorAll("[data-ai-first-cell]").forEach((input) => input.addEventListener("input", () => updateAIFirstRenderedRowState(input.dataset.aiFirstCell)));
-  root.querySelectorAll("[data-ai-first-row-role]").forEach((select) => select.addEventListener("change", () => {
-    const parent = root.querySelector(`[data-ai-first-parent-row="${CSS.escape(select.dataset.aiFirstRowRole)}"]`);
-    if (parent) parent.hidden = select.value !== "component";
-    updateAIFirstRenderedRowState(select.dataset.aiFirstRowRole);
-  }));
-  root.querySelectorAll("[data-ai-first-row-panel]").forEach((panel) => panel.addEventListener("toggle", () => {
-    if (panel.open) state.aiFirst.openRowPanels.add(panel.dataset.aiFirstRowPanel);
-    else state.aiFirst.openRowPanels.delete(panel.dataset.aiFirstRowPanel);
-  }));
-  root.querySelectorAll("[data-ai-first-save-role]").forEach((button) => button.addEventListener("click", () => {
-    const recordId = button.dataset.aiFirstSaveRole;
-    const snapshot = aiFirstRowInputSnapshot(recordId);
-    if (snapshot.some((item) => item.value !== item.baseline)) {
-      toast("Сначала сохраните или отмените правки ячеек этой строки, затем измените её роль.", "error");
-      return;
-    }
-    const role = root.querySelector(`[data-ai-first-row-role="${CSS.escape(recordId)}"]`)?.value;
-    const parent = root.querySelector(`[data-ai-first-parent-row="${CSS.escape(recordId)}"]`)?.value || null;
-    if (role === "component" && !parent) {
-      toast("Для компонента выберите самостоятельную позицию-родителя на этой странице.", "error");
-      return;
-    }
-    if (!role) return;
-    void postAIFirstReview("row-role", {record_id:recordId,role,parent_record_id:role === "component" ? parent : null});
-  }));
-  root.querySelectorAll("[data-ai-first-confirm-row]").forEach((button) => button.addEventListener("click", () => {
-    const id = button.dataset.aiFirstConfirmRow, snapshot = aiFirstRowInputSnapshot(id);
-    const changed = snapshot.filter((item) => item.value !== item.baseline);
-    const preview = snapshot.map((item) => `${item.label}: ${item.value || "пусто"}`).join("\n");
-    const question = changed.length
-      ? `Сохранить несохранённые изменения и подтвердить эту строку?\n\n${changed.map((item) => `${item.label}: ${item.baseline || "пусто"} → ${item.value || "пусто"}`).join("\n")}`
-      : `Подтвердить показанные значения после сверки с PDF?\n\n${preview}`;
-    if (!confirm(question)) return;
-    void postAIFirstReview("row", {record_id:id,...aiFirstRowConfirmationPayload(snapshot)});
-  }));
-  root.querySelectorAll("[data-ai-first-exclude-row]").forEach((button) => button.addEventListener("click", () => {
-    const id = button.dataset.aiFirstExcludeRow, current = aiFirstDecision(id);
-    const disposition = current?.active && current.disposition === "excluded" ? "confirmed" : "excluded";
-    const snapshot = aiFirstRowInputSnapshot(id);
-    if (disposition === "excluded") {
-      if (!confirm("Исключить строку из проверенных позиций? Сохранённые исправления останутся в истории, строка сохранится в распознанных данных.")) return;
-      void postAIFirstReview("row", {record_id:id,disposition,values:{}});
-      return;
-    }
-    const values = aiFirstRowValues(snapshot);
-    const changedFromSource = Object.keys(current?.values || {}).length > 0;
-    const preview = snapshot.map((item) => `${item.label}: ${item.value || "пусто"}`).join("\n");
-    if (!confirm(`Вернуть строку в проверку со сохранёнными значениями? Сверьте их с PDF перед подтверждением.\n\n${preview}`)) return;
-    void postAIFirstReview("row", {record_id:id,disposition:changedFromSource ? "corrected" : "confirmed",confirmed:true,values});
-  }));
-  root.querySelectorAll("[data-ai-first-resolve]").forEach((button) => button.addEventListener("click", () => {
-    const id = button.dataset.aiFirstResolve;
-    const detail = document.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
-    void postAIFirstReview("resolve-issue", {issue_id:id,detail});
-  }));
+  root.querySelectorAll("[data-ai-first-cell]").forEach((input) => {
+    input.addEventListener("input", () => {
+      updateAIFirstRenderedRowState(input.dataset.aiFirstCell);
+      if (input.dataset.aiFirstCell === state.aiFirst.inspectorRowId) renderAIFirstInspectorValues(state.aiFirst.renderedEntries?.get(input.dataset.aiFirstCell));
+    });
+  });
   root.querySelectorAll("[data-ai-first-row]").forEach((row) => row.addEventListener("click", (event) => {
     if (event.target.closest("button, input, select, textarea, summary, details")) return;
-    void locateAIFirstSource(row.dataset.aiFirstRow, null);
+    selectAIFirstRow(row.dataset.aiFirstRow, null);
   }));
+  root.querySelectorAll("[data-ai-first-open-row]").forEach((button) => button.addEventListener("click", () => selectAIFirstRow(button.dataset.aiFirstOpenRow, null)));
   root.querySelectorAll("[data-ai-first-cell]").forEach((input) => input.addEventListener("click", (event) => {
     event.stopPropagation();
-    void locateAIFirstSource(input.dataset.aiFirstCell, Number(input.dataset.columnIndex));
+    selectAIFirstRow(input.dataset.aiFirstCell, Number(input.dataset.columnIndex));
   }));
   root.querySelectorAll("[data-ai-first-show-page]").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     showAIFirstPage(Number(button.dataset.aiFirstShowPage));
   }));
-  root.querySelector("[data-ai-first-next-attention]")?.addEventListener("click", () => {
+  controls.querySelector("[data-ai-first-next-attention]")?.addEventListener("click", () => {
     const rows = [...root.querySelectorAll("tr[data-ai-first-row]")].filter((row) => !row.hidden && ["attention", "unsaved"].includes(row.dataset.reviewState));
     if (!rows.length) { toast("В текущем фильтре нет строк, требующих внимания.", "warning"); return; }
     const current = rows.findIndex((row) => row.dataset.aiFirstRow === state.aiFirst.lastAttentionRow);
     const next = rows[(current + 1) % rows.length];
     state.aiFirst.lastAttentionRow = next.dataset.aiFirstRow;
     next.scrollIntoView({block:"center"});
-    void locateAIFirstSource(next.dataset.aiFirstRow, null);
+    selectAIFirstRow(next.dataset.aiFirstRow, null);
   });
-  root.querySelector("[data-ai-first-bulk-role-submit]")?.addEventListener("click", () => void assignSelectedAIFirstRole());
+  controls.querySelector("#ai-first-confirm-selected")?.addEventListener("click", () => void confirmSelectedAIFirstRows());
+  controls.querySelector("[data-ai-first-bulk-role-submit]")?.addEventListener("click", () => void assignSelectedAIFirstRole());
   applyAIFirstReviewFilters();
+  renderAIFirstRowInspector();
   restoreAIFirstViewState(view);
 }
 
@@ -1042,16 +1155,17 @@ async function confirmSelectedAIFirstRows() {
   if (result.refreshed) renderAIFirstReview();
   else {
     document.querySelectorAll("#ai-first-table-scroll [data-ai-first-select-row]").forEach((input) => { input.checked = false; });
-    const confirmButton = document.querySelector("#ai-first-table-scroll #ai-first-confirm-selected");
+    const confirmButton = document.querySelector("#ai-first-review-controls #ai-first-confirm-selected");
     if (confirmButton) confirmButton.disabled = true;
   }
 }
 
 async function assignSelectedAIFirstRole() {
   const root = document.querySelector("#ai-first-table-scroll");
+  const controls = document.querySelector("#ai-first-review-controls");
   const recordIds = aiFirstVisibleSelectedIds();
-  if (!root || !recordIds.length) return;
-  const role = root.querySelector("#ai-first-bulk-role")?.value;
+  if (!root || !controls || !recordIds.length) return;
+  const role = controls.querySelector("#ai-first-bulk-role")?.value;
   if (!["standalone_item", "header", "column_numbering", "section", "continuation", "note"].includes(role)) return;
   const changedValues = recordIds.filter((id) => aiFirstRowInputSnapshot(id).some((item) => item.value !== item.baseline));
   const changedRoles = recordIds.filter((id) => state.aiFirst.pendingRowRoles?.[id]);
@@ -1059,7 +1173,7 @@ async function assignSelectedAIFirstRole() {
     toast("Сначала сохраните или отмените индивидуальные правки выбранных строк, затем применяйте общую роль.", "error");
     return;
   }
-  const roleLabel = root.querySelector("#ai-first-bulk-role option:checked")?.textContent || role;
+  const roleLabel = controls.querySelector("#ai-first-bulk-role option:checked")?.textContent || role;
   if (!confirm(`Назначить роль «${roleLabel}» для ${recordIds.length} выбранных строк? Каждая строка останется исходной, а роль будет записана в историю проверки.`)) return;
   const result = await postAIFirstReview("bulk-role", {record_ids:recordIds,role});
   if (!result?.saved) return;
@@ -1104,10 +1218,10 @@ function aiFirstHasUnsavedReviewEdits() {
   for (const recordId of recordIds) {
     if (aiFirstRowInputSnapshot(recordId).some((item) => item.value !== item.baseline)) return true;
   }
-  for (const select of document.querySelectorAll("#ai-first-table-scroll [data-ai-first-row-role]")) {
+  for (const select of document.querySelectorAll("#ai-first-row-inspector [data-ai-first-row-role]")) {
     const role = state.aiFirst.data?.review?.row_roles?.[select.dataset.aiFirstRowRole];
     if (select.value !== (role?.active ? role.role : "unknown")) return true;
-    const parent = document.querySelector(`[data-ai-first-parent-row="${CSS.escape(select.dataset.aiFirstRowRole)}"]`);
+    const parent = document.querySelector(`#ai-first-row-inspector [data-ai-first-parent-row="${CSS.escape(select.dataset.aiFirstRowRole)}"]`);
     if (parent && !parent.hidden && parent.value !== (role?.active ? role.parent_record_id || "" : "")) return true;
   }
   if ([...document.querySelectorAll("#ai-first-page-issues [data-ai-first-issue-note]")].some((input) => input.value.trim())) return true;
@@ -1185,7 +1299,11 @@ function installAIFirstUIEvents() {
   document.querySelector("#ai-first-zoom-100").addEventListener("click", () => setAIFirstPdfZoom(1));
   window.addEventListener("resize", renderAIFirstPdfZoom);
   document.querySelector("#cancel-ai-first-button").addEventListener("click", () => void cancelAIFirstRecognition());
-  document.querySelector("#ai-first-back-to-pages").addEventListener("click", () => { setView("pages"); renderAIFirstResumeControls(); });
+  document.querySelector("#ai-first-back-to-pages").addEventListener("click", () => {
+    captureAIFirstPendingEdits();
+    setView("pages");
+    renderAIFirstResumeControls();
+  });
   document.querySelector("#ai-first-save-review").addEventListener("click", () => void saveAIFirstReview());
   document.querySelector("#ai-first-export-pilot").addEventListener("click", () => void downloadAIFirstPilotXlsx());
   document.querySelector("#ai-first-retry-export-preview").addEventListener("click", () => void retryAIFirstPilotExportPreview());

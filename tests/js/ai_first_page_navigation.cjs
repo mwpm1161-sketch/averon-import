@@ -172,10 +172,10 @@ assert(elements.get("#ai-first-page-issues").innerHTML.includes("Номер по
 assert.equal(elements.get("#ai-first-add-row-form").newCells.find(input => input.dataset.aiFirstNewColumnKey === "количество#1").value, "24", "add-row values remain available when returning");
 console.log("PASS: AI-first page navigation refreshes page issues and add-row columns while preserving unsaved values");
 
-const roleUi = sourceBetween("function renderAIFirstTables", "async function postAIFirstReview");
+const roleUi = sourceBetween("function renderAIFirstRowInspector", "function selectAIFirstRow");
 assert(roleUi.includes('role?.active ? role.role : "unknown"'), "row roles start unverified instead of inheriting model classification");
 assert(roleUi.includes('data-ai-first-save-role'), "Human Review can save a row role explicitly");
-assert(roleUi.includes('role === "component" ? parent : null'), "component rows require an explicit standalone parent");
+assert(roleUi.includes('roleValue === "component" ? parent : null'), "component rows require an explicit standalone parent");
 assert(roleUi.includes("Сначала сохраните или отмените правки ячеек"), "role changes cannot discard unsaved cell edits");
 const exportUi = sourceBetween("function renderAIFirstReview", "function aiFirstColumnList");
 assert(exportUi.includes("exportPages.size >= 3"), "pilot export scope is bounded to three pages");

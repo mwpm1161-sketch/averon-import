@@ -17,6 +17,7 @@ const wrap = {style:{}};
 const label = {textContent:""};
 const button = {disabled:false};
 const exportNote = {textContent:""};
+const exportFeedback = {hidden:false};
 const retryButton = {hidden:true};
 const elements = new Map([
   ["#ai-first-pdf-image",image],
@@ -25,6 +26,7 @@ const elements = new Map([
   ["#ai-first-zoom-label",label],
   ["#ai-first-export-pilot",button],
   ["#ai-first-export-note",exportNote],
+  ["#ai-first-export-feedback",exportFeedback],
   ["#ai-first-retry-export-preview",retryButton],
 ]);
 const state = {document:{document_id:"synthetic-document"},aiFirst:{pdfZoom:1,pdfFitWidth:true,exportPages:new Set([1]),reviewGeneration:4,exportPreviewSelectionKey:"1|4"}};
@@ -66,22 +68,23 @@ async function run() {
   context.updateExport();
   assert.equal(previewCalls,1,"the preview comes from the server once per selected fragment and review generation");
   assert.equal(button.disabled,false,"the test export is enabled only after the server has checked the fragment");
-  assert(exportNote.textContent.includes("Предварительно допущено 2 самостоятельных позиций"));
-  assert(exportNote.textContent.includes("всего 3 строк"));
-  assert(exportNote.textContent.includes("распознано OCR — 2"));
-  assert(exportNote.textContent.includes("добавлено вручную — 1"));
-  assert(exportNote.textContent.includes("экспорт дополнительно проверяет ограничения Excel"));
+  assert(exportNote.textContent.includes("К проверенным позициям допущено 2"));
+  assert(exportNote.textContent.includes("строк в файле — 3"));
+  assert(exportNote.textContent.includes("OCR 2"));
+  assert(exportNote.textContent.includes("вручную 1"));
+  assert(exportNote.textContent.includes("Предварительная проверка допуска не гарантирует создание файла"));
+  assert.equal(exportFeedback.hidden,false,"test and partial-scope warnings appear beside the download action after page selection");
   state.aiFirst.exportPages.clear();
   context.updateExport();
   assert.equal(button.disabled,true,"the workbook remains disabled without selected pages");
-  assert(exportNote.textContent.includes("Выберите от одной до трёх"));
+  assert.equal(exportFeedback.hidden,true,"the test-export note stays contextual and hidden before page selection");
   state.aiFirst.exportPages = new Set([1]);
   state.aiFirst.reviewGeneration = 5;
   previewFails = true;
   context.updateExport();
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(button.disabled,true,"the workbook stays disabled when the server cannot verify its contents");
-  assert(exportNote.textContent.includes("Не удалось проверить допуск"));
+  assert(exportNote.textContent.includes("Не удалось проверить строки"));
   assert.equal(retryButton.hidden,false,"an explicit retry is offered after preview failure");
   previewFails = false;
   await context.retryPreview();
@@ -100,6 +103,6 @@ async function run() {
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.notEqual(state.aiFirst.exportPreviewErrorKey,"1|6","a stale response cannot mark a changed selection as failed");
   assert.equal(button.disabled,true,"no selected pages remains fail-closed while a stale response settles");
-  console.log("PASS: AI-first PDF zoom bounds and server-derived test-export count");
+  console.log("PASS: AI-first PDF zoom bounds, server-derived test-export count and contextual safety notes");
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});
