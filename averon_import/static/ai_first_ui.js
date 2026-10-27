@@ -238,6 +238,15 @@ function updateAIFirstRenderedRowState(recordId) {
   rowElement.dataset.reviewState = reviewState.status;
   const label = rowElement.querySelector("[data-ai-first-row-status]");
   if (label) label.textContent = aiFirstRowStatusLabel(reviewState);
+  const statusPill = rowElement.querySelector(".ai-first-status-pill");
+  if (statusPill) {
+    const excluded = Boolean(aiFirstDecision(recordId)?.active && aiFirstDecision(recordId)?.disposition === "excluded");
+    statusPill.className = `ai-first-status-pill ai-first-status-pill--${reviewState.status}`;
+    statusPill.textContent = reviewState.status === "checked" ? "Проверено"
+      : reviewState.status === "unsaved" ? "Не сохранено"
+      : excluded ? "Исключена"
+      : reviewState.status === "neutral" ? "Роль назначена" : "Внимание";
+  }
   if (recordId === state.aiFirst.inspectorRowId) {
     const inspectorStatus = document.querySelector("#ai-first-row-inspector .ai-first-inspector-heading h4");
     if (inspectorStatus) inspectorStatus.textContent = aiFirstRowStatusLabel(reviewState);
@@ -921,10 +930,6 @@ function renderAIFirstRowInspector() {
     note?.focus({preventScroll:true});
   }));
   root.querySelector("[data-ai-first-save-row]")?.addEventListener("click", () => {
-    if (state.aiFirst.pendingRowRoles?.[recordId]) {
-      toast("Сначала сохраните или отмените выбранную роль.", "error");
-      return;
-    }
     const values = Object.fromEntries(aiFirstRowInputSnapshot(recordId).map((item) => [item.key,item.value]));
     void postAIFirstReview("row", {record_id:recordId,disposition:"corrected",confirmed:false,values});
   });
@@ -1112,8 +1117,8 @@ async function postAIFirstReview(action, body) {
   try {
     state.aiFirst.data = await api(`/api/documents/${encodeURIComponent(state.document.document_id)}/ai-first`);
     for (const id of affected) {
-      delete state.aiFirst.pendingRowValues?.[id];
-      delete state.aiFirst.pendingRowRoles?.[id];
+      if (action === "row" || action === "bulk-confirm") delete state.aiFirst.pendingRowValues?.[id];
+      if (action === "row-role" || action === "bulk-role") delete state.aiFirst.pendingRowRoles?.[id];
     }
     if (body.issue_id) delete state.aiFirst.pendingIssueNotes?.[body.issue_id];
     renderAIFirstReview();
