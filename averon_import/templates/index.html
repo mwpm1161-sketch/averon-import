@@ -66,6 +66,7 @@
         </div>
         <div class="top-actions">
           <button class="button ghost" id="new-document-button" hidden>Новый документ</button>
+          <button class="button secondary" id="ai-first-open-saved" type="button" hidden>Открыть AI-first проверку</button>
           <button class="button ghost" id="settings-button" hidden>Настройки</button>
           <button class="button ghost" id="admin-reports-button" hidden>Обращения</button>
           <button class="button ghost" id="users-button" type="button" hidden>Пользователи</button>
@@ -244,6 +245,26 @@
               <div class="cloud-ocr-settings"><span>Языки: <b id="yandex-language-codes">ru, en</b></span><span>AI: <b>выключен</b></span></div>
             </div>
             <div class="ai-disabled-note"><b>AI-проверка будет доступна после настройки модели</b><span>Сейчас выполняются только Yandex Vision OCR и инженерные правила Averon Import.</span></div>
+            <section class="ai-first-local-controls" id="ai-first-local-controls" hidden aria-labelledby="ai-first-mode-title">
+              <div class="divider"></div>
+              <label class="field-label" id="ai-first-mode-title" for="ai-first-mode">Экспериментальное распознавание</label>
+              <select class="select" id="ai-first-mode">
+                <option value="standard">Стандартный Averon OCR</option>
+                <option value="fake" hidden>AI-first · синтетический тест</option>
+                <option value="qwen" hidden>AI-first · Qwen Vision</option>
+              </select>
+              <p class="hint" id="ai-first-mode-note">Обычный OCR продолжит работать без изменений.</p>
+              <label class="field-label" for="ai-first-context">Опишите нюансы работы <span class="optional-label">Необязательно</span></label>
+              <textarea class="input ai-first-context" id="ai-first-context" maxlength="1000" rows="3" placeholder="Например: в документе есть зачёркнутые количества и рукописные исправления. Обратите на них особое внимание."></textarea>
+              <div class="ai-first-context-meta"><span>Подсказка рассматривается как недоверенный контекст и не заменяет исходные значения.</span><span id="ai-first-context-count">0 / 1000</span></div>
+              <label class="ai-first-live-confirm" id="ai-first-live-confirm-wrap" hidden>
+                <input type="checkbox" id="ai-first-live-confirm">
+                <span>Подтверждаю отправку выбранных страниц в Yandex AI Studio. Запросы могут тарифицироваться; автоматических повторов нет.</span>
+              </label>
+              <p class="ai-first-demo-warning" id="ai-first-demo-warning" hidden>Синтетический режим не анализирует PDF и выполняет ноль сетевых запросов. Он нужен для проверки интерфейса.</p>
+              <div class="ai-first-resume-controls" id="ai-first-resume-controls" hidden></div>
+              <div class="ai-first-run-feedback" id="ai-first-run-feedback" hidden></div>
+            </section>
             <div class="divider"></div>
             <div class="crop-section">
               <div><b>Область таблицы</b><p>Необязательно. Выделите таблицу, если на странице есть штамп или другие элементы.</p></div>
@@ -280,6 +301,46 @@
           <p id="processing-message">Подготовка страниц…</p>
           <div class="progress"><span id="processing-progress"></span></div>
           <div class="processing-stats"><span id="processing-count">0 / 0</span><span>Не закрывайте окно</span></div>
+          <div class="ai-first-live-pages" id="ai-first-live-pages" hidden aria-live="polite"></div>
+          <button class="button secondary" id="cancel-ai-first-button" type="button" hidden>Отменить распознавание</button>
+        </div>
+      </section>
+
+      <section id="ai-first-review-view" class="view review-view ai-first-review-view">
+        <div class="ai-first-review-toolbar">
+          <div><span class="eyebrow">AI-first · проверка</span><h2>Проверка распознавания</h2><p id="ai-first-review-status" role="status" aria-live="polite"></p></div>
+          <div class="ai-first-review-actions">
+            <button class="button ghost" type="button" id="ai-first-back-to-pages">К страницам</button>
+            <button class="button secondary" type="button" id="ai-first-add-row">+ Добавить позицию</button>
+            <button class="button primary" type="button" id="ai-first-save-review">Сохранить черновик проверки</button>
+            <button class="button secondary" type="button" id="ai-first-export-pilot" disabled>Скачать тестовый XLSX</button>
+          </div>
+        </div>
+        <div id="ai-first-export-feedback" class="ai-first-export-feedback" hidden>
+          <div><b id="ai-first-export-feedback-title">Тестовая выгрузка</b><p id="ai-first-export-note"></p></div>
+          <button class="button text" type="button" id="ai-first-retry-export-preview" hidden>Повторить проверку</button>
+        </div>
+        <details id="ai-first-export-reasons" class="ai-first-export-reasons" hidden><summary>Почему некоторые строки не войдут</summary><ul id="ai-first-export-reasons-list"></ul></details>
+        <details class="ai-first-help"><summary>Как работать с проверкой</summary><p>Сверьте строку с PDF, внесите правки в исходные колонки и сохраните их. Затем назначьте роль и подтвердите значения. Отдельно подтвердите полноту каждой проверенной страницы.</p></details>
+        <div class="summary-row ai-first-review-summary" id="ai-first-review-summary"></div>
+        <details class="ai-first-page-details" id="ai-first-page-details">
+          <summary id="ai-first-page-details-label">Страницы документа</summary>
+          <div id="ai-first-page-status-list"></div>
+        </details>
+        <div class="split-workspace ai-first-review-workspace">
+          <div class="pdf-pane ai-first-pdf-panel" aria-label="Исходный PDF">
+            <div class="pane-header"><div><b>Исходный PDF</b><small id="ai-first-pdf-page-label">Страница 1</small></div><div class="ai-first-page-nav"><button class="button ghost" type="button" id="ai-first-prev-page" aria-label="Предыдущая страница">←</button><select class="select" id="ai-first-page-select" aria-label="Перейти к странице"></select><button class="button ghost" type="button" id="ai-first-next-page" aria-label="Следующая страница">→</button></div><div class="ai-first-zoom-controls" aria-label="Масштаб PDF"><button class="button ghost" type="button" id="ai-first-zoom-out" aria-label="Уменьшить масштаб PDF">−</button><output id="ai-first-zoom-label" aria-live="polite">По ширине</output><button class="button ghost" type="button" id="ai-first-zoom-in" aria-label="Увеличить масштаб PDF">+</button><button class="button ghost" type="button" id="ai-first-zoom-fit">По ширине</button><button class="button ghost" type="button" id="ai-first-zoom-100">100%</button></div></div>
+            <div class="pdf-stage ai-first-pdf-stage"><div class="pdf-image-wrap ai-first-pdf-image-wrap"><img id="ai-first-pdf-image" alt="Исходная страница документа"><div id="ai-first-row-highlight" class="row-highlight" hidden></div></div></div>
+          </div>
+          <div class="table-pane ai-first-table-panel" aria-label="Распознанная спецификация">
+            <div class="panel-heading ai-first-table-heading"><div><h3>Все строки · страница <span id="ai-first-table-page-number">1</span></h3><p>Выберите строку для проверки. Исходные колонки сохранены полностью.</p></div><button class="button ghost" type="button" id="ai-first-confirm-page">Подтвердить полноту страницы</button></div>
+            <div id="ai-first-page-issues" class="ai-first-issues"></div>
+            <div id="ai-first-add-row-form"></div>
+            <div id="ai-first-review-controls" class="ai-first-review-controls"></div>
+            <section id="ai-first-row-inspector" class="ai-first-row-inspector" hidden aria-label="Проверка выбранной строки"></section>
+            <div class="table-scroll ai-first-table-scroll" id="ai-first-table-scroll"></div>
+            <div id="ai-first-review-footer" class="ai-first-review-footer" role="status" aria-live="polite"></div>
+          </div>
         </div>
       </section>
 
@@ -649,6 +710,7 @@
     </div>
   </dialog>
 
+  <script src="/static/ai_first_ui.js?v={{ asset_revisions.ai_first }}" defer></script>
   <script src="/static/app.js?v={{ asset_revisions.app }}" defer></script>
 </body>
 </html>

@@ -31,6 +31,7 @@ const state = {
   config: null,
   document: null,
   selectedPages: new Set(),
+  aiFirst: {mode:"standard",previousPages:null,data:null,page:1,selectedRows:new Set(),retryPages:new Set(),exportPages:new Set(),locatorRequestId:0,jobId:null,addRowOpen:false,addRowValues:{}},
   previewPage: null,
   crop: null,
   cropSelecting: false,
@@ -323,6 +324,7 @@ function isCurrentOneCHistoryRequest(generation) {
 }
 
 function cancelDocumentNavigation() {
+  if (typeof resetAIFirstDocumentState === "function") resetAIFirstDocumentState();
   resetPageInspection();
   state.documentNavigationGeneration = (state.documentNavigationGeneration || 0) + 1;
   if (state.documentNavigationController) {
@@ -849,7 +851,7 @@ function setView(name) {
   $$(".view").forEach((view) => view.classList.remove("visible"));
   $(`#${name}-view`).classList.add("visible");
   document.body.classList.toggle("manual-mode", name === "manual");
-  const stepMap = {upload:"upload", pages:"pages", processing:"recognition", review:"review"};
+  const stepMap = {upload:"upload", pages:"pages", processing:"recognition", review:"review", "ai-first-review":"review"};
   const step = stepMap[name] || name;
   $$(".step").forEach((button) => button.classList.toggle("active", button.dataset.step === step));
   const titles = {
@@ -857,6 +859,7 @@ function setView(name) {
     pages: ["Выбор страниц", "Укажите, какие таблицы необходимо распознать"],
     processing: ["Распознавание документа", "Определение строк, столбцов и текста"],
     review: ["Проверка данных", "Сравните результат с PDF и подготовьте экспорт"],
+    "ai-first-review": ["Проверка данных", "Сверьте позиции с PDF, сохраните изменения и подтвердите полноту страниц"],
     manual: ["Тендер без спецификации", "Введите позиции и подберите предложения в общем sourcing-процессе"],
     "excel-tender": ["Тендер из Excel", "Проверка структуры и чтение исходной ресурсной ведомости"],
   };
@@ -864,6 +867,52 @@ function setView(name) {
   $("#page-title").textContent = title;
   $("#page-subtitle").textContent = subtitle;
   updateContextualSupportButton();
+}
+
+function configureAIFirstControls() {
+  const options = state.config?.ai_first_experimental || {};
+  const enabled = options.enabled === true && (options.fake_ocr_enabled === true || options.live_qwen_enabled === true);
+  const controls = $("#ai-first-local-controls");
+  if (!controls) return;
+  controls.hidden = !enabled;
+  $(".ai-disabled-note").hidden = enabled;
+  const fake = $("#ai-first-mode option[value='fake']");
+  const qwen = $("#ai-first-mode option[value='qwen']");
+  fake.hidden = options.fake_ocr_enabled !== true;
+  qwen.hidden = options.live_qwen_enabled !== true;
+  if (!enabled && state.aiFirst.mode !== "standard") {
+    state.aiFirst.mode = "standard";
+    $("#ai-first-mode").value = "standard";
+  }
+  updateAIFirstModeControls();
+}
+
+function updateAIFirstModeControls() {
+  const mode = $("#ai-first-mode")?.value || "standard";
+  const experimental = mode !== "standard";
+  state.aiFirst.mode = mode;
+  $("#ai-first-context").disabled = !experimental;
+  $("#ai-first-context").parentElement?.classList.toggle("is-disabled", !experimental);
+  $("#ai-first-demo-warning").hidden = mode !== "fake";
+  $("#ai-first-live-confirm-wrap").hidden = mode !== "qwen";
+  const note = $("#ai-first-mode-note");
+  if (mode === "fake") note.textContent = "Синтетический тест проверяет интерфейс и Human Review. PDF не отправляется и не анализируется.";
+  else if (mode === "qwen") note.textContent = "Выбранные страницы будут переданы Qwen Vision только после отдельного подтверждения.";
+  else note.textContent = "Обычный Yandex Vision OCR продолжит работать без изменений.";
+  const context = $("#ai-first-context");
+  $("#ai-first-context-count").textContent = `${context.value.length} / 1000`;
+  const recognizeButton = $("#recognize-button");
+  if (recognizeButton) {
+    recognizeButton.textContent = mode === "standard" ? "Распознать выбранные страницы" : "Начать AI-first распознавание";
+    recognizeButton.disabled = state.selectedPages.size === 0 || (mode === "qwen" && !$("#ai-first-live-confirm").checked);
+  }
+  renderAIFirstResumeControls();
+}
+
+function selectAllPagesForAIFirst() {
+  if (!state.document) return;
+  state.selectedPages = new Set(Array.from({length:state.document.page_count}, (_, index) => index + 1));
+  updatePageSelection();
 }
 
 function bytes(value) {
@@ -926,6 +975,7 @@ async function boot() {
       ]);
       if (generation !== state.authGeneration) return;
       state.config = config;
+      configureAIFirstControls();
       state.sourcingHealth = health.sourcing || null;
       await loadSourcingHistoryStatus();
       if (generation !== state.authGeneration) return;
@@ -3377,6 +3427,7 @@ function clearDeletedCurrentDocument(documentId, {notify = true} = {}) {
 
 async function openExistingDocument(documentId, {announce = true, navigation = null} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
+  if (typeof prepareAIFirstDocumentNavigation === "function" && !(await prepareAIFirstDocumentNavigation())) return;
   navigation = navigation || beginDocumentNavigation();
   const encodedId = encodeURIComponent(documentId);
   const documentData = await api(`/api/documents/${encodedId}`, {signal:navigation.signal});
@@ -3388,6 +3439,8 @@ async function openExistingDocument(documentId, {announce = true, navigation = n
   }
   clearExportError();
   state.document = documentData;
+  if (typeof resetAIFirstDocumentState === "function") resetAIFirstDocumentState(documentData.document_id);
+  $("#ai-first-open-saved").hidden = documentData.has_ai_first_result !== true || state.config?.ai_first_experimental?.enabled !== true;
   state.selectedPages = new Set();
   state.previewPage = null;
   updatePageInspectionOpenButton();
@@ -3407,6 +3460,7 @@ async function openExistingDocument(documentId, {announce = true, navigation = n
     loadResult(result, {announce});
   } else {
     setView("pages");
+    if (state.aiFirst.mode !== "standard") selectAllPagesForAIFirst();
     renderThumbnails();
   }
   if (announce && !documentData.has_result) toast("Документ открыт", "success");
@@ -3417,6 +3471,7 @@ async function uploadFile(file) {
     toast("Выберите PDF-файл", "error");
     return;
   }
+  if (typeof prepareAIFirstDocumentNavigation === "function" && !(await prepareAIFirstDocumentNavigation())) return;
   const form = new FormData();
   form.append("file", file);
   const navigation = beginDocumentNavigation();
@@ -3427,8 +3482,13 @@ async function uploadFile(file) {
     if (!isCurrentDocumentNavigation(navigation.generation)) return;
     clearExportError();
     state.document = documentData;
+    if (typeof resetAIFirstDocumentState === "function") resetAIFirstDocumentState(documentData.document_id);
+    $("#ai-first-open-saved").hidden = true;
     localStorage.setItem("averonCurrentDocument", documentData.document_id);
     state.selectedPages.clear();
+    if (state.aiFirst.mode !== "standard") {
+      state.selectedPages = new Set(Array.from({length:documentData.page_count}, (_, index) => index + 1));
+    }
     state.previewPage = null;
     updatePageInspectionOpenButton();
     state.crop = null;
@@ -3482,7 +3542,7 @@ function updatePageSelection() {
   });
   $("#selected-pages-badge").textContent = `${state.selectedPages.size} выбрано`;
   const recognizeButton = $("#recognize-button");
-  if (recognizeButton) recognizeButton.disabled = state.selectedPages.size === 0;
+  if (recognizeButton) recognizeButton.disabled = state.selectedPages.size === 0 || (state.aiFirst.mode === "qwen" && !$("#ai-first-live-confirm").checked);
   if (state.selectedPages.size) {
     $("#page-range").value = compactRanges([...state.selectedPages].sort((a,b)=>a-b));
   }
@@ -3529,6 +3589,12 @@ function updatePageInspectionOpenButton() {
 }
 
 async function showCropPreview(page) {
+  if (state.aiFirst.mode !== "standard" && state.crop && state.aiFirst.cropPage !== page) {
+    state.crop = null;
+    $("#crop-box").hidden = true;
+    $("#clear-crop").hidden = true;
+    toast("При смене страницы область сброшена. При необходимости выделите её на этой странице.", "warning");
+  }
   if (!state.document?.document_id || !Number.isInteger(Number(page)) || Number(page) < 1) return;
   page = Number(page);
   state.previewPage = page;
@@ -3686,6 +3752,7 @@ function positionCropBox() {
 }
 
 async function startRecognition() {
+  if (state.aiFirst.mode !== "standard") return startAIFirstRecognition();
   const pages = [...state.selectedPages].sort((a,b)=>a-b);
   if (!pages.length) return;
   const button = $("#recognize-button");
@@ -5988,14 +6055,20 @@ async function selectRow(id) {
   } else positionHighlight(row);
 }
 
-function positionHighlight(row) {
-  const highlight = $("#row-highlight");
-  if (!row?.bbox) { highlight.hidden = true; return; }
+function positionHighlight(row, targetHighlight = null) {
+  const highlight = targetHighlight || $("#row-highlight");
+  const box = row?.bbox;
+  if (!box || ![box.x, box.y, box.width, box.height].every(Number.isFinite)
+      || box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0
+      || box.x + box.width > 1.000001 || box.y + box.height > 1.000001) {
+    highlight.hidden = true;
+    return;
+  }
   highlight.hidden = false;
-  highlight.style.left = `${row.bbox.x * 100}%`;
-  highlight.style.top = `${row.bbox.y * 100}%`;
-  highlight.style.width = `${row.bbox.width * 100}%`;
-  highlight.style.height = `${row.bbox.height * 100}%`;
+  highlight.style.left = `${box.x * 100}%`;
+  highlight.style.top = `${box.y * 100}%`;
+  highlight.style.width = `${box.width * 100}%`;
+  highlight.style.height = `${box.height * 100}%`;
   requestAnimationFrame(() => highlight.scrollIntoView({block:"center",inline:"nearest",behavior:"smooth"}));
 }
 
@@ -6845,7 +6918,8 @@ async function downloadReviewExcel() {
   }
 }
 
-function resetApp() {
+async function resetApp() {
+  if (state.aiFirst?.data && typeof prepareAIFirstDocumentNavigation === "function" && !(await prepareAIFirstDocumentNavigation())) return;
   if (state.dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
   cancelDocumentNavigation();
   clearExportError();
@@ -7111,6 +7185,7 @@ function setupCropEvents() {
   });
   area.addEventListener("pointermove",(event)=>{
     if(!start)return; const {rect}=start; const x1=Math.max(rect.left,Math.min(start.x,event.clientX)); const x2=Math.min(rect.right,Math.max(start.x,event.clientX)); const y1=Math.max(rect.top,Math.min(start.y,event.clientY)); const y2=Math.min(rect.bottom,Math.max(start.y,event.clientY));
+    state.aiFirst.cropDocumentId=state.document?.document_id; state.aiFirst.cropPage=state.previewPage;
     state.crop={x:(x1-rect.left)/rect.width,y:(y1-rect.top)/rect.height,width:(x2-x1)/rect.width,height:(y2-y1)/rect.height}; positionCropBox();
   });
   area.addEventListener("pointerup",()=>{

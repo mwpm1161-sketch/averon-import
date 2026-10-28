@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "cases": [
+    {
+      "case_id": "synthetic_ordinary_columns_a_multipage",
+      "expected_page_numbers": [1, 2],
+      "expected_columns": [
+        {"page_number": 1, "table_index": 0, "fields": ["position", "code", "name", "unit", "quantity", "note"]},
+        {"page_number": 2, "table_index": 0, "fields": ["position", "code", "name", "unit", "quantity", "note"]}
+      ],
+      "expected_rows": [
+        {"page_number": 1, "table_index": 0, "row_index": 0, "role": "item", "fields": {"position": "1", "article": "SYN-A-001", "name": "Synthetic valve, DN 20", "unit": "шт", "quantity": "2", "note": "Synthetic handling note"}},
+        {"page_number": 1, "table_index": 0, "row_index": 1, "role": "section", "fields": {"name": "Synthetic section Alpha"}},
+        {"page_number": 1, "table_index": 0, "row_index": 2, "role": "item", "fields": {"position": "2", "article": "SYN-A-002", "name": "Synthetic filter\nDN 20", "unit": "шт", "quantity": "3", "note": ""}},
+        {"page_number": 2, "table_index": 0, "row_index": 0, "role": "item", "fields": {"position": "3", "article": "SYN-A-003", "name": "Synthetic coupling, DN 20", "unit": "компл.", "quantity": "1", "note": ""}}
+      ],
+      "synthetic_model_output": [
+        {
+          "page": 1,
+          "tables": [{"headers": ["Поз.", "Артикул", "Наименование", "Ед. изм.", "Количество", "Примечание"], "rows": [
+            {"kind": "item", "cells": [{"column_index": 0, "raw_text": "1"}, {"column_index": 1, "raw_text": "SYN-A-001"}, {"column_index": 2, "raw_text": "Synthetic valve, DN 20"}, {"column_index": 3, "raw_text": "шт"}, {"column_index": 4, "raw_text": "2"}, {"column_index": 5, "raw_text": "Synthetic handling note"}]},
+            {"kind": "section", "cells": [{"column_index": 0, "raw_text": ""}, {"column_index": 1, "raw_text": ""}, {"column_index": 2, "raw_text": "Synthetic section Alpha"}, {"column_index": 3, "raw_text": ""}, {"column_index": 4, "raw_text": ""}, {"column_index": 5, "raw_text": ""}]},
+            {"kind": "item", "cells": [{"column_index": 0, "raw_text": "2"}, {"column_index": 1, "raw_text": "SYN-A-002"}, {"column_index": 2, "raw_text": "Synthetic filter\nDN 20"}, {"column_index": 3, "raw_text": "шт"}, {"column_index": 4, "raw_text": "3"}, {"column_index": 5, "raw_text": ""}]}
+          ]}],
+          "unreadable_fragments": [], "handwritten_replacements": []
+        },
+        {
+          "page": 2,
+          "tables": [{"headers": ["Поз.", "Артикул", "Наименование", "Ед. изм.", "Количество", "Примечание"], "rows": [
+            {"kind": "item", "cells": [{"column_index": 0, "raw_text": "3"}, {"column_index": 1, "raw_text": "SYN-A-003"}, {"column_index": 2, "raw_text": "Synthetic coupling, DN 20"}, {"column_index": 3, "raw_text": "компл."}, {"column_index": 4, "raw_text": "1"}, {"column_index": 5, "raw_text": ""}]}
+          ]}],
+          "unreadable_fragments": [], "handwritten_replacements": []
+        }
+      ]
+    },
+    {
+      "case_id": "synthetic_ordinary_columns_b_reordered",
+      "expected_page_numbers": [1],
+      "expected_columns": [
+        {"page_number": 1, "table_index": 0, "fields": ["code", "position", "quantity", "unit", "name", "mass"]}
+      ],
+      "expected_rows": [
+        {"page_number": 1, "table_index": 0, "row_index": 0, "role": "item", "fields": {"position": "1", "article": "SYN-B-101", "name": "Synthetic pipe, DN 50", "quantity": "1,5", "unit": "м", "mass": "2,30"}},
+        {"page_number": 1, "table_index": 0, "row_index": 1, "role": "item", "fields": {"position": "2", "article": "SYN-B-102", "name": "Synthetic fastener M8", "quantity": "4", "unit": "шт", "mass": "0,02"}}
+      ],
+      "synthetic_model_output": [
+        {
+          "page": 1,
+          "tables": [{"headers": ["Код", "№", "Количество", "Единица измерения", "Наименование", "Масса единицы, кг"], "rows": [
+            {"kind": "item", "cells": [{"column_index": 0, "raw_text": "SYN-B-101"}, {"column_index": 1, "raw_text": "1"}, {"column_index": 2, "raw_text": "1,5"}, {"column_index": 3, "raw_text": "м"}, {"column_index": 4, "raw_text": "Synthetic pipe, DN 50"}, {"column_index": 5, "raw_text": "2,30"}]},
+            {"kind": "item", "cells": [{"column_index": 0, "raw_text": "SYN-B-102"}, {"column_index": 1, "raw_text": "2"}, {"column_index": 2, "raw_text": "4"}, {"column_index": 3, "raw_text": "шт"}, {"column_index": 4, "raw_text": "Synthetic fastener M8"}, {"column_index": 5, "raw_text": "0,02"}]}
+          ]}],
+          "unreadable_fragments": [], "handwritten_replacements": []
+        }
+      ]
+    }
+  ]
+}

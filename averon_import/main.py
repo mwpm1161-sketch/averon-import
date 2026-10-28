@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -10,6 +11,7 @@ import shutil
 import tempfile
 import threading
 import webbrowser
+from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -123,6 +125,29 @@ from averon_import.services.document_lifecycle import (
     DocumentActivityRegistry,
     DocumentUnavailable,
 )
+from averon_import.services.ai_first.contracts import AIHumanRowRole, AIDocumentDraft, AIReviewState
+from averon_import.services.ai_first.editor_draft import (
+    DraftEditError, EditorEdits, consume_editor, current_editor, editor_export_snapshot, export_review,
+    review_token, save_editor,
+)
+from averon_import.services.ai_first.local_workflow import (
+    AICancellationSignal, AIWorkspaceStore, SyntheticPageAdapter, build_live_qwen_runtime,
+)
+from averon_import.services.ai_first.pilot_export import (
+    MAX_PILOT_EXPORT_PAGES, XLSX_MIME as AI_FIRST_PILOT_XLSX_MIME,
+    PilotExportError, build_ai_first_diagnostic_xlsx, build_ai_first_pilot_xlsx, preview_ai_first_pilot_export,
+)
+from averon_import.services.ai_first.pdf_locator import locate_ai_first_pdf_bbox
+from averon_import.services.ai_first.orchestration import (
+    CheckpointStore, FitZPageRenderer, OrchestrationConfig, OrchestrationError, PageOrchestrator,
+    TokenPricing, inspect_pdf,
+)
+from averon_import.services.ai_first.qwen_vision_adapter import QwenVisionQuotaRegistry
+from averon_import.services.ai_first.review import (
+    AIReviewError, assert_no_open_review_conflicts, assert_review_ready_for_export, confirm_page_complete, new_review_state,
+    reconcile_reprocessed_pages, record_row_decision, record_row_role_classification,
+    record_structure_change, resolve_review_issue,
+)
 from averon_import.services.ocr.yandex_vision import YandexVisionProvider
 from averon_import.services.pdf_service import PdfService
 from averon_import.services.processing_coordinator import (
@@ -202,6 +227,7 @@ def _static_asset_revision(filename: str) -> str:
 
 STATIC_ASSET_REVISIONS = {
     "app": _static_asset_revision("app.js"),
+    "ai_first": _static_asset_revision("ai_first_ui.js"),
     "styles": _static_asset_revision("styles.css"),
 }
 
@@ -249,6 +275,17 @@ yandex_vision_provider = YandexVisionProvider(
     secret_store=secret_store,
     cache_dir=DATA_DIR / "ocr_cache",
 )
+
+AI_FIRST_UI_ENABLED = os.environ.get("AVERON_AI_FIRST_UI_ENABLED", "").strip().casefold() in {"1", "true", "yes"}
+AI_FIRST_FAKE_OCR_ENABLED = AI_FIRST_UI_ENABLED and os.environ.get(
+    "AVERON_AI_FIRST_FAKE_OCR", "",
+).strip().casefold() in {"1", "true", "yes"}
+AI_FIRST_LIVE_ENABLED = AI_FIRST_UI_ENABLED and os.environ.get(
+    "AVERON_AI_FIRST_LIVE_ENABLED", "",
+).strip().casefold() in {"1", "true", "yes"}
+ai_first_quota_registry = QwenVisionQuotaRegistry()
+_ai_first_cancel_signals: dict[str, AICancellationSignal] = {}
+_ai_first_cancel_lock = threading.RLock()
 coordinator = ProcessingCoordinator(
     pdf_service,
     smart_ai=smart_ai,
@@ -273,8 +310,40 @@ document_activity_registry = DocumentActivityRegistry()
 _sourcing_runtime_lock = threading.RLock()
 
 
-def require_document_activity(document_id: str):
+class _AIFirstJobFailure(RuntimeError):
+    """Safe job error that preserves the diagnostic code through JobService."""
+
+    def __init__(self, code: str):
+        super().__init__("AI-first обработка не завершена")
+        self.code = code
+
+
+def _assert_ai_first_document_access(document_id: str, user: CurrentUser) -> None:
+    """Protect AI-first documents in session mode, retaining legacy shared OCR."""
+    if auth_config().mode != "session" or not isinstance(user, CurrentUser) or user.role is Role.ADMIN:
+        return
     try:
+        workspace = workspace_service.get(document_id)
+        if not (workspace.root / "ai_first").exists():
+            return
+        store = AIWorkspaceStore(workspace.root)
+        access = store.read("access.json")
+        if access is not None:
+            allowed = {access.get("owner_id"), *access.get("legacy_reviewer_ids", [])}
+        else:
+            # Read existing server-authored provenance without claiming another
+            # reviewer's workspace or rewriting legacy saved decisions.
+            review = store.read("review.json") or {}
+            allowed = {event.get("reviewer_id") for event in review.get("history", [])}
+        if _job_owner_id(user) not in allowed:
+            raise HTTPException(404, "Документ не найден")
+    except FileNotFoundError:
+        raise HTTPException(404, "Документ не найден") from None
+
+
+def require_document_activity(document_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        _assert_ai_first_document_access(document_id, user)
         with document_activity_registry.lease(document_id):
             yield
     except DocumentUnavailable as exc:
@@ -398,7 +467,7 @@ def _source_fingerprint(workspace) -> str:
 
 
 def _public_document_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in metadata.items() if key != "source_sha256"}
+    return {key: value for key, value in metadata.items() if key not in {"source_sha256", "uploaded_by_user_id"}}
 
 
 def _rebuild_sourcing_runtime() -> None:
@@ -1090,6 +1159,11 @@ def config():
             "processing_status": coordinator.mode_status(),
             "warnings": app_settings_service.warnings_snapshot(),
         },
+        "ai_first_experimental": {
+            "enabled": AI_FIRST_UI_ENABLED,
+            "fake_ocr_enabled": AI_FIRST_FAKE_OCR_ENABLED,
+            "live_qwen_enabled": AI_FIRST_LIVE_ENABLED,
+        },
     }
 
 
@@ -1697,7 +1771,7 @@ def delete_tstn_x_sp_secret():
 
 
 @app.post("/api/documents", dependencies=[Depends(require_authenticated)])
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(file: UploadFile = File(...), user: CurrentUser = Depends(require_authenticated)):
     filename = file.filename or "document.pdf"
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Поддерживаются только PDF-файлы")
@@ -1730,6 +1804,7 @@ async def upload_document(file: UploadFile = File(...)):
                     else inspection["title"]
                 ),
                 "size": total,
+                **({"uploaded_by_user_id": _job_owner_id(user)} if auth_config().mode == "session" else {}),
             },
             source_sha256=source_digest.hexdigest(),
         )
@@ -1742,8 +1817,17 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.get("/api/documents", dependencies=[Depends(require_authenticated)])
-def list_documents(limit: int = 50):
-    return {"documents": workspace_service.list_recent(limit)}
+def list_documents(limit: int = 50, user: CurrentUser = Depends(require_authenticated)):
+    documents = []
+    for item in workspace_service.list_recent(limit):
+        try:
+            _assert_ai_first_document_access(item["document_id"], user)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            continue
+        documents.append(item)
+    return {"documents": documents}
 
 
 @app.delete("/api/admin/documents/{document_id}", dependencies=[Depends(require_admin)])
@@ -1808,6 +1892,7 @@ def get_document(document_id: str):
             **_public_document_metadata(metadata),
             "has_result": workspace.result_path.is_file(),
             "has_review_decisions": workspace.review_decisions_path.is_file(),
+            "has_ai_first_result": (workspace.root / "ai_first" / "transcription.json").is_file(),
         }
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
@@ -1962,6 +2047,741 @@ def get_job(job_id: str, user: CurrentUser = Depends(require_authenticated)):
             404,
             detail={"code": "JOB_NOT_FOUND", "message": "Задание не найдено"},
         ) from exc
+
+
+class AIFirstCropRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    page_number: StrictInt = Field(ge=1)
+    x: float = Field(ge=0, lt=1, allow_inf_nan=False)
+    y: float = Field(ge=0, lt=1, allow_inf_nan=False)
+    width: float = Field(gt=0, le=1, allow_inf_nan=False)
+    height: float = Field(gt=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def within_page(self):
+        if self.x + self.width > 1 or self.y + self.height > 1:
+            raise ValueError("crop_outside_page")
+        return self
+
+
+class AIFirstRecognizeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    mode: Literal["fake", "qwen"]
+    pages: list[StrictInt] | None = None
+    retry_pages: list[StrictInt] = Field(default_factory=list)
+    user_context: StrictStr | None = None
+    live_acknowledged: StrictBool = False
+    start_new_run: StrictBool = False
+    crop: AIFirstCropRequest | None = None
+
+    @field_validator("user_context")
+    @classmethod
+    def validate_context(cls, value):
+        from averon_import.services.ocr.qwen_vision_client import validate_user_context
+
+        try:
+            return validate_user_context(value)
+        except Exception as exc:
+            raise ValueError(getattr(exc, "code", "invalid_user_context")) from None
+
+
+class AIFirstReviewMutationRequest(BaseModel):
+    review_token: StrictStr | None = Field(default=None, min_length=64, max_length=64)
+
+
+class AIFirstSaveDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    review_token: StrictStr = Field(min_length=64, max_length=64)
+    edits: EditorEdits
+
+
+class AIFirstRowDecisionRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    record_id: StrictStr
+    disposition: Literal["confirmed", "corrected", "excluded"]
+    values: dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    confirmed: StrictBool = True
+
+    @model_validator(mode="after")
+    def bounded_values(self):
+        if len(self.values) > 64 or any(len(key) > 64 or len(value) > 2000 for key, value in self.values.items()):
+            raise ValueError("review_values_out_of_range")
+        if sum(len(key) + len(value) for key, value in self.values.items()) > 30_000:
+            raise ValueError("review_values_out_of_range")
+        return self
+
+
+class AIFirstRowRoleRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    record_id: StrictStr
+    role: AIHumanRowRole
+    parent_record_id: StrictStr | None = None
+
+
+class AIFirstBulkConfirmRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
+
+
+class AIFirstBulkRoleRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
+    role: Literal["standalone_item", "header", "column_numbering", "section", "continuation", "note"]
+
+
+def require_ai_first_enabled():
+    if not AI_FIRST_UI_ENABLED:
+        raise HTTPException(404, "Экспериментальный режим выключен")
+
+
+class AIFirstAddRowRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    page_number: StrictInt = Field(ge=1)
+    values: dict[StrictStr, StrictStr]
+
+    @model_validator(mode="after")
+    def bounded_values(self):
+        if not self.values or len(self.values) > 64 or any(len(key) > 64 or len(value) > 2000 for key, value in self.values.items()):
+            raise ValueError("review_values_out_of_range")
+        if sum(len(key) + len(value) for key, value in self.values.items()) > 30_000:
+            raise ValueError("review_values_out_of_range")
+        return self
+
+
+class AIFirstPageRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    page_number: StrictInt = Field(ge=1)
+
+
+class AIFirstPilotExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    page_numbers: list[StrictInt] = Field(min_length=1, max_length=MAX_PILOT_EXPORT_PAGES)
+
+    @model_validator(mode="after")
+    def unique_pages(self):
+        if len(set(self.page_numbers)) != len(self.page_numbers):
+            raise ValueError("duplicate_page_scope")
+        return self
+
+
+class AIFirstResolveIssueRequest(AIFirstReviewMutationRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    issue_id: StrictStr
+    detail: StrictStr = Field(min_length=1, max_length=2000)
+
+
+def _ai_first_store(workspace):
+    return AIWorkspaceStore(workspace.root)
+
+
+def _ai_first_read_state(workspace):
+    store = _ai_first_store(workspace)
+    raw_draft = store.read("transcription.json")
+    raw_review = store.read("review.json")
+    raw_report = store.read("report.json")
+    if raw_draft is None or raw_review is None or raw_report is None:
+        raise HTTPException(404, detail={"code": "AI_FIRST_RESULT_NOT_FOUND", "message": "Результат AI-first ещё не сохранён."})
+    try:
+        draft = AIDocumentDraft.model_validate(raw_draft)
+        review = AIReviewState.model_validate_json(json.dumps(raw_review, ensure_ascii=False))
+        current_editor(draft, store.read("editor-draft.json"))
+    except (ValidationError, DraftEditError):
+        raise HTTPException(409, detail={"code": "AI_FIRST_STATE_INVALID", "message": "Сохранённое состояние проверки повреждено."}) from None
+    return store, draft, review, raw_report
+
+
+def _ai_first_page_counts(draft: AIDocumentDraft) -> dict[str, int]:
+    rows = [row for page in draft.pages for table in page.tables for row in table.rows]
+    cells = [cell for row in rows for cell in row.raw_cells]
+    return {"tables": sum(len(page.tables) for page in draft.pages), "rows": len(rows), "cells": len(cells)}
+
+
+def _build_ai_first_runtime(request, page_count):
+    if request.mode == "fake":
+        adapter = SyntheticPageAdapter(request.user_context)
+        fake_request_limit = min(10000, max(1, page_count * 2))
+        config = OrchestrationConfig(
+            concurrency=1,
+            dpi=150,
+            max_requests=fake_request_limit,
+            requests_per_minute=fake_request_limit,
+            tokens_per_minute=fake_request_limit,
+            max_budget_rub=Decimal(fake_request_limit) / Decimal("1000"),
+            pricing=TokenPricing(
+                profile_id="synthetic-no-billing",
+                input_rub_per_1k=Decimal("1"),
+                output_rub_per_1k=Decimal("1"),
+            ),
+            max_pages=max(1, page_count),
+        )
+    else:
+        adapter, config = build_live_qwen_runtime(
+            settings=app_settings_service.settings.yandex,
+            secret_store=secret_store,
+            quota_registry=ai_first_quota_registry,
+            user_context=request.user_context,
+            page_count=page_count,
+        )
+    return adapter, config
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/recognize",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+async def recognize_ai_first(
+    document_id: str,
+    http_request: Request,
+    user: CurrentUser = Depends(require_authenticated),
+):
+    try:
+        request = AIFirstRecognizeRequest.model_validate(await http_request.json())
+    except (ValidationError, ValueError, TypeError):
+        raise HTTPException(
+            422,
+            detail={"code": "AI_FIRST_INVALID_REQUEST", "message": "Проверьте режим, выбор страниц и длину подсказки."},
+        ) from None
+    if request.mode == "fake" and not AI_FIRST_FAKE_OCR_ENABLED:
+        raise HTTPException(403, "Синтетический режим не разрешён конфигурацией сервера")
+    if request.mode == "qwen" and not AI_FIRST_LIVE_ENABLED:
+        raise HTTPException(403, "Qwen Vision не включён конфигурацией локального сервера")
+    if request.mode == "qwen" and not request.live_acknowledged:
+        raise HTTPException(400, "Перед отправкой подтвердите возможную тарификацию запросов.")
+    try:
+        workspace = workspace_service.get(document_id)
+        metadata = workspace_service.read_json(workspace.metadata_path)
+        page_count = int(metadata["page_count"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        raise HTTPException(404, "Документ не найден") from None
+    if (auth_config().mode == "session" and metadata.get("uploaded_by_user_id")
+            and metadata["uploaded_by_user_id"] != _job_owner_id(user) and user.role is not Role.ADMIN):
+        raise HTTPException(404, "Документ не найден")
+    pages = sorted(set(request.pages if request.pages is not None else range(1, page_count + 1)))
+    if not pages or any(type(page) is not int or page < 1 or page > page_count for page in pages):
+        raise HTTPException(400, "Некорректный выбор страниц")
+    retry_pages = set(request.retry_pages)
+    if request.start_new_run and retry_pages:
+        raise HTTPException(400, "Новый запуск не может продолжать страницы старого checkpoint.")
+    if len(retry_pages) != len(request.retry_pages) or not retry_pages.issubset(pages):
+        raise HTTPException(400, "Страницы для продолжения должны входить в выбранный диапазон.")
+
+    store = _ai_first_store(workspace)
+    try:
+        store.ensure()
+        if auth_config().mode == "session":
+            with document_mutation_locks.for_document(document_id):
+                access = store.read("access.json")
+                if access is None:
+                    old_review = store.read("review.json") or {}
+                    legacy_reviewers = sorted({event["reviewer_id"] for event in old_review.get("history", []) if event.get("reviewer_id")})
+                    store.write("access.json", {"version": 1, "owner_id": metadata.get("uploaded_by_user_id") or _job_owner_id(user),
+                                                "legacy_reviewer_ids": legacy_reviewers})
+                else:
+                    _assert_ai_first_document_access(document_id, user)
+    except RuntimeError:
+        raise HTTPException(503, "Не удалось подтвердить защищённое локальное хранилище.") from None
+
+    if request.crop is not None and request.crop.page_number not in pages:
+        raise HTTPException(400, "Область должна относиться к выбранной странице.")
+    try:
+        prepared_adapter, prepared_config = _build_ai_first_runtime(request, page_count)
+        if request.crop is not None:
+            crop = request.crop
+            prepared_config = prepared_config.model_copy(update={"page_regions": {
+                crop.page_number: (crop.x, crop.y, crop.width, crop.height),
+            }})
+        if len(pages) > prepared_config.max_requests:
+            raise OrchestrationError("local_request_limit_exceeded")
+        prepared_run_id, prepared_checkpoint_path = store.select_run(document_id)
+        identity = inspect_pdf(workspace.pdf_path, prepared_adapter, prepared_config, run_id=prepared_run_id)
+        manifest = prepared_checkpoint_path / "manifest.json"
+        if not request.start_new_run and manifest.exists():
+            from averon_import.services.ai_first.private_acl import verify_private_tree
+            verify_private_tree(prepared_checkpoint_path)
+            expected = {"format_version": 2, "identity": identity.model_dump(mode="json"),
+                        "identity_fingerprint": identity.fingerprint}
+            if json.loads(manifest.read_text(encoding="utf-8")) != expected:
+                raise OrchestrationError("checkpoint_identity_mismatch")
+    except Exception as exc:
+        code = getattr(exc, "code", None) or (str(exc) if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", str(exc)) else "ai_first_preflight_failed")
+        mismatch = code == "checkpoint_identity_mismatch"
+        raise HTTPException(409, detail={"code": code, "can_start_new_run": mismatch,
+            "message": "Настройки отличаются от сохранённого запуска. Создайте новый запуск; прежние результаты и правки будут сохранены." if mismatch else "Локальная проверка не пройдена. Проверьте настройки и выбранную область; запрос не отправлен."}) from None
+
+    cancellation = AICancellationSignal()
+
+    def run(progress):
+        try:
+            adapter, config = prepared_adapter, prepared_config
+            if request.start_new_run:
+                with document_mutation_locks.for_document(document_id):
+                    run_id, checkpoint_path = store.select_run(document_id, new_run=True)
+            else:
+                run_id, checkpoint_path = prepared_run_id, prepared_checkpoint_path
+            identity = inspect_pdf(
+                workspace.pdf_path, adapter, config, run_id=run_id,
+            )
+            checkpoint = CheckpointStore(checkpoint_path, identity)
+            prior_progress = {} if request.start_new_run else (store.read("progress.json") or {})
+            for page_number in pages:
+                if page_number in retry_pages:
+                    prior_progress[str(page_number)] = "pending"
+                else:
+                    prior_progress.setdefault(str(page_number), "pending")
+            store.write("progress.json", prior_progress)
+
+            async def execute():
+                cancel_event = asyncio.Event()
+                cancellation.bind(asyncio.get_running_loop(), cancel_event)
+
+                async def on_page(event):
+                    prior_progress[str(event.page_number)] = event.state
+                    store.write("progress.json", prior_progress)
+                    safe_message = f"Страница {event.page_number}: {event.state}"
+                    finished_selected = sum(
+                        prior_progress.get(str(page_number))
+                        in {"completed", "incomplete", "failed", "unknown_outcome"}
+                        for page_number in pages
+                    )
+                    progress(finished_selected, len(pages), safe_message)
+
+                orchestrator = PageOrchestrator(
+                    adapter, FitZPageRenderer(), config, checkpoint, progress=on_page,
+                )
+                return await orchestrator.run(
+                    workspace.pdf_path,
+                    cancel_event=cancel_event,
+                    retry_pages=retry_pages,
+                    selected_pages=set(pages),
+                )
+
+            report = asyncio.run(execute())
+            _publish_ai_first_report(document_id, store, report)
+            counts = _ai_first_page_counts(report.draft)
+            return {
+                "workflow": "ai_first",
+                "mode": request.mode,
+                "status": report.status,
+                "completed_pages": sum(page.state == "completed" for page in report.pages),
+                "total_pages": report.expected_page_count,
+                "counts": counts,
+                "cost_rub": str(report.actual_cost_rub) if report.actual_cost_rub is not None else None,
+                "billing": "synthetic_no_billing" if request.mode == "fake" else "usage_based_estimate",
+            }
+        except Exception as exc:
+            safe_code = getattr(exc, "code", None) or getattr(exc, "safe_code", None)
+            if safe_code is None and isinstance(exc, RuntimeError):
+                candidate = str(exc)
+                safe_code = candidate if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate) else None
+            if not isinstance(safe_code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
+                safe_code = "ai_first_processing_failed"
+            raise _AIFirstJobFailure(safe_code) from None
+
+    try:
+        job = _submit_document_job(
+            document_id,
+            run,
+            kind="ai_first_recognition",
+            owner_id=_job_owner_id(user),
+            dedupe_key=None,
+        )
+    except HTTPException:
+        raise
+    with _ai_first_cancel_lock:
+        _ai_first_cancel_signals[job.id] = cancellation
+        while len(_ai_first_cancel_signals) > 256:
+            _ai_first_cancel_signals.pop(next(iter(_ai_first_cancel_signals)))
+    return job.public()
+
+
+@app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(require_authenticated), Depends(require_ai_first_enabled)])
+def cancel_ai_first_job(job_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        job = job_service.get(job_id, owner_id=_job_owner_id(user))
+    except KeyError as exc:
+        raise HTTPException(404, detail={"code": "JOB_NOT_FOUND", "message": "Задание не найдено"}) from exc
+    if job.kind != "ai_first_recognition":
+        raise HTTPException(409, "Отменять через этот маршрут можно только AI-first распознавание.")
+    if not job.active:
+        return {"cancel_requested": False, "status": job.status}
+    with _ai_first_cancel_lock:
+        signal = _ai_first_cancel_signals.get(job_id)
+    if signal is None:
+        raise HTTPException(409, "Сигнал отмены недоступен; текущее задание не изменено.")
+    signal.request()
+    return {"cancel_requested": True, "status": job.status}
+
+
+@app.get(
+    "/api/documents/{document_id}/ai-first",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def get_ai_first_state(document_id: str):
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        store, draft, review, report = _ai_first_read_state(workspace)
+        progress_state = store.read("progress.json") or {}
+        editor = store.read("editor-draft.json")
+        token = review_token(draft, review, editor)
+    try:
+        if current_editor(draft, editor)["stale"]:
+            raise AIReviewError("editor_draft_revision_mismatch")
+        assert_review_ready_for_export(draft, export_review(draft, review, editor))
+        guard = {"ready": True, "code": None}
+    except AIReviewError as exc:
+        guard = {"ready": False, "code": str(exc)}
+    latest_pages = report.get("pages", []) if isinstance(report, dict) else []
+    return {
+        "draft": draft.model_dump(mode="json"),
+        "review": review.model_dump(mode="json"),
+        "editor_draft": current_editor(draft, editor),
+        "review_token": token,
+        "workspace_document_id": document_id,
+        "progress": progress_state,
+        "pages": [
+            {
+                "page_number": item.get("page_number"),
+                "state": item.get("state"),
+                "safe_error_code": ((item.get("attempts") or [{}])[-1] or {}).get("safe_error_code"),
+            }
+            for item in latest_pages if isinstance(item, dict)
+        ],
+        "status": report.get("status") if isinstance(report, dict) else None,
+        "mode": report.get("adapter", {}).get("model_id") if isinstance(report, dict) else None,
+        "review_ready_for_guard": guard,
+    }
+
+
+@app.get(
+    "/api/documents/{document_id}/ai-first/progress",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def get_ai_first_progress(document_id: str):
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    if not (workspace.root / "ai_first").exists():
+        return {"progress": {}}
+    return {"progress": AIWorkspaceStore(workspace.root).read("progress.json") or {}}
+
+
+def _mutate_ai_first_state(document_id: str, operation, *, request=None):
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        store, draft, review, _report = _ai_first_read_state(workspace)
+        editor = store.read("editor-draft.json")
+        if request is not None and request.review_token is not None and request.review_token != review_token(draft, review, editor):
+            raise HTTPException(409, detail={"code": "review_revision_conflict", "message": "Проверка изменена в другом окне. Правки оставлены на экране; обновите состояние перед повторным сохранением."})
+        try:
+            updated = operation(draft, review)
+        except AIReviewError as exc:
+            raise HTTPException(409, detail={"code": str(exc), "message": "Действие не применено; состояние проверки осталось без изменений."}) from None
+        state_writes = {"review.json": updated.model_dump(mode="json")}
+        if request is not None and editor is not None:
+            ids = [request.record_id] if hasattr(request, "record_id") else getattr(request, "record_ids", [])
+            editor = consume_editor(editor,
+                values=ids if isinstance(request, (AIFirstRowDecisionRequest, AIFirstBulkConfirmRequest)) else (),
+                roles=ids if isinstance(request, (AIFirstRowRoleRequest, AIFirstBulkRoleRequest)) else (),
+                issue_id=getattr(request, "issue_id", None), add_row=isinstance(request, AIFirstAddRowRequest))
+            state_writes["editor-draft.json"] = editor
+        store.write_many(state_writes)
+        return {"review": updated.model_dump(mode="json")}
+
+
+def _publish_ai_first_report(document_id: str, store: AIWorkspaceStore, report):
+    """Publish extraction and its reconciled review state as one document mutation."""
+    with document_mutation_locks.for_document(document_id):
+        old_draft_data = store.read("transcription.json")
+        old_review_data = store.read("review.json")
+        if old_draft_data is None or old_review_data is None:
+            review = new_review_state(report.draft)
+        else:
+            old_draft = AIDocumentDraft.model_validate(old_draft_data)
+            old_review = AIReviewState.model_validate_json(json.dumps(old_review_data, ensure_ascii=False))
+            review = reconcile_reprocessed_pages(old_draft, report.draft, old_review)
+        writes = {
+            "transcription.json": report.draft.model_dump(mode="json"),
+            "review.json": review.model_dump(mode="json"),
+        }
+        editor = store.read("editor-draft.json")
+        if editor is not None and current_editor(report.draft, editor)["stale"]:
+            # History remains private and recoverable; old buffers cannot apply
+            # silently to rows from a different extraction revision.
+            writes["editor-draft.json"] = {**editor, "revision": editor["revision"] + 1,
+                "source_document_id": report.draft.source_document_id,
+                "draft_revision_id": report.draft.revision_id, "edits": EditorEdits().model_dump()}
+        writes["report.json"] = report.model_dump(
+            mode="json", exclude={"draft": True, "pages": {"__all__": {"extraction"}}},
+        )
+        store.write_many(writes)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/row",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def decide_ai_first_row(document_id: str, request: AIFirstRowDecisionRequest, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        return _mutate_ai_first_state(document_id, lambda draft, state: record_row_decision(
+            draft, state, request.record_id, disposition=request.disposition,
+            reviewer_id=_job_owner_id(user), values=dict(request.values), human_confirmed=request.confirmed,
+        ), request=request)
+    except HTTPException:
+        raise
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/row-role",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def classify_ai_first_row_role(document_id: str, request: AIFirstRowRoleRequest, user: CurrentUser = Depends(require_authenticated)):
+    return _mutate_ai_first_state(document_id, lambda draft, state: record_row_role_classification(
+        draft, state, request.record_id, role=request.role,
+        parent_record_id=request.parent_record_id, reviewer_id=_job_owner_id(user),
+    ), request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/bulk-confirm",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def bulk_confirm_ai_first_rows(document_id: str, request: AIFirstBulkConfirmRequest, user: CurrentUser = Depends(require_authenticated)):
+    if len(set(request.record_ids)) != len(request.record_ids):
+        raise HTTPException(400, "В списке есть повторяющиеся строки.")
+    def apply(draft, state):
+        assert_no_open_review_conflicts(draft, state, request.record_ids)
+        current = state
+        for record_id in request.record_ids:
+            current = record_row_decision(
+                draft, current, record_id, disposition="confirmed", reviewer_id=_job_owner_id(user),
+            )
+        return current
+    return _mutate_ai_first_state(document_id, apply, request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/bulk-role",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def bulk_classify_ai_first_rows(document_id: str, request: AIFirstBulkRoleRequest, user: CurrentUser = Depends(require_authenticated)):
+    if len(set(request.record_ids)) != len(request.record_ids):
+        raise HTTPException(400, "В списке есть повторяющиеся строки.")
+    def apply(draft, state):
+        assert_no_open_review_conflicts(draft, state, request.record_ids)
+        current = state
+        for record_id in request.record_ids:
+            current = record_row_role_classification(
+                draft, current, record_id, role=request.role, reviewer_id=_job_owner_id(user),
+            )
+        return current
+    return _mutate_ai_first_state(document_id, apply, request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/add-row",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def add_ai_first_row(document_id: str, request: AIFirstAddRowRequest, user: CurrentUser = Depends(require_authenticated)):
+    if not request.values or not any(value.strip() for value in request.values.values()):
+        raise HTTPException(400, "Заполните хотя бы одну ячейку ручной позиции.")
+    return _mutate_ai_first_state(document_id, lambda draft, state: record_structure_change(
+        draft, state, action="add_row", source_record_ids=[], result_rows=[dict(request.values)],
+        reviewer_id=_job_owner_id(user), page_number=request.page_number,
+    ), request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/complete-page",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def confirm_ai_first_page(document_id: str, request: AIFirstPageRequest, user: CurrentUser = Depends(require_authenticated)):
+    def apply(draft, state):
+        page = next((page for page in draft.pages if page.page_number == request.page_number), None)
+        if page is None or page.status not in {"extracted", "no_specification"}:
+            raise AIReviewError("page_processing_incomplete")
+        return confirm_page_complete(draft, state, request.page_number, reviewer_id=_job_owner_id(user))
+    return _mutate_ai_first_state(document_id, apply, request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/resolve-issue",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def resolve_ai_first_issue(document_id: str, request: AIFirstResolveIssueRequest, user: CurrentUser = Depends(require_authenticated)):
+    return _mutate_ai_first_state(document_id, lambda draft, state: resolve_review_issue(
+        draft, state, request.issue_id, reviewer_id=_job_owner_id(user), detail=request.detail,
+    ), request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/save",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def save_ai_first_review(document_id: str, request: AIFirstSaveDraftRequest | None = None, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        store, draft, review, report = _ai_first_read_state(workspace)
+        editor = store.read("editor-draft.json")
+        if request is not None:
+            try:
+                editor = save_editor(draft, review, editor, request.edits,
+                    expected_token=request.review_token, reviewer_id=_job_owner_id(user))
+            except DraftEditError as exc:
+                raise HTTPException(409, detail={"code": str(exc), "record_id": exc.record_id,
+                    "message": "Черновик не сохранён: состояние изменилось или поле больше не относится к текущей строке. Введённые правки оставлены на экране."}) from None
+            store.write("editor-draft.json", editor)
+    return {"saved": True, "history_events": len(review.history),
+            "editor_draft": current_editor(draft, editor), "review_token": review_token(draft, review, editor)}
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/pilot-export",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
+    """Download a test-marked workbook from the saved local Human Review ledger."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        _store, draft, review, report = _ai_first_read_state(workspace)
+        editor = _store.read("editor-draft.json")
+        if current_editor(draft, editor)["stale"]:
+            raise HTTPException(409, "Черновик относится к прежнему распознаванию. Откройте актуальный запуск перед выгрузкой.")
+        review = export_review(draft, review, editor)
+        report = {**report, "saved_editor_draft": editor_export_snapshot(draft, review, editor, request.page_numbers)}
+        metadata = workspace_service.read_json(workspace.metadata_path) or {}
+        document_name = str(metadata.get("filename") or "document.pdf")
+        try:
+            content = build_ai_first_pilot_xlsx(
+                draft, review, report, page_numbers=request.page_numbers,
+                document_name=document_name,
+            )
+        except PilotExportError as exc:
+            code = str(exc)
+            if code in {"export_cell_limit_exceeded", "export_long_text_overflow_exceeded"}:
+                message = "Файл не создан: текст исходного документа превышает ограничение Excel. Данные не изменены; обратитесь к администратору для диагностической выгрузки."
+            elif code == "no_verified_positions":
+                message = "Файл не создан: нет самостоятельных позиций, прошедших проверку. Все исходные строки сохранены."
+            else:
+                message = "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и сохранённые решения."
+            raise HTTPException(
+                409,
+                detail={"code": code, "message": message},
+            ) from None
+    filename = f"Averon_AI-first_TEST_{workspace.document_id[:8]}.xlsx"
+    return Response(
+        content=content,
+        media_type=AI_FIRST_PILOT_XLSX_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/pilot-export/preview",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def preview_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
+    """Return content-free pilot counts using the same backend admission rules as XLSX."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        _store, draft, review, report = _ai_first_read_state(workspace)
+        editor = _store.read("editor-draft.json")
+        if current_editor(draft, editor)["stale"]:
+            raise HTTPException(409, "Черновик относится к прежнему распознаванию. Откройте актуальный запуск перед выгрузкой.")
+        review = export_review(draft, review, editor)
+        metadata = workspace_service.read_json(workspace.metadata_path) or {}
+        try:
+            return preview_ai_first_pilot_export(
+                draft, review, report, page_numbers=request.page_numbers,
+                document_name=str(metadata.get("filename") or "document.pdf"),
+            )
+        except PilotExportError as exc:
+            raise HTTPException(
+                409,
+                detail={"code": str(exc), "message": "Тестовую выгрузку не удалось проверить. Перепроверьте выбранные страницы."},
+            ) from None
+
+
+@app.post(
+    "/api/admin/documents/{document_id}/ai-first/diagnostic-export",
+    dependencies=[Depends(require_admin), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def export_ai_first_diagnostic(document_id: str, request: AIFirstPilotExportRequest):
+    """Administrator-only loss-preserving diagnostic export of one saved snapshot."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        store, draft, review, report = _ai_first_read_state(workspace)
+        editor = store.read("editor-draft.json")
+        if current_editor(draft, editor)["stale"]:
+            raise HTTPException(409, "Черновик относится к прежнему распознаванию. Откройте актуальный запуск перед диагностикой.")
+        review = export_review(draft, review, editor)
+        report = {**report, "saved_editor_draft": editor_export_snapshot(draft, review, editor, request.page_numbers)}
+        metadata = workspace_service.read_json(workspace.metadata_path) or {}
+        try:
+            content = build_ai_first_diagnostic_xlsx(
+                draft, review, report, page_numbers=request.page_numbers,
+                document_name=str(metadata.get("filename") or "document.pdf"),
+            )
+        except PilotExportError as exc:
+            raise HTTPException(409, detail={"code": str(exc), "message": "Диагностическую выгрузку не удалось подготовить."}) from None
+    filename = f"Averon_AI-first_DIAGNOSTIC_{workspace.document_id[:8]}.xlsx"
+    return Response(
+        content=content,
+        media_type=AI_FIRST_PILOT_XLSX_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get(
+    "/api/documents/{document_id}/ai-first/locator",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def locate_ai_first_row(document_id: str, record_id: str = Query(min_length=1, max_length=256), cell_index: int | None = Query(default=None, ge=0, le=63)):
+    """Resolve only unique exact text-layer matches; never returns document text."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        _store, draft, _review, _report = _ai_first_read_state(workspace)
+        return locate_ai_first_pdf_bbox(
+            workspace.pdf_path, draft, record_id, cell_index=cell_index,
+        )
 
 
 @app.get(
