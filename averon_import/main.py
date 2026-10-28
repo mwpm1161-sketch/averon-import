@@ -126,6 +126,10 @@ from averon_import.services.document_lifecycle import (
     DocumentUnavailable,
 )
 from averon_import.services.ai_first.contracts import AIHumanRowRole, AIDocumentDraft, AIReviewState
+from averon_import.services.ai_first.editor_draft import (
+    DraftEditError, EditorEdits, consume_editor, current_editor, editor_export_snapshot, export_review,
+    review_token, save_editor,
+)
 from averon_import.services.ai_first.local_workflow import (
     AICancellationSignal, AIWorkspaceStore, SyntheticPageAdapter, build_live_qwen_runtime,
 )
@@ -135,7 +139,7 @@ from averon_import.services.ai_first.pilot_export import (
 )
 from averon_import.services.ai_first.pdf_locator import locate_ai_first_pdf_bbox
 from averon_import.services.ai_first.orchestration import (
-    CheckpointStore, FitZPageRenderer, OrchestrationConfig, PageOrchestrator,
+    CheckpointStore, FitZPageRenderer, OrchestrationConfig, OrchestrationError, PageOrchestrator,
     TokenPricing, inspect_pdf,
 )
 from averon_import.services.ai_first.qwen_vision_adapter import QwenVisionQuotaRegistry
@@ -306,8 +310,32 @@ document_activity_registry = DocumentActivityRegistry()
 _sourcing_runtime_lock = threading.RLock()
 
 
-def require_document_activity(document_id: str):
+def _assert_ai_first_document_access(document_id: str, user: CurrentUser) -> None:
+    """Protect AI-first documents in session mode, retaining legacy shared OCR."""
+    if auth_config().mode != "session" or not isinstance(user, CurrentUser) or user.role is Role.ADMIN:
+        return
     try:
+        workspace = workspace_service.get(document_id)
+        if not (workspace.root / "ai_first").exists():
+            return
+        store = AIWorkspaceStore(workspace.root)
+        access = store.read("access.json")
+        if access is not None:
+            allowed = {access.get("owner_id"), *access.get("legacy_reviewer_ids", [])}
+        else:
+            # Read existing server-authored provenance without claiming another
+            # reviewer's workspace or rewriting legacy saved decisions.
+            review = store.read("review.json") or {}
+            allowed = {event.get("reviewer_id") for event in review.get("history", [])}
+        if _job_owner_id(user) not in allowed:
+            raise HTTPException(404, "Документ не найден")
+    except FileNotFoundError:
+        raise HTTPException(404, "Документ не найден") from None
+
+
+def require_document_activity(document_id: str, user: CurrentUser = Depends(require_authenticated)):
+    try:
+        _assert_ai_first_document_access(document_id, user)
         with document_activity_registry.lease(document_id):
             yield
     except DocumentUnavailable as exc:
@@ -431,7 +459,7 @@ def _source_fingerprint(workspace) -> str:
 
 
 def _public_document_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in metadata.items() if key != "source_sha256"}
+    return {key: value for key, value in metadata.items() if key not in {"source_sha256", "uploaded_by_user_id"}}
 
 
 def _rebuild_sourcing_runtime() -> None:
@@ -1735,7 +1763,7 @@ def delete_tstn_x_sp_secret():
 
 
 @app.post("/api/documents", dependencies=[Depends(require_authenticated)])
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(file: UploadFile = File(...), user: CurrentUser = Depends(require_authenticated)):
     filename = file.filename or "document.pdf"
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Поддерживаются только PDF-файлы")
@@ -1768,6 +1796,7 @@ async def upload_document(file: UploadFile = File(...)):
                     else inspection["title"]
                 ),
                 "size": total,
+                **({"uploaded_by_user_id": _job_owner_id(user)} if auth_config().mode == "session" else {}),
             },
             source_sha256=source_digest.hexdigest(),
         )
@@ -1780,8 +1809,17 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.get("/api/documents", dependencies=[Depends(require_authenticated)])
-def list_documents(limit: int = 50):
-    return {"documents": workspace_service.list_recent(limit)}
+def list_documents(limit: int = 50, user: CurrentUser = Depends(require_authenticated)):
+    documents = []
+    for item in workspace_service.list_recent(limit):
+        try:
+            _assert_ai_first_document_access(item["document_id"], user)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            continue
+        documents.append(item)
+    return {"documents": documents}
 
 
 @app.delete("/api/admin/documents/{document_id}", dependencies=[Depends(require_admin)])
@@ -2003,6 +2041,21 @@ def get_job(job_id: str, user: CurrentUser = Depends(require_authenticated)):
         ) from exc
 
 
+class AIFirstCropRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    page_number: StrictInt = Field(ge=1)
+    x: float = Field(ge=0, lt=1, allow_inf_nan=False)
+    y: float = Field(ge=0, lt=1, allow_inf_nan=False)
+    width: float = Field(gt=0, le=1, allow_inf_nan=False)
+    height: float = Field(gt=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def within_page(self):
+        if self.x + self.width > 1 or self.y + self.height > 1:
+            raise ValueError("crop_outside_page")
+        return self
+
+
 class AIFirstRecognizeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -2011,6 +2064,8 @@ class AIFirstRecognizeRequest(BaseModel):
     retry_pages: list[StrictInt] = Field(default_factory=list)
     user_context: StrictStr | None = None
     live_acknowledged: StrictBool = False
+    start_new_run: StrictBool = False
+    crop: AIFirstCropRequest | None = None
 
     @field_validator("user_context")
     @classmethod
@@ -2023,7 +2078,17 @@ class AIFirstRecognizeRequest(BaseModel):
             raise ValueError(getattr(exc, "code", "invalid_user_context")) from None
 
 
-class AIFirstRowDecisionRequest(BaseModel):
+class AIFirstReviewMutationRequest(BaseModel):
+    review_token: StrictStr | None = Field(default=None, min_length=64, max_length=64)
+
+
+class AIFirstSaveDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    review_token: StrictStr = Field(min_length=64, max_length=64)
+    edits: EditorEdits
+
+
+class AIFirstRowDecisionRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     record_id: StrictStr
@@ -2040,7 +2105,7 @@ class AIFirstRowDecisionRequest(BaseModel):
         return self
 
 
-class AIFirstRowRoleRequest(BaseModel):
+class AIFirstRowRoleRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     record_id: StrictStr
@@ -2048,13 +2113,13 @@ class AIFirstRowRoleRequest(BaseModel):
     parent_record_id: StrictStr | None = None
 
 
-class AIFirstBulkConfirmRequest(BaseModel):
+class AIFirstBulkConfirmRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid")
 
     record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
 
 
-class AIFirstBulkRoleRequest(BaseModel):
+class AIFirstBulkRoleRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid")
 
     record_ids: list[StrictStr] = Field(min_length=1, max_length=500)
@@ -2066,7 +2131,7 @@ def require_ai_first_enabled():
         raise HTTPException(404, "Экспериментальный режим выключен")
 
 
-class AIFirstAddRowRequest(BaseModel):
+class AIFirstAddRowRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     page_number: StrictInt = Field(ge=1)
@@ -2081,7 +2146,7 @@ class AIFirstAddRowRequest(BaseModel):
         return self
 
 
-class AIFirstPageRequest(BaseModel):
+class AIFirstPageRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid")
 
     page_number: StrictInt = Field(ge=1)
@@ -2099,7 +2164,7 @@ class AIFirstPilotExportRequest(BaseModel):
         return self
 
 
-class AIFirstResolveIssueRequest(BaseModel):
+class AIFirstResolveIssueRequest(AIFirstReviewMutationRequest):
     model_config = ConfigDict(extra="forbid")
 
     issue_id: StrictStr
@@ -2120,7 +2185,8 @@ def _ai_first_read_state(workspace):
     try:
         draft = AIDocumentDraft.model_validate(raw_draft)
         review = AIReviewState.model_validate_json(json.dumps(raw_review, ensure_ascii=False))
-    except ValidationError:
+        current_editor(draft, store.read("editor-draft.json"))
+    except (ValidationError, DraftEditError):
         raise HTTPException(409, detail={"code": "AI_FIRST_STATE_INVALID", "message": "Сохранённое состояние проверки повреждено."}) from None
     return store, draft, review, raw_report
 
@@ -2129,6 +2195,35 @@ def _ai_first_page_counts(draft: AIDocumentDraft) -> dict[str, int]:
     rows = [row for page in draft.pages for table in page.tables for row in table.rows]
     cells = [cell for row in rows for cell in row.raw_cells]
     return {"tables": sum(len(page.tables) for page in draft.pages), "rows": len(rows), "cells": len(cells)}
+
+
+def _build_ai_first_runtime(request, page_count):
+    if request.mode == "fake":
+        adapter = SyntheticPageAdapter(request.user_context)
+        fake_request_limit = min(10000, max(1, page_count * 2))
+        config = OrchestrationConfig(
+            concurrency=1,
+            dpi=150,
+            max_requests=fake_request_limit,
+            requests_per_minute=fake_request_limit,
+            tokens_per_minute=fake_request_limit,
+            max_budget_rub=Decimal(fake_request_limit) / Decimal("1000"),
+            pricing=TokenPricing(
+                profile_id="synthetic-no-billing",
+                input_rub_per_1k=Decimal("1"),
+                output_rub_per_1k=Decimal("1"),
+            ),
+            max_pages=max(1, page_count),
+        )
+    else:
+        adapter, config = build_live_qwen_runtime(
+            settings=app_settings_service.settings.yandex,
+            secret_store=secret_store,
+            quota_registry=ai_first_quota_registry,
+            user_context=request.user_context,
+            page_count=page_count,
+        )
+    return adapter, config
 
 
 @app.post(
@@ -2159,55 +2254,76 @@ async def recognize_ai_first(
         page_count = int(metadata["page_count"])
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         raise HTTPException(404, "Документ не найден") from None
+    if (auth_config().mode == "session" and metadata.get("uploaded_by_user_id")
+            and metadata["uploaded_by_user_id"] != _job_owner_id(user) and user.role is not Role.ADMIN):
+        raise HTTPException(404, "Документ не найден")
     pages = sorted(set(request.pages if request.pages is not None else range(1, page_count + 1)))
     if not pages or any(type(page) is not int or page < 1 or page > page_count for page in pages):
         raise HTTPException(400, "Некорректный выбор страниц")
     retry_pages = set(request.retry_pages)
+    if request.start_new_run and retry_pages:
+        raise HTTPException(400, "Новый запуск не может продолжать страницы старого checkpoint.")
     if len(retry_pages) != len(request.retry_pages) or not retry_pages.issubset(pages):
         raise HTTPException(400, "Страницы для продолжения должны входить в выбранный диапазон.")
 
     store = _ai_first_store(workspace)
     try:
         store.ensure()
+        if auth_config().mode == "session":
+            with document_mutation_locks.for_document(document_id):
+                access = store.read("access.json")
+                if access is None:
+                    old_review = store.read("review.json") or {}
+                    legacy_reviewers = sorted({event["reviewer_id"] for event in old_review.get("history", []) if event.get("reviewer_id")})
+                    store.write("access.json", {"version": 1, "owner_id": metadata.get("uploaded_by_user_id") or _job_owner_id(user),
+                                                "legacy_reviewer_ids": legacy_reviewers})
+                else:
+                    _assert_ai_first_document_access(document_id, user)
     except RuntimeError:
         raise HTTPException(503, "Не удалось подтвердить защищённое локальное хранилище.") from None
+
+    if request.crop is not None and request.crop.page_number not in pages:
+        raise HTTPException(400, "Область должна относиться к выбранной странице.")
+    try:
+        prepared_adapter, prepared_config = _build_ai_first_runtime(request, page_count)
+        if request.crop is not None:
+            crop = request.crop
+            prepared_config = prepared_config.model_copy(update={"page_regions": {
+                crop.page_number: (crop.x, crop.y, crop.width, crop.height),
+            }})
+        if len(pages) > prepared_config.max_requests:
+            raise OrchestrationError("local_request_limit_exceeded")
+        prepared_run_id, prepared_checkpoint_path = store.select_run(document_id)
+        identity = inspect_pdf(workspace.pdf_path, prepared_adapter, prepared_config, run_id=prepared_run_id)
+        manifest = prepared_checkpoint_path / "manifest.json"
+        if not request.start_new_run and manifest.exists():
+            from averon_import.services.ai_first.private_acl import verify_private_tree
+            verify_private_tree(prepared_checkpoint_path)
+            expected = {"format_version": 2, "identity": identity.model_dump(mode="json"),
+                        "identity_fingerprint": identity.fingerprint}
+            if json.loads(manifest.read_text(encoding="utf-8")) != expected:
+                raise OrchestrationError("checkpoint_identity_mismatch")
+    except Exception as exc:
+        code = getattr(exc, "code", None) or (str(exc) if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", str(exc)) else "ai_first_preflight_failed")
+        mismatch = code == "checkpoint_identity_mismatch"
+        raise HTTPException(409, detail={"code": code, "can_start_new_run": mismatch,
+            "message": "Настройки отличаются от сохранённого запуска. Создайте новый запуск; прежние результаты и правки будут сохранены." if mismatch else "Локальная проверка не пройдена. Проверьте настройки и выбранную область; запрос не отправлен."}) from None
 
     cancellation = AICancellationSignal()
 
     def run(progress):
         try:
-            if request.mode == "fake":
-                adapter = SyntheticPageAdapter(request.user_context)
-                fake_request_limit = min(10000, max(1, page_count * 2))
-                config = OrchestrationConfig(
-                    concurrency=1,
-                    dpi=150,
-                    max_requests=fake_request_limit,
-                    requests_per_minute=fake_request_limit,
-                    tokens_per_minute=fake_request_limit,
-                    max_budget_rub=Decimal(fake_request_limit) / Decimal("1000"),
-                    pricing=TokenPricing(
-                        profile_id="synthetic-no-billing",
-                        input_rub_per_1k=Decimal("1"),
-                        output_rub_per_1k=Decimal("1"),
-                    ),
-                    max_pages=max(1, page_count),
-                )
+            adapter, config = prepared_adapter, prepared_config
+            if request.start_new_run:
+                with document_mutation_locks.for_document(document_id):
+                    run_id, checkpoint_path = store.select_run(document_id, new_run=True)
             else:
-                adapter, config = build_live_qwen_runtime(
-                    settings=app_settings_service.settings.yandex,
-                    secret_store=secret_store,
-                    quota_registry=ai_first_quota_registry,
-                    user_context=request.user_context,
-                    page_count=page_count,
-                )
-                if len(pages) > config.max_requests:
-                    raise RuntimeError("local_request_limit_exceeded")
+                run_id, checkpoint_path = prepared_run_id, prepared_checkpoint_path
             identity = inspect_pdf(
-                workspace.pdf_path, adapter, config, run_id=f"local-{document_id}",
+                workspace.pdf_path, adapter, config, run_id=run_id,
             )
-            checkpoint = CheckpointStore(store.checkpoint_directory, identity)
-            prior_progress = store.read("progress.json") or {}
+            checkpoint = CheckpointStore(checkpoint_path, identity)
+            prior_progress = {} if request.start_new_run else (store.read("progress.json") or {})
             for page_number in pages:
                 if page_number in retry_pages:
                     prior_progress[str(page_number)] = "pending"
@@ -2306,8 +2422,12 @@ def get_ai_first_state(document_id: str):
     with document_mutation_locks.for_document(document_id):
         store, draft, review, report = _ai_first_read_state(workspace)
         progress_state = store.read("progress.json") or {}
+        editor = store.read("editor-draft.json")
+        token = review_token(draft, review, editor)
     try:
-        assert_review_ready_for_export(draft, review)
+        if current_editor(draft, editor)["stale"]:
+            raise AIReviewError("editor_draft_revision_mismatch")
+        assert_review_ready_for_export(draft, export_review(draft, review, editor))
         guard = {"ready": True, "code": None}
     except AIReviewError as exc:
         guard = {"ready": False, "code": str(exc)}
@@ -2315,6 +2435,9 @@ def get_ai_first_state(document_id: str):
     return {
         "draft": draft.model_dump(mode="json"),
         "review": review.model_dump(mode="json"),
+        "editor_draft": current_editor(draft, editor),
+        "review_token": token,
+        "workspace_document_id": document_id,
         "progress": progress_state,
         "pages": [
             {
@@ -2344,18 +2467,28 @@ def get_ai_first_progress(document_id: str):
     return {"progress": AIWorkspaceStore(workspace.root).read("progress.json") or {}}
 
 
-def _mutate_ai_first_state(document_id: str, operation):
+def _mutate_ai_first_state(document_id: str, operation, *, request=None):
     try:
         workspace = workspace_service.get(document_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
     with document_mutation_locks.for_document(document_id):
         store, draft, review, _report = _ai_first_read_state(workspace)
+        editor = store.read("editor-draft.json")
+        if request is not None and request.review_token is not None and request.review_token != review_token(draft, review, editor):
+            raise HTTPException(409, detail={"code": "review_revision_conflict", "message": "Проверка изменена в другом окне. Правки оставлены на экране; обновите состояние перед повторным сохранением."})
         try:
             updated = operation(draft, review)
         except AIReviewError as exc:
             raise HTTPException(409, detail={"code": str(exc), "message": "Действие не применено; состояние проверки осталось без изменений."}) from None
         store.write("review.json", updated.model_dump(mode="json"))
+        if request is not None and editor is not None:
+            ids = [request.record_id] if hasattr(request, "record_id") else getattr(request, "record_ids", [])
+            editor = consume_editor(editor,
+                values=ids if isinstance(request, (AIFirstRowDecisionRequest, AIFirstBulkConfirmRequest)) else (),
+                roles=ids if isinstance(request, (AIFirstRowRoleRequest, AIFirstBulkRoleRequest)) else (),
+                issue_id=getattr(request, "issue_id", None), add_row=isinstance(request, AIFirstAddRowRequest))
+            store.write("editor-draft.json", editor)
         return {"review": updated.model_dump(mode="json")}
 
 
@@ -2372,6 +2505,13 @@ def _publish_ai_first_report(document_id: str, store: AIWorkspaceStore, report):
             review = reconcile_reprocessed_pages(old_draft, report.draft, old_review)
         store.write("transcription.json", report.draft.model_dump(mode="json"))
         store.write("review.json", review.model_dump(mode="json"))
+        editor = store.read("editor-draft.json")
+        if editor is not None and current_editor(report.draft, editor)["stale"]:
+            # History remains private and recoverable; old buffers cannot apply
+            # silently to rows from a different extraction revision.
+            store.write("editor-draft.json", {**editor, "revision": editor["revision"] + 1,
+                "source_document_id": report.draft.source_document_id,
+                "draft_revision_id": report.draft.revision_id, "edits": EditorEdits().model_dump()})
         store.write("report.json", report.model_dump(
             mode="json", exclude={"draft": True, "pages": {"__all__": {"extraction"}}},
         ))
@@ -2386,7 +2526,7 @@ def decide_ai_first_row(document_id: str, request: AIFirstRowDecisionRequest, us
         return _mutate_ai_first_state(document_id, lambda draft, state: record_row_decision(
             draft, state, request.record_id, disposition=request.disposition,
             reviewer_id=_job_owner_id(user), values=dict(request.values), human_confirmed=request.confirmed,
-        ))
+        ), request=request)
     except HTTPException:
         raise
 
@@ -2399,7 +2539,7 @@ def classify_ai_first_row_role(document_id: str, request: AIFirstRowRoleRequest,
     return _mutate_ai_first_state(document_id, lambda draft, state: record_row_role_classification(
         draft, state, request.record_id, role=request.role,
         parent_record_id=request.parent_record_id, reviewer_id=_job_owner_id(user),
-    ))
+    ), request=request)
 
 
 @app.post(
@@ -2417,7 +2557,7 @@ def bulk_confirm_ai_first_rows(document_id: str, request: AIFirstBulkConfirmRequ
                 draft, current, record_id, disposition="confirmed", reviewer_id=_job_owner_id(user),
             )
         return current
-    return _mutate_ai_first_state(document_id, apply)
+    return _mutate_ai_first_state(document_id, apply, request=request)
 
 
 @app.post(
@@ -2435,7 +2575,7 @@ def bulk_classify_ai_first_rows(document_id: str, request: AIFirstBulkRoleReques
                 draft, current, record_id, role=request.role, reviewer_id=_job_owner_id(user),
             )
         return current
-    return _mutate_ai_first_state(document_id, apply)
+    return _mutate_ai_first_state(document_id, apply, request=request)
 
 
 @app.post(
@@ -2448,7 +2588,7 @@ def add_ai_first_row(document_id: str, request: AIFirstAddRowRequest, user: Curr
     return _mutate_ai_first_state(document_id, lambda draft, state: record_structure_change(
         draft, state, action="add_row", source_record_ids=[], result_rows=[dict(request.values)],
         reviewer_id=_job_owner_id(user), page_number=request.page_number,
-    ))
+    ), request=request)
 
 
 @app.post(
@@ -2461,7 +2601,7 @@ def confirm_ai_first_page(document_id: str, request: AIFirstPageRequest, user: C
         if page is None or page.status not in {"extracted", "no_specification"}:
             raise AIReviewError("page_processing_incomplete")
         return confirm_page_complete(draft, state, request.page_number, reviewer_id=_job_owner_id(user))
-    return _mutate_ai_first_state(document_id, apply)
+    return _mutate_ai_first_state(document_id, apply, request=request)
 
 
 @app.post(
@@ -2471,24 +2611,31 @@ def confirm_ai_first_page(document_id: str, request: AIFirstPageRequest, user: C
 def resolve_ai_first_issue(document_id: str, request: AIFirstResolveIssueRequest, user: CurrentUser = Depends(require_authenticated)):
     return _mutate_ai_first_state(document_id, lambda draft, state: resolve_review_issue(
         draft, state, request.issue_id, reviewer_id=_job_owner_id(user), detail=request.detail,
-    ))
+    ), request=request)
 
 
 @app.post(
     "/api/documents/{document_id}/ai-first/review/save",
     dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
 )
-def save_ai_first_review(document_id: str):
+def save_ai_first_review(document_id: str, request: AIFirstSaveDraftRequest | None = None, user: CurrentUser = Depends(require_authenticated)):
     try:
         workspace = workspace_service.get(document_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "Документ не найден") from exc
     with document_mutation_locks.for_document(document_id):
         store, draft, review, report = _ai_first_read_state(workspace)
-        store.write("transcription.json", draft.model_dump(mode="json"))
-        store.write("review.json", review.model_dump(mode="json"))
-        store.write("report.json", report)
-    return {"saved": True, "history_events": len(review.history)}
+        editor = store.read("editor-draft.json")
+        if request is not None:
+            try:
+                editor = save_editor(draft, review, editor, request.edits,
+                    expected_token=request.review_token, reviewer_id=_job_owner_id(user))
+            except DraftEditError as exc:
+                raise HTTPException(409, detail={"code": str(exc), "record_id": exc.record_id,
+                    "message": "Черновик не сохранён: состояние изменилось или поле больше не относится к текущей строке. Введённые правки оставлены на экране."}) from None
+            store.write("editor-draft.json", editor)
+    return {"saved": True, "history_events": len(review.history),
+            "editor_draft": current_editor(draft, editor), "review_token": review_token(draft, review, editor)}
 
 
 @app.post(
@@ -2503,6 +2650,11 @@ def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
         raise HTTPException(404, "Документ не найден") from exc
     with document_mutation_locks.for_document(document_id):
         _store, draft, review, report = _ai_first_read_state(workspace)
+        editor = _store.read("editor-draft.json")
+        if current_editor(draft, editor)["stale"]:
+            raise HTTPException(409, "Черновик относится к прежнему распознаванию. Откройте актуальный запуск перед выгрузкой.")
+        review = export_review(draft, review, editor)
+        report = {**report, "saved_editor_draft": editor_export_snapshot(draft, review, editor, request.page_numbers)}
         metadata = workspace_service.read_json(workspace.metadata_path) or {}
         document_name = str(metadata.get("filename") or "document.pdf")
         try:
@@ -2547,6 +2699,10 @@ def preview_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest)
         raise HTTPException(404, "Документ не найден") from exc
     with document_mutation_locks.for_document(document_id):
         _store, draft, review, report = _ai_first_read_state(workspace)
+        editor = _store.read("editor-draft.json")
+        if current_editor(draft, editor)["stale"]:
+            raise HTTPException(409, "Черновик относится к прежнему распознаванию. Откройте актуальный запуск перед выгрузкой.")
+        review = export_review(draft, review, editor)
         metadata = workspace_service.read_json(workspace.metadata_path) or {}
         try:
             return preview_ai_first_pilot_export(

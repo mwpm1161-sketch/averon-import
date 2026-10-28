@@ -82,6 +82,7 @@ const context = {
     return data;
   },
 };
+vm.runInNewContext(sourceBetween("function aiFirstRequestContext", "function renderAIFirstResumeControls"), context);
 vm.runInNewContext(`${sourceBetween("function renderAIFirstInspectorValues", "function selectAIFirstRow")}; ${sourceBetween("async function postAIFirstReview", "async function confirmAIFirstPageCompleteness")}; globalThis.renderInspector=renderAIFirstRowInspector; globalThis.saveReview=postAIFirstReview; renderAIFirstInspectorValues=()=>{};`,context);
 
 async function flush() { await new Promise(resolve=>setTimeout(resolve,0)); }

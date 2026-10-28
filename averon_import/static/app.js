@@ -324,6 +324,7 @@ function isCurrentOneCHistoryRequest(generation) {
 }
 
 function cancelDocumentNavigation() {
+  if (typeof resetAIFirstDocumentState === "function") resetAIFirstDocumentState();
   resetPageInspection();
   state.documentNavigationGeneration = (state.documentNavigationGeneration || 0) + 1;
   if (state.documentNavigationController) {
@@ -3426,6 +3427,7 @@ function clearDeletedCurrentDocument(documentId, {notify = true} = {}) {
 
 async function openExistingDocument(documentId, {announce = true, navigation = null} = {}) {
   if (!documentId) throw new Error("Документ не выбран");
+  if (typeof prepareAIFirstDocumentNavigation === "function" && !(await prepareAIFirstDocumentNavigation())) return;
   navigation = navigation || beginDocumentNavigation();
   const encodedId = encodeURIComponent(documentId);
   const documentData = await api(`/api/documents/${encodedId}`, {signal:navigation.signal});
@@ -3437,6 +3439,7 @@ async function openExistingDocument(documentId, {announce = true, navigation = n
   }
   clearExportError();
   state.document = documentData;
+  if (typeof resetAIFirstDocumentState === "function") resetAIFirstDocumentState(documentData.document_id);
   $("#ai-first-open-saved").hidden = documentData.has_ai_first_result !== true || state.config?.ai_first_experimental?.enabled !== true;
   state.selectedPages = new Set();
   state.previewPage = null;
@@ -3468,6 +3471,7 @@ async function uploadFile(file) {
     toast("Выберите PDF-файл", "error");
     return;
   }
+  if (typeof prepareAIFirstDocumentNavigation === "function" && !(await prepareAIFirstDocumentNavigation())) return;
   const form = new FormData();
   form.append("file", file);
   const navigation = beginDocumentNavigation();
@@ -3478,6 +3482,7 @@ async function uploadFile(file) {
     if (!isCurrentDocumentNavigation(navigation.generation)) return;
     clearExportError();
     state.document = documentData;
+    if (typeof resetAIFirstDocumentState === "function") resetAIFirstDocumentState(documentData.document_id);
     $("#ai-first-open-saved").hidden = true;
     localStorage.setItem("averonCurrentDocument", documentData.document_id);
     state.selectedPages.clear();
@@ -3584,6 +3589,12 @@ function updatePageInspectionOpenButton() {
 }
 
 async function showCropPreview(page) {
+  if (state.aiFirst.mode !== "standard" && state.crop && state.aiFirst.cropPage !== page) {
+    state.crop = null;
+    $("#crop-box").hidden = true;
+    $("#clear-crop").hidden = true;
+    toast("При смене страницы область сброшена. При необходимости выделите её на этой странице.", "warning");
+  }
   if (!state.document?.document_id || !Number.isInteger(Number(page)) || Number(page) < 1) return;
   page = Number(page);
   state.previewPage = page;
@@ -6907,7 +6918,8 @@ async function downloadReviewExcel() {
   }
 }
 
-function resetApp() {
+async function resetApp() {
+  if (state.aiFirst?.data && typeof prepareAIFirstDocumentNavigation === "function" && !(await prepareAIFirstDocumentNavigation())) return;
   if (state.dirty && !confirm("Несохранённые правки будут потеряны. Продолжить?")) return;
   cancelDocumentNavigation();
   clearExportError();
@@ -7173,6 +7185,7 @@ function setupCropEvents() {
   });
   area.addEventListener("pointermove",(event)=>{
     if(!start)return; const {rect}=start; const x1=Math.max(rect.left,Math.min(start.x,event.clientX)); const x2=Math.min(rect.right,Math.max(start.x,event.clientX)); const y1=Math.max(rect.top,Math.min(start.y,event.clientY)); const y2=Math.min(rect.bottom,Math.max(start.y,event.clientY));
+    state.aiFirst.cropDocumentId=state.document?.document_id; state.aiFirst.cropPage=state.previewPage;
     state.crop={x:(x1-rect.left)/rect.width,y:(y1-rect.top)/rect.height,width:(x2-x1)/rect.width,height:(y2-y1)/rect.height}; positionCropBox();
   });
   area.addEventListener("pointerup",()=>{

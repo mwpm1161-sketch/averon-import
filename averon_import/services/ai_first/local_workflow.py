@@ -29,7 +29,7 @@ from averon_import.services.ai_first.private_acl import (
 class AIWorkspaceStore:
     """Strictly private per-document state store with atomic JSON writes."""
 
-    _NAMES = {"transcription.json", "review.json", "report.json", "progress.json"}
+    _NAMES = {"transcription.json", "review.json", "report.json", "progress.json", "editor-draft.json", "active-run.json", "access.json"}
 
     def __init__(self, document_root: str | os.PathLike[str]):
         self.root = Path(document_root) / "ai_first"
@@ -47,6 +47,34 @@ class AIWorkspaceStore:
     @property
     def checkpoint_directory(self) -> Path:
         return self.ensure() / "checkpoint"
+
+    def select_run(self, document_id: str, *, new_run: bool = False) -> tuple[str, Path]:
+        """Keep legacy checkpoints in place; new runs get distinct private directories."""
+        active = self.read("active-run.json")
+        if not new_run:
+            if active is None:
+                return f"local-{document_id}", self.checkpoint_directory
+            run_id = active.get("run_id", "")
+            if not re.fullmatch(r"run-[0-9a-f]{32}", run_id):
+                raise RuntimeError("ai_first_private_state_unavailable")
+            return run_id, self.ensure() / "runs" / run_id / "checkpoint"
+        from uuid import uuid4
+        run_id = f"run-{uuid4().hex}"
+        root = self.ensure() / "runs"
+        if root.exists():
+            verify_private_tree(root)
+        else:
+            create_private_directory(root)
+        run_root = create_private_directory(root / run_id)
+        # A private atomic JSON snapshot preserves the previous OCR, ledger and
+        # buffered edits. Its checkpoint is never moved or removed.
+        snapshot = AIWorkspaceStore(run_root)
+        for name in self._NAMES - {"active-run.json"}:
+            previous = self.read(name)
+            if previous is not None:
+                snapshot.write(name, previous)
+        self.write("active-run.json", {"version": 1, "run_id": run_id})
+        return run_id, run_root / "checkpoint"
 
     def read(self, name: str) -> Any | None:
         if name not in self._NAMES:

@@ -140,6 +140,7 @@ const addRowToggle = sourceBetween(
 );
 assert(addRowToggle.includes("renderAIFirstAddRowForm()"), "opening the add-row form updates only that form");
 assert(!addRowToggle.includes("renderAIFirstReview()"), "opening the form must not rerender and discard unsaved table edits");
+vm.runInNewContext(sourceBetween("function aiFirstRequestContext", "function renderAIFirstResumeControls"), context);
 vm.runInNewContext(`${snippet}; globalThis.showPage=showAIFirstPage; globalThis.renderAddForm=renderAIFirstAddRowForm;`, context);
 
 context.renderAddForm();

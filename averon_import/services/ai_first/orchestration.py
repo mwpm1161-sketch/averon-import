@@ -193,6 +193,16 @@ class OrchestrationConfig(_StrictModel):
     max_image_bytes: int = Field(default=20_000_000, ge=1, le=100_000_000)
     max_image_pixels: int = Field(default=30_000_000, ge=1, le=100_000_000)
     max_pages: int = Field(default=1000, ge=1, le=10000)
+    page_regions: dict[int, tuple[float, float, float, float]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def valid_regions(self):
+        for page, (x, y, width, height) in self.page_regions.items():
+            if (page < 1 or not all(math.isfinite(v) for v in (x, y, width, height))
+                    or x < 0 or y < 0 or width <= 0 or height <= 0
+                    or x + width > 1 or y + height > 1):
+                raise ValueError("invalid_page_region")
+        return self
 
     def processing_fingerprint(self) -> str:
         # Concurrency, RPM, TPM, and the budget cap may be adjusted for resume.
@@ -201,12 +211,15 @@ class OrchestrationConfig(_StrictModel):
         if self.pricing.profile_id is None:
             # Keep pre-profile checkpoints compatible with the original pricing DTO.
             pricing.pop("profile_id", None)
-        return _fingerprint({
+        processing = {
             "dpi": self.dpi,
             "max_image_bytes": self.max_image_bytes,
             "max_image_pixels": self.max_image_pixels,
             "pricing": pricing,
-        })
+        }
+        if self.page_regions:
+            processing["page_regions"] = self.page_regions
+        return _fingerprint(processing)
 
 
 class CheckpointIdentity(_StrictModel):
@@ -479,6 +492,13 @@ class FitZPageRenderer:
                 page = document.load_page(page_number - 1)
                 scale = dpi / 72
                 rect = page.rect
+                region = config.page_regions.get(page_number)
+                clip = None
+                if region is not None:
+                    x, y, width, height = region
+                    clip = fitz.Rect(rect.x0 + x * rect.width, rect.y0 + y * rect.height,
+                                     rect.x0 + (x + width) * rect.width, rect.y0 + (y + height) * rect.height)
+                    rect = clip
                 projected_width = float(rect.width) * scale
                 projected_height = float(rect.height) * scale
                 if (
@@ -490,7 +510,7 @@ class FitZPageRenderer:
                     raise OrchestrationError("page_dimensions_invalid")
                 if math.ceil(projected_width) * math.ceil(projected_height) > config.max_image_pixels:
                     raise OrchestrationError("image_pixel_limit")
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, clip=clip)
                 if pixmap.width * pixmap.height > config.max_image_pixels:
                     raise OrchestrationError("image_pixel_limit")
                 data = pixmap.tobytes("png")
@@ -841,6 +861,15 @@ ProgressCallback = Callable[[ProgressEvent], None | Awaitable[None]]
 
 
 class PageOrchestrator:
+    def _region_pdf_points(self, pdf_path) -> dict[str, list[float]]:
+        with fitz.open(pdf_path) as document:
+            result = {}
+            for number, (x, y, width, height) in self.config.page_regions.items():
+                rect = document.load_page(number - 1).rect
+                result[str(number)] = [rect.x0 + x * rect.width, rect.y0 + y * rect.height,
+                                       rect.x0 + (x + width) * rect.width, rect.y0 + (y + height) * rect.height]
+            return result
+
     def __init__(
         self,
         adapter: PageExtractionAdapter,
@@ -1282,6 +1311,14 @@ class PageOrchestrator:
                         response = response.model_copy(update={"extraction": safe_extraction})
                 elif extraction.status == "incomplete":
                     error_state, error_code = "incomplete", "transcription_incomplete"
+                if response is not None and (identity.run_id.startswith("run-") or self.config.page_regions):
+                    # Identical model text in a different visual/run context is
+                    # not independent evidence for retaining prior decisions.
+                    scoped_fingerprint = _fingerprint({"payload": response.extraction.extraction_fingerprint,
+                        "run": identity.run_id, "adapter": identity.adapter_fingerprint,
+                        "processing": identity.processing_fingerprint})
+                    response = response.model_copy(update={"extraction": response.extraction.model_copy(
+                        update={"extraction_fingerprint": scoped_fingerprint})})
 
             if error_request_started is False:
                 await release_request_slot()
@@ -1450,6 +1487,9 @@ class PageOrchestrator:
                 "run_id": identity.run_id,
                 "adapter_fingerprint": identity.adapter_fingerprint,
                 "processing_fingerprint": identity.processing_fingerprint,
+                **({"page_regions": {str(number): list(region) for number, region in self.config.page_regions.items()},
+                    "region_coordinate_system": "normalized_pdf_page",
+                    "page_region_pdf_points": self._region_pdf_points(pdf_path)} if self.config.page_regions else {}),
             },
         )
         all_attempts = [attempt for record in ordered_records for attempt in record.attempts]

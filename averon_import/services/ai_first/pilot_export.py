@@ -715,6 +715,9 @@ def build_ai_first_pilot_xlsx(
     positions = workbook.active
     positions.title = "Спецификация"
     scope_label = "Тестовая выгрузка · Полный охват" if set(selected) == expected else "Тестовая выгрузка · Частичный охват"
+    regions = draft.source_envelope.get("page_regions", {})
+    if any(str(number) in regions for number in selected):
+        scope_label = "ТЕСТ · Частичный охват · Выбранная область страницы"
     specification_groups: list[dict[str, Any]] = []
 
     # The user-facing specification keeps each physical table's own schema.
@@ -900,7 +903,7 @@ def build_ai_first_pilot_xlsx(
             page_number, report_states.get(page_number, "не запускалась"), page_errors.get(page_number, ""), page.status if page else "нет результата",
             "Да" if page_number in confirmed_pages else "Нет", len(page_rows),
             sum(bool(row["verified_position"]) for row in page_rows), len(open_page_issues),
-            "Полный" if set(selected) == expected else "Частичный",
+            "Только выбранная область" if str(page_number) in regions else "Полный" if set(selected) == expected else "Частичный",
         ])
     _write_sheet(
         coverage_sheet, "Состояние обработки выбранного фрагмента", filename,
@@ -925,6 +928,22 @@ def build_ai_first_pilot_xlsx(
         draft.source_document_id, selected, page_count, source_header, source_rows,
         widths=[12, 12, 14, 100], source_label=source_label, long_values=long_values,
     )
+
+    if regions:
+        region_sheet = workbook.create_sheet("Области страниц")
+        points = draft.source_envelope.get("page_region_pdf_points", {})
+        _write_sheet(region_sheet, "Обработаны только указанные области, не страницы целиком", filename,
+            draft.source_document_id, selected, page_count,
+            ["Страница", "Область · нормализованные x, y, ширина, высота", "Область PDF · x0, y0, x1, y1"],
+            [[number, _json_text(regions[str(number)]), _json_text(points.get(str(number)))]
+             for number in selected if str(number) in regions], source_label=source_label, long_values=long_values)
+    if report.get("saved_editor_draft"):
+        editor_sheet = workbook.create_sheet("Черновик редактора")
+        encoded = _json_text(report["saved_editor_draft"])
+        chunks = [encoded[i:i + 30000] for i in range(0, len(encoded), 30000)]
+        _write_sheet(editor_sheet, "Сохранённые промежуточные правки и история; не подтверждение", filename,
+            draft.source_document_id, selected, page_count, ["Часть", "Всего", "JSON · соединить без разделителей"],
+            [[i + 1, len(chunks), part] for i, part in enumerate(chunks)], source_label=source_label, long_values=long_values)
 
     if long_values:
         long_sheet = workbook.create_sheet(LONG_TEXT_SHEET_NAME)

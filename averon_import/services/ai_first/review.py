@@ -579,6 +579,8 @@ def reconcile_reprocessed_pages(
 def assert_review_ready_for_export(draft: AIDocumentDraft, state: AIReviewState) -> None:
     """Safety guard only; this package contains no exporter or sourcing adapter."""
     _check_current(draft, state)
+    if draft.source_envelope.get("page_regions"):
+        raise AIReviewError("partial_page_scope")
     if not draft.pages:
         raise AIReviewError("empty_document")
     expected_page_numbers = set(draft.expected_page_numbers)

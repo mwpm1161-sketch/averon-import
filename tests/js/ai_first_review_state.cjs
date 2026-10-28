@@ -35,6 +35,7 @@ const context = {
     querySelector:selector=>selector.includes("data-ai-first-row-role") ? roleInput : selector.includes("data-ai-first-parent-row") ? parentInput : null,
   },
 };
+vm.runInNewContext(sourceBetween("function aiFirstRequestContext", "function renderAIFirstResumeControls"), context);
 vm.runInNewContext(`${sourceBetween("function aiFirstDecision", "function aiFirstProcessingMessage")}; globalThis.evaluateRow=aiFirstRowReviewState; globalThis.confirmationPayload=aiFirstRowConfirmationPayload; globalThis.statusLabel=aiFirstRowStatusLabel;`, context);
 const entry = {row,page,manual:false};
 const evaluate = () => context.evaluateRow(entry);
@@ -104,6 +105,15 @@ assert(context.statusLabel(evaluate()).includes("подтвердите знач
 data.review.decisions[row.id] = decision({"cell:1":"Saved correction"});
 input.value = "Unsaved correction";
 assert.equal(evaluate().status,"unsaved","unsaved DOM edits are visibly distinct");
+context.state.aiFirst.pendingRowValues = {[row.id]:{"cell:1":"Unsaved correction"}};
+data.editor_draft = {stale:false,edits:{row_values:{[row.id]:{"cell:1":"Unsaved correction"}},row_roles:{}}};
+const savedBufferState = evaluate();
+assert.equal(savedBufferState.savedDraftEdits,true);
+assert.equal(savedBufferState.status,"attention","server-saved buffers do not count as unsaved rows in the footer");
+assert(context.statusLabel(savedBufferState).includes("сохранены в черновике"));
+assert.equal(savedBufferState.exportReady,false);
+delete data.editor_draft;
+context.state.aiFirst.pendingRowValues = {};
 
 const payload = context.confirmationPayload([{key:"cell:1",value:"Edited",baseline:"Original"}]);
 assert.equal(payload.disposition,"corrected","editing and confirming records a corrected decision");
@@ -116,15 +126,13 @@ context.api = async () => { saveCalls += 1; return {}; };
 context.toast = (message,kind) => saveWarnings.push({message,kind});
 vm.runInNewContext(`${sourceBetween("async function saveAIFirstReview", "async function downloadAIFirstPilotXlsx")}; globalThis.saveDraft=saveAIFirstReview;`, context);
 async function verifySaveGuard() {
-  input.value = "DOM-only correction";
-  await context.saveDraft();
-  assert.equal(saveCalls,0,"draft save is blocked while an edit exists only in the DOM");
-  assert.equal(saveWarnings.at(-1).kind,"warning");
-  assert(saveWarnings.at(-1).message.includes("не попадут в файл"));
-  input.value = "Saved correction";
-  await context.saveDraft();
-  assert.equal(saveCalls,1,"draft save proceeds after unsaved edits are cleared");
+  // The former DOM-blocking guard is replaced by full dynamic save/restore
+  // coverage in ai_first_draft_lifecycle.cjs.
+  const result = await context.saveDraft();
+  assert.equal(result.saved,false,"missing server revision fails closed");
+  assert.equal(saveCalls,0);
 }
+
 verifySaveGuard().then(() => {
   const bulkContext = {
     state:{aiFirst:{selectedRows:new Set(["row-visible","row-hidden"])}},

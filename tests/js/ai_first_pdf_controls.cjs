@@ -49,6 +49,7 @@ const context = {
 };
 
 const zoomCode = sourceBetween("const AI_FIRST_PDF_MIN_ZOOM", "function showAIFirstPage");
+vm.runInNewContext(sourceBetween("function aiFirstRequestContext", "function renderAIFirstResumeControls"), context);
 vm.runInNewContext(`${zoomCode}; globalThis.setZoom=setAIFirstPdfZoom; globalThis.renderZoom=renderAIFirstPdfZoom; globalThis.nudgeZoom=nudgeAIFirstPdfZoom;`,context);
 context.renderZoom();
 assert.equal(image.style.width,"600px","fit width accounts for the PDF pane padding");
@@ -68,16 +69,16 @@ async function run() {
   context.updateExport();
   assert.equal(previewCalls,1,"the preview comes from the server once per selected fragment and review generation");
   assert.equal(button.disabled,false,"the test export is enabled only after the server has checked the fragment");
-  assert(exportNote.textContent.includes("К проверенным позициям допущено 2"));
-  assert(exportNote.textContent.includes("строк в файле — 3"));
-  assert(exportNote.textContent.includes("OCR 2"));
-  assert(exportNote.textContent.includes("вручную 1"));
-  assert(exportNote.textContent.includes("Предварительная проверка допуска не гарантирует создание файла"));
+  assert(exportNote.textContent.includes("Проверенных позиций: 2"));
+  assert(exportNote.textContent.includes("Страницы: 1"));
+  assert(exportNote.textContent.includes("всего строк: 3"));
+  assert(!exportNote.textContent.includes("коммерч"));
   assert.equal(exportFeedback.hidden,false,"test and partial-scope warnings appear beside the download action after page selection");
   state.aiFirst.exportPages.clear();
   context.updateExport();
   assert.equal(button.disabled,true,"the workbook remains disabled without selected pages");
-  assert.equal(exportFeedback.hidden,true,"the test-export note stays contextual and hidden before page selection");
+  assert.equal(exportFeedback.hidden,false,"an empty selection shows the actionable page-selection hint");
+  assert(exportNote.textContent.includes("Остальные страницы проверять"));
   state.aiFirst.exportPages = new Set([1]);
   state.aiFirst.reviewGeneration = 5;
   previewFails = true;
