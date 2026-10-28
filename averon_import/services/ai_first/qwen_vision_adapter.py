@@ -19,6 +19,9 @@ import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from pydantic import ValidationError
+
+from averon_import.services.ai_request_diagnostics import AIRequestDiagnostics
 from averon_import.services.ai_first.assembly import page_from_payload
 from averon_import.services.ai_first.contracts import AIPageExtraction, AIReviewIssue
 from averon_import.services.ai_first.orchestration import (
@@ -220,6 +223,7 @@ class QwenVisionAdapter:
             ).hexdigest()
             scope_value["document_context_policy_version"] = USER_CONTEXT_POLICY_VERSION
             scope_value["document_context_hmac"] = context_binding
+            scope_value["document_context_template_sha256"] = self.client.contextual_request_template_sha256
             scope = json.dumps(
                 scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             ).encode("utf-8")
@@ -383,6 +387,7 @@ class QwenVisionAdapter:
                 http_status=http_status,
                 finish_reason=finish_reason,
                 request_latency_ms=request_latency_ms,
+                request_diagnostics=self._request_diagnostics(diagnostics),
             )
         request_started = diagnostics.get("request_attempted") is True
         status = diagnostics.get("http_status")
@@ -402,7 +407,19 @@ class QwenVisionAdapter:
             http_status=http_status,
             finish_reason=finish_reason,
             request_latency_ms=request_latency_ms,
+            request_diagnostics=self._request_diagnostics(diagnostics),
         ) from None
+
+    @staticmethod
+    def _request_diagnostics(diagnostics: dict[str, Any]) -> AIRequestDiagnostics | None:
+        value = diagnostics.get("request_diagnostics")
+        if not isinstance(value, dict):
+            return None
+        try:
+            return AIRequestDiagnostics.model_validate(value)
+        except (ValidationError, ValueError, TypeError):
+            # Invalid metadata must not replace the original request outcome.
+            return None
 
     @staticmethod
     def _usage(value: Any) -> TokenUsage | None:
@@ -487,6 +504,7 @@ class QwenVisionAdapter:
                 and math.isfinite(completion.diagnostics["latency_ms"])
                 and completion.diagnostics["latency_ms"] >= 0 else None
             ),
+            request_diagnostics=QwenVisionAdapter._request_diagnostics(completion.diagnostics),
         )
 
     @staticmethod

@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import replace
 from decimal import Decimal
 import json
+import hashlib
+import hmac
 import logging
 import re
 import threading
@@ -230,16 +232,119 @@ def _make_pdf(path, pages=1):
     return path
 
 
-def _make_orchestrator(pdf, adapter, config, checkpoint_dir, *, progress=None, rate_window_s=0.002):
+def _make_orchestrator(pdf, adapter, config, checkpoint_dir, *, progress=None, rate_window_s=0.002,
+                       capture_diagnostics=False):
     identity = inspect_pdf(pdf, adapter, config, run_id="qwen-synthetic-run")
     return PageOrchestrator(
         adapter,
         FitZPageRenderer(),
         config,
-        CheckpointStore(checkpoint_dir, identity),
+        CheckpointStore(checkpoint_dir, identity, capture_request_diagnostics=capture_diagnostics),
         progress=progress,
         rate_window_s=rate_window_s,
     )
+
+
+def test_http400_safe_sidecar_survives_resume_without_changing_core_records(tmp_path, caplog):
+    request_id = "b19f41cb-256a-4fb0-87f0-fdcd3af29a73"
+    private_context = "Synthetic private context never included in technical reports"
+    body = json.dumps({"error": {"code": "unsupported_parameter", "param": "messages",
+                                "type": "invalid_request_error", "message": SYNTHETIC_KEY + private_context}}).encode()
+    transport = FakeTransport(lambda *_: VisionHttpResponse(400, body, {"x-request-id": request_id}))
+    adapter = _adapter(transport, user_context=private_context, input_bound=2048)
+    config = _orchestration_config()
+    pdf = _make_pdf(tmp_path / "synthetic-http400.pdf")
+    checkpoint = tmp_path / "checkpoint"
+    identity_before = inspect_pdf(pdf, adapter, config, run_id="qwen-synthetic-run").fingerprint
+    first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint, capture_diagnostics=True).run(pdf))
+    resumed = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    assert len(transport.calls) == 1
+    assert first.pages[0].state == resumed.pages[0].state == "failed"
+    attempt = resumed.pages[0].attempts[0]
+    assert attempt.safe_error_code == "http_400" and attempt.request_started is True
+    assert attempt.usage is None and attempt.actual_cost_rub is None
+    assert resumed.actual_cost_rub is None
+    saved = json.loads((checkpoint / "page-000001.json").read_text(encoding="utf-8"))
+    assert "request_diagnostics" not in saved["attempts"][0]
+    sidecars = list((checkpoint / "request-diagnostics-v1").glob("request-*.json"))
+    assert len(sidecars) == 1
+    sidecar = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert sidecar["format_version"] == 1
+    assert sidecar["checkpoint_identity_fingerprint"] == identity_before
+    assert sidecar["page_number"] == 1 and sidecar["attempt_started_at"] == attempt.started_at
+    evidence = sidecar["evidence"]
+    assert evidence["provider_error_code"] == "unsupported_parameter"
+    assert evidence["provider_error_param"] == "messages"
+    assert evidence["provider_request_id"] == request_id
+    assert evidence["system_message_count"] == 1
+    safe_report = resumed.model_dump_json(exclude={"draft": True, "pages": {"__all__": {"extraction"}}})
+    evidence_text = json.dumps(sidecar) + safe_report + caplog.text
+    assert private_context not in evidence_text and SYNTHETIC_KEY not in evidence_text
+    assert "data:image" not in evidence_text
+    assert inspect_pdf(pdf, adapter, config, run_id="qwen-synthetic-run").fingerprint == identity_before
+
+
+def test_default_checkpoint_and_report_schema_remain_unchanged_and_resumable(tmp_path):
+    transport = FakeTransport()
+    adapter = _adapter(transport)
+    config = _orchestration_config()
+    pdf = _make_pdf(tmp_path / "synthetic-old-checkpoint.pdf")
+    checkpoint = tmp_path / "checkpoint"
+    first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    manifest = (checkpoint / "manifest.json").read_bytes()
+    page_path = checkpoint / "page-000001.json"
+    legacy = json.loads(page_path.read_text(encoding="utf-8"))
+    assert all("request_diagnostics" not in attempt for attempt in legacy["attempts"])
+    assert not (checkpoint / "request-diagnostics-v1").exists()
+    before = page_path.read_bytes()
+    resumed = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    assert resumed.pages[0].state == "completed" and len(transport.calls) == 1
+    assert "request_diagnostics" not in resumed.model_dump_json()
+    assert resumed.actual_input_tokens == first.actual_input_tokens
+    assert resumed.actual_cost_rub == first.actual_cost_rub
+    assert (checkpoint / "manifest.json").read_bytes() == manifest
+    assert page_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("version", [2, True, "1", None])
+def test_diagnostic_version_failure_blocks_only_opted_in_run_before_http(tmp_path, version):
+    adapter = _adapter(FakeTransport())
+    pdf = _make_pdf(tmp_path / "diagnostic-version.pdf")
+    config = _orchestration_config()
+    checkpoint = tmp_path / "checkpoint"
+    identity = inspect_pdf(pdf, adapter, config, run_id="qwen-synthetic-run")
+    store = CheckpointStore(checkpoint, identity, capture_request_diagnostics=True)
+    store.open()
+    store.close()
+    marker = checkpoint / "request-diagnostics-v1" / "format.json"
+    marker.write_text(json.dumps({"format_version": version}), encoding="utf-8")
+    with pytest.raises(OrchestrationError, match="request_diagnostics_unavailable"):
+        asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint, capture_diagnostics=True).run(pdf))
+    assert adapter.client._transport.calls == []
+    # Diagnostic sidecars have no effect on the standard loader or its lock.
+    ordinary = CheckpointStore(checkpoint, identity)
+    assert ordinary.open() == {}
+    ordinary.close()
+
+
+def test_diagnostic_write_failure_keeps_success_usage_and_never_resends(tmp_path, monkeypatch):
+    transport = FakeTransport()
+    adapter = _adapter(transport)
+    pdf = _make_pdf(tmp_path / "diagnostic-failure.pdf")
+    config = _orchestration_config()
+    checkpoint = tmp_path / "checkpoint"
+    orchestrator = _make_orchestrator(pdf, adapter, config, checkpoint, capture_diagnostics=True)
+    async def fail(*args):
+        raise OrchestrationError("request_diagnostics_write_failed")
+    monkeypatch.setattr(orchestrator.checkpoint, "write_request_diagnostics", fail)
+    with pytest.raises(OrchestrationError, match="request_diagnostics_write_failed"):
+        asyncio.run(orchestrator.run(pdf))
+    saved = json.loads((checkpoint / "page-000001.json").read_text(encoding="utf-8"))
+    assert saved["state"] == "completed"
+    assert saved["attempts"][0]["usage"]["input_tokens"] == 100
+    resumed = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    assert resumed.status == "completed" and resumed.actual_input_tokens == 100
+    assert len(transport.calls) == 1
 
 
 def test_thirty_page_pdf_runs_offline_at_parallelism_three_and_keeps_order(tmp_path):
@@ -723,6 +828,68 @@ def test_changed_prompt_invalidates_checkpoint_even_when_prompt_version_is_uncha
     assert len(transport.calls) == 1
 
 
+def _legacy_context_scope(adapter, context):
+    config = adapter.client.config
+    value = {"api_key": config.api_key, "auth_scheme": config.auth_scheme, "folder_id": config.folder_id}
+    if context is not None:
+        value["document_context_policy_version"] = "document-context-v1"
+        value["document_context_hmac"] = hmac.new(config.api_key.encode(),
+            b"averon-qwen-document-context-v1\0" + context.encode(), hashlib.sha256).hexdigest()
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"averon-qwen-checkpoint-scope-v1\0" + encoded).hexdigest()
+
+
+def test_empty_context_keeps_legacy_identity_and_old_contextual_run_requires_new_workspace(tmp_path):
+    context = "Synthetic exact contextual hint"
+    transport = FakeTransport()
+    adapter = _adapter(transport, user_context=context)
+    empty_adapter = _adapter(FakeTransport())
+    assert empty_adapter.private_checkpoint_scope_fingerprint == _legacy_context_scope(empty_adapter, None)
+    legacy_scope = _legacy_context_scope(adapter, context)
+    assert adapter.private_checkpoint_scope_fingerprint != legacy_scope
+    pdf = _make_pdf(tmp_path / "legacy-context.pdf")
+    config = _orchestration_config()
+    identity = inspect_pdf(pdf, adapter, config, run_id="qwen-synthetic-run")
+    legacy_identity = identity.model_copy(update={"private_adapter_scope_fingerprint": legacy_scope})
+    old_checkpoint = tmp_path / "legacy-checkpoint"
+    store = CheckpointStore(old_checkpoint, legacy_identity)
+    store.open()
+    store.close()
+    manifest = (old_checkpoint / "manifest.json").read_bytes()
+    with pytest.raises(OrchestrationError, match="checkpoint_identity_mismatch"):
+        asyncio.run(_make_orchestrator(pdf, adapter, config, old_checkpoint).run(pdf))
+    assert transport.calls == [] and (old_checkpoint / "manifest.json").read_bytes() == manifest
+    fresh = asyncio.run(_make_orchestrator(pdf, adapter, config, tmp_path / "fresh-checkpoint").run(pdf))
+    assert fresh.status == "completed" and len(transport.calls) == 1
+    assert (old_checkpoint / "manifest.json").read_bytes() == manifest
+
+
+def test_context_identity_binds_actual_policy_and_layout_without_relying_on_version_bump(monkeypatch):
+    context = "Synthetic stable hint"
+    initial = _adapter(FakeTransport(), user_context=context)
+    empty = _adapter(FakeTransport())
+    initial_scope = initial.private_checkpoint_scope_fingerprint
+    empty_scope = empty.private_checkpoint_scope_fingerprint
+    version = qwen_vision_client_module.USER_CONTEXT_POLICY_VERSION
+    monkeypatch.setattr(qwen_vision_client_module, "_USER_CONTEXT_POLICY",
+        qwen_vision_client_module._USER_CONTEXT_POLICY + " Synthetic extra safety restriction.")
+    policy_scope = _adapter(FakeTransport(), user_context=context).private_checkpoint_scope_fingerprint
+    assert policy_scope != initial_scope
+    assert _adapter(FakeTransport()).private_checkpoint_scope_fingerprint == empty_scope
+    original = QwenVisionClient._request_body
+    def split_system(self, image, page, user_context=None):
+        body = json.loads(original(self, image, page, user_context))
+        if user_context:
+            body["messages"][0]["content"] = qwen_vision_client_module._PROMPT
+            body["messages"].insert(1, {"role": "system", "content": qwen_vision_client_module._USER_CONTEXT_POLICY})
+        return json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
+    monkeypatch.setattr(QwenVisionClient, "_request_body", split_system)
+    layout_scope = _adapter(FakeTransport(), user_context=context).private_checkpoint_scope_fingerprint
+    assert layout_scope != policy_scope
+    assert qwen_vision_client_module.USER_CONTEXT_POLICY_VERSION == version
+    assert _adapter(FakeTransport()).private_checkpoint_scope_fingerprint == empty_scope
+
+
 def test_user_context_is_private_checkpoint_identity_and_exactly_resumed(tmp_path):
     context = "Synthetic hint: inspect wrapped names. Preserve every source value as read."
     changed_context = context + " Check the note column too."
@@ -747,7 +914,7 @@ def test_user_context_is_private_checkpoint_identity_and_exactly_resumed(tmp_pat
     first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
     assert first.status == "completed"
     request_messages = transport.calls[0]["payload"]["messages"]
-    assert request_messages[2]["content"][1]["text"].endswith(context)
+    assert request_messages[1]["content"][1]["text"].endswith(context)
     public = json.dumps({"descriptor": first.adapter.model_dump(), "report": first.model_dump(mode="json")})
     saved = "".join(path.read_text(encoding="utf-8") for path in checkpoint.glob("*.json"))
     assert context not in public and context not in saved

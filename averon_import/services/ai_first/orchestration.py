@@ -24,7 +24,7 @@ from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from averon_import.services.ai_first.private_acl import (
-    PrivateAclError, secure_private_tree, verify_private_path, verify_private_tree,
+    PrivateAclError, create_private_directory, secure_private_tree, verify_private_path, verify_private_tree,
 )
 
 import fitz
@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from averon_import.services.ai_first.assembly import assemble_document_draft, failed_page
 from averon_import.services.ai_first.contracts import AIDocumentDraft, AIPageExtraction
+from averon_import.services.ai_request_diagnostics import AIRequestDiagnosticRecord, AIRequestDiagnostics
 
 
 class OrchestrationError(RuntimeError):
@@ -294,6 +295,7 @@ class AdapterPageResult(_StrictModel):
     http_status: int | None = Field(default=None, ge=100, le=599)
     finish_reason: Literal["stop", "length", "content_filter", "tool_calls", "unknown"] | None = None
     request_latency_ms: float | None = Field(default=None, ge=0)
+    request_diagnostics: AIRequestDiagnostics | None = None
 
 
 class PageExtractionAdapter(Protocol):
@@ -315,6 +317,7 @@ class AdapterRequestError(RuntimeError):
         self, safe_code: str, *, outcome_unknown: bool, usage: TokenUsage | None = None,
         request_started: bool | None = None, http_status: int | None = None,
         finish_reason: str | None = None, request_latency_ms: float | None = None,
+        request_diagnostics: AIRequestDiagnostics | None = None,
     ):
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
             safe_code = "adapter_error"
@@ -337,6 +340,7 @@ class AdapterRequestError(RuntimeError):
             and request_latency_ms >= 0
             else None
         )
+        self.request_diagnostics = request_diagnostics if isinstance(request_diagnostics, AIRequestDiagnostics) else None
 
 
 class PageAttempt(_StrictModel):
@@ -527,9 +531,13 @@ class FitZPageRenderer:
 class CheckpointStore:
     """Private, atomic per-page JSON checkpoint with an OS-released run lock."""
 
-    def __init__(self, directory: str | os.PathLike[str], identity: CheckpointIdentity):
+    def __init__(self, directory: str | os.PathLike[str], identity: CheckpointIdentity,
+                 *, capture_request_diagnostics: bool = False):
+        if type(capture_request_diagnostics) is not bool:
+            raise ValueError("invalid diagnostic capture setting")
         self.directory = Path(directory).expanduser().resolve()
         self.identity = identity
+        self.capture_request_diagnostics = capture_request_diagnostics
         self._lock_stream: Any = None
         self._io_lock = asyncio.Lock()
 
@@ -569,6 +577,8 @@ class CheckpointStore:
                 if any(path.name != ".run.lock" for path in self.directory.iterdir()):
                     raise OrchestrationError("checkpoint_manifest_missing")
                 self._atomic_json(manifest, expected)
+            if self.capture_request_diagnostics:
+                self._prepare_request_diagnostics()
             records: dict[int, PageRunRecord] = {}
             for path in self.directory.glob("page-*.json"):
                 if path.is_symlink():
@@ -675,6 +685,53 @@ class CheckpointStore:
             if path.is_symlink():
                 raise OrchestrationError("checkpoint_invalid")
             self._atomic_json(path, record.model_dump(mode="json"))
+
+    def _prepare_request_diagnostics(self) -> Path:
+        """Opt-in sidecar; old readers ignore it and core schemas stay intact."""
+        directory = self.directory / "request-diagnostics-v1"
+        try:
+            if directory.exists():
+                verify_private_tree(directory)
+            else:
+                create_private_directory(directory)
+            marker = directory / "format.json"
+            expected = {"format_version": 1}
+            if marker.exists():
+                verify_private_path(marker, directory=False)
+                if marker.stat().st_size > 1024:
+                    raise ValueError("unsupported diagnostic version")
+                actual = json.loads(marker.read_text(encoding="utf-8"))
+                if actual != expected or type(actual.get("format_version")) is not int:
+                    raise ValueError("unsupported diagnostic version")
+            else:
+                self._atomic_json(marker, expected)
+            return directory
+        except Exception:
+            raise OrchestrationError("request_diagnostics_unavailable") from None
+
+    async def write_request_diagnostics(
+        self, page_number: int, attempt: PageAttempt, evidence: AIRequestDiagnostics | None,
+    ) -> None:
+        if not self.capture_request_diagnostics or evidence is None or evidence.client_request_id is None:
+            return
+        record = AIRequestDiagnosticRecord(
+            format_version=1,
+            checkpoint_identity_fingerprint=self.identity.fingerprint,
+            page_number=page_number, attempt_started_at=attempt.started_at,
+            http_status=attempt.http_status, finish_reason=attempt.finish_reason,
+            request_latency_ms=attempt.request_latency_ms, evidence=evidence,
+        )
+        async with self._io_lock:
+            try:
+                directory = self._prepare_request_diagnostics()
+                path = directory / f"request-{evidence.client_request_id}.json"
+                if path.exists() or path.is_symlink():
+                    raise ValueError("duplicate diagnostic request id")
+                self._atomic_json(path, record.model_dump(mode="json"))
+            except Exception:
+                # The canonical outcome/usage has already been persisted. Stop
+                # this diagnostic run instead of repeating a dispatched request.
+                raise OrchestrationError("request_diagnostics_write_failed") from None
 
     def close(self) -> None:
         if self._lock_stream is not None:
@@ -1232,6 +1289,7 @@ class PageOrchestrator:
             error_http_status: int | None = None
             error_finish_reason: str | None = None
             error_request_latency_ms: float | None = None
+            request_diagnostics: AIRequestDiagnostics | None = None
             request_task = asyncio.create_task(self.adapter.extract(PageExtractionRequest(
                 identity.source_document_id, number, image, identity.run_id,
                 cancel_event=cancel_event,
@@ -1261,6 +1319,7 @@ class PageOrchestrator:
                         error_http_status = settled.http_status
                         error_finish_reason = settled.finish_reason
                         error_request_latency_ms = settled.request_latency_ms
+                        request_diagnostics = settled.request_diagnostics
                     else:
                         error_state, error_code = "unknown_outcome", "cancelled_after_dispatch"
             except AdapterRequestError as exc:
@@ -1271,6 +1330,7 @@ class PageOrchestrator:
                 error_http_status = exc.http_status
                 error_finish_reason = exc.finish_reason
                 error_request_latency_ms = exc.request_latency_ms
+                request_diagnostics = exc.request_diagnostics
             except asyncio.CancelledError:
                 request_task.cancel()
                 cancel_task.cancel()
@@ -1298,6 +1358,7 @@ class PageOrchestrator:
                 http_status = response.http_status
                 finish_reason = response.finish_reason
                 request_latency_ms = response.request_latency_ms
+                request_diagnostics = response.request_diagnostics
                 extraction = response.extraction
                 if extraction.source_document_id != identity.source_document_id or extraction.page_number != number:
                     error_state, error_code = "failed", "response_identity_mismatch"
@@ -1358,6 +1419,7 @@ class PageOrchestrator:
                 "updated_at": _utc_now(),
             })
             await self.checkpoint.write(records[number])
+            await self.checkpoint.write_request_diagnostics(number, updated_attempt, request_diagnostics)
             await notify(number, final_state)
 
         async def worker() -> None:

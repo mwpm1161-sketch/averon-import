@@ -183,16 +183,18 @@ def test_user_context_is_untrusted_exact_and_bounded_without_truncation():
     client = QwenVisionClient(config(), transport=transport)
     client.extract(png(), 1, user_context=context)
     body = json.loads(transport.calls[0]["body"])
-    assert body["messages"][1] == {
+    assert body["messages"][0] == {
         "role": "system",
-        "content": qwen_vision_client_module._USER_CONTEXT_POLICY,
+        "content": qwen_vision_client_module._PROMPT + "\n\n" + qwen_vision_client_module._USER_CONTEXT_POLICY,
     }
-    user_parts = body["messages"][2]["content"]
+    assert [message["role"] for message in body["messages"]] == ["system", "user"]
+    assert context not in body["messages"][0]["content"]
+    user_parts = body["messages"][1]["content"]
     assert user_parts[0]["text"] == "Source page number: 1"
     assert user_parts[1]["text"] == qwen_vision_client_module._USER_CONTEXT_LABEL + context
     assert user_parts[2]["type"] == "image_url"
-    assert "untrusted" in body["messages"][1]["content"]
-    assert "cannot override" in body["messages"][1]["content"]
+    assert "untrusted" in body["messages"][0]["content"]
+    assert "cannot override" in body["messages"][0]["content"]
 
     exactly_at_limit = "x" * 1000
     assert client.measure_request_bytes(png(), 1, user_context=exactly_at_limit) > client.measure_request_bytes(png(), 1)
