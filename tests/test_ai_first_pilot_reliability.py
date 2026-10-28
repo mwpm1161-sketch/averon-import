@@ -35,6 +35,33 @@ def edits(**values):
             "add_row_values": {}, **values}
 
 
+def test_workspace_store_recovers_related_state_after_interrupted_bundle(tmp_path, monkeypatch):
+    """A process stop between ledger files must not expose a mixed review state."""
+    root = tmp_path / "document"
+    store = AIWorkspaceStore(root)
+    store.write("review.json", {"revision": "old"})
+    store.write("editor-draft.json", {"revision": "old"})
+    write_json = store._write_atomic_json
+    target_writes = 0
+
+    def interrupted_write(directory, name, payload):
+        nonlocal target_writes
+        if name != store._TRANSACTION_NAME:
+            target_writes += 1
+            if target_writes == 2:
+                raise OSError("synthetic interruption")
+        return write_json(directory, name, payload)
+
+    monkeypatch.setattr(store, "_write_atomic_json", interrupted_write)
+    with pytest.raises(RuntimeError, match="ai_first_private_state_unavailable"):
+        store.write_many({"review.json": {"revision": "new"}, "editor-draft.json": {"revision": "new"}})
+
+    reopened = AIWorkspaceStore(root)
+    assert reopened.read("review.json") == {"revision": "new"}
+    assert reopened.read("editor-draft.json") == {"revision": "new"}
+    assert not (reopened.root / reopened._TRANSACTION_NAME).exists()
+
+
 def test_save_restores_all_editor_buffers_without_confirming_or_changing_ocr(ai_first_client):
     main, client = ai_first_client
     workspace = _make_document(main)
@@ -87,6 +114,8 @@ def test_page10_of20_exports_without_confirming_other_pages_and_buffered_edits_f
     assert preview.status_code == 200, preview.text
     assert preview.json()["verified_position_count"] == 1
     assert preview.json()["ocr_row_count"] == 2
+    assert preview.json()["preview_checks_admission_only"] is True
+    assert preview.json()["xlsx_technical_limits_checked"] is False
     book = load_workbook(BytesIO(post(client, workspace, "pilot-export", {"page_numbers": [10]}).content))
     assert book.sheetnames[0] == "Спецификация"
     assert book["Спецификация"].cell(5, 2).value == "Synthetic checked name"
@@ -99,10 +128,9 @@ def test_page10_of20_exports_without_confirming_other_pages_and_buffered_edits_f
     pending = edits(row_values={row["id"]: {"cell:1": "=SYNTHETIC_UNCONFIRMED()"}})
     assert post(client, workspace, "review/save", {"review_token": before["review_token"], "edits": pending}).status_code == 200
     assert post(client, workspace, "pilot-export/preview", {"page_numbers": [10]}).json()["verified_position_count"] == 0
-    book = load_workbook(BytesIO(post(client, workspace, "pilot-export", {"page_numbers": [10]}).content))
-    assert book["Спецификация"].cell(5, 1).value.startswith("Нет позиций")
-    assert "Черновик редактора" in book.sheetnames
-    assert all(cell.data_type != "f" for sheet in book for cells in sheet for cell in cells)
+    export = post(client, workspace, "pilot-export", {"page_numbers": [10]})
+    assert export.status_code == 409
+    assert export.json()["detail"]["code"] == "no_verified_positions"
     assert state(client, workspace)["review"] == before["review"]
     # Explicit confirmation consumes the buffer, while the private editor history remains.
     current = state(client, workspace)
@@ -115,7 +143,7 @@ def test_page10_of20_exports_without_confirming_other_pages_and_buffered_edits_f
 
 
 @pytest.mark.parametrize("change", ["context", "dpi", "model", "output"])
-def test_changed_identity_requires_explicit_new_run_preserves_old_checkpoint_and_other_document(ai_first_client, monkeypatch, change):
+def test_new_run_preserves_old_checkpoint(ai_first_client, monkeypatch, change):
     main, client = ai_first_client
     workspace = _make_document(main)
     _start_fake(client, workspace.document_id, pages=[1])
@@ -150,7 +178,8 @@ def test_changed_identity_requires_explicit_new_run_preserves_old_checkpoint_and
     assert _wait_for_job(client, response.json()["id"])["status"] == "completed"
     response = post(client, workspace, "recognize", {**payload, "start_new_run": True})
     assert response.status_code == 200, response.text
-    assert _wait_for_job(client, response.json()["id"])["status"] == "completed"
+    new_run_result = _wait_for_job(client, response.json()["id"])
+    assert new_run_result["status"] == "completed", new_run_result.get("error_code")
     assert (store.checkpoint_directory / "manifest.json").read_bytes() == manifest
     active = store.read("active-run.json")["run_id"]
     assert (store.root / "runs" / active / "checkpoint" / "manifest.json").exists()
@@ -186,9 +215,9 @@ def test_real_crop_renders_small_region_before_allocation_and_marks_scope(ai_fir
     assert envelope["page_regions"] == {"1": [0.01, 0.01, 0.02, 0.01]}
     assert envelope["page_region_pdf_points"]["1"] == [100.0, 100.0, 300.0, 200.0]
     assert data["review_ready_for_guard"]["code"] == "partial_page_scope"
-    book = load_workbook(BytesIO(post(client, workspace, "pilot-export", {"page_numbers": [1]}).content))
-    assert "Выбранная область" in book["Спецификация"]["A1"].value
-    assert "Области страниц" in book.sheetnames
+    export = post(client, workspace, "pilot-export", {"page_numbers": [1]})
+    assert export.status_code == 409
+    assert export.json()["detail"]["code"] == "no_verified_positions"
     for bad in [{**crop, "page_number": 2}, {**crop, "width": 2}, {**crop, "x": float("inf")}]:
         assert post(client, workspace, "recognize", {"mode": "fake", "pages": [1], "crop": bad}).status_code in {400, 422}
     assert len(sizes) == 1
@@ -329,9 +358,8 @@ def test_fragment_workbook_does_not_include_buffered_text_from_other_pages(ai_fi
                     add_row_page=1, add_row_values={"name#1": other_text})
     assert post(client, workspace, "review/save", {"review_token": before["review_token"], "edits": pending}).status_code == 200
     response = post(client, workspace, "pilot-export", {"page_numbers": [10]})
-    assert response.status_code == 200
-    with ZipFile(BytesIO(response.content)) as archive:
-        xml = "".join(archive.read(name).decode("utf8") for name in archive.namelist() if name.endswith(".xml"))
-    assert selected_text in xml
-    assert other_text not in xml
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "no_verified_positions"
+    assert selected_text not in response.text
+    assert other_text not in response.text
     assert state(client, workspace)["editor_draft"]["edits"] == pending

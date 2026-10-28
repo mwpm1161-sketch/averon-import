@@ -304,11 +304,13 @@ def test_pilot_xlsx_exports_saved_review_fragment_without_production_export(ai_f
     assert response.status_code == 200, response.text
     assert not workspace.result_path.exists()
     workbook = load_workbook(BytesIO(response.content), data_only=False)
-    assert {"Спецификация", "Все распознанные строки", "Охват страниц", "Исходная структура"} <= set(workbook.sheetnames)
-    assert workbook["Спецификация"].max_row == 5
-    assert workbook["Все распознанные строки"].max_row == 7
-    assert workbook["Спецификация"]["A1"].value == "Тестовая выгрузка · Частичный охват"
-    assert preview_data["verified_position_count"] == workbook["Спецификация"].max_row - 4
+    assert len(workbook.worksheets) == 1
+    specification = workbook.worksheets[0]
+    assert specification.max_row == 5
+    assert specification.cell(5, 2).value == "Synthetic corrected item"
+    exported_values = [cell.value for row in specification.iter_rows() for cell in row]
+    assert "Synthetic manual row" not in exported_values, "unreviewed manual rows stay off the verified sheet"
+    assert preview_data["verified_position_count"] == specification.max_row - 4
 
 
 def test_pilot_export_chunks_long_source_text_after_admission_preview(ai_first_client):
@@ -316,10 +318,17 @@ def test_pilot_export_chunks_long_source_text_after_admission_preview(ai_first_c
     workspace = _make_document(main, 1)
     _start_fake(client, workspace.document_id)
     path = f"/api/documents/{workspace.document_id}/ai-first"
+    rows = client.get(path).json()["draft"]["pages"][0]["tables"][0]["rows"]
+    for index, row in enumerate(rows):
+        assert client.post(f"{path}/review/row-role", json={
+            "record_id":row["id"],"role":"standalone_item" if index == 0 else "section",
+        }).status_code == 200
+        assert client.post(f"{path}/review/row", json={"record_id":row["id"],"disposition":"confirmed"}).status_code == 200
+    assert client.post(f"{path}/review/complete-page", json={"page_number":1}).status_code == 200
     store, draft, _review, _report = main._ai_first_read_state(workspace)
     original_value = "=" + "x" * 32767
     row = draft.pages[0].tables[0].rows[0]
-    row.raw_cells[0] = row.raw_cells[0].model_copy(update={"raw_value": original_value})
+    row.raw_cells[1] = row.raw_cells[1].model_copy(update={"raw_value": original_value})
     store.write("transcription.json", draft.model_dump(mode="json"))
 
     preview = client.post(f"{path}/pilot-export/preview", json={"page_numbers":[1]})
@@ -329,18 +338,12 @@ def test_pilot_export_chunks_long_source_text_after_admission_preview(ai_first_c
     response = client.post(f"{path}/pilot-export", json={"page_numbers":[1]})
     assert response.status_code == 200, response.text
     workbook = load_workbook(BytesIO(response.content), data_only=False)
-    assert "Длинные значения" in workbook.sheetnames
-    source_sheet = workbook["P001-T001"]
-    marker = next(
-        cell for row in source_sheet.iter_rows() for cell in row
-        if isinstance(cell.value, str) and cell.value.startswith("Длинный текст · запись ")
-    )
-    parts = [
-        row for row in workbook["Длинные значения"].iter_rows(min_row=5, values_only=True)
-        if row[1] == "P001-T001" and row[2] == marker.coordinate
-    ]
-    parts.sort(key=lambda row: row[3])
-    assert "".join(row[5] for row in parts) == original_value
+    assert len(workbook.worksheets) == 2
+    specification, overflow = workbook.worksheets
+    marker = next(cell for row in specification.iter_rows() for cell in row if cell.hyperlink)
+    parts = [row for row in overflow.iter_rows(min_row=2, values_only=True) if row[1] == marker.coordinate]
+    parts.sort(key=lambda row: row[2])
+    assert "".join(row[4] for row in parts) == original_value
     assert all(cell.data_type != "f" for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row)
 
 
@@ -361,8 +364,9 @@ def test_pilot_export_refusal_explains_source_value_remains_in_export(ai_first_c
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert detail["code"] == error_code
-    assert "исходный OCR-текст" in detail["message"]
-    assert "исправление только проверенного значения не удалит" in detail["message"]
+    assert "\u0438\u0441\u0445\u043e\u0434\u043d\u043e\u0433\u043e \u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u0430" in detail["message"]
+    assert "\u0414\u0430\u043d\u043d\u044b\u0435 \u043d\u0435 \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u044b" in detail["message"]
+    assert "\u043f\u0440\u043e\u0432\u0435\u0440\u0435\u043d\u043d\u043e\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435" not in detail["message"]
 
 
 def test_ai_first_locator_returns_only_safe_no_match_status_for_fake_page(ai_first_client):
@@ -417,17 +421,17 @@ def test_review_change_during_result_publication_is_serialized_and_audited(ai_fi
     row = client.get(path).json()["draft"]["pages"][0]["tables"][0]["rows"][0]
 
     from averon_import.services.ai_first.local_workflow import AIWorkspaceStore
-    original_write = AIWorkspaceStore.write
+    original_write_many = AIWorkspaceStore.write_many
     publication_blocked = threading.Event()
     release_publication = threading.Event()
 
-    def pause_publication(store, name, payload):
-        if name == "transcription.json" and not publication_blocked.is_set():
+    def pause_publication(store, payloads):
+        if "transcription.json" in payloads and not publication_blocked.is_set():
             publication_blocked.set()
             assert release_publication.wait(5), "test did not release AI-first publication"
-        return original_write(store, name, payload)
+        return original_write_many(store, payloads)
 
-    monkeypatch.setattr(AIWorkspaceStore, "write", pause_publication)
+    monkeypatch.setattr(AIWorkspaceStore, "write_many", pause_publication)
     start = client.post(
         f"/api/documents/{workspace.document_id}/ai-first/recognize",
         json={"mode":"fake","pages":[1]},

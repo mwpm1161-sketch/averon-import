@@ -1,8 +1,8 @@
 """Explicitly experimental XLSX for local AI-first estimator pilots.
 
-This exporter is intentionally separate from the production export service and
-does not authorize sourcing or a commercial estimate. It always includes a
-loss-preserving review sheet and a page-coverage sheet.
+This exporter is intentionally separate from the production export service.
+The ordinary pilot workbook is estimator-facing; the diagnostic workbook is
+an administrator-only audit artifact.
 """
 from __future__ import annotations
 
@@ -84,7 +84,22 @@ def _canonical_field(header: object) -> str | None:
 
 
 def _json_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return json.dumps(_redact_secret_fields(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+_DIAGNOSTIC_SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|password|secret|credential|access[_-]?token|refresh[_-]?token)", re.IGNORECASE)
+
+
+def _redact_secret_fields(value: Any) -> Any:
+    """Redact operational credentials from admin diagnostic JSON projections."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): "[REDACTED]" if _DIAGNOSTIC_SECRET_KEY.search(str(key)) else _redact_secret_fields(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_secret_fields(child) for child in value]
+    return value
 
 
 def _append_export_row(sheet, values: Sequence[object], long_values: list[dict[str, Any]] | None) -> None:
@@ -425,6 +440,28 @@ def _prepare_pilot_export_rows(
             and page is not None and page.status == "extracted" and not row["open_issue"]
             and not row["ambiguous_field_mapping"]
         )
+        reasons: list[str] = []
+        if row["superseded"]:
+            reasons.append("superseded")
+        if not row["active"]:
+            reasons.append("inactive_row")
+        if not row["role_active"]:
+            reasons.append("role_unconfirmed")
+        elif row["role"] != "standalone_item":
+            reasons.append("role_not_standalone")
+        if row["decision"] is None or not row["decision"].active:
+            reasons.append("values_unconfirmed")
+        elif not row["decision"].human_confirmed:
+            reasons.append("values_not_confirmed")
+        if not row["page_confirmed"]:
+            reasons.append("page_completeness_unconfirmed")
+        if row["processing_state"] != "completed" or page is None or page.status != "extracted":
+            reasons.append("page_processing_incomplete")
+        if row["open_issue"]:
+            reasons.append("open_issue")
+        if row["ambiguous_field_mapping"]:
+            reasons.append("ambiguous_column_mapping")
+        row["export_reason_codes"] = reasons
         if row["verified_position"]:
             selected_rows.append(row)
     return {
@@ -437,6 +474,10 @@ def _prepare_pilot_export_rows(
         "issue_index": issue_index,
         "all_rows": all_rows,
         "selected_rows": selected_rows,
+        "export_reasons": {
+            str(row["id"]): list(row["export_reason_codes"])
+            for row in all_rows if not row["verified_position"]
+        },
     }
 
 
@@ -461,6 +502,13 @@ def preview_ai_first_pilot_export(
         "manual_row_count": len(manual_rows),
         "total_row_count": len(all_rows),
         "verified_position_count": len(selected_rows),
+        "preview_checks_admission_only": True,
+        "xlsx_technical_limits_checked": False,
+        "blocked_rows": [
+            {"page_number": row["page"], "source_row_number": row["row_index"],
+             "reason_codes": list(row["export_reason_codes"])}
+            for row in all_rows if not row["verified_position"]
+        ],
         "pages": [
             {
                 "page_number": number,
@@ -688,7 +736,7 @@ def _source_table_sheet(
     return location
 
 
-def build_ai_first_pilot_xlsx(
+def build_ai_first_diagnostic_xlsx(
     draft: AIDocumentDraft,
     review: AIReviewState,
     report: Mapping[str, Any],
@@ -945,6 +993,70 @@ def build_ai_first_pilot_xlsx(
             draft.source_document_id, selected, page_count, ["Часть", "Всего", "JSON · соединить без разделителей"],
             [[i + 1, len(chunks), part] for i, part in enumerate(chunks)], source_label=source_label, long_values=long_values)
 
+    # A separate administrative run sheet uses an explicit allowlist. It never
+    # serializes the full report/config/adapter objects or checkpoint hashes.
+    adapter = report.get("adapter") if isinstance(report.get("adapter"), Mapping) else {}
+    config = report.get("config") if isinstance(report.get("config"), Mapping) else {}
+    pricing = config.get("pricing") if isinstance(config.get("pricing"), Mapping) else {}
+    run_rows: list[list[object]] = [
+        ["Состояние запуска", report.get("status", "Неизвестно")],
+        ["Провайдер", adapter.get("provider_id", "Неизвестно")],
+        ["Модель", adapter.get("model_id", "Неизвестно")],
+        ["Версия модели", adapter.get("model_version", "Неизвестно")],
+        ["Версия промпта", adapter.get("prompt_version", "Неизвестно")],
+        ["Версия схемы", adapter.get("schema_version", "Неизвестно")],
+        ["Целостность исходного PDF", "Подтверждена" if report.get("source_integrity_verified") is True else "Не подтверждена"],
+        ["Ожидаемых страниц", report.get("expected_page_count", "Не сообщено")],
+        ["Время обработки, с", report.get("elapsed_s", "Не сообщено")],
+        ["Фактические входные токены", report.get("actual_input_tokens") if report.get("actual_input_tokens") is not None else "Не сообщено"],
+        ["Фактические выходные токены", report.get("actual_output_tokens") if report.get("actual_output_tokens") is not None else "Не сообщено"],
+        ["Reasoning tokens", report.get("actual_reasoning_tokens") if report.get("actual_reasoning_tokens") is not None else "Не сообщено"],
+        ["Фактическая расчётная стоимость, ₽", report.get("actual_cost_rub") if report.get("actual_cost_rub") is not None else "Не рассчитана"],
+        ["Зарезервированная стоимость неизвестных запросов, ₽", report.get("reserved_unknown_cost_rub", "Не сообщено")],
+        ["Параллельность", config.get("concurrency", "Не сообщено")],
+        ["DPI", config.get("dpi", "Не сообщено")],
+        ["Локальный лимит RPM", config.get("requests_per_minute", "Не сообщено")],
+        ["Локальный лимит TPM", config.get("tokens_per_minute", "Не сообщено")],
+        ["Локальный бюджет, ₽", config.get("max_budget_rub", "Не сообщено")],
+        ["Тариф входа за 1000 токенов, ₽", pricing.get("input_rub_per_1k", "Не сообщено")],
+        ["Тариф кешированного входа за 1000 токенов, ₽", pricing.get("cached_input_rub_per_1k", "Не сообщено")],
+        ["Тариф выхода за 1000 токенов, ₽", pricing.get("output_rub_per_1k", "Не сообщено")],
+    ]
+    attempt_rows: list[list[object]] = []
+    for page_record in report.get("pages", []) if isinstance(report.get("pages"), list) else []:
+        if not isinstance(page_record, Mapping):
+            continue
+        attempts = page_record.get("attempts") if isinstance(page_record.get("attempts"), list) else []
+        if not attempts:
+            attempt_rows.append([page_record.get("page_number", ""), "", page_record.get("state", ""), "", "", "", "", ""])
+            continue
+        for attempt_index, attempt in enumerate(attempts, start=1):
+            if not isinstance(attempt, Mapping):
+                continue
+            usage = attempt.get("usage") if isinstance(attempt.get("usage"), Mapping) else {}
+            attempt_rows.append([
+                page_record.get("page_number", ""), attempt_index, attempt.get("state", ""),
+                attempt.get("http_status", ""), attempt.get("finish_reason", ""),
+                usage.get("input_tokens", "Не сообщено"), usage.get("output_tokens", "Не сообщено"),
+                usage.get("reasoning_tokens", "Не сообщено"),
+                attempt.get("elapsed_s", "Не сообщено"), attempt.get("request_latency_ms", "Не сообщено"),
+                attempt.get("actual_cost_rub", "Не рассчитана"), attempt.get("safe_error_code", ""),
+            ])
+    run_sheet = workbook.create_sheet("Диагностика запуска")
+    _write_sheet(
+        run_sheet, "Разрешённые метаданные запуска", filename, draft.source_document_id,
+        selected, page_count, ["Показатель", "Значение"], run_rows,
+        widths=[48, 72], source_label=source_label, long_values=long_values,
+    )
+    attempt_sheet = workbook.create_sheet("Попытки страниц")
+    _write_sheet(
+        attempt_sheet, "Безопасные статусы попыток по страницам", filename, draft.source_document_id,
+        selected, page_count,
+        ["Страница", "Попытка", "Статус", "HTTP", "finish_reason", "Входные токены", "Выходные токены", "Reasoning", "Время, с", "Задержка, мс", "Стоимость, ₽", "Код ошибки"],
+        attempt_rows, widths=[12, 12, 18, 10, 18, 18, 18, 18, 14, 16, 16, 28],
+        source_label=source_label, long_values=long_values,
+    )
+
     if long_values:
         long_sheet = workbook.create_sheet(LONG_TEXT_SHEET_NAME)
         long_rows: list[list[object]] = []
@@ -966,7 +1078,7 @@ def build_ai_first_pilot_xlsx(
             source_cell.style = "Hyperlink"
 
     workbook.properties.title = f"ТЕСТ — AI-first {source_label}"
-    workbook.properties.subject = "Локальная пилотная выгрузка проверяемого фрагмента; не коммерческая смета"
+    workbook.properties.subject = "AI-first · административная диагностика выбранного фрагмента"
     stream = BytesIO()
     try:
         workbook.save(stream)
@@ -975,4 +1087,213 @@ def build_ai_first_pilot_xlsx(
     return stream.getvalue()
 
 
-__all__ = ["MAX_PILOT_EXPORT_PAGES", "XLSX_MIME", "PilotExportError", "build_ai_first_pilot_xlsx", "preview_ai_first_pilot_export"]
+def build_ai_first_pilot_xlsx(
+    draft: AIDocumentDraft,
+    review: AIReviewState,
+    report: Mapping[str, Any],
+    *,
+    page_numbers: Sequence[int],
+    document_name: str,
+) -> bytes:
+    """Build the estimator-facing workbook without a synthetic column template.
+
+    Each physical source table is a separate block on the one ordinary sheet.
+    Only rows admitted by the existing Human Review checks are emitted as
+    positions. Notes remain in their own section and are explicitly marked if
+    their role/value review is still outstanding.
+    """
+    prepared = _prepare_pilot_export_rows(draft, review, report, page_numbers, document_name)
+    selected = prepared["selected"]
+    positions_rows = prepared["selected_rows"]
+    if not positions_rows:
+        raise PilotExportError("no_verified_positions")
+
+    sheet = Workbook().active
+    sheet.title = "Спецификация"
+    workbook = sheet.parent
+    sheet.sheet_view.showGridLines = False
+    sheet.sheet_properties.tabColor = "39766A"
+    long_values: list[dict[str, Any]] = []
+    full_page_selection = set(selected) == set(draft.expected_page_numbers)
+    all_pages_completed = all(prepared["report_states"].get(number) == "completed" for number in selected)
+    marker = "ТЕСТ · Полный охват" if full_page_selection and all_pages_completed else "ТЕСТ · Частичный охват"
+    if any(str(number) in draft.source_envelope.get("page_regions", {}) for number in selected):
+        marker = "ТЕСТ · Частичный охват области"
+    _append_export_row(sheet, [marker], long_values)
+    _append_export_row(sheet, [f"{prepared['filename']} · страницы {', '.join(map(str, selected))} из {prepared['page_count']}"], long_values)
+    sheet.row_dimensions[1].height = 24
+    sheet.row_dimensions[2].height = 21
+
+    row_index = 3
+    page_lookup = prepared["pages_by_number"]
+    table_groups: list[tuple[int, int, list[tuple[int, str]], list[dict[str, Any]]]] = []
+    for page_number in selected:
+        page = page_lookup.get(page_number)
+        if page is None:
+            continue
+        for table in sorted(page.tables, key=lambda item: (item.index, item.id)):
+            rows = sorted(
+                (row for row in positions_rows if not row["manual"] and row["table_id"] == table.id),
+                key=lambda row: row["row_index"],
+            )
+            if not rows:
+                continue
+            headers = {column.index: column.raw_header or "" for column in table.columns}
+            for item in rows:
+                for value in item["current_values"]:
+                    headers.setdefault(int(value["column_index"]), "")
+            table_groups.append((page_number, table.index + 1, sorted(headers.items()), rows))
+
+    # Manual rows have no OCR table identity, so keep them grouped by source page.
+    for page_number in selected:
+        rows = sorted(
+            (row for row in positions_rows if row["manual"] and row["page"] == page_number),
+            key=lambda row: row["row_index"],
+        )
+        if rows:
+            headers: dict[int, str] = {}
+            for item in rows:
+                for value in item["source_values"]:
+                    headers.setdefault(int(value["column_index"]), str(value["header"] or ""))
+            table_groups.append((page_number, 0, sorted(headers.items()), rows))
+
+    if not table_groups:
+        raise PilotExportError("no_verified_positions")
+
+    def merged_label(label: str, column_count: int, *, fill: str, color: str, font_size: int = 10) -> None:
+        nonlocal row_index
+        _append_export_row(sheet, [label] + [""] * max(0, column_count - 1), long_values)
+        if column_count > 1:
+            sheet.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=column_count)
+        cell = sheet.cell(row_index, 1)
+        cell.fill = PatternFill("solid", fgColor=fill)
+        cell.font = Font(name="Aptos", size=font_size, bold=True, color=color)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        sheet.row_dimensions[row_index].height = 22
+        row_index += 1
+
+    row_number = 0
+    for page_number, table_number, columns, rows in table_groups:
+        column_count = max(1, len(columns))
+        table_label = f"Страница {page_number} · " + (f"Таблица {table_number}" if table_number else "Добавленные позиции")
+        merged_label(table_label, column_count, fill="EAF2F0", color="275C53", font_size=10)
+        _append_export_row(sheet, [header for _, header in columns] if columns else [""], long_values)
+        for cell in sheet[row_index]:
+            cell.fill = PatternFill("solid", fgColor="315F72")
+            cell.font = Font(name="Aptos", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        sheet.row_dimensions[row_index].height = 36
+        header_row = row_index
+        row_index += 1
+        for item in rows:
+            current = {int(value["column_index"]): value["value"] for value in item["current_values"]}
+            _append_export_row(sheet, [current.get(index, "") for index, _ in columns] or [""], long_values)
+            for cell in sheet[row_index]:
+                cell.font = Font(name="Aptos", size=10, color="253746")
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=Side(style="thin", color="DCE4E8"))
+                if cell.value is not None:
+                    cell.data_type = "s"
+            sheet.row_dimensions[row_index].height = 42
+            row_index += 1
+        if len(table_groups) == 1 and rows:
+            sheet.auto_filter.ref = f"A{header_row}:{get_column_letter(column_count)}{row_index - 1}"
+        row_index += 1
+
+    note_rows = []
+    for item in prepared["all_rows"]:
+        kind = str(item["model_kind"] or "").casefold().replace("-", "_")
+        candidate = getattr(item["row"], "server_role_candidate", None)
+        is_note = (item["role_active"] and item["role"] == "note") or kind in {"note", "document_note", "project_note"} or candidate == "note"
+        if is_note and not item["superseded"]:
+            note_rows.append(item)
+    if note_rows:
+        note_groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+        for item in note_rows:
+            note_groups[(int(item["page"]), str(item["table_id"]))].append(item)
+        # Different note tables keep their own source headings and order.
+        for (page_number, _table_id), group in sorted(note_groups.items()):
+            source_columns = sorted(group[0]["columns"])
+            note_header = ["Страница", "Таблица", "Строка", "Статус проверки"]
+            note_header.extend(group[0]["columns"].get(index, "") for index in source_columns)
+            note_width = max(1, len(note_header))
+            table_label = f"Примечания из документа · страница {page_number}"
+            if group[0]["table_index"]:
+                table_label += f" · таблица {group[0]['table_index']}"
+            merged_label(table_label, note_width, fill="F2F5F6", color="425466")
+            _append_export_row(sheet, note_header, long_values)
+            for cell in sheet[row_index]:
+                cell.fill = PatternFill("solid", fgColor="6B7280")
+                cell.font = Font(name="Aptos", size=9, bold=True, color="FFFFFF")
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+            sheet.row_dimensions[row_index].height = 34
+            row_index += 1
+            for item in group:
+                decision = item["decision"]
+                values = item["current_values"] if decision and decision.active and decision.human_confirmed else item["source_values"]
+                by_column = {int(value["column_index"]): value["value"] for value in values}
+                table_title = item["table_index"] if item["table_index"] else "—"
+                status = "Проверено человеком" if item["role_active"] and decision and decision.active and decision.human_confirmed else "Требует проверки"
+                _append_export_row(sheet, [item["page"], table_title, item["row_index"], status] + [by_column.get(index, "") for index in source_columns], long_values)
+                for cell in sheet[row_index]:
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+                    cell.border = Border(bottom=Side(style="thin", color="DCE4E8"))
+                    if cell.value is not None:
+                        cell.data_type = "s"
+                sheet.row_dimensions[row_index].height = 36
+                row_index += 1
+
+    # Excel limits a cell to 32,767 characters. Only oversized values add a
+    # continuation sheet; normal workbooks stay a single readable sheet.
+    if long_values:
+        overflow = workbook.create_sheet(LONG_TEXT_SHEET_NAME)
+        overflow.sheet_view.showGridLines = False
+        overflow.append(["Запись", "Ячейка спецификации", "Часть", "Всего частей", "Исходный текст · часть"])
+        for cell in overflow[1]:
+            cell.fill = PatternFill("solid", fgColor="315F72")
+            cell.font = Font(name="Aptos", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        overflow.freeze_panes = "A2"
+        for item in long_values:
+            first_row = overflow.max_row + 1
+            item["first_chunk_row"] = first_row
+            for part, chunk in enumerate(item["chunks"], start=1):
+                overflow.append([item["reference"], item["source_cell"], part, len(item["chunks"]), chunk])
+                for cell in overflow[overflow.max_row]:
+                    if cell.value is not None:
+                        cell.value = str(cell.value)
+                        cell.data_type = "s"
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+            item["cell"].hyperlink = f"#'{LONG_TEXT_SHEET_NAME}'!A{first_row}"
+            item["cell"].style = "Hyperlink"
+        overflow.column_dimensions["A"].width = 12
+        overflow.column_dimensions["B"].width = 22
+        overflow.column_dimensions["C"].width = 12
+        overflow.column_dimensions["D"].width = 16
+        overflow.column_dimensions["E"].width = 100
+
+    rule = Side(style="thin", color="DCE4E8")
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.border = Border(bottom=rule)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if cell.value is not None:
+                cell.value = str(cell.value)
+                cell.data_type = "s"
+    sheet.freeze_panes = "A4"
+    sheet.sheet_view.zoomScale = 85
+    for column_index in range(1, sheet.max_column + 1):
+        values = [str(sheet.cell(row, column_index).value or "") for row in range(1, sheet.max_row + 1)]
+        sheet.column_dimensions[get_column_letter(column_index)].width = min(44, max(12, max((len(v) for v in values), default=10) + 2))
+
+    workbook.properties.title = "ТЕСТ · Спецификация AI-first"
+    workbook.properties.subject = "Проверенный фрагмент исходной спецификации"
+    stream = BytesIO()
+    try:
+        workbook.save(stream)
+    except (ValueError, OSError):
+        raise PilotExportError("pilot_workbook_generation_failed") from None
+    return stream.getvalue()
+
+
+__all__ = ["MAX_PILOT_EXPORT_PAGES", "XLSX_MIME", "PilotExportError", "build_ai_first_pilot_xlsx", "build_ai_first_diagnostic_xlsx", "preview_ai_first_pilot_export"]

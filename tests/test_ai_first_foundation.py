@@ -176,6 +176,31 @@ def test_duplicate_and_gap_positions_are_review_issues_only():
     assert gap.export_authorized is False
 
 
+def test_hierarchical_duplicate_position_is_flagged_without_renumbering():
+    draft = _draft(_payload(rows=[
+        _row(0, "3.3", "Первый компонент"),
+        _row(1, "3.3", "Второй компонент"),
+    ]))
+    duplicate = next(issue for issue in draft.issues if issue.code == "duplicate_position_candidate")
+    assert len(duplicate.record_ids) == 2
+    assert all(row.raw_cells[0].raw_value == "3.3" for row in _all_rows(draft))
+    assert not any(issue.code == "position_gap_candidate" for issue in draft.issues)
+
+
+def test_suspicious_long_code_cell_is_warning_only_and_preserves_source_value():
+    row = _row(0, "1", "Насос", cells=[
+        _cell(0, "1"), _cell(1, "Насос"),
+        _cell(2, "Марка Сигма-731, модель Вектор-4 и синтетические характеристики изделия"),
+    ])
+    draft = _draft(_payload(
+        rows=[row], headers=["Поз.", "Наименование", "Код оборудования"],
+    ))
+    issue = next(issue for issue in draft.issues if issue.code == "suspicious_column_shift_candidate")
+    assert draft.pages[0].tables[0].rows[0].raw_cells[2].raw_value.startswith("Марка Сигма-731")
+    assert issue.severity == "review"
+    assert draft.export_authorized is False
+
+
 def test_extreme_position_gap_does_not_materialize_a_large_range():
     draft = _draft(_payload(rows=[
         _row(0, "1", "Первый элемент"),

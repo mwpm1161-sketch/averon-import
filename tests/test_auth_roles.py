@@ -601,6 +601,14 @@ def test_one_c_history_routes_require_admin_dependency(auth_client):
     assert all(has_admin_dependency(route.dependant) for route in routes)
 
 
+def test_ai_first_diagnostic_export_is_admin_only(auth_client):
+    path = "/api/admin/documents/0123456789abcdef0123456789abcdef/ai-first/diagnostic-export"
+    assert auth_client.post(path, json={"page_numbers": [1]}).status_code == 401
+    assert auth_client.post(path, headers=_headers("colleague"), json={"page_numbers": [1]}).status_code == 403
+    # Admin passes authorization and reaches document lookup; no workspace is created.
+    assert auth_client.post(path, headers=_headers("averon"), json={"page_numbers": [1]}).status_code == 404
+
+
 def test_capability_one_c_history_routes_are_available_to_users_without_system_settings(auth_client):
     from averon_import import main
     from averon_import.services.auth import require_one_c_history_import

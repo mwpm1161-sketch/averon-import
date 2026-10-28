@@ -313,13 +313,14 @@
             <button class="button ghost" type="button" id="ai-first-back-to-pages">К страницам</button>
             <button class="button secondary" type="button" id="ai-first-add-row">+ Добавить позицию</button>
             <button class="button primary" type="button" id="ai-first-save-review">Сохранить черновик проверки</button>
-            <button class="button secondary" type="button" id="ai-first-export-pilot" disabled title="Только успешно обработанные страницы; файл будет помечен ТЕСТ">Скачать тестовый XLSX</button>
+            <button class="button secondary" type="button" id="ai-first-export-pilot" disabled>Скачать тестовый XLSX</button>
           </div>
         </div>
         <div id="ai-first-export-feedback" class="ai-first-export-feedback" hidden>
           <div><b id="ai-first-export-feedback-title">Тестовая выгрузка</b><p id="ai-first-export-note"></p></div>
           <button class="button text" type="button" id="ai-first-retry-export-preview" hidden>Повторить проверку</button>
         </div>
+        <details id="ai-first-export-reasons" class="ai-first-export-reasons" hidden><summary>Почему некоторые строки не войдут</summary><ul id="ai-first-export-reasons-list"></ul></details>
         <details class="ai-first-help"><summary>Как работать с проверкой</summary><p>Сверьте строку с PDF, внесите правки в исходные колонки и сохраните их. Затем назначьте роль и подтвердите значения. Отдельно подтвердите полноту каждой проверенной страницы.</p></details>
         <div class="summary-row ai-first-review-summary" id="ai-first-review-summary"></div>
         <details class="ai-first-page-details" id="ai-first-page-details">

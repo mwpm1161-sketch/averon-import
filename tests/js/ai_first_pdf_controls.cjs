@@ -69,9 +69,10 @@ async function run() {
   context.updateExport();
   assert.equal(previewCalls,1,"the preview comes from the server once per selected fragment and review generation");
   assert.equal(button.disabled,false,"the test export is enabled only after the server has checked the fragment");
-  assert(exportNote.textContent.includes("Проверенных позиций: 2"));
-  assert(exportNote.textContent.includes("Страницы: 1"));
-  assert(exportNote.textContent.includes("всего строк: 3"));
+  assert(exportNote.textContent.includes("Страницы 1"));
+  assert(exportNote.textContent.includes("позиций к выгрузке: 2"));
+  assert(exportNote.textContent.includes("Тестовая выгрузка"));
+  assert(!exportNote.textContent.includes("ограничения Excel"));
   assert(!exportNote.textContent.includes("коммерч"));
   assert.equal(exportFeedback.hidden,false,"test and partial-scope warnings appear beside the download action after page selection");
   state.aiFirst.exportPages.clear();

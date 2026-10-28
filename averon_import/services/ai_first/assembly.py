@@ -28,6 +28,7 @@ _HEADER_MAP = {
     for field, aliases in _HEADER_ALIASES.items() for alias in aliases
 }
 _POSITIVE_INTEGER = re.compile(r"^[1-9]\d*$")
+_POSITION_IDENTIFIER = re.compile(r"^[1-9]\d*(?:[.-][1-9]\d*){0,5}$")
 
 
 class AIInputError(ValueError):
@@ -285,18 +286,15 @@ def _issue(source_document_id: str, code: str, severity: str, page: int, record_
     )
 
 
-def _candidate_position(row: AIRow, position_column: int, name_column: int) -> int | None:
+def _candidate_position(row: AIRow, position_column: int, name_column: int) -> str | None:
     values = {cell.column_index: cell.raw_value for cell in row.raw_cells}
     position = values.get(position_column)
     name = values.get(name_column)
-    if not isinstance(position, str) or not _POSITIVE_INTEGER.fullmatch(position.strip()):
+    if not isinstance(position, str) or not _POSITION_IDENTIFIER.fullmatch(position.strip()):
         return None
     if not isinstance(name, str) or not name.strip() or _POSITIVE_INTEGER.fullmatch(name.strip()):
         return None
-    try:
-        return int(position.strip())
-    except ValueError:
-        return None
+    return position.strip()
 
 
 def _table_candidate_issues(table: AITable) -> list[AIReviewIssue]:
@@ -304,16 +302,17 @@ def _table_candidate_issues(table: AITable) -> list[AIReviewIssue]:
     for column in table.columns:
         if column.canonical_field_candidate:
             by_field[column.canonical_field_candidate].append(column.index)
-    # A duplicated or unknown header is insufficient evidence for column-level checks.
-    if len(by_field.get("position", [])) != 1 or len(by_field.get("name", [])) != 1:
-        return []
-    position_column, name_column = by_field["position"][0], by_field["name"][0]
-    candidates = [
-        (row, _candidate_position(row, position_column, name_column)) for row in table.rows
-    ]
-    numbered = [(row, number) for row, number in candidates if number is not None]
     issues: list[AIReviewIssue] = []
-    occurrences: dict[int, list[str]] = defaultdict(list)
+    # A duplicated or unknown header is insufficient evidence for position
+    # numbering checks, but independent source-cell warnings remain useful.
+    numbered: list[tuple[AIRow, str]] = []
+    if len(by_field.get("position", [])) == 1 and len(by_field.get("name", [])) == 1:
+        position_column, name_column = by_field["position"][0], by_field["name"][0]
+        numbered = [
+            (row, number) for row in table.rows
+            if (number := _candidate_position(row, position_column, name_column)) is not None
+        ]
+    occurrences: dict[str, list[str]] = defaultdict(list)
     for row, number in numbered:
         occurrences[number].append(row.id)
     for number, row_ids in occurrences.items():
@@ -322,13 +321,36 @@ def _table_candidate_issues(table: AITable) -> list[AIReviewIssue]:
                 table.source_document_id, "duplicate_position_candidate", "review", table.page_number, row_ids,
                 f"Position number {number} appears in multiple candidate rows; inspect source page.",
             ))
-    numbers = sorted(occurrences)
-    if any(right - left > 1 for left, right in zip(numbers, numbers[1:])):
+    integer_numbers = sorted(int(number) for number in occurrences if _POSITIVE_INTEGER.fullmatch(number))
+    if any(right - left > 1 for left, right in zip(integer_numbers, integer_numbers[1:])):
         issues.append(_issue(
             table.source_document_id, "position_gap_candidate", "review", table.page_number,
             [row.id for row, _ in numbered],
             "A gap in candidate position numbers may indicate a missing or split row; inspect source page.",
         ))
+
+    # Conservative source-column warning only; never move or rewrite values.
+    columns_by_index = {column.index: column for column in table.columns}
+    for row in table.rows:
+        cells_by_index = {cell.column_index: cell for cell in row.raw_cells}
+        if sum(bool((cell.raw_value or "").strip()) for cell in row.raw_cells) < 2:
+            continue
+        for column_index, cell in cells_by_index.items():
+            column = columns_by_index.get(column_index)
+            field = column.canonical_field_candidate if column else None
+            value = (cell.raw_value or "").strip()
+            words = re.findall(r"\w+", value, flags=re.UNICODE)
+            suspicious = (
+                field == "code" and (len(words) >= 6 or len(value) >= 72)
+                or field == "quantity" and (len(words) >= 4 or len(value) >= 48)
+                or field == "unit" and (len(words) >= 4 or len(value) >= 32)
+            )
+            if suspicious:
+                issues.append(_issue(
+                    table.source_document_id, "suspicious_column_shift_candidate", "review", table.page_number,
+                    [table.id, row.id, cell.id],
+                    "A value looks unusually long for its source column. Compare this row with the PDF; no values were moved.",
+                ))
     return issues
 
 

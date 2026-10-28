@@ -135,7 +135,7 @@ from averon_import.services.ai_first.local_workflow import (
 )
 from averon_import.services.ai_first.pilot_export import (
     MAX_PILOT_EXPORT_PAGES, XLSX_MIME as AI_FIRST_PILOT_XLSX_MIME,
-    PilotExportError, build_ai_first_pilot_xlsx, preview_ai_first_pilot_export,
+    PilotExportError, build_ai_first_diagnostic_xlsx, build_ai_first_pilot_xlsx, preview_ai_first_pilot_export,
 )
 from averon_import.services.ai_first.pdf_locator import locate_ai_first_pdf_bbox
 from averon_import.services.ai_first.orchestration import (
@@ -308,6 +308,14 @@ human_review_service = HumanReviewService()
 document_mutation_locks = DocumentMutationLocks()
 document_activity_registry = DocumentActivityRegistry()
 _sourcing_runtime_lock = threading.RLock()
+
+
+class _AIFirstJobFailure(RuntimeError):
+    """Safe job error that preserves the diagnostic code through JobService."""
+
+    def __init__(self, code: str):
+        super().__init__("AI-first обработка не завершена")
+        self.code = code
 
 
 def _assert_ai_first_document_access(document_id: str, user: CurrentUser) -> None:
@@ -2370,10 +2378,13 @@ async def recognize_ai_first(
                 "billing": "synthetic_no_billing" if request.mode == "fake" else "usage_based_estimate",
             }
         except Exception as exc:
-            safe_code = getattr(exc, "code", None)
+            safe_code = getattr(exc, "code", None) or getattr(exc, "safe_code", None)
+            if safe_code is None and isinstance(exc, RuntimeError):
+                candidate = str(exc)
+                safe_code = candidate if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate) else None
             if not isinstance(safe_code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_code):
                 safe_code = "ai_first_processing_failed"
-            raise RuntimeError(safe_code) from None
+            raise _AIFirstJobFailure(safe_code) from None
 
     try:
         job = _submit_document_job(
@@ -2481,14 +2492,15 @@ def _mutate_ai_first_state(document_id: str, operation, *, request=None):
             updated = operation(draft, review)
         except AIReviewError as exc:
             raise HTTPException(409, detail={"code": str(exc), "message": "Действие не применено; состояние проверки осталось без изменений."}) from None
-        store.write("review.json", updated.model_dump(mode="json"))
+        state_writes = {"review.json": updated.model_dump(mode="json")}
         if request is not None and editor is not None:
             ids = [request.record_id] if hasattr(request, "record_id") else getattr(request, "record_ids", [])
             editor = consume_editor(editor,
                 values=ids if isinstance(request, (AIFirstRowDecisionRequest, AIFirstBulkConfirmRequest)) else (),
                 roles=ids if isinstance(request, (AIFirstRowRoleRequest, AIFirstBulkRoleRequest)) else (),
                 issue_id=getattr(request, "issue_id", None), add_row=isinstance(request, AIFirstAddRowRequest))
-            store.write("editor-draft.json", editor)
+            state_writes["editor-draft.json"] = editor
+        store.write_many(state_writes)
         return {"review": updated.model_dump(mode="json")}
 
 
@@ -2503,18 +2515,21 @@ def _publish_ai_first_report(document_id: str, store: AIWorkspaceStore, report):
             old_draft = AIDocumentDraft.model_validate(old_draft_data)
             old_review = AIReviewState.model_validate_json(json.dumps(old_review_data, ensure_ascii=False))
             review = reconcile_reprocessed_pages(old_draft, report.draft, old_review)
-        store.write("transcription.json", report.draft.model_dump(mode="json"))
-        store.write("review.json", review.model_dump(mode="json"))
+        writes = {
+            "transcription.json": report.draft.model_dump(mode="json"),
+            "review.json": review.model_dump(mode="json"),
+        }
         editor = store.read("editor-draft.json")
         if editor is not None and current_editor(report.draft, editor)["stale"]:
             # History remains private and recoverable; old buffers cannot apply
             # silently to rows from a different extraction revision.
-            store.write("editor-draft.json", {**editor, "revision": editor["revision"] + 1,
+            writes["editor-draft.json"] = {**editor, "revision": editor["revision"] + 1,
                 "source_document_id": report.draft.source_document_id,
-                "draft_revision_id": report.draft.revision_id, "edits": EditorEdits().model_dump()})
-        store.write("report.json", report.model_dump(
+                "draft_revision_id": report.draft.revision_id, "edits": EditorEdits().model_dump()}
+        writes["report.json"] = report.model_dump(
             mode="json", exclude={"draft": True, "pages": {"__all__": {"extraction"}}},
-        ))
+        )
+        store.write_many(writes)
 
 
 @app.post(
@@ -2664,13 +2679,12 @@ def export_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest):
             )
         except PilotExportError as exc:
             code = str(exc)
-            message = (
-                "Тестовый XLSX не создан из-за технического ограничения размера Excel. "
-                "Исходные данные сохранены без изменений; исправление только проверенного значения не удалит исходный OCR-текст из выгрузки. "
-                "Попробуйте выгрузить меньший фрагмент страниц."
-                if code in {"export_cell_limit_exceeded", "export_long_text_overflow_exceeded"}
-                else "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и локальные данные."
-            )
+            if code in {"export_cell_limit_exceeded", "export_long_text_overflow_exceeded"}:
+                message = "Файл не создан: текст исходного документа превышает ограничение Excel. Данные не изменены; обратитесь к администратору для диагностической выгрузки."
+            elif code == "no_verified_positions":
+                message = "Файл не создан: нет самостоятельных позиций, прошедших проверку. Все исходные строки сохранены."
+            else:
+                message = "Тестовую выгрузку не удалось подготовить. Проверьте выбранные страницы и сохранённые решения."
             raise HTTPException(
                 409,
                 detail={"code": code, "message": message},
@@ -2714,6 +2728,43 @@ def preview_ai_first_pilot(document_id: str, request: AIFirstPilotExportRequest)
                 409,
                 detail={"code": str(exc), "message": "Тестовую выгрузку не удалось проверить. Перепроверьте выбранные страницы."},
             ) from None
+
+
+@app.post(
+    "/api/admin/documents/{document_id}/ai-first/diagnostic-export",
+    dependencies=[Depends(require_admin), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def export_ai_first_diagnostic(document_id: str, request: AIFirstPilotExportRequest):
+    """Administrator-only loss-preserving diagnostic export of one saved snapshot."""
+    try:
+        workspace = workspace_service.get(document_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Документ не найден") from exc
+    with document_mutation_locks.for_document(document_id):
+        store, draft, review, report = _ai_first_read_state(workspace)
+        editor = store.read("editor-draft.json")
+        if current_editor(draft, editor)["stale"]:
+            raise HTTPException(409, "Черновик относится к прежнему распознаванию. Откройте актуальный запуск перед диагностикой.")
+        review = export_review(draft, review, editor)
+        report = {**report, "saved_editor_draft": editor_export_snapshot(draft, review, editor, request.page_numbers)}
+        metadata = workspace_service.read_json(workspace.metadata_path) or {}
+        try:
+            content = build_ai_first_diagnostic_xlsx(
+                draft, review, report, page_numbers=request.page_numbers,
+                document_name=str(metadata.get("filename") or "document.pdf"),
+            )
+        except PilotExportError as exc:
+            raise HTTPException(409, detail={"code": str(exc), "message": "Диагностическую выгрузку не удалось подготовить."}) from None
+    filename = f"Averon_AI-first_DIAGNOSTIC_{workspace.document_id[:8]}.xlsx"
+    return Response(
+        content=content,
+        media_type=AI_FIRST_PILOT_XLSX_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get(

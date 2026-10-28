@@ -26,13 +26,26 @@ from averon_import.services.ai_first.private_acl import (
 )
 
 
+_STORE_LOCKS: dict[str, threading.RLock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _store_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _STORE_LOCKS_GUARD:
+        return _STORE_LOCKS.setdefault(key, threading.RLock())
+
+
 class AIWorkspaceStore:
-    """Strictly private per-document state store with atomic JSON writes."""
+    """Strictly private per-document state store with crash-recoverable writes."""
 
     _NAMES = {"transcription.json", "review.json", "report.json", "progress.json", "editor-draft.json", "active-run.json", "access.json"}
+    _TRANSACTION_NAME = ".state-transaction.json"
+    _MAX_TRANSACTION_BYTES = 64 * 1024 * 1024
 
     def __init__(self, document_root: str | os.PathLike[str]):
         self.root = Path(document_root) / "ai_first"
+        self._lock = _store_lock(self.root)
 
     def ensure(self) -> Path:
         try:
@@ -79,25 +92,36 @@ class AIWorkspaceStore:
     def read(self, name: str) -> Any | None:
         if name not in self._NAMES:
             raise ValueError("invalid_ai_first_store_file")
-        root = self.ensure()
-        path = root / name
-        if not path.exists():
-            return None
-        try:
-            verify_private_path(path, directory=False)
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, PrivateAclError):
-            raise RuntimeError("ai_first_private_state_unavailable") from None
+        with self._lock:
+            root = self.ensure()
+            self._recover_transaction_locked(root)
+            path = root / name
+            if not path.exists():
+                return None
+            try:
+                verify_private_path(path, directory=False)
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, PrivateAclError):
+                raise RuntimeError("ai_first_private_state_unavailable") from None
 
     def write(self, name: str, payload: Any) -> None:
         if name not in self._NAMES:
             raise ValueError("invalid_ai_first_store_file")
-        root = self.ensure()
+        with self._lock:
+            root = self.ensure()
+            self._recover_transaction_locked(root)
+            self._write_atomic_json(root, name, payload)
+
+    @staticmethod
+    def _encoded(payload: Any) -> bytes:
+        return json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+
+    def _write_atomic_json(self, root: Path, name: str, payload: Any) -> None:
         temporary: str | None = None
         try:
-            encoded = json.dumps(
-                payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False,
-            ).encode("utf-8")
+            encoded = self._encoded(payload)
             with tempfile.NamedTemporaryFile(
                 mode="wb", prefix=f".{name}.", suffix=".tmp", dir=root, delete=False,
             ) as stream:
@@ -117,6 +141,62 @@ class AIWorkspaceStore:
         finally:
             if temporary:
                 Path(temporary).unlink(missing_ok=True)
+
+    def write_many(self, payloads: dict[str, Any]) -> None:
+        """Commit related JSON files as one recoverable document-state transaction.
+
+        The private journal is written atomically before any target changes. If
+        the process stops mid-publication, the next read reapplies the same
+        complete bundle. This is process-local serialized; deployment still
+        requires the documented single-worker configuration.
+        """
+        if not isinstance(payloads, dict) or not payloads or not set(payloads) <= self._NAMES:
+            raise ValueError("invalid_ai_first_store_transaction")
+        with self._lock:
+            root = self.ensure()
+            self._recover_transaction_locked(root)
+            transaction_body = {"version": 1, "writes": payloads}
+            encoded = self._encoded(transaction_body)
+            if len(encoded) > self._MAX_TRANSACTION_BYTES:
+                raise RuntimeError("ai_first_private_state_unavailable")
+            envelope = {**transaction_body, "sha256": hashlib.sha256(encoded).hexdigest()}
+            self._write_atomic_json(root, self._TRANSACTION_NAME, envelope)
+            self._apply_transaction_locked(root, envelope)
+
+    def _recover_transaction_locked(self, root: Path) -> None:
+        journal = root / self._TRANSACTION_NAME
+        if not journal.exists():
+            return
+        try:
+            verify_private_path(journal, directory=False)
+            payload = json.loads(journal.read_text(encoding="utf-8"))
+            self._validate_transaction(payload)
+        except (OSError, ValueError, PrivateAclError):
+            raise RuntimeError("ai_first_private_state_unavailable") from None
+        self._apply_transaction_locked(root, payload)
+
+    def _validate_transaction(self, payload: Any) -> None:
+        if (not isinstance(payload, dict) or set(payload) != {"version", "writes", "sha256"}
+                or payload.get("version") != 1 or not isinstance(payload.get("writes"), dict)
+                or not payload["writes"] or not set(payload["writes"]) <= self._NAMES
+                or not isinstance(payload.get("sha256"), str)):
+            raise ValueError("invalid_ai_first_store_transaction")
+        body = {"version": 1, "writes": payload["writes"]}
+        encoded = self._encoded(body)
+        if (len(encoded) > self._MAX_TRANSACTION_BYTES
+                or not hashlib.sha256(encoded).hexdigest() == payload["sha256"]):
+            raise ValueError("invalid_ai_first_store_transaction")
+
+    def _apply_transaction_locked(self, root: Path, payload: dict[str, Any]) -> None:
+        try:
+            for name, value in payload["writes"].items():
+                self._write_atomic_json(root, name, value)
+            journal = root / self._TRANSACTION_NAME
+            verify_private_path(journal, directory=False)
+            journal.unlink()
+            verify_private_tree(root)
+        except (OSError, ValueError, PrivateAclError):
+            raise RuntimeError("ai_first_private_state_unavailable") from None
 
 
 class SyntheticPageAdapter:

@@ -425,6 +425,7 @@ function aiFirstIssueMessage(code) {
     page_handwriting_unlocalized:"Найдена рукописная пометка без надёжной привязки к строке.",
     duplicate_position_candidate:"Номер позиции встречается в нескольких строках.",
     position_gap_candidate:"В нумерации есть пропуск; проверьте, не потерялась ли позиция.",
+    suspicious_column_shift_candidate:"Значение выглядит необычно для этой колонки. Сверьте строку с PDF и при необходимости исправьте её.",
     page_transcription_incomplete:"Часть страницы распознана неполно. Сверьте результат с оригиналом.",
   };
   return messages[code] || "Проверьте отмеченный фрагмент по PDF.";
@@ -543,7 +544,13 @@ function renderAIFirstPageIssues(pageNumber) {
     .filter((issue, index, all) => (issue.page_number == null || issue.page_number === pageNumber) && issue.code !== "page_extraction_failed"
       && ["review", "blocking"].includes(issue.severity) && !(review?.resolved_issue_ids || []).includes(issue.id)
       && all.findIndex((item) => item.id === issue.id) === index);
-  root.innerHTML = pageIssues.map((issue) => `<div class="ai-first-issue ${issue.severity === "blocking" ? "blocking" : ""}"><div>${escapeHtml(aiFirstIssueMessage(issue.code))}<div class="ai-first-resolve-row"><input class="input" data-ai-first-issue-note="${escapeHtml(issue.id)}" maxlength="2000" value="${escapeHtml(state.aiFirst.pendingIssueNotes?.[issue.id] || "")}" placeholder="Что проверили по PDF?"><button class="button secondary" type="button" data-ai-first-resolve="${escapeHtml(issue.id)}">Отметить проверенным</button></div></div></div>`).join("");
+  const pageRowIds = new Set((page?.tables || []).flatMap((table) => (table.rows || []).map((row) => row.id)));
+  root.innerHTML = pageIssues.map((issue) => {
+    const rowId = (issue.record_ids || []).find((id) => pageRowIds.has(id));
+    const jump = rowId ? `<button class="button text" type="button" data-ai-first-jump-row="${escapeHtml(rowId)}">К строке</button>` : "";
+    return `<div class="ai-first-issue ${issue.severity === "blocking" ? "blocking" : ""}"><div>${escapeHtml(aiFirstIssueMessage(issue.code))}<div class="ai-first-resolve-row">${jump}<input class="input" data-ai-first-issue-note="${escapeHtml(issue.id)}" maxlength="2000" value="${escapeHtml(state.aiFirst.pendingIssueNotes?.[issue.id] || "")}" placeholder="Что проверили по PDF?"><button class="button secondary" type="button" data-ai-first-resolve="${escapeHtml(issue.id)}">Отметить проверенным</button></div></div></div>`;
+  }).join("");
+  root.querySelectorAll("[data-ai-first-jump-row]").forEach((button) => button.addEventListener("click", () => selectAIFirstRow(button.dataset.aiFirstJumpRow, null)));
   root.querySelectorAll("[data-ai-first-resolve]").forEach((button) => button.addEventListener("click", () => {
     const id = button.dataset.aiFirstResolve;
     const detail = root.querySelector(`[data-ai-first-issue-note="${CSS.escape(id)}"]`)?.value || "";
@@ -743,6 +750,8 @@ function updateAIFirstExportControls() {
   const label = document.querySelector("#ai-first-export-note");
   const feedback = document.querySelector("#ai-first-export-feedback");
   const retryButton = document.querySelector("#ai-first-retry-export-preview");
+  const reasons = document.querySelector("#ai-first-export-reasons");
+  const reasonsList = document.querySelector("#ai-first-export-reasons-list");
   if (!button || !label) return;
   state.aiFirst.exportPages ||= new Set();
   const selected = [...state.aiFirst.exportPages].sort((a,b)=>a-b);
@@ -756,7 +765,10 @@ function updateAIFirstExportControls() {
     state.aiFirst.exportPreviewLoadingKey = null;
     state.aiFirst.exportPreviewErrorKey = null;
     state.aiFirst.exportDownloadError = null;
+    state.aiFirst.exportReasonHtml = "";
   }
+  if (reasons) reasons.hidden = true;
+  if (reasonsList) reasonsList.innerHTML = "";
   if (retryButton) retryButton.hidden = true;
   if (!selected.length) {
     button.disabled = true;
@@ -772,10 +784,20 @@ function updateAIFirstExportControls() {
     return;
   }
   if (state.aiFirst.exportPreview?.key === key) {
-    button.disabled = false;
     const preview = state.aiFirst.exportPreview.data;
+    button.disabled = preview.verified_position_count <= 0;
     const lastFailure = state.aiFirst.exportDownloadError ? ` Последняя попытка экспорта: ${state.aiFirst.exportDownloadError}` : "";
-    label.textContent = `Страницы: ${scope}. Проверенных позиций: ${preview.verified_position_count}; всего строк: ${preview.total_row_count}. ТЕСТ · выбранный фрагмент.${lastFailure}`;
+    label.textContent = preview.verified_position_count > 0
+      ? `Страницы ${scope} · позиций к выгрузке: ${preview.verified_position_count}. Тестовая выгрузка.${lastFailure}`
+      : `Страницы ${scope} · пока нет позиций, допущенных к выгрузке. Проверьте причины ниже.${lastFailure}`;
+    const blocked = preview.blocked_rows || [];
+    if (blocked.length && reasons && reasonsList) {
+      const labels = {superseded:"заменена структурным решением",inactive_row:"неактивная строка",role_unconfirmed:"роль не подтверждена",role_not_standalone:"не самостоятельная позиция",values_unconfirmed:"значения не проверены",values_not_confirmed:"значения не подтверждены",page_completeness_unconfirmed:"полнота страницы не подтверждена",page_processing_incomplete:"обработка страницы не завершена",open_issue:"есть открытое замечание",ambiguous_column_mapping:"неоднозначное сопоставление колонок"};
+      const shown = blocked.slice(0, 50).map((row) => `<li>Стр. ${escapeHtml(row.page_number)}${row.source_row_number ? `, строка ${escapeHtml(row.source_row_number)}` : ""}: ${escapeHtml((row.reason_codes || []).map(code => labels[code] || "требует проверки").join("; "))}</li>`);
+      if (blocked.length > 50) shown.push(`<li>И ещё ${blocked.length - 50} строк.</li>`);
+      reasonsList.innerHTML = shown.join("");
+      reasons.hidden = false;
+    }
     return;
   }
   if (state.aiFirst.exportPreviewErrorKey === key) {
@@ -828,6 +850,7 @@ async function loadAIFirstPilotExportPreview(pageNumbers, key) {
     const currentSelectionKey = currentPages.length ? `${currentPages.join(",")}|${state.aiFirst.reviewGeneration || 0}` : "";
     if (!isCurrentAIFirstContext(context) || requestId !== state.aiFirst.exportPreviewRequestId || key !== currentSelectionKey) return;
     state.aiFirst.exportPreview = {key,data};
+    state.aiFirst.exportReasonHtml = "";
     state.aiFirst.exportPreviewErrorKey = null;
     state.aiFirst.exportPreviewLoadingKey = null;
     updateAIFirstExportControls();
