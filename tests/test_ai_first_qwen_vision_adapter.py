@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -14,6 +16,8 @@ import fitz
 import pytest
 
 from averon_import.services.ai_first.assembly import assemble_document_draft
+from averon_import.services.ai_first.contracts import AIReviewState
+from averon_import.services.ai_first.local_workflow import AIWorkspaceStore
 from averon_import.services.ai_first.orchestration import (
     CheckpointStore, FitZPageRenderer, OrchestrationConfig, OrchestrationError, PageOrchestrator,
     TokenPricing, _fingerprint, inspect_pdf,
@@ -23,6 +27,7 @@ from averon_import.services.ai_first.qwen_vision_adapter import (
 )
 from averon_import.services.ai_first.review import (
     AIReviewError, assert_review_ready_for_export, new_review_state,
+    record_row_decision, record_row_role_classification,
 )
 from averon_import.services.ocr.qwen_vision_client import (
     QwenVisionClient, QwenVisionConfig, VisionHttpResponse, VisionLimits, _HttpsTransport,
@@ -747,7 +752,7 @@ def test_user_context_is_private_checkpoint_identity_and_exactly_resumed(tmp_pat
     first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
     assert first.status == "completed"
     request_messages = transport.calls[0]["payload"]["messages"]
-    assert request_messages[2]["content"][1]["text"].endswith(context)
+    assert request_messages[1]["content"][1]["text"].endswith(context)
     public = json.dumps({"descriptor": first.adapter.model_dump(), "report": first.model_dump(mode="json")})
     saved = "".join(path.read_text(encoding="utf-8") for path in checkpoint.glob("*.json"))
     assert context not in public and context not in saved
@@ -762,6 +767,106 @@ def test_user_context_is_private_checkpoint_identity_and_exactly_resumed(tmp_pat
             pdf, changed_context_adapter, config, checkpoint,
         ).run(pdf))
     assert len(transport.calls) == 1
+
+
+def _production_v1_scope(adapter, context=None):
+    """Private scope snapshot from 9d1a46f, before contextual layout v2."""
+    config = adapter.client.config
+    value = {"api_key": config.api_key, "auth_scheme": config.auth_scheme, "folder_id": config.folder_id}
+    if context is not None:
+        value["document_context_policy_version"] = "document-context-v1"
+        value["document_context_hmac"] = hmac.new(
+            config.api_key.encode(), b"averon-qwen-document-context-v1\0" + context.encode(), hashlib.sha256,
+        ).hexdigest()
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"averon-qwen-checkpoint-scope-v1\0" + raw).hexdigest()
+
+
+@pytest.mark.parametrize("context", [None, ""])
+def test_no_context_scope_and_resume_match_production_v1(tmp_path, context):
+    adapter = _adapter(FakeTransport(), user_context=context)
+    assert adapter.private_checkpoint_scope_fingerprint == _production_v1_scope(adapter)
+    pdf = _make_pdf(tmp_path / "no-context.pdf")
+    checkpoint, config = tmp_path / "checkpoint", _orchestration_config()
+    first = asyncio.run(_make_orchestrator(pdf, adapter, config, checkpoint).run(pdf))
+    assert first.status == "completed"
+    resumed_adapter = _adapter(FakeTransport(), user_context=context)
+    second = asyncio.run(_make_orchestrator(pdf, resumed_adapter, config, checkpoint).run(pdf))
+    assert second.status == "completed" and resumed_adapter.client._transport.calls == []
+
+
+def test_context_v1_resume_blocks_before_http_and_preserves_review_and_checkpoint(tmp_path, monkeypatch):
+    context = "Synthetic hint for the legacy checkpoint fixture."
+    transport, config = FakeTransport(), _orchestration_config()
+    adapter = _adapter(transport, user_context=context)
+    legacy_scope = _production_v1_scope(adapter, context)
+    pdf = _make_pdf(tmp_path / "legacy.pdf")
+    store = AIWorkspaceStore(tmp_path / "document")
+    checkpoint = store.checkpoint_directory
+    with monkeypatch.context() as legacy:
+        legacy.setattr(QwenVisionAdapter, "private_checkpoint_scope_fingerprint", property(lambda _: legacy_scope))
+        original = _make_orchestrator(pdf, adapter, config, checkpoint)
+        old_identity = original.checkpoint.identity
+        first = asyncio.run(original.run(pdf))
+    draft = first.draft
+    row = draft.pages[0].tables[0].rows[0]
+    review = record_row_role_classification(draft, new_review_state(draft), row.id,
+                                           role="standalone_item", reviewer_id="synthetic-reviewer")
+    review = record_row_decision(draft, review, row.id, disposition="corrected",
+                                 reviewer_id="synthetic-reviewer", values={"cell:3": "7"})
+    review = record_row_decision(draft, review, row.id, disposition="confirmed", reviewer_id="synthetic-reviewer")
+    store.write_many({"transcription.json": draft.model_dump(mode="json"),
+                      "review.json": review.model_dump(mode="json"),
+                      "report.json": first.model_dump(mode="json", exclude={"draft": True}),
+                      "editor-draft.json": {"synthetic_pending_value": "not yet saved"}})
+    before = {str(p.relative_to(store.root)): p.read_bytes() for p in store.root.rglob("*.json")}
+    no_send = FakeTransport()
+    changed = _adapter(no_send, user_context=context)
+    assert changed.private_checkpoint_scope_fingerprint != legacy_scope
+    assert changed.descriptor.fingerprint == adapter.descriptor.fingerprint
+    with pytest.raises(OrchestrationError, match="checkpoint_identity_mismatch"):
+        asyncio.run(_make_orchestrator(pdf, changed, config, checkpoint).run(pdf))
+    assert no_send.calls == [] and len(transport.calls) == 1
+    reopened = AIWorkspaceStore(tmp_path / "document")
+    saved_review = AIReviewState.model_validate_json(json.dumps(reopened.read("review.json")))
+    assert saved_review.decisions[row.id].values == {"cell:3": "7"}
+    assert saved_review.decisions[row.id].human_confirmed
+    assert saved_review.row_roles[row.id].role == "standalone_item"
+    assert saved_review.history == review.history
+    assert reopened.read("transcription.json") == draft.model_dump(mode="json")
+    reader = CheckpointStore(checkpoint, old_identity)
+    try:
+        assert reader.open()[1].state == "completed"  # Original identity still reads the old result.
+    finally:
+        reader.close()
+    assert {str(p.relative_to(store.root)): p.read_bytes() for p in store.root.rglob("*.json")} == before
+
+
+@pytest.mark.parametrize("change", ["policy", "layout"])
+def test_context_scope_binds_actual_policy_and_layout_without_version_bump(monkeypatch, change):
+    context = "Synthetic private hint."
+    original = _adapter(FakeTransport(), user_context=context)
+    scope = original.private_checkpoint_scope_fingerprint
+    empty_scope = _adapter(FakeTransport()).private_checkpoint_scope_fingerprint
+    version = qwen_vision_client_module.USER_CONTEXT_POLICY_VERSION
+    if change == "policy":
+        monkeypatch.setattr(qwen_vision_client_module, "_USER_CONTEXT_POLICY",
+                            qwen_vision_client_module._USER_CONTEXT_POLICY + "\nSynthetic policy amendment.")
+    else:
+        request_body = QwenVisionClient._request_body
+        def changed_layout(self, image, page, user_context=None):
+            payload = json.loads(request_body(self, image, page, user_context))
+            if user_context:
+                parts = payload["messages"][1]["content"]
+                parts[1], parts[2] = parts[2], parts[1]
+            return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()
+        monkeypatch.setattr(QwenVisionClient, "_request_body", changed_layout)
+    changed = _adapter(FakeTransport(), user_context=context)
+    assert qwen_vision_client_module.USER_CONTEXT_POLICY_VERSION == version
+    assert changed.descriptor.fingerprint == original.descriptor.fingerprint
+    assert changed.private_checkpoint_scope_fingerprint != scope
+    assert _adapter(FakeTransport()).private_checkpoint_scope_fingerprint == empty_scope
+    assert context not in json.dumps(changed.descriptor.model_dump(mode="json"))
 
 
 def test_user_context_has_no_silent_truncation_and_reserves_safe_tpm_bound(tmp_path):

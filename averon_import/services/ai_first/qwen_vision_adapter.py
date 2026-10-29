@@ -220,6 +220,7 @@ class QwenVisionAdapter:
             ).hexdigest()
             scope_value["document_context_policy_version"] = USER_CONTEXT_POLICY_VERSION
             scope_value["document_context_hmac"] = context_binding
+            scope_value["document_context_template_sha256"] = self.client.contextual_request_template_sha256
             scope = json.dumps(
                 scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             ).encode("utf-8")
