@@ -109,12 +109,16 @@ assert(source.includes("const headers = columns.map"),"every source column is st
 assert(source.includes("const cells = columns.map"),"each source cell remains available in the table");
 assert.match(css,/\.ai-first-table-scroll\s*\{[^}]*min-width:0[^}]*overflow:auto/s,"horizontal scroll container may shrink inside the split pane");
 assert.match(css,/\.ai-first-table\s*\{[^}]*width:max-content[^}]*min-width:100%/s,"wide source columns remain intact and scrollable");
-assert.match(css,/\.ai-first-table\s*\{[^}]*--ai-first-selector-column-width:42px[^}]*border-collapse:separate[^}]*border-spacing:0/s,"AI-first table uses a deterministic selector-column width and stable cell geometry");
-assert.match(css,/\.ai-first-table th\.selector,\.ai-first-table td\.selector\s*\{[^}]*position:sticky;[^}]*left:0;[^}]*box-sizing:border-box;[^}]*width:var\(--ai-first-selector-column-width\)/s,"row selectors stay pinned at an exact opaque 42px width");
+assert.match(css,/\.ai-first-table\s*\{[^}]*--ai-first-selector-column-width:48px[^}]*border-collapse:separate[^}]*border-spacing:0/s,"AI-first table uses a deterministic 48px selector-column width and stable cell geometry");
+assert.match(css,/\.ai-first-table th\.selector,\.ai-first-table td\.selector\s*\{[^}]*position:sticky;[^}]*left:0;[^}]*box-sizing:border-box;[^}]*width:var\(--ai-first-selector-column-width\)/s,"row selectors stay pinned at an exact opaque shared CSS width");
 assert.match(css,/\.ai-first-table th\.selector,\.ai-first-table td\.selector\s*\{[^}]*background-color:#fafbfc;[^}]*background-clip:padding-box/s,"sticky selector cells have an opaque background that covers scrolled content");
 assert.match(css,/\.ai-first-table th:nth-child\(2\),\.ai-first-table td:nth-child\(2\)\s*\{[^}]*position:sticky;[^}]*left:var\(--ai-first-selector-column-width\)/s,"the row-label column starts exactly after the selector column");
 assert.match(css,/\.ai-first-table th:nth-child\(2\),\.ai-first-table td:nth-child\(2\)\s*\{[^}]*background-color:#fff;[^}]*background-clip:padding-box/s,"sticky row labels have an opaque background that covers scrolled content");
 assert.match(css,/\.ai-first-table td\.selector\s*\{[^}]*z-index:5/s,"sticky selector cells paint above scrolled source cells");
+assert.match(css,/\.ai-first-row-select-hit\s*\{[^}]*width:44px;[^}]*height:44px/s,"row selection offers a 44 by 44 pixel click target without changing sticky offsets");
+assert.match(css,/\.ai-first-row-select-hit input\s*\{[^}]*width:44px;[^}]*height:44px;[^}]*opacity:0/s,"the native checkbox covers the full hit target so modifier keys reach its click event");
+assert.match(css,/\.ai-first-row-select-hit > span\s*\{[^}]*width:21px;[^}]*height:21px/s,"the visible checkbox remains 20 to 22 pixels while the native input stays accessible");
+assert(source.includes("<label class=\"ai-first-row-select-hit\">") && source.includes("<span aria-hidden=\"true\"></span>") && source.includes("aria-label=\"Выбрать строку"),"checkboxes retain an accessible label and a separate visual checkmark");
 assert.match(css,/\.ai-first-table td:nth-child\(2\)\s*\{[^}]*z-index:6/s,"sticky row labels have a stable body stacking layer");
 assert.match(css,/\.ai-first-table th\.selector\s*\{[^}]*z-index:11/s,"the selector header is the top-left table corner layer");
 assert.match(css,/\.ai-first-table th:nth-child\(2\)\s*\{[^}]*z-index:10/s,"the row-label header layers below the selector corner and above other headers");

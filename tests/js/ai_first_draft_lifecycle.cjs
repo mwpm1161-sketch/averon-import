@@ -12,7 +12,7 @@ const root = {querySelectorAll:()=>inputs,innerHTML:""};
 const data = {review_token:"a".repeat(64),draft:{source_document_id:"synthetic",pages:[{page_number:1,tables:[{rows:[
   {id:"row-1",raw_cells:[{column_index:0,raw_value:"Original synthetic name"}]},
 ]}]}]},review:{decisions:{},row_roles:{}}};
-const state = {document:{document_id:"document-1"},authGeneration:1,aiFirst:{data,page:1,
+const state = {document:{document_id:"document-1"},authGeneration:1,aiFirst:{data,page:1,selectedRows:new Set(),
   pendingRowValues:{"row-2":{"cell:0":"Other page edit"}},pendingRowRoles:{},pendingIssueNotes:{},addRowValues:{}}};
 let fail = false, held = null, sent = [], toasts = [];
 const context = {state,console,setTimeout,Map,Set,CSS:{escape:v=>v},

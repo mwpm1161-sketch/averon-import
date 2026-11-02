@@ -62,6 +62,8 @@ const context = {
   aiFirstRowValues:snapshot=>Object.fromEntries(snapshot.map(item=>[item.key,item.value])),
   aiFirstRowConfirmationPayload:snapshot=>({disposition:"corrected",confirmed:true,values:Object.fromEntries(snapshot.map(item=>[item.key,item.value]))}),
   updateAIFirstRenderedRowState:()=>{},
+  updateAIFirstBulkControls:()=>{},
+  renderAIFirstReviewSyncWarning:()=>{},
   renderAIFirstReview:()=>{},
   captureAIFirstPendingEdits:()=>{},
   toast:(message)=>toasts.push(message),
@@ -74,7 +76,7 @@ const context = {
     if (options.method === "POST") {
       const body=JSON.parse(options.body);
       posted.push({url,body});
-      if (failNextPost) { failNextPost=false; throw new Error("offline mock failure"); }
+      if (failNextPost) { failNextPost=false; throw Object.assign(new Error("offline mock failure"),{name:"ApiError",status:422}); }
       if (url.endsWith("/row")) data.review.decisions[body.record_id]={active:true,disposition:body.disposition,human_confirmed:false,values:body.values};
       if (url.endsWith("/row-role")) data.review.row_roles[body.record_id]={active:true,role:body.role,parent_record_id:body.parent_record_id,source_document_id:"doc-1",page_number:1,page_extraction_fingerprint:"fp-1",table_id:"table-1"};
       return {};
@@ -83,7 +85,7 @@ const context = {
   },
 };
 vm.runInNewContext(sourceBetween("function aiFirstRequestContext", "function renderAIFirstResumeControls"), context);
-vm.runInNewContext(`${sourceBetween("function renderAIFirstInspectorValues", "function selectAIFirstRow")}; ${sourceBetween("async function postAIFirstReview", "async function confirmAIFirstPageCompleteness")}; globalThis.renderInspector=renderAIFirstRowInspector; globalThis.saveReview=postAIFirstReview; renderAIFirstInspectorValues=()=>{};`,context);
+vm.runInNewContext(`${sourceBetween("function renderAIFirstInspectorValues", "function selectAIFirstRow")}; ${sourceBetween("function aiFirstReviewErrorIsDefinitiveRejection", "function updateAIFirstBulkControls")}; ${sourceBetween("async function postAIFirstReview", "async function confirmAIFirstPageCompleteness")}; globalThis.renderInspector=renderAIFirstRowInspector; globalThis.saveReview=postAIFirstReview; renderAIFirstInspectorValues=()=>{};`,context);
 
 async function flush() { await new Promise(resolve=>setTimeout(resolve,0)); }
 async function run() {

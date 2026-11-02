@@ -76,6 +76,7 @@ const state = {
   document:{document_id:"synthetic-doc",page_count:2},
   aiFirst:{
     page:1,
+    selectedRows:new Set(),
     addRowOpen:true,
     addRowValues:{},
     data:{
@@ -108,13 +109,14 @@ const context = {
   api:async (url, options = {}) => {
     if (options.method === "POST") {
       context.reviewPosts.push({url,body:JSON.parse(options.body || "{}")});
-      if (context.apiMode === "post-fail") throw new Error("synthetic server rejection");
+      if (context.apiMode === "post-fail") throw Object.assign(new Error("synthetic server rejection"),{name:"ApiError",status:422});
       return {};
     }
     if (context.apiMode === "get-fail") throw new Error("synthetic refresh failure");
     return state.aiFirst.data;
   },
   aiFirstRowInputSnapshot:() => [],
+  updateAIFirstBulkControls:() => {},
   toast:() => {},
   confirm:message => { context.confirmMessages.push(message); return context.confirmAnswer; },
 };
@@ -131,6 +133,7 @@ context.document = {
 };
 
 const snippet = [
+  sourceBetween("function resetAIFirstSelectionAnchor", "function aiFirstSelectionFilterKey"),
   sourceBetween("function aiFirstPageRecord", "function renderAIFirstRunFeedback"),
   sourceBetween("function aiFirstColumnList", "function aiFirstDocumentEntries"),
 ].join("\n");
@@ -150,8 +153,10 @@ pageOneFields.find(input => input.dataset.aiFirstNewColumnKey === "количе�
 pageOneFields.find(input => input.dataset.aiFirstNewColumnKey === "наименование#1").handlers.input();
 pageOneFields.find(input => input.dataset.aiFirstNewColumnKey === "количество#1").handlers.input();
 
+state.aiFirst.selectionAnchor = {recordId:"row-1"};
 context.showPage(2);
 assert.equal(state.aiFirst.page, 2, "page selection updates review state");
+assert.equal(state.aiFirst.selectionAnchor, null, "changing pages clears the Shift-selection anchor");
 assert.equal(context.pendingCaptureCount, 1, "page changes capture unsaved review values before rerendering");
 assert.equal(context.reviewTableRenderCount, 1, "the table is scoped to the newly selected page");
 assert.equal(elements.get("#ai-first-page-select").value, "2", "page selector follows the selected page");

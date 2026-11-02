@@ -5,7 +5,8 @@ function resetAIFirstDocumentState(documentId = null) {
     data:null,page:1,selectedRows:new Set(),retryPages:new Set(),exportPages:new Set(),
     jobId:null,locatorRequestId:(previous.locatorRequestId || 0) + 1,
     pendingRowValues:{},pendingRowRoles:{},pendingIssueNotes:{},addRowValues:{},addRowOpen:false,
-    reviewGeneration:0,inspectorRowId:null};
+    reviewGeneration:0,inspectorRowId:null,reviewSyncRequired:false,reviewRefreshInFlight:false,uncertainReviewMutation:null};
+  renderAIFirstReviewSyncWarning();
   clearAIFirstRenderedReview();
   for (const selector of ["#ai-first-run-feedback", "#ai-first-resume-controls", "#ai-first-live-pages", "#ai-first-export-feedback"]) {
     const root = document.querySelector(selector);
@@ -28,6 +29,95 @@ function aiFirstRequestContext() {
 function isCurrentAIFirstContext(context) {
   return Boolean(context.documentId && context.documentId === state.document?.document_id
     && context.epoch === (state.aiFirst.epoch || 0) && context.auth === (state.authGeneration || 0));
+}
+function renderAIFirstReviewSyncWarning() {
+  let root = document.querySelector("#ai-first-review-sync-warning");
+  if (!root) {
+    const toolbar = document.querySelector("#ai-first-review-view .ai-first-review-toolbar");
+    if (!toolbar || typeof document.createElement !== "function") return;
+    root = document.createElement("div");
+    root.id = "ai-first-review-sync-warning";
+    root.className = "ai-first-review-sync-warning";
+    root.setAttribute("role", "alert");
+    root.setAttribute("aria-live", "assertive");
+    toolbar.insertAdjacentElement("afterend",root);
+  }
+  if (!state.aiFirst.reviewSyncRequired) {
+    root.hidden = true;
+    root.innerHTML = "";
+    return;
+  }
+  const loading = Boolean(state.aiFirst.reviewRefreshInFlight);
+  const message = state.aiFirst.uncertainReviewMutation
+    ? "Ответ на действие не получен однозначно: сервер мог его сохранить. Повторная отправка заблокирована."
+    : "Последнее действие сохранено, но состояние проверки не обновлено. Новые действия временно заблокированы.";
+  root.hidden = false;
+  root.innerHTML = `<span>${message}</span><button class="button secondary" type="button" data-ai-first-refresh-review ${loading ? "disabled" : ""}>${loading ? "Обновляем…" : "Загрузить актуальное состояние"}</button>`;
+  root.querySelector("[data-ai-first-refresh-review]")?.addEventListener("click", () => void refreshAIFirstReviewState());
+}
+async function refreshAIFirstReviewState() {
+  if (!state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight || state.aiFirst.mutationInFlight) return {refreshed:false};
+  const context = aiFirstRequestContext();
+  const previousData = state.aiFirst.data;
+  const local = aiFirstEditorSnapshot();
+  state.aiFirst.reviewRefreshInFlight = true;
+  renderAIFirstReviewSyncWarning();
+  updateAIFirstBulkControls();
+  try {
+    const data = await api(`/api/documents/${encodeURIComponent(context.documentId)}/ai-first`);
+    if (!isCurrentAIFirstContext(context)) return {refreshed:false,stale:true};
+    if (!data?.draft || !data?.review || !data?.review_token) throw new Error("Review state response was incomplete");
+    const oldEntries = new Map(aiFirstDocumentEntries(previousData?.draft,previousData?.review).map((entry) => [entry.row.id,entry]));
+    const newEntries = aiFirstDocumentEntries(data.draft,data.review);
+    const compatibleIds = new Set(newEntries.filter((entry) => {
+      const previous = oldEntries.get(entry.row.id);
+      return previous && sameAIFirstSelectionIdentity(aiFirstSelectionIdentity(previous),aiFirstSelectionIdentity(entry));
+    }).map((entry) => entry.row.id));
+    state.aiFirst.data = data;
+    state.aiFirst.pendingRowValues = {};
+    state.aiFirst.pendingRowRoles = {};
+    state.aiFirst.pendingIssueNotes = {};
+    state.aiFirst.addRowValues = {};
+    state.aiFirst.addRowOpen = false;
+    restoreAIFirstEditorDraft(data);
+    const compatibleEdits = (values) => Object.fromEntries(Object.entries(values || {}).filter(([id]) => compatibleIds.has(id)));
+    state.aiFirst.pendingRowValues = {...state.aiFirst.pendingRowValues,...compatibleEdits(local.row_values)};
+    state.aiFirst.pendingRowRoles = {...state.aiFirst.pendingRowRoles,...compatibleEdits(local.row_roles)};
+    const issueIds = new Set((data.draft.issues || []).map((issue) => issue.id));
+    state.aiFirst.pendingIssueNotes = {...state.aiFirst.pendingIssueNotes,
+      ...Object.fromEntries(Object.entries(local.issue_notes || {}).filter(([id]) => issueIds.has(id)))};
+    if (local.add_row_page && local.add_row_page <= (state.document?.page_count || 0)) {
+      state.aiFirst.addRowValues = local.add_row_values;
+      state.aiFirst.addRowOpen = Object.values(local.add_row_values || {}).some((value) => String(value).length > 0);
+      state.aiFirst.page = local.add_row_page;
+    }
+    state.aiFirst.skipPendingCaptureOnce = true;
+    renderAIFirstReview();
+    const uncertain = state.aiFirst.uncertainReviewMutation;
+    for (const id of uncertain?.recordIds || []) forgetAIFirstSelectedRow(id);
+    if (uncertain) syncAIFirstSelectionUI();
+    state.aiFirst.uncertainReviewMutation = null;
+    state.aiFirst.reviewSyncRequired = false;
+    state.aiFirst.reviewRefreshInFlight = false;
+    renderAIFirstReviewSyncWarning();
+    updateAIFirstBulkControls();
+    toast("Состояние проверки обновлено. Несохранённые правки совместимых строк сохранены на экране.", "success");
+    return {refreshed:true};
+  } catch (_) {
+    if (isCurrentAIFirstContext(context)) {
+      state.aiFirst.reviewRefreshInFlight = false;
+      renderAIFirstReviewSyncWarning();
+      updateAIFirstBulkControls();
+      toast("Не удалось обновить состояние. Ничего не отправлено повторно; попробуйте загрузить состояние ещё раз.", "warning");
+    }
+    return {refreshed:false};
+  } finally {
+    if (isCurrentAIFirstContext(context) && state.aiFirst.reviewRefreshInFlight) {
+      state.aiFirst.reviewRefreshInFlight = false;
+      renderAIFirstReviewSyncWarning();
+      updateAIFirstBulkControls();
+    }
+  }
 }
 function restoreAIFirstEditorDraft(data) {
   const saved = data.editor_draft;
@@ -193,6 +283,8 @@ async function pollAIFirstJob(jobId, context = aiFirstRequestContext()) {
       const successfulPages = (data.pages || []).filter((page) => page.state === "completed").map((page) => page.page_number);
       if (!successfulPages.includes(state.aiFirst.page)) state.aiFirst.page = successfulPages[0] || 1;
       state.aiFirst.selectedRows.clear();
+      state.aiFirst.selectionRevisions ||= new Map();
+      state.aiFirst.selectionRevisions.clear();
       const result = job.result || {};
       if ((result.completed_pages || 0) === 0 && result.status !== "completed") {
         renderAIFirstRunFeedback(state.aiFirst.data, true);
@@ -484,7 +576,10 @@ function showAIFirstPage(pageNumber) {
   const pageNumbers = Array.from({length:state.document.page_count}, (_, index) => index + 1);
   if (!pageNumbers.includes(pageNumber)) return;
   const changedPage = state.aiFirst.page !== pageNumber;
-  if (changedPage) captureAIFirstPendingEdits();
+  if (changedPage) {
+    captureAIFirstPendingEdits();
+    resetAIFirstSelectionAnchor();
+  }
   state.aiFirst.locatorRequestId = (state.aiFirst.locatorRequestId || 0) + 1;
   const highlight = document.querySelector("#ai-first-row-highlight");
   if (highlight) highlight.hidden = true;
@@ -650,6 +745,7 @@ function installAIFirstUnsavedNavigationGuard() {
 function renderAIFirstReview() {
   const data = state.aiFirst.data;
   if (!data?.draft || !state.document) return;
+  renderAIFirstReviewSyncWarning();
   installAIFirstUnsavedNavigationGuard();
   state.aiFirst.reviewGeneration = (state.aiFirst.reviewGeneration || 0) + 1;
   const draft = data.draft, review = data.review;
@@ -987,15 +1083,207 @@ function aiFirstVisibleSelectedIds() {
     .map((row) => row.dataset.aiFirstRow);
 }
 
+function aiFirstSelectionIdentity(entry) {
+  const pageNumber = Number(entry.page?.page_number || entry.row.page_number);
+  const pageRecord = entry.page || aiFirstPageRecord(pageNumber);
+  return {pageNumber,fingerprint:pageRecord?.extraction_fingerprint || null,pageRecord};
+}
+
+function sameAIFirstSelectionIdentity(left, right) {
+  return Boolean(left && right && left.pageNumber === right.pageNumber
+    && left.fingerprint === right.fingerprint
+    && (left.fingerprint || left.pageRecord === right.pageRecord));
+}
+
+function reconcileAIFirstSelectedRows(entries) {
+  state.aiFirst.selectedRows ||= new Set();
+  state.aiFirst.selectionRevisions ||= new Map();
+  const currentRows = new Map(entries.map((entry) => [entry.row.id,aiFirstSelectionIdentity(entry)]));
+  for (const recordId of [...state.aiFirst.selectedRows]) {
+    const current = currentRows.get(recordId);
+    if (!current) {
+      state.aiFirst.selectedRows.delete(recordId);
+      state.aiFirst.selectionRevisions.delete(recordId);
+      continue;
+    }
+    const previous = state.aiFirst.selectionRevisions.get(recordId);
+    if (previous && !sameAIFirstSelectionIdentity(previous,current)) {
+      state.aiFirst.selectedRows.delete(recordId);
+      state.aiFirst.selectionRevisions.delete(recordId);
+    } else if (!previous) state.aiFirst.selectionRevisions.set(recordId,current);
+  }
+  for (const recordId of state.aiFirst.selectionRevisions.keys()) {
+    if (!state.aiFirst.selectedRows.has(recordId)) state.aiFirst.selectionRevisions.delete(recordId);
+  }
+}
+
+function rememberAIFirstSelectedRow(recordId, pageNumber) {
+  state.aiFirst.selectionRevisions ||= new Map();
+  const entry = state.aiFirst.renderedEntries?.get(recordId);
+  if (entry) state.aiFirst.selectionRevisions.set(recordId,aiFirstSelectionIdentity(entry));
+  else {
+    const pageRecord = aiFirstPageRecord(Number(pageNumber || state.aiFirst.page));
+    state.aiFirst.selectionRevisions.set(recordId,{pageNumber:Number(pageNumber || state.aiFirst.page),fingerprint:pageRecord?.extraction_fingerprint || null,pageRecord});
+  }
+}
+
+function forgetAIFirstSelectedRow(recordId) {
+  state.aiFirst.selectedRows.delete(recordId);
+  state.aiFirst.selectionRevisions?.delete(recordId);
+}
+
+function syncAIFirstSelectionUI() {
+  const root = document.querySelector("#ai-first-table-scroll");
+  for (const input of root?.querySelectorAll("[data-ai-first-select-row]") || []) {
+    input.checked = state.aiFirst.selectedRows.has(input.dataset.aiFirstSelectRow);
+  }
+  updateAIFirstBulkControls();
+}
+
+function aiFirstReviewErrorIsDefinitiveRejection(error) {
+  const status = error?.status;
+  return error?.name === "ApiError" && Number.isInteger(status)
+    && status >= 400 && status < 500 && status !== 408;
+}
+
+function shouldOpenAIFirstRowInspector(event) {
+  return !event.target?.closest("button, input, select, textarea, summary, details, td.selector");
+}
+
+function resetAIFirstSelectionAnchor() {
+  if (state.aiFirst) state.aiFirst.selectionAnchor = null;
+}
+
+function aiFirstSelectionFilterKey(controls = document.querySelector("#ai-first-review-controls")) {
+  const query = (controls?.querySelector("#ai-first-search")?.value || "").trim().toLocaleLowerCase("ru-RU");
+  const filter = controls?.querySelector("#ai-first-review-filter")?.value || "all";
+  return JSON.stringify([query, filter]);
+}
+
+function aiFirstSelectionScope(filterKey = aiFirstSelectionFilterKey()) {
+  const pageNumber = Number(state.aiFirst.page);
+  const pageRecord = aiFirstPageRecord(pageNumber);
+  return {
+    documentId:state.document?.document_id || "",
+    pageNumber,
+    pageRecord,
+    extractionFingerprint:pageRecord?.extraction_fingerprint || null,
+    filterKey,
+  };
+}
+
+function aiFirstSelectionAnchorMatches(anchor, scope, visibleIds) {
+  return Boolean(anchor && anchor.documentId === scope.documentId
+    && anchor.pageNumber === scope.pageNumber
+    && anchor.extractionFingerprint === scope.extractionFingerprint
+    && (scope.extractionFingerprint || anchor.pageRecord === scope.pageRecord)
+    && anchor.filterKey === scope.filterKey && visibleIds.includes(anchor.recordId));
+}
+
+function handleAIFirstRowSelection(input, event = {}) {
+  const root = document.querySelector("#ai-first-table-scroll");
+  const recordId = input?.dataset?.aiFirstSelectRow;
+  if (!root || !recordId) return;
+  state.aiFirst.selectedRows ||= new Set();
+  const visibleRows = [...root.querySelectorAll("tr[data-ai-first-row]")].filter((row) => !row.hidden);
+  const visibleIds = visibleRows.map((row) => row.dataset.aiFirstRow);
+  const scope = aiFirstSelectionScope();
+  const anchor = state.aiFirst.selectionAnchor;
+  if (event.shiftKey) {
+    const anchorIndex = aiFirstSelectionAnchorMatches(anchor, scope, visibleIds)
+      ? visibleIds.indexOf(anchor.recordId) : -1;
+    const targetIndex = visibleIds.indexOf(recordId);
+    if (anchorIndex >= 0 && targetIndex >= 0) {
+      const start = Math.min(anchorIndex, targetIndex);
+      const end = Math.max(anchorIndex, targetIndex);
+      for (const row of visibleRows.slice(start,end + 1)) {
+        state.aiFirst.selectedRows.add(row.dataset.aiFirstRow);
+        rememberAIFirstSelectedRow(row.dataset.aiFirstRow,row.dataset.pageNumber);
+      }
+    } else {
+      // A stale or filtered-out anchor cannot expand the selection. Treat this
+      // Shift-click as a single-row selection and make it the new anchor.
+      state.aiFirst.selectedRows.add(recordId);
+      rememberAIFirstSelectedRow(recordId,visibleRows.find((row) => row.dataset.aiFirstRow === recordId)?.dataset.pageNumber);
+      state.aiFirst.selectionAnchor = {...scope,recordId};
+    }
+  } else {
+    if (input.checked) {
+      state.aiFirst.selectedRows.add(recordId);
+      rememberAIFirstSelectedRow(recordId,visibleRows.find((row) => row.dataset.aiFirstRow === recordId)?.dataset.pageNumber);
+    } else forgetAIFirstSelectedRow(recordId);
+    state.aiFirst.selectionAnchor = {...scope,recordId};
+  }
+  for (const checkbox of root.querySelectorAll("[data-ai-first-select-row]")) {
+    checkbox.checked = state.aiFirst.selectedRows.has(checkbox.dataset.aiFirstSelectRow);
+  }
+  updateAIFirstBulkControls();
+}
+
+function selectAllVisibleAIFirstRows() {
+  const root = document.querySelector("#ai-first-table-scroll");
+  if (!root) return;
+  state.aiFirst.selectedRows ||= new Set();
+  for (const row of root.querySelectorAll("tr[data-ai-first-row]")) {
+    if (!row.hidden) {
+      state.aiFirst.selectedRows.add(row.dataset.aiFirstRow);
+      rememberAIFirstSelectedRow(row.dataset.aiFirstRow,row.dataset.pageNumber);
+    }
+  }
+  for (const checkbox of root.querySelectorAll("[data-ai-first-select-row]")) {
+    checkbox.checked = state.aiFirst.selectedRows.has(checkbox.dataset.aiFirstSelectRow);
+  }
+  updateAIFirstBulkControls();
+}
+
+function clearAIFirstPageSelection() {
+  const root = document.querySelector("#ai-first-table-scroll");
+  if (!root) return;
+  for (const row of root.querySelectorAll("tr[data-ai-first-row]")) {
+    forgetAIFirstSelectedRow(row.dataset.aiFirstRow);
+  }
+  resetAIFirstSelectionAnchor();
+  for (const checkbox of root.querySelectorAll("[data-ai-first-select-row]")) checkbox.checked = false;
+  updateAIFirstBulkControls();
+}
+
+function aiFirstHiddenSelectionText(count) {
+  const lastTwo = count % 100;
+  const last = count % 10;
+  if (last === 1 && lastTwo !== 11) return `${count} строка скрыта фильтром и не участвует`;
+  if (last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14)) return `${count} строки скрыты фильтром и не участвуют`;
+  return `${count} строк скрыто фильтром; они не участвуют`;
+}
+
 function updateAIFirstBulkControls() {
   const root = document.querySelector("#ai-first-review-controls");
+  const tableRoot = document.querySelector("#ai-first-table-scroll");
   const visibleIds = aiFirstVisibleSelectedIds();
+  const pageRows = [...(tableRoot?.querySelectorAll("tr[data-ai-first-row]") || [])];
+  const hiddenSelectedCount = pageRows.filter((row) => row.hidden && state.aiFirst.selectedRows.has(row.dataset.aiFirstRow)).length;
+  const currentPageSelectedCount = pageRows.filter((row) => state.aiFirst.selectedRows.has(row.dataset.aiFirstRow)).length;
+  const otherPageSelectedCount = Math.max(0, state.aiFirst.selectedRows.size - currentPageSelectedCount);
   const confirmButton = root?.querySelector("#ai-first-confirm-selected");
   const roleButton = root?.querySelector("[data-ai-first-bulk-role-submit]");
-  if (confirmButton) confirmButton.disabled = visibleIds.length === 0;
-  if (roleButton) roleButton.disabled = visibleIds.length === 0;
+  const selectVisibleButton = root?.querySelector("[data-ai-first-select-visible]");
+  const clearPageButton = root?.querySelector("[data-ai-first-clear-page-selection]");
+  const mutationBlocked = Boolean(state.aiFirst.mutationInFlight || state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight);
+  if (confirmButton) confirmButton.disabled = mutationBlocked || visibleIds.length === 0;
+  if (roleButton) roleButton.disabled = mutationBlocked || visibleIds.length === 0;
+  const visibleRows = pageRows.filter((row) => !row.hidden);
+  if (selectVisibleButton) selectVisibleButton.disabled = visibleRows.length === 0 || visibleRows.every((row) => state.aiFirst.selectedRows.has(row.dataset.aiFirstRow));
+  if (clearPageButton) clearPageButton.disabled = currentPageSelectedCount === 0;
   const count = root?.querySelector("[data-ai-first-selected-count]");
-  if (count) count.textContent = visibleIds.length ? `Выбрано: ${visibleIds.length}` : "Выберите строки для группового действия";
+  if (count) {
+    if (!state.aiFirst.selectedRows.size) count.textContent = "Выбрано 0 строк";
+    else {
+      const details = [];
+      if (visibleIds.length !== state.aiFirst.selectedRows.size) details.push(`видно ${visibleIds.length}`);
+      if (hiddenSelectedCount) details.push(`ещё ${aiFirstHiddenSelectionText(hiddenSelectedCount)}`);
+      if (otherPageSelectedCount) details.push(`${otherPageSelectedCount} на других страницах и не участвуют`);
+      count.textContent = `Выбрано ${state.aiFirst.selectedRows.size}${details.length ? `; ${details.join("; ")}` : ""}`;
+    }
+  }
 }
 
 function applyAIFirstReviewFilters() {
@@ -1004,6 +1292,8 @@ function applyAIFirstReviewFilters() {
   if (!root || !controls) return;
   const query = (controls.querySelector("#ai-first-search")?.value || "").trim().toLocaleLowerCase("ru-RU");
   const filter = controls.querySelector("#ai-first-review-filter")?.value || "all";
+  const filterKey = JSON.stringify([query, filter]);
+  if (state.aiFirst.selectionAnchor && state.aiFirst.selectionAnchor.filterKey !== filterKey) resetAIFirstSelectionAnchor();
   state.aiFirst.reviewSearch = query;
   state.aiFirst.reviewFilter = filter;
   for (const row of root.querySelectorAll("tr[data-ai-first-row]")) {
@@ -1024,6 +1314,10 @@ function applyAIFirstReviewFilters() {
   }
   for (const group of root.querySelectorAll("[data-ai-first-table-group]")) {
     group.hidden = ![...group.querySelectorAll("tr[data-ai-first-row]")].some((row) => !row.hidden);
+  }
+  const anchor = state.aiFirst.selectionAnchor;
+  if (anchor && ![...root.querySelectorAll("tr[data-ai-first-row]")].some((row) => !row.hidden && row.dataset.aiFirstRow === anchor.recordId)) {
+    resetAIFirstSelectionAnchor();
   }
   const visible = [...root.querySelectorAll("tr[data-ai-first-row]")].filter((row) => !row.hidden).length;
   const total = root.querySelectorAll("tr[data-ai-first-row]").length;
@@ -1197,10 +1491,18 @@ function renderAIFirstTables(entries) {
   const root = document.querySelector("#ai-first-table-scroll");
   const controls = document.querySelector("#ai-first-review-controls");
   if (!root || !controls) return;
-  captureAIFirstPendingEdits();
+  if (state.aiFirst.skipPendingCaptureOnce) state.aiFirst.skipPendingCaptureOnce = false;
+  else captureAIFirstPendingEdits();
   const view = captureAIFirstViewState();
+  reconcileAIFirstSelectedRows(entries);
   const pageEntries = entries.filter((entry) => Number(entry.page?.page_number || entry.row.page_number) === state.aiFirst.page);
   state.aiFirst.renderedEntries = new Map(pageEntries.map((entry) => [entry.row.id, entry]));
+  const selectionScope = aiFirstSelectionScope();
+  const oldAnchor = state.aiFirst.selectionAnchor;
+  if (oldAnchor && (oldAnchor.documentId !== selectionScope.documentId
+    || oldAnchor.pageNumber !== selectionScope.pageNumber
+    || oldAnchor.extractionFingerprint !== selectionScope.extractionFingerprint
+    || (!selectionScope.extractionFingerprint && oldAnchor.pageRecord !== selectionScope.pageRecord))) resetAIFirstSelectionAnchor();
   state.aiFirst.inspectorRowId ||= null;
   const byGroup = new Map();
   for (const entry of pageEntries) {
@@ -1239,25 +1541,21 @@ function renderAIFirstTables(entries) {
       const searchable = aiFirstEntrySearchText(entry);
       const selectedRole = state.aiFirst.pendingRowRoles?.[row.id]?.role || state.aiFirst.data.review.row_roles?.[row.id]?.role || "unknown";
       const statusPillLabel = aiFirstStatusPillLabel(reviewState, excluded);
-      return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${rowPage}" data-review-state="${reviewState.status}" data-role="${escapeHtml(selectedRole)}" data-disposition="${escapeHtml(decision?.disposition || "")}" data-search-text="${escapeHtml(searchable)}" class="ai-first-row--${reviewState.status} ${excluded ? "is-excluded" : ""} ${state.aiFirst.inspectorRowId === row.id ? "active" : ""}"><td class="selector"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}></td><td><button class="button text ai-first-open-row" type="button" data-ai-first-open-row="${escapeHtml(row.id)}" aria-expanded="${state.aiFirst.inspectorRowId === row.id ? "true" : "false"}">${escapeHtml(rowLabel)} · Проверить</button><small class="ai-first-cell-source">${escapeHtml(kindLabel)} · <span data-ai-first-row-status>${escapeHtml(aiFirstRowStatusLabel(reviewState))}</span></small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${rowPage}">Стр. ${rowPage}</button></td>${cells}<td><span class="ai-first-status-pill ai-first-status-pill--${reviewState.status}">${statusPillLabel}</span></td></tr>`;
+      return `<tr data-ai-first-row="${escapeHtml(row.id)}" data-page-number="${rowPage}" data-review-state="${reviewState.status}" data-role="${escapeHtml(selectedRole)}" data-disposition="${escapeHtml(decision?.disposition || "")}" data-search-text="${escapeHtml(searchable)}" class="ai-first-row--${reviewState.status} ${excluded ? "is-excluded" : ""} ${state.aiFirst.inspectorRowId === row.id ? "active" : ""}"><td class="selector"><label class="ai-first-row-select-hit"><input type="checkbox" data-ai-first-select-row="${escapeHtml(row.id)}" aria-label="Выбрать строку ${escapeHtml(rowLabel)}" ${state.aiFirst.selectedRows.has(row.id) ? "checked" : ""}><span aria-hidden="true"></span></label></td><td><button class="button text ai-first-open-row" type="button" data-ai-first-open-row="${escapeHtml(row.id)}" aria-expanded="${state.aiFirst.inspectorRowId === row.id ? "true" : "false"}">${escapeHtml(rowLabel)} · Проверить</button><small class="ai-first-cell-source">${escapeHtml(kindLabel)} · <span data-ai-first-row-status>${escapeHtml(aiFirstRowStatusLabel(reviewState))}</span></small></td><td><button class="button text ai-first-source-page" type="button" data-ai-first-show-page="${rowPage}">Стр. ${rowPage}</button></td>${cells}<td><span class="ai-first-status-pill ai-first-status-pill--${reviewState.status}">${statusPillLabel}</span></td></tr>`;
     }).join("");
     const title = group.manual ? "Добавленные вручную" : `Таблица ${Number(group.table?.index ?? 0) + 1}`;
     const count = group.entries.length;
-    return `<section class="ai-first-source-table-group" data-ai-first-table-group="${escapeHtml(group.key)}"><h4>${escapeHtml(title)} <small>${count} строк</small></h4><table class="data-table ai-first-table"><thead><tr><th class="selector">Выбор</th><th>Строка</th><th>Страница</th>${headers}<th>Проверка</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+    return `<section class="ai-first-source-table-group" data-ai-first-table-group="${escapeHtml(group.key)}"><h4>${escapeHtml(title)} <small>${count} строк</small></h4><table class="data-table ai-first-table"><thead><tr><th class="selector" title="Выбор строки">Выбор</th><th>Строка</th><th>Страница</th>${headers}<th>Проверка</th></tr></thead><tbody>${rows}</tbody></table></section>`;
   }).join("");
   const options = `<option value="all">Все строки</option><option value="attention">Требуют внимания</option><option value="unassigned">Роль не назначена</option><option value="checked">Проверены</option><option value="corrected">Исправлены</option><option value="excluded">Исключены</option><option value="service">Служебные строки</option>`;
   const bulkRoles = [["standalone_item","Самостоятельная позиция"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
   root.innerHTML = groupHtml || `<div class="empty-table">На этой странице распознанных строк нет.</div>`;
-  controls.innerHTML = `<div class="ai-first-row-toolbar"><label class="ai-first-search-label">Поиск по строкам<input class="input" id="ai-first-search" type="search" value="${escapeHtml(state.aiFirst.reviewSearch || "")}" placeholder="Наименование, марка или артикул"></label><label>Показать<select class="select" id="ai-first-review-filter">${options}</select></label><button class="button ghost" type="button" data-ai-first-next-attention>Следующая для проверки</button><span data-ai-first-filter-summary role="status" aria-live="polite"></span></div><div class="ai-first-bulk-toolbar"><label>Роль выбранных<select class="select" id="ai-first-bulk-role">${bulkRoles.map(([value,label]) => `<option value="${value}">${label}</option>`).join("")}</select></label><button class="button secondary" id="ai-first-confirm-selected" type="button" disabled>Подтвердить выбранные</button><button class="button secondary" type="button" data-ai-first-bulk-role-submit disabled>Применить роль</button><span data-ai-first-selected-count>Выберите строки для группового действия</span></div>`;
+  controls.innerHTML = `<div class="ai-first-row-toolbar"><label class="ai-first-search-label">Поиск по строкам<input class="input" id="ai-first-search" type="search" value="${escapeHtml(state.aiFirst.reviewSearch || "")}" placeholder="Наименование, марка или артикул"></label><label>Показать<select class="select" id="ai-first-review-filter">${options}</select></label><button class="button ghost" type="button" data-ai-first-next-attention>Следующая для проверки</button><span data-ai-first-filter-summary role="status" aria-live="polite"></span></div><div class="ai-first-bulk-toolbar"><div class="ai-first-selection-actions"><button class="button ghost" type="button" data-ai-first-select-visible>Выбрать все видимые</button><button class="button ghost" type="button" data-ai-first-clear-page-selection title="Снимает выбор на текущей странице, включая скрытые фильтром строки. Выбор других страниц сохраняется.">Снять выделение</button><span data-ai-first-selected-count role="status" aria-live="polite">Выбрано 0 строк</span></div><label>Роль выбранных<select class="select" id="ai-first-bulk-role">${bulkRoles.map(([value,label]) => `<option value="${value}">${label}</option>`).join("")}</select></label><button class="button secondary" id="ai-first-confirm-selected" type="button" disabled>Подтвердить выбранные</button><button class="button secondary" type="button" data-ai-first-bulk-role-submit disabled>Применить роль</button></div>`;
   const filter = controls.querySelector("#ai-first-review-filter");
   if (filter) filter.value = state.aiFirst.reviewFilter || "all";
   controls.querySelector("#ai-first-search")?.addEventListener("input", applyAIFirstReviewFilters);
   filter?.addEventListener("change", applyAIFirstReviewFilters);
-  root.querySelectorAll("[data-ai-first-select-row]").forEach((input) => input.addEventListener("change", () => {
-    const id = input.dataset.aiFirstSelectRow;
-    if (input.checked) state.aiFirst.selectedRows.add(id); else state.aiFirst.selectedRows.delete(id);
-    updateAIFirstBulkControls();
-  }));
+  root.querySelectorAll("[data-ai-first-select-row]").forEach((input) => input.addEventListener("click", (event) => handleAIFirstRowSelection(input,event)));
   root.querySelectorAll("[data-ai-first-cell]").forEach((input) => {
     input.addEventListener("input", () => {
       updateAIFirstRenderedRowState(input.dataset.aiFirstCell);
@@ -1269,7 +1567,7 @@ function renderAIFirstTables(entries) {
     });
   });
   root.querySelectorAll("[data-ai-first-row]").forEach((row) => row.addEventListener("click", (event) => {
-    if (event.target.closest("button, input, select, textarea, summary, details")) return;
+    if (!shouldOpenAIFirstRowInspector(event)) return;
     selectAIFirstRow(row.dataset.aiFirstRow, null);
   }));
   root.querySelectorAll("[data-ai-first-open-row]").forEach((button) => button.addEventListener("click", () => selectAIFirstRow(button.dataset.aiFirstOpenRow, null)));
@@ -1292,12 +1590,18 @@ function renderAIFirstTables(entries) {
   });
   controls.querySelector("#ai-first-confirm-selected")?.addEventListener("click", () => void confirmSelectedAIFirstRows());
   controls.querySelector("[data-ai-first-bulk-role-submit]")?.addEventListener("click", () => void assignSelectedAIFirstRole());
+  controls.querySelector("[data-ai-first-select-visible]")?.addEventListener("click", selectAllVisibleAIFirstRows);
+  controls.querySelector("[data-ai-first-clear-page-selection]")?.addEventListener("click", clearAIFirstPageSelection);
   applyAIFirstReviewFilters();
   renderAIFirstRowInspector();
   restoreAIFirstViewState(view);
 }
 
 async function postAIFirstReview(action, body) {
+  if (state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight) {
+    toast("Сначала загрузите актуальное состояние проверки. Новое действие не отправлено.", "warning");
+    return {saved:false,refreshed:false,blocked:true};
+  }
   if (state.aiFirst.mutationInFlight) { toast("Дождитесь завершения сохранения.", "warning"); return {saved:false,refreshed:false}; }
   const context = aiFirstRequestContext();
   const affected = new Set(body.record_id ? [body.record_id] : (body.record_ids || []));
@@ -1305,6 +1609,7 @@ async function postAIFirstReview(action, body) {
   const submittedValues = aiFirstClone(state.aiFirst.pendingRowValues || {});
   const submittedRoles = aiFirstClone(state.aiFirst.pendingRowRoles || {});
   state.aiFirst.mutationInFlight = true;
+  updateAIFirstBulkControls();
   try {
     await api(`/api/documents/${encodeURIComponent(context.documentId)}/ai-first/review/${action}`, {
       method:"POST",headers:{"Content-Type":"application/json"},
@@ -1313,13 +1618,27 @@ async function postAIFirstReview(action, body) {
   } catch (error) {
     if (isCurrentAIFirstContext(context)) {
       state.aiFirst.mutationInFlight = false;
-      if (error.code === "review_revision_conflict") {
+      const revisionConflict = error.code === "review_revision_conflict";
+      const outcomeUnknown = !revisionConflict && !aiFirstReviewErrorIsDefinitiveRejection(error);
+      if (revisionConflict) {
         try { await reloadAIFirstAfterConflict(context); } catch (_) {}
       }
       if (!isCurrentAIFirstContext(context)) return {saved:false,stale:true};
-      toast(error.message || "Действие не сохранено. Правки и выбор строк оставлены на экране.", "error");
+      if (outcomeUnknown) {
+        state.aiFirst.reviewSyncRequired = true;
+        state.aiFirst.uncertainReviewMutation = {action,recordIds:[...affected]};
+        renderAIFirstReviewSyncWarning();
+        updateAIFirstBulkControls();
+        toast("Ответ на действие не получен однозначно. Сервер мог его сохранить; повторная отправка заблокирована. Загрузите актуальное состояние.", "warning");
+      } else {
+        if (!revisionConflict) updateAIFirstBulkControls();
+        toast(error.message || "Сервер отклонил действие. Правки и выбор строк оставлены на экране.", "error");
+      }
     }
-    return {saved:false,refreshed:false};
+    if (error.code === "review_revision_conflict") return {saved:false,refreshed:false,conflict:true};
+    return aiFirstReviewErrorIsDefinitiveRejection(error)
+      ? {saved:false,refreshed:false}
+      : {saved:null,refreshed:false,outcome:"unknown"};
   }
   if (!isCurrentAIFirstContext(context)) return {saved:true,refreshed:false,stale:true};
   try {
@@ -1336,10 +1655,18 @@ async function postAIFirstReview(action, body) {
     toast("Изменение сохранено в черновике и добавлено в историю проверки.", "success");
     return {saved:true,refreshed:true};
   } catch (_) {
-    if (isCurrentAIFirstContext(context)) toast("Изменение сохранено, но состояние не обновлено. Правки оставлены; повторно откройте документ перед продолжением.", "warning");
+    if (isCurrentAIFirstContext(context)) {
+      state.aiFirst.reviewSyncRequired = true;
+      renderAIFirstReviewSyncWarning();
+      updateAIFirstBulkControls();
+      toast("Изменение сохранено, но состояние не обновлено. Новые действия заблокированы до загрузки актуального состояния.", "warning");
+    }
     return {saved:true,refreshed:false};
   } finally {
-    if (isCurrentAIFirstContext(context)) state.aiFirst.mutationInFlight = false;
+    if (isCurrentAIFirstContext(context)) {
+      state.aiFirst.mutationInFlight = false;
+      updateAIFirstBulkControls();
+    }
   }
 }
 
@@ -1363,13 +1690,9 @@ async function confirmSelectedAIFirstRows() {
   if (!confirm(`Подтвердить ${recordIds.length} выбранных строк? Будут подтверждены значения, показанные в таблице; несохранённых правок нет. Сначала сверьте строки с PDF.`)) return;
   const result = await postAIFirstReview("bulk-confirm", {record_ids:recordIds});
   if (!result?.saved || result.stale) return;
-  for (const id of recordIds) state.aiFirst.selectedRows.delete(id);
+  for (const id of recordIds) forgetAIFirstSelectedRow(id);
   if (result.refreshed) renderAIFirstReview();
-  else {
-    document.querySelectorAll("#ai-first-table-scroll [data-ai-first-select-row]").forEach((input) => { input.checked = false; });
-    const confirmButton = document.querySelector("#ai-first-review-controls #ai-first-confirm-selected");
-    if (confirmButton) confirmButton.disabled = true;
-  }
+  syncAIFirstSelectionUI();
 }
 
 async function assignSelectedAIFirstRole() {
@@ -1389,12 +1712,9 @@ async function assignSelectedAIFirstRole() {
   if (!confirm(`Назначить роль «${roleLabel}» для ${recordIds.length} выбранных строк? Каждая строка останется исходной, а роль будет записана в историю проверки.`)) return;
   const result = await postAIFirstReview("bulk-role", {record_ids:recordIds,role});
   if (!result?.saved || result.stale) return;
-  for (const id of recordIds) state.aiFirst.selectedRows.delete(id);
+  for (const id of recordIds) forgetAIFirstSelectedRow(id);
   if (result.refreshed) renderAIFirstReview();
-  else for (const input of root.querySelectorAll("[data-ai-first-select-row]")) {
-    if (recordIds.includes(input.dataset.aiFirstSelectRow)) input.checked = false;
-  }
-  updateAIFirstBulkControls();
+  syncAIFirstSelectionUI();
 }
 
 async function cancelAIFirstRecognition() {
@@ -1415,6 +1735,10 @@ async function cancelAIFirstRecognition() {
 
 async function saveAIFirstReview() {
   if (!state.document || !state.aiFirst.data?.review_token) return {saved:false};
+  if (state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight) {
+    toast("Сначала загрузите актуальное состояние проверки. Черновик не отправлен.", "warning");
+    return {saved:false,blocked:true};
+  }
   if (state.aiFirst.mutationInFlight) { toast("Дождитесь завершения сохранения.", "warning"); return {saved:false}; }
   const context = aiFirstRequestContext();
   const edits = aiFirstEditorSnapshot();
