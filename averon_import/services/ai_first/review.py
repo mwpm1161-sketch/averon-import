@@ -107,6 +107,17 @@ def record_row_role_classification(
     reviewer_id: str, parent_record_id: str | None = None,
 ) -> AIReviewState:
     """Record a human role and optional parent link without mutating the AI row."""
+    return _record_row_role_classification_in_place(
+        draft, state.model_copy(deep=True), record_id, role=role,
+        reviewer_id=reviewer_id, parent_record_id=parent_record_id,
+    )
+
+
+def _record_row_role_classification_in_place(
+    draft: AIDocumentDraft, state: AIReviewState, record_id: str, *, role: AIHumanRowRole,
+    reviewer_id: str, parent_record_id: str | None = None,
+) -> AIReviewState:
+    """Apply to a caller-owned working copy only; never pass shared review state."""
     _check_current(draft, state)
     allowed_roles = {
         "header", "column_numbering", "section", "standalone_item",
@@ -136,7 +147,7 @@ def record_row_role_classification(
         table_id=table_id, role=role, parent_record_id=parent_record_id,
         reviewer_id=reviewer_id,
     )
-    updated = state.model_copy(deep=True)
+    updated = state
     previous = updated.row_roles.get(record_id)
     changed = previous is None or not previous.active or (
         previous.role != current.role
@@ -178,6 +189,18 @@ def record_row_decision(
     human_confirmed: bool = True,
 ) -> AIReviewState:
     """Record an explicit human decision; nothing in extraction calls this."""
+    return _record_row_decision_in_place(
+        draft, state.model_copy(deep=True), record_id, disposition=disposition,
+        reviewer_id=reviewer_id, values=values, human_confirmed=human_confirmed,
+    )
+
+
+def _record_row_decision_in_place(
+    draft: AIDocumentDraft, state: AIReviewState, record_id: str, *,
+    disposition: str, reviewer_id: str, values: dict[str, str] | None = None,
+    human_confirmed: bool = True,
+) -> AIReviewState:
+    """Apply to a caller-owned working copy only; never pass shared review state."""
     _check_current(draft, state)
     if not reviewer_id or disposition not in {"confirmed", "corrected", "excluded"}:
         raise AIReviewError("invalid_review_decision")
@@ -210,7 +233,7 @@ def record_row_decision(
         # silently reset those values.
         values = dict(prior.values)
     action = {"confirmed": "confirm_row", "corrected": "edit_value", "excluded": "exclude_row"}[disposition]
-    updated = state.model_copy(deep=True)
+    updated = state
     updated.decisions[record_id] = AIReviewDecision(
         record_id=record_id, source_document_id=draft.source_document_id,
         page_number=page_number, disposition=disposition, reviewer_id=reviewer_id,

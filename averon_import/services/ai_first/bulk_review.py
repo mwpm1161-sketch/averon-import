@@ -11,7 +11,7 @@ from .contracts import AIDocumentDraft, AIReviewState
 from .editor_draft import consume_editor, current_editor, review_token
 from .review import (
     AIReviewError, _active_lineage_sources, _row_role_source,
-    assert_no_open_review_conflicts, record_row_decision, record_row_role_classification,
+    assert_no_open_review_conflicts, _record_row_decision_in_place, _record_row_role_classification_in_place,
 )
 
 BulkRole = Literal["standalone_item", "component", "header", "column_numbering", "section", "continuation", "note"]
@@ -209,20 +209,22 @@ def prepare_bulk_review(draft: AIDocumentDraft, state: AIReviewState, editor, re
         except AIReviewError as exc:
             raise BulkReviewError(str(exc), record_id) from None
         sources[record_id] = original
+    # The private applicators below may mutate only this owned copy. No write is
+    # published until every operation and final state validation has succeeded.
     updated = state.model_copy(deep=True)
     start = len(updated.history)
     for record_id in request.record_ids:
-        updated = record_row_role_classification(draft, updated, record_id, role=request.role,
+        updated = _record_row_role_classification_in_place(draft, updated, record_id, role=request.role,
                     parent_record_id=request.parents.get(record_id), reviewer_id=reviewer_id)
         values = request.values[record_id]
         if request.intent == "exclude_from_positions":
             # Exclusion retains any explicitly edited cells in the existing ledger.
-            updated = record_row_decision(draft, updated, record_id, disposition="corrected",
+            updated = _record_row_decision_in_place(draft, updated, record_id, disposition="corrected",
                         values=values, human_confirmed=False, reviewer_id=reviewer_id)
-            updated = record_row_decision(draft, updated, record_id, disposition="excluded", reviewer_id=reviewer_id)
+            updated = _record_row_decision_in_place(draft, updated, record_id, disposition="excluded", reviewer_id=reviewer_id)
         else:
             changed = values != sources[record_id]
-            updated = record_row_decision(draft, updated, record_id,
+            updated = _record_row_decision_in_place(draft, updated, record_id,
                         disposition="corrected" if changed else "confirmed", values=values,
                         human_confirmed=True, reviewer_id=reviewer_id)
     invalidated = sorted({decision.record_id for event in updated.history[start:]
