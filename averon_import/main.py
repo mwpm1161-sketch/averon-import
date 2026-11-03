@@ -130,6 +130,7 @@ from averon_import.services.ai_first.editor_draft import (
     DraftEditError, EditorEdits, consume_editor, current_editor, editor_export_snapshot, export_review,
     review_token, save_editor,
 )
+from averon_import.services.ai_first.bulk_review import BulkReviewRequest, execute_bulk_review
 from averon_import.services.ai_first.local_workflow import (
     AICancellationSignal, AIWorkspaceStore, SyntheticPageAdapter, build_live_qwen_runtime,
 )
@@ -2478,7 +2479,7 @@ def get_ai_first_progress(document_id: str):
     return {"progress": AIWorkspaceStore(workspace.root).read("progress.json") or {}}
 
 
-def _mutate_ai_first_state(document_id: str, operation, *, request=None):
+def _mutate_ai_first_state(document_id: str, operation, *, request=None, bulk_reviewer_id=None):
     try:
         workspace = workspace_service.get(document_id)
     except FileNotFoundError as exc:
@@ -2486,6 +2487,12 @@ def _mutate_ai_first_state(document_id: str, operation, *, request=None):
     with document_mutation_locks.for_document(document_id):
         store, draft, review, _report = _ai_first_read_state(workspace)
         editor = store.read("editor-draft.json")
+        if isinstance(request, BulkReviewRequest):
+            try:
+                return execute_bulk_review(store, draft, review, editor, request, bulk_reviewer_id)
+            except AIReviewError as exc:
+                raise HTTPException(409, detail={"code": str(exc), "record_id": getattr(exc, "record_id", None),
+                    "message": "Пакет не применён. Обновите проверку и устраните замечания перед повторным действием."}) from None
         if request is not None and request.review_token is not None and request.review_token != review_token(draft, review, editor):
             raise HTTPException(409, detail={"code": "review_revision_conflict", "message": "Проверка изменена в другом окне. Правки оставлены на экране; обновите состояние перед повторным сохранением."})
         try:
@@ -2555,6 +2562,14 @@ def classify_ai_first_row_role(document_id: str, request: AIFirstRowRoleRequest,
         draft, state, request.record_id, role=request.role,
         parent_record_id=request.parent_record_id, reviewer_id=_job_owner_id(user),
     ), request=request)
+
+
+@app.post(
+    "/api/documents/{document_id}/ai-first/review/bulk-role-decision",
+    dependencies=[Depends(require_authenticated), Depends(require_document_activity), Depends(require_ai_first_enabled)],
+)
+def bulk_decide_ai_first_rows(document_id: str, request: BulkReviewRequest, user: CurrentUser = Depends(require_authenticated)):
+    return _mutate_ai_first_state(document_id, None, request=request, bulk_reviewer_id=_job_owner_id(user))
 
 
 @app.post(

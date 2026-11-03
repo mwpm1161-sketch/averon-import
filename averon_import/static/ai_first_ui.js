@@ -50,7 +50,7 @@ function renderAIFirstReviewSyncWarning() {
   const loading = Boolean(state.aiFirst.reviewRefreshInFlight);
   const message = state.aiFirst.uncertainReviewMutation
     ? "Ответ на действие не получен однозначно: сервер мог его сохранить. Повторная отправка заблокирована."
-    : "Последнее действие сохранено, но состояние проверки не обновлено. Новые действия временно заблокированы.";
+    : "Текущее состояние проверки не обновлено. Новые действия временно заблокированы.";
   root.hidden = false;
   root.innerHTML = `<span>${message}</span><button class="button secondary" type="button" data-ai-first-refresh-review ${loading ? "disabled" : ""}>${loading ? "Обновляем…" : "Загрузить актуальное состояние"}</button>`;
   root.querySelector("[data-ai-first-refresh-review]")?.addEventListener("click", () => void refreshAIFirstReviewState());
@@ -67,6 +67,12 @@ async function refreshAIFirstReviewState() {
     const data = await api(`/api/documents/${encodeURIComponent(context.documentId)}/ai-first`);
     if (!isCurrentAIFirstContext(context)) return {refreshed:false,stale:true};
     if (!data?.draft || !data?.review || !data?.review_token) throw new Error("Review state response was incomplete");
+    const pendingBatch = state.aiFirst.pendingBulkOperation;
+    const batchApplied = pendingBatch && (data.review.history || []).some((event) => event.payload?.bulk_operation?.operation_id === pendingBatch.operationId);
+    if (batchApplied) {
+      for (const [id, values] of Object.entries(pendingBatch.values || {})) if (aiFirstSameEdits(local.row_values[id],values)) delete local.row_values[id];
+      for (const [id, role] of Object.entries(pendingBatch.roles || {})) if (aiFirstSameEdits(local.row_roles[id],role)) delete local.row_roles[id];
+    }
     const oldEntries = new Map(aiFirstDocumentEntries(previousData?.draft,previousData?.review).map((entry) => [entry.row.id,entry]));
     const newEntries = aiFirstDocumentEntries(data.draft,data.review);
     const compatibleIds = new Set(newEntries.filter((entry) => {
@@ -97,6 +103,7 @@ async function refreshAIFirstReviewState() {
     for (const id of uncertain?.recordIds || []) forgetAIFirstSelectedRow(id);
     if (uncertain) syncAIFirstSelectionUI();
     state.aiFirst.uncertainReviewMutation = null;
+    state.aiFirst.pendingBulkOperation = null;
     state.aiFirst.reviewSyncRequired = false;
     state.aiFirst.reviewRefreshInFlight = false;
     renderAIFirstReviewSyncWarning();
@@ -1040,7 +1047,7 @@ function captureAIFirstViewState() {
   else if (dataset.aiFirstConfirmRow) focus = {type:"row-action",attribute:"confirm-row",id:dataset.aiFirstConfirmRow};
   else if (dataset.aiFirstExcludeRow) focus = {type:"row-action",attribute:"exclude-row",id:dataset.aiFirstExcludeRow};
   else if (dataset.aiFirstSaveRole) focus = {type:"row-action",attribute:"save-role",id:dataset.aiFirstSaveRole};
-  else if (["ai-first-search", "ai-first-review-filter", "ai-first-bulk-role", "ai-first-page-select"].includes(active?.id)) focus = {type:"id",id:active.id};
+  else if (["ai-first-search", "ai-first-review-filter", "ai-first-bulk-role", "ai-first-bulk-parent", "ai-first-bulk-review", "ai-first-page-select"].includes(active?.id)) focus = {type:"id",id:active.id};
   return {scrollTop:root?.scrollTop || 0,scrollLeft:root?.scrollLeft || 0,inspectorScrollTop:inspector?.scrollTop || 0,focus,selectionStart:active?.selectionStart,selectionEnd:active?.selectionEnd};
 }
 
@@ -1265,11 +1272,19 @@ function updateAIFirstBulkControls() {
   const otherPageSelectedCount = Math.max(0, state.aiFirst.selectedRows.size - currentPageSelectedCount);
   const confirmButton = root?.querySelector("#ai-first-confirm-selected");
   const roleButton = root?.querySelector("[data-ai-first-bulk-role-submit]");
+  const combinedButton = root?.querySelector("[data-ai-first-bulk-review-submit]");
+  const bulkRole = root?.querySelector("#ai-first-bulk-role")?.value || "standalone_item";
+  const parentWrap = root?.querySelector("[data-ai-first-bulk-parent-wrap]");
   const selectVisibleButton = root?.querySelector("[data-ai-first-select-visible]");
   const clearPageButton = root?.querySelector("[data-ai-first-clear-page-selection]");
-  const mutationBlocked = Boolean(state.aiFirst.mutationInFlight || state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight);
+  const mutationBlocked = Boolean(state.aiFirst.mutationInFlight || state.aiFirst.bulkPreviewInFlight || state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight);
   if (confirmButton) confirmButton.disabled = mutationBlocked || visibleIds.length === 0;
-  if (roleButton) roleButton.disabled = mutationBlocked || visibleIds.length === 0;
+  if (roleButton) roleButton.disabled = mutationBlocked || visibleIds.length === 0 || bulkRole === "component";
+  if (parentWrap) parentWrap.hidden = bulkRole !== "component";
+  if (combinedButton) {
+    combinedButton.disabled = mutationBlocked || state.aiFirst.bulkPreviewInFlight || visibleIds.length === 0;
+    combinedButton.textContent = ["standalone_item","component"].includes(bulkRole) ? "Назначить роль и подтвердить" : "Назначить роль и исключить из позиций";
+  }
   const visibleRows = pageRows.filter((row) => !row.hidden);
   if (selectVisibleButton) selectVisibleButton.disabled = visibleRows.length === 0 || visibleRows.every((row) => state.aiFirst.selectedRows.has(row.dataset.aiFirstRow));
   if (clearPageButton) clearPageButton.disabled = currentPageSelectedCount === 0;
@@ -1548,10 +1563,20 @@ function renderAIFirstTables(entries) {
     return `<section class="ai-first-source-table-group" data-ai-first-table-group="${escapeHtml(group.key)}"><h4>${escapeHtml(title)} <small>${count} строк</small></h4><table class="data-table ai-first-table"><thead><tr><th class="selector" title="Выбор строки">Выбор</th><th>Строка</th><th>Страница</th>${headers}<th>Проверка</th></tr></thead><tbody>${rows}</tbody></table></section>`;
   }).join("");
   const options = `<option value="all">Все строки</option><option value="attention">Требуют внимания</option><option value="unassigned">Роль не назначена</option><option value="checked">Проверены</option><option value="corrected">Исправлены</option><option value="excluded">Исключены</option><option value="service">Служебные строки</option>`;
-  const bulkRoles = [["standalone_item","Самостоятельная позиция"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
+  const bulkRoles = [["standalone_item","Самостоятельная позиция"],["component","В составе комплекта"],["header","Заголовок"],["column_numbering","Нумерация колонок"],["section","Раздел"],["continuation","Продолжение строки"],["note","Примечание"]];
+  const parentOptions = entries.filter((entry) => {
+    const role = state.aiFirst.data.review.row_roles?.[entry.row.id], decision = aiFirstDecision(entry.row.id);
+    return Number(entry.row.page_number) === state.aiFirst.page && role?.active && role.role === "standalone_item"
+      && decision?.active && decision.human_confirmed !== false && ["confirmed","corrected"].includes(decision.disposition);
+  }).map((entry) => `<option value="${escapeHtml(entry.row.id)}">Строка ${Number(entry.row.index || 0) + 1}</option>`).join("");
   root.innerHTML = groupHtml || `<div class="empty-table">На этой странице распознанных строк нет.</div>`;
-  controls.innerHTML = `<div class="ai-first-row-toolbar"><label class="ai-first-search-label">Поиск по строкам<input class="input" id="ai-first-search" type="search" value="${escapeHtml(state.aiFirst.reviewSearch || "")}" placeholder="Наименование, марка или артикул"></label><label>Показать<select class="select" id="ai-first-review-filter">${options}</select></label><button class="button ghost" type="button" data-ai-first-next-attention>Следующая для проверки</button><span data-ai-first-filter-summary role="status" aria-live="polite"></span></div><div class="ai-first-bulk-toolbar"><div class="ai-first-selection-actions"><button class="button ghost" type="button" data-ai-first-select-visible>Выбрать все видимые</button><button class="button ghost" type="button" data-ai-first-clear-page-selection title="Снимает выбор на текущей странице, включая скрытые фильтром строки. Выбор других страниц сохраняется.">Снять выделение</button><span data-ai-first-selected-count role="status" aria-live="polite">Выбрано 0 строк</span></div><label>Роль выбранных<select class="select" id="ai-first-bulk-role">${bulkRoles.map(([value,label]) => `<option value="${value}">${label}</option>`).join("")}</select></label><button class="button secondary" id="ai-first-confirm-selected" type="button" disabled>Подтвердить выбранные</button><button class="button secondary" type="button" data-ai-first-bulk-role-submit disabled>Применить роль</button></div>`;
+  controls.innerHTML = `<div class="ai-first-row-toolbar"><label class="ai-first-search-label">Поиск по строкам<input class="input" id="ai-first-search" type="search" value="${escapeHtml(state.aiFirst.reviewSearch || "")}" placeholder="Наименование, марка или артикул"></label><label>Показать<select class="select" id="ai-first-review-filter">${options}</select></label><button class="button ghost" type="button" data-ai-first-next-attention>Следующая для проверки</button><span data-ai-first-filter-summary role="status" aria-live="polite"></span></div><div class="ai-first-bulk-toolbar"><div class="ai-first-selection-actions"><button class="button ghost" type="button" data-ai-first-select-visible>Выбрать все видимые</button><button class="button ghost" type="button" data-ai-first-clear-page-selection title="Снимает выбор на текущей странице, включая скрытые фильтром строки. Выбор других страниц сохраняется.">Снять выделение</button><span data-ai-first-selected-count role="status" aria-live="polite">Выбрано 0 строк</span></div><label>Роль выбранных<select class="select" id="ai-first-bulk-role">${bulkRoles.map(([value,label]) => `<option value="${value}">${label}</option>`).join("")}</select></label><button class="button secondary" id="ai-first-confirm-selected" type="button" disabled>Подтвердить выбранные</button><button class="button secondary" type="button" data-ai-first-bulk-role-submit disabled>Применить роль</button><label data-ai-first-bulk-parent-wrap hidden>Родительская позиция<select class="select" id="ai-first-bulk-parent"><option value="">Выберите проверенную позицию</option>${parentOptions}</select></label><button class="button primary" type="button" id="ai-first-bulk-review" data-ai-first-bulk-review-submit disabled>Назначить роль и подтвердить</button></div>`;
   const filter = controls.querySelector("#ai-first-review-filter");
+  const bulkRoleSelect = controls.querySelector("#ai-first-bulk-role"), bulkParentSelect = controls.querySelector("#ai-first-bulk-parent");
+  if (bulkRoleSelect) bulkRoleSelect.value = state.aiFirst.bulkTargetRole || "standalone_item";
+  if (bulkParentSelect) bulkParentSelect.value = state.aiFirst.bulkTargetParent || "";
+  bulkRoleSelect?.addEventListener("change", () => { state.aiFirst.bulkTargetRole = bulkRoleSelect.value; updateAIFirstBulkControls(); });
+  bulkParentSelect?.addEventListener("change", () => { state.aiFirst.bulkTargetParent = bulkParentSelect.value; });
   if (filter) filter.value = state.aiFirst.reviewFilter || "all";
   controls.querySelector("#ai-first-search")?.addEventListener("input", applyAIFirstReviewFilters);
   filter?.addEventListener("change", applyAIFirstReviewFilters);
@@ -1590,6 +1615,7 @@ function renderAIFirstTables(entries) {
   });
   controls.querySelector("#ai-first-confirm-selected")?.addEventListener("click", () => void confirmSelectedAIFirstRows());
   controls.querySelector("[data-ai-first-bulk-role-submit]")?.addEventListener("click", () => void assignSelectedAIFirstRole());
+  controls.querySelector("[data-ai-first-bulk-review-submit]")?.addEventListener("click", () => void reviewSelectedAIFirstRowsAtomically());
   controls.querySelector("[data-ai-first-select-visible]")?.addEventListener("click", selectAllVisibleAIFirstRows);
   controls.querySelector("[data-ai-first-clear-page-selection]")?.addEventListener("click", clearAIFirstPageSelection);
   applyAIFirstReviewFilters();
@@ -1602,7 +1628,7 @@ async function postAIFirstReview(action, body) {
     toast("Сначала загрузите актуальное состояние проверки. Новое действие не отправлено.", "warning");
     return {saved:false,refreshed:false,blocked:true};
   }
-  if (state.aiFirst.mutationInFlight) { toast("Дождитесь завершения сохранения.", "warning"); return {saved:false,refreshed:false}; }
+  if (state.aiFirst.mutationInFlight || state.aiFirst.bulkPreviewInFlight) { toast("Дождитесь завершения проверки или сохранения.", "warning"); return {saved:false,refreshed:false,blocked:true}; }
   const context = aiFirstRequestContext();
   const affected = new Set(body.record_id ? [body.record_id] : (body.record_ids || []));
   captureAIFirstPendingEdits();
@@ -1626,7 +1652,7 @@ async function postAIFirstReview(action, body) {
       if (!isCurrentAIFirstContext(context)) return {saved:false,stale:true};
       if (outcomeUnknown) {
         state.aiFirst.reviewSyncRequired = true;
-        state.aiFirst.uncertainReviewMutation = {action,recordIds:[...affected]};
+        state.aiFirst.uncertainReviewMutation = {action,recordIds:[...affected],operationId:body.operation_id || null};
         renderAIFirstReviewSyncWarning();
         updateAIFirstBulkControls();
         toast("Ответ на действие не получен однозначно. Сервер мог его сохранить; повторная отправка заблокирована. Загрузите актуальное состояние.", "warning");
@@ -1641,16 +1667,21 @@ async function postAIFirstReview(action, body) {
       : {saved:null,refreshed:false,outcome:"unknown"};
   }
   if (!isCurrentAIFirstContext(context)) return {saved:true,refreshed:false,stale:true};
+  let refreshedView = null;
   try {
     const data = await api(`/api/documents/${encodeURIComponent(context.documentId)}/ai-first`);
     if (!isCurrentAIFirstContext(context)) return {saved:true,refreshed:false,stale:true};
     captureAIFirstPendingEdits();
     for (const id of affected) {
-      if ((action === "row" || action === "bulk-confirm") && aiFirstSameEdits(state.aiFirst.pendingRowValues?.[id],submittedValues[id])) delete state.aiFirst.pendingRowValues?.[id];
-      if ((action === "row-role" || action === "bulk-role") && aiFirstSameEdits(state.aiFirst.pendingRowRoles?.[id],submittedRoles[id])) delete state.aiFirst.pendingRowRoles?.[id];
+      if (["row","bulk-confirm","bulk-role-decision"].includes(action) && aiFirstSameEdits(state.aiFirst.pendingRowValues?.[id],submittedValues[id])) delete state.aiFirst.pendingRowValues?.[id];
+      if (["row-role","bulk-role","bulk-role-decision"].includes(action) && aiFirstSameEdits(state.aiFirst.pendingRowRoles?.[id],submittedRoles[id])) delete state.aiFirst.pendingRowRoles?.[id];
     }
     if (body.issue_id && state.aiFirst.pendingIssueNotes?.[body.issue_id] === body.detail) delete state.aiFirst.pendingIssueNotes[body.issue_id];
     state.aiFirst.data = data;
+    if (action === "bulk-role-decision") {
+      state.aiFirst.skipPendingCaptureOnce = true;
+      refreshedView = captureAIFirstViewState();
+    }
     renderAIFirstReview();
     toast("Изменение сохранено в черновике и добавлено в историю проверки.", "success");
     return {saved:true,refreshed:true};
@@ -1666,6 +1697,7 @@ async function postAIFirstReview(action, body) {
     if (isCurrentAIFirstContext(context)) {
       state.aiFirst.mutationInFlight = false;
       updateAIFirstBulkControls();
+      if (refreshedView && !state.aiFirst.reviewSyncRequired) restoreAIFirstViewState(refreshedView);
     }
   }
 }
@@ -1679,7 +1711,106 @@ async function confirmAIFirstPageCompleteness(pageNumber) {
   return postAIFirstReview("complete-page", {page_number:Number(pageNumber)});
 }
 
+function aiFirstBulkDependencyPreview(preview) {
+  const decisions = new Set(preview.invalidated_decision_ids || []), roles = new Set(preview.invalidated_role_ids || []);
+  const ids = [...new Set([...decisions,...roles])];
+  const review = state.aiFirst.data.review || {};
+  const entries = new Map(aiFirstDocumentEntries(state.aiFirst.data.draft,review).map((entry) => [entry.row.id,entry]));
+  const roleLabels = {standalone_item:"Самостоятельная позиция",component:"В составе комплекта",header:"Заголовок",column_numbering:"Нумерация колонок",section:"Раздел",continuation:"Продолжение строки",note:"Примечание",unknown:"Тип не подтверждён"};
+  const lines = ids.map((id) => {
+    const entry = entries.get(id);
+    if (!entry) throw new Error("Не удалось найти связанную строку в текущей проверке. Обновите состояние перед пакетным действием.");
+    const location = entry.manual
+      ? `ручная строка ${(review.manual_rows || []).findIndex((row) => row.id === id) + 1}`
+      : `таблица ${Number(entry.table.index || 0) + 1}, строка ${Number(entry.row.index || 0) + 1}`;
+    const role = review.row_roles?.[id];
+    const changes = [roles.has(id) ? "роль" : "",decisions.has(id) ? "подтверждение значений" : ""].filter(Boolean).join(" и ");
+    return `• Стр. ${entry.row.page_number}, ${location} — ${roleLabels[role?.active ? role.role : "unknown"] || "Тип не подтверждён"}: ${changes}.`;
+  });
+  return {count:ids.length,text:lines.join("\n")};
+}
+
+function aiFirstAtomicBatchSnapshot(operationId) {
+  const controls = document.querySelector("#ai-first-review-controls");
+  const recordIds = aiFirstVisibleSelectedIds(), role = controls?.querySelector("#ai-first-bulk-role")?.value;
+  if (!recordIds.length || recordIds.length > 100 || !state.aiFirst.data?.review_token) throw new Error("Выберите от 1 до 100 видимых строк.");
+  const parent = controls?.querySelector("#ai-first-bulk-parent")?.value || "";
+  const parents = {}, provenance = {}, values = {};
+  for (const id of recordIds) {
+    const entry = state.aiFirst.renderedEntries?.get(id);
+    if (!entry) throw new Error("Набор строк изменился. Обновите проверку.");
+    const pendingRole = state.aiFirst.pendingRowRoles?.[id];
+    if (pendingRole && (pendingRole.role !== role || (pendingRole.parent_record_id || "") !== (role === "component" ? parent : ""))) throw new Error("В выбранной строке есть другое несохранённое назначение роли. Сохраните или исправьте его перед пакетным действием.");
+    if (role === "component") parents[id] = parent;
+    provenance[id] = {page_number:Number(entry.row.page_number),extraction_fingerprint:entry.page.extraction_fingerprint,table_id:entry.manual ? null : entry.table.id};
+    values[id] = aiFirstRowValues(aiFirstRowInputSnapshot(id));
+  }
+  return {mode:"preview",operation_id:operationId,review_token:state.aiFirst.data.review_token,
+    draft_revision_id:state.aiFirst.data.draft.revision_id,editor_revision:state.aiFirst.data.editor_draft?.revision || 0,
+    record_ids:recordIds,role,intent:["standalone_item","component"].includes(role) ? "confirm_values" : "exclude_from_positions",parents,provenance,values};
+}
+
+async function reviewSelectedAIFirstRowsAtomically() {
+  if (state.aiFirst.mutationInFlight || state.aiFirst.bulkPreviewInFlight || state.aiFirst.reviewSyncRequired || state.aiFirst.reviewRefreshInFlight) return;
+  const context = aiFirstRequestContext();
+  let request, preview;
+  try {
+    captureAIFirstPendingEdits();
+    request = aiFirstAtomicBatchSnapshot(crypto.randomUUID().replaceAll("-",""));
+    state.aiFirst.bulkPreviewInFlight = true;
+    updateAIFirstBulkControls();
+    preview = await api(`/api/documents/${encodeURIComponent(context.documentId)}/ai-first/review/bulk-role-decision`, {
+      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(request),
+    });
+  } catch (error) {
+    if (isCurrentAIFirstContext(context)) {
+      if (error.code === "review_revision_conflict") {
+        state.aiFirst.reviewSyncRequired = true;
+        renderAIFirstReviewSyncWarning();
+        await refreshAIFirstReviewState();
+      } else toast(error.message || "Не удалось проверить пакет. Изменения не отправлены на сохранение.","warning");
+    }
+    return;
+  } finally {
+    if (isCurrentAIFirstContext(context)) { state.aiFirst.bulkPreviewInFlight = false; updateAIFirstBulkControls(); }
+  }
+  if (!isCurrentAIFirstContext(context)) return;
+  if (preview.replayed) {
+    state.aiFirst.reviewSyncRequired = true;
+    await refreshAIFirstReviewState();
+    return;
+  }
+  if (!preview.can_commit) {
+    const labels = {bulk_selection_has_open_issues:"Есть открытые замечания: проверьте строки и разрешите их отдельно.",component_parent_not_confirmed_item:"Нужна действующая проверенная родительская позиция.",bulk_editor_revision_conflict:"Черновик изменён. Обновите состояние.",bulk_editor_values_mismatch:"Показанные значения отличаются от сохранённых исправлений. Сверьте их с черновиком и явно сохраните нужный вариант перед пакетным действием.",bulk_editor_role_mismatch:"В черновике есть другое назначение роли.",bulk_column_provenance_invalid:"Колонки требуют отдельной проверки.",review_source_superseded:"Среди выбранных есть заменённая строка."};
+    toast(labels[preview.errors?.[0]?.code] || "Пакет требует отдельной проверки. Изменения не сохранены.","warning");
+    return;
+  }
+  try {
+    captureAIFirstPendingEdits();
+    if (!aiFirstSameEdits(request,aiFirstAtomicBatchSnapshot(request.operation_id))) {
+      toast("Выбор или значения изменились во время проверки. Запустите действие заново.","warning"); return;
+    }
+  } catch (error) { toast(error.message,"warning"); return; }
+  const roleLabel = document.querySelector("#ai-first-review-controls #ai-first-bulk-role option:checked")?.textContent || request.role;
+  const intent = request.intent === "confirm_values" ? "подтвердить показанные значения" : "исключить из закупочных позиций, сохранив исходные строки";
+  let dependencies;
+  try { dependencies = aiFirstBulkDependencyPreview(preview); }
+  catch (error) { toast(error.message,"warning"); return; }
+  if (!confirm(`Строк: ${request.record_ids.length}. Роль: «${roleLabel}». Действие: ${intent}. Изменённых ячеек: ${preview.corrected_cell_count || 0}.\nЗатронутых строк к пересмотру: ${dependencies.count}.${dependencies.text ? `\n${dependencies.text}` : ""}\nСверьте значения с PDF. Применить весь пакет?`)) return;
+  const selectedEdits = (values) => Object.fromEntries(Object.entries(values || {}).filter(([id]) => request.record_ids.includes(id)));
+  state.aiFirst.pendingBulkOperation = {operationId:request.operation_id,values:aiFirstClone(selectedEdits(state.aiFirst.pendingRowValues)),roles:aiFirstClone(selectedEdits(state.aiFirst.pendingRowRoles))};
+  const result = await postAIFirstReview("bulk-role-decision",{...request,mode:"commit"});
+  if (!result?.saved || result.stale) {
+    if (!result?.stale && result?.outcome !== "unknown") state.aiFirst.pendingBulkOperation = null;
+    return;
+  }
+  for (const id of request.record_ids) forgetAIFirstSelectedRow(id);
+  if (result.refreshed) state.aiFirst.pendingBulkOperation = null;
+  syncAIFirstSelectionUI();
+}
+
 async function confirmSelectedAIFirstRows() {
+  if (state.aiFirst.bulkPreviewInFlight) return;
   const recordIds = aiFirstVisibleSelectedIds();
   if (!recordIds.length) return;
   const changedRows = recordIds.filter((id) => aiFirstRowInputSnapshot(id).some((item) => item.value !== item.baseline));
@@ -1696,6 +1827,7 @@ async function confirmSelectedAIFirstRows() {
 }
 
 async function assignSelectedAIFirstRole() {
+  if (state.aiFirst.bulkPreviewInFlight) return;
   const root = document.querySelector("#ai-first-table-scroll");
   const controls = document.querySelector("#ai-first-review-controls");
   const recordIds = aiFirstVisibleSelectedIds();
