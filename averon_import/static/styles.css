@@ -974,3 +974,40 @@ button { cursor: pointer; }
   .ai-first-inspector-review { grid-template-columns:minmax(0,1fr); }
   .ai-first-inspector-actions { flex-wrap:wrap; }
 }
+
+/* Keep the PDF and table headings inside their own columns at narrow widths. */
+.ai-first-pdf-panel .pane-header {
+  box-sizing:border-box; width:100%; height:auto; min-height:53px;
+  flex-wrap:wrap; align-content:center; justify-content:flex-start;
+  gap:6px 8px; padding:7px 10px;
+}
+.ai-first-pdf-panel .pane-header > div:first-child {
+  flex:0 0 auto; min-width:max-content;
+}
+.ai-first-page-nav { flex:0 1 auto; min-width:0; }
+.ai-first-page-nav .select { flex:0 1 100px; min-width:0; }
+.ai-first-zoom-controls {
+  box-sizing:border-box; flex:0 0 100%; width:100%; min-width:0;
+  margin-left:0; justify-content:flex-start; flex-wrap:wrap;
+}
+.ai-first-zoom-controls output { flex:0 0 auto; }
+.ai-first-table-heading {
+  box-sizing:border-box; height:auto; min-height:53px; flex-wrap:wrap;
+}
+.ai-first-table-heading > div { flex:1 1 180px; min-width:0; }
+.ai-first-table-heading .button { flex:0 1 auto; max-width:100%; white-space:normal; }
+@media (max-width:850px) {
+  .ai-first-review-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+.ai-first-review-summary .summary-card.warning {
+  display:grid; grid-template-columns:minmax(0,1fr); align-content:center;
+  align-items:stretch; justify-items:stretch; gap:3px;
+}
+.ai-first-review-summary .summary-card.warning small {
+  display:block; width:100%; max-width:100%; min-width:0;
+  line-height:1.25;
+}
+.ai-first-review-summary .summary-card.warning b {
+  display:block; width:100%; max-width:100%; min-width:0;
+  font-size:17px; line-height:1.25; overflow-wrap:anywhere;
+}
