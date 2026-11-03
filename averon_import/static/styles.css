@@ -798,8 +798,8 @@ button { cursor: pointer; }
 .ai-first-review-summary .summary-card { min-width:0; min-height:51px; padding:7px 10px; border-radius:9px; }
 .ai-first-review-summary .summary-card small { font-size:10px; line-height:1.25; }
 .ai-first-review-summary .summary-card b { font-size:17px; }
-.ai-first-review-workspace { grid-template-columns:minmax(285px,39fr) minmax(0,61fr); height:calc(100vh - 370px); min-height:470px; margin-top:7px; }
-.ai-first-table-panel { min-width:0; width:100%; max-width:100%; overflow:hidden; }
+.ai-first-review-workspace { grid-template-columns:minmax(285px,39fr) minmax(0,61fr); height:auto; min-height:470px; margin-top:7px; overflow:visible; }
+.ai-first-table-panel { min-width:0; width:100%; max-width:100%; overflow:visible; }
 .ai-first-table-heading { min-width:0; flex:0 0 auto; gap:8px; padding:8px 10px; }
 .ai-first-table-heading h3 { font-size:13px; }
 .ai-first-table-heading p { font-size:11px; line-height:1.35; }
@@ -818,7 +818,7 @@ button { cursor: pointer; }
 .ai-first-search-label { flex:1 1 160px; }
 .ai-first-row-toolbar .button,.ai-first-bulk-toolbar .button { min-height:32px; font-size:10px; }
 .ai-first-row-toolbar [data-ai-first-filter-summary],.ai-first-bulk-toolbar [data-ai-first-selected-count] { font-size:10px; }
-.ai-first-table-scroll { flex:1 1 auto; min-width:0; width:100%; max-width:100%; min-height:120px; overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; isolation:isolate; }
+.ai-first-table-scroll { flex:1 1 180px; min-width:0; width:100%; max-width:100%; min-height:180px; max-height:48vh; overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; isolation:isolate; }
 .ai-first-source-table-group { width:max-content; min-width:100%; margin:7px 0 10px; overflow:visible; border-radius:7px; }
 .ai-first-source-table-group h4 { position:sticky; left:0; width:max-content; min-width:100%; box-sizing:border-box; padding:7px 9px; font-size:11px; }
 .ai-first-table { --ai-first-selector-column-width:48px; width:max-content; min-width:100%; border-collapse:separate; border-spacing:0; font-size:12px; }
