@@ -134,7 +134,9 @@ def run_job(
 
 def test_30_pages_concurrency_three_and_deterministic_source_order(tmp_path):
     pdf = make_pdf(tmp_path / "synthetic-30.pdf", 30)
-    adapter = SyntheticAdapter(delay=lambda page: (page % 5) * 0.001)
+    # Legacy sync rendering is serialized for PyMuPDF safety. Keep the fake
+    # provider latency realistic enough to prove requests overlap across pages.
+    adapter = SyntheticAdapter(delay=lambda page: 0.1 + (page % 5) * 0.005)
     report = run_job(tmp_path, pdf, adapter)
     assert report.status == "completed"
     assert report.source_integrity_verified is True
@@ -623,7 +625,7 @@ def test_v2a_draft_preserves_unknown_fields_without_export_authorization(tmp_pat
 
 def test_invalid_concurrency_and_token_rate_limits_are_rejected():
     with pytest.raises(ValidationError):
-        make_config(concurrency=9)
+        make_config(concurrency=11)
     with pytest.raises(ValidationError):
         make_config(tokens_per_minute=0)
 

@@ -391,6 +391,8 @@ class QwenVisionClient:
     def extract(
         self, image: bytes, page: int, *, timeout_s: float | None = None,
         cancel: threading.Event | None = None, user_context: str | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> VisionCompletion:
         limits = self.config.limits
         diagnostics: dict[str, Any] = {
@@ -435,6 +437,13 @@ class QwenVisionClient:
             if self.config.folder_id:
                 headers["OpenAI-Project"] = self.config.folder_id
             _check_cancel(cancel)
+            if before_dispatch is not None:
+                before_dispatch()
+            _check_cancel(cancel)
+            # Quota/checkpoint waiting is outside the provider's HTTP timeout.
+            # A dispatch callback may block, so start its deadline afterwards.
+            if on_dispatch is not None:
+                on_dispatch()
             diagnostics.update(request_attempted=True, client_request_id=client_id, request_bytes=len(body))
             call_started = self._clock()
             call_deadline = call_started + timeout

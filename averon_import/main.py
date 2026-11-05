@@ -141,7 +141,7 @@ from averon_import.services.ai_first.pilot_export import (
 from averon_import.services.ai_first.pdf_locator import locate_ai_first_pdf_bbox
 from averon_import.services.ai_first.orchestration import (
     CheckpointStore, FitZPageRenderer, OrchestrationConfig, OrchestrationError, PageOrchestrator,
-    TokenPricing, inspect_pdf,
+    TokenPricing, inspect_pdf, inspect_pdf_async,
 )
 from averon_import.services.ai_first.qwen_vision_adapter import QwenVisionQuotaRegistry
 from averon_import.services.ai_first.review import (
@@ -2303,7 +2303,9 @@ async def recognize_ai_first(
         if len(pages) > prepared_config.max_requests:
             raise OrchestrationError("local_request_limit_exceeded")
         prepared_run_id, prepared_checkpoint_path = store.select_run(document_id)
-        identity = inspect_pdf(workspace.pdf_path, prepared_adapter, prepared_config, run_id=prepared_run_id)
+        identity = await inspect_pdf_async(
+            workspace.pdf_path, prepared_adapter, prepared_config, run_id=prepared_run_id,
+        )
         manifest = prepared_checkpoint_path / "manifest.json"
         if not request.start_new_run and manifest.exists():
             from averon_import.services.ai_first.private_acl import verify_private_tree

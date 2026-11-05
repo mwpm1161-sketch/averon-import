@@ -6,7 +6,6 @@ observations and must be placed outside the repository in a private local direct
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
@@ -18,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 from typing import Any, Awaitable, Callable, Literal, Protocol
 from urllib.parse import parse_qsl, urlsplit
@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from averon_import.services.ai_first.assembly import assemble_document_draft, failed_page
 from averon_import.services.ai_first.contracts import AIDocumentDraft, AIPageExtraction
+from averon_import.services.ai_first.dispatch import PAGE_CAPACITY, SYNC_RENDER_CAPACITY, RollingQuota
 
 
 class OrchestrationError(RuntimeError):
@@ -183,7 +184,7 @@ class TokenPricing(_StrictModel):
 
 
 class OrchestrationConfig(_StrictModel):
-    concurrency: int = Field(default=3, ge=1, le=8)
+    concurrency: int = Field(default=3, ge=1, le=10)
     dpi: int = Field(default=150, ge=36, le=600)
     max_requests: int = Field(default=1000, ge=1, le=10000)
     requests_per_minute: int = Field(default=60, ge=1, le=10000)
@@ -275,17 +276,23 @@ class RequestEstimate(_StrictModel):
 
 
 class PageExtractionRequest:
-    __slots__ = ("source_document_id", "page_number", "image", "run_id", "cancel_event")
+    __slots__ = ("source_document_id", "page_number", "image", "run_id", "cancel_event",
+                 "before_dispatch", "dispatch_started_at", "reservation_id")
 
     def __init__(
         self, source_document_id: str, page_number: int, image: PageImage, run_id: str,
         cancel_event: asyncio.Event | None = None,
+        before_dispatch: Callable[[], Awaitable[None]] | None = None,
+        reservation_id: str | None = None,
     ):
         self.source_document_id = source_document_id
         self.page_number = page_number
         self.image = image
         self.run_id = run_id
         self.cancel_event = cancel_event
+        self.before_dispatch = before_dispatch
+        self.dispatch_started_at: str | None = None
+        self.reservation_id = reservation_id
 
 
 class AdapterPageResult(_StrictModel):
@@ -342,6 +349,7 @@ class AdapterRequestError(RuntimeError):
 class PageAttempt(_StrictModel):
     state: Literal["running", "completed", "incomplete", "failed", "unknown_outcome"]
     started_at: str
+    dispatch_intent_at: str | None = None
     dispatched_at: str | None = None
     finished_at: str | None = None
     request_started: bool = False
@@ -406,6 +414,30 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _possibly_dispatched(attempt: PageAttempt) -> bool:
+    return attempt.request_started or (
+        attempt.dispatch_intent_at is not None and attempt.state in {"running", "unknown_outcome"}
+    )
+
+
+def _quota_reservation_id(identity: CheckpointIdentity, number: int, attempt_index: int) -> str:
+    return _fingerprint([identity.fingerprint, number, attempt_index])
+
+
+def _quota_age(attempt: PageAttempt) -> float:
+    # Cool down from settlement, not admission. Missing/legacy timestamps get
+    # a full window; unknown outcomes get one on each explicit reopen.
+    if attempt.state == "unknown_outcome":
+        return 0.0
+    try:
+        stamp = datetime.fromisoformat(attempt.finished_at or attempt.dispatched_at or "")
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds() - 1.0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -421,15 +453,21 @@ def inspect_pdf(
     *,
     run_id: str | None = None,
 ) -> CheckpointIdentity:
-    """Hash the source and read its local page count before any model request."""
+    """Synchronous preflight; async callers must use :func:`inspect_pdf_async`."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise OrchestrationError("async_inspect_required")
     path = Path(pdf_path)
     if not path.is_file():
         raise OrchestrationError("source_pdf_unavailable")
     try:
         before = path.stat()
         source_sha256 = _sha256_file(path)
-        with fitz.open(path) as document:
-            count = document.page_count
+        from averon_import.services.ai_first.pdf_render_worker import pdf_page_count
+        count = pdf_page_count(path)
         after = path.stat()
     except Exception:
         raise OrchestrationError("source_pdf_invalid") from None
@@ -450,6 +488,68 @@ def inspect_pdf(
         ),
         processing_fingerprint=config.processing_fingerprint(),
     )
+
+
+async def inspect_pdf_async(
+    pdf_path: str | os.PathLike[str],
+    adapter: PageExtractionAdapter,
+    config: OrchestrationConfig,
+    *,
+    run_id: str | None = None,
+) -> CheckpointIdentity:
+    """Async equivalent for event-loop callers; PDF I/O stays in its worker."""
+    path = Path(pdf_path)
+    if not path.is_file():
+        raise OrchestrationError("source_pdf_unavailable")
+    try:
+        before = path.stat()
+        from averon_import.services.ai_first.pdf_render_worker import inspect_source_async
+        source_sha256, count = await inspect_source_async(path)
+        after = path.stat()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise OrchestrationError("source_pdf_invalid") from None
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise OrchestrationError("source_changed_during_inspection")
+    if count < 1 or count > config.max_pages:
+        raise OrchestrationError("source_page_count_out_of_range")
+    return CheckpointIdentity(
+        source_sha256=source_sha256,
+        source_size_bytes=after.st_size,
+        source_mtime_ns=after.st_mtime_ns,
+        page_count=count,
+        run_id=run_id or uuid4().hex,
+        source_document_id=f"pdf-sha256:{source_sha256}",
+        adapter_fingerprint=adapter.descriptor.fingerprint,
+        private_adapter_scope_fingerprint=getattr(adapter, "private_checkpoint_scope_fingerprint", None),
+        processing_fingerprint=config.processing_fingerprint(),
+    )
+
+
+async def _render_sync_adapter(renderer, pdf_path, page_number, dpi, config):
+    """Run a legacy sync renderer off-loop, serialized across document jobs.
+
+    The slot stays held after task cancellation until the native/thread call
+    has actually returned. This keeps synchronous PyMuPDF adapters serialized.
+    """
+    await SYNC_RENDER_CAPACITY.acquire()
+    task = asyncio.create_task(asyncio.to_thread(renderer.render, pdf_path, page_number, dpi, config))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
+    finally:
+        SYNC_RENDER_CAPACITY.release()
 
 
 def _assert_source_signature(pdf_path: str | os.PathLike[str], identity: CheckpointIdentity) -> None:
@@ -483,6 +583,10 @@ def _verify_source_content(
 
 class FitZPageRenderer:
     """Renders only the requested page and releases its PDF handle immediately."""
+
+    async def render_async(self, pdf_path, page_number, dpi, config):
+        from averon_import.services.ai_first.pdf_render_worker import render_page
+        return await render_page(pdf_path, page_number, dpi, config)
 
     def render(self, pdf_path: str | os.PathLike[str], page_number: int, dpi: int, config: OrchestrationConfig) -> PageImage:
         try:
@@ -532,8 +636,11 @@ class CheckpointStore:
         self.identity = identity
         self._lock_stream: Any = None
         self._io_lock = asyncio.Lock()
+        self._execution_lock = threading.Lock()
 
     def open(self) -> dict[int, PageRunRecord]:
+        if self._lock_stream is not None:
+            raise OrchestrationError("checkpoint_in_use")
         repo_root = Path(__file__).resolve().parents[3]
         try:
             self.directory.relative_to(repo_root)
@@ -579,13 +686,14 @@ class CheckpointStore:
                 if record.extraction is not None and record.extraction.source_document_id != self.identity.source_document_id:
                     raise OrchestrationError("checkpoint_invalid")
                 if record.state == "running":
+                    ambiguous = _possibly_dispatched(record.attempts[-1])
                     attempt = record.attempts[-1].model_copy(update={
-                        "state": "unknown_outcome",
+                        "state": "unknown_outcome" if ambiguous else "failed",
                         "finished_at": _utc_now(),
-                        "safe_error_code": "process_restarted_during_request",
+                        "safe_error_code": "process_restarted_during_request" if ambiguous else "process_restarted_before_dispatch",
                     })
                     record = record.model_copy(update={
-                        "state": "unknown_outcome",
+                        "state": "unknown_outcome" if ambiguous else "pending",
                         "attempts": [*record.attempts[:-1], attempt],
                         "updated_at": _utc_now(),
                     })
@@ -694,85 +802,24 @@ class CheckpointStore:
                 self._lock_stream = None
 
 
-class _RateGate:
-    RESTORE_SAFETY_MARGIN_S = 1.0
-
+class _RateGate(RollingQuota):
     def __init__(
         self, rpm: int, tpm: int, *, window_s: float = 60.0,
         records: dict[int, PageRunRecord] | None = None,
     ):
-        self.rpm = rpm
-        self.tpm = tpm
-        self.window_s = window_s
-        self.events: deque[tuple[float, int]] = deque()
-        self._lock = asyncio.Lock()
+        super().__init__(rpm, tpm, window_s=window_s)
         self._restore_events(records or {})
 
     def _restore_events(self, records: dict[int, PageRunRecord]) -> None:
-        if not records:
-            return
-        loop = asyncio.get_running_loop()
-        now_monotonic = loop.time()
-        now_utc = datetime.now(timezone.utc)
-        restored: list[tuple[float, int]] = []
         for record in records.values():
             for attempt in record.attempts:
-                if not attempt.request_started:
-                    continue
-                timestamp = attempt.dispatched_at
-                if timestamp is None:
-                    # Legacy or incomplete dispatch evidence consumes a full cooldown.
-                    age_s = 0.0
-                else:
-                    try:
-                        dispatched = datetime.fromisoformat(timestamp)
-                        if dispatched.tzinfo is None:
-                            dispatched = dispatched.replace(tzinfo=timezone.utc)
-                        age_s = max(0.0, (now_utc - dispatched.astimezone(timezone.utc)).total_seconds())
-                    except (TypeError, ValueError):
-                        age_s = 0.0
-                    age_s = max(0.0, age_s - self.RESTORE_SAFETY_MARGIN_S)
-                if age_s >= self.window_s:
+                if not _possibly_dispatched(attempt):
                     continue
                 if attempt.reserved_input_tokens is None or attempt.reserved_output_tokens is None:
                     token_reservation = self.tpm
                 else:
                     token_reservation = attempt.reserved_input_tokens + attempt.reserved_output_tokens
-                restored.append((now_monotonic - age_s, token_reservation))
-        self.events.extend(sorted(restored))
-
-    async def acquire(
-        self, token_count: int, cancel_event: asyncio.Event,
-        stop_event: asyncio.Event | None = None,
-    ) -> bool:
-        if token_count > self.tpm:
-            return False
-        loop = asyncio.get_running_loop()
-        while True:
-            if cancel_event.is_set() or (stop_event is not None and stop_event.is_set()):
-                return False
-            async with self._lock:
-                now = loop.time()
-                while self.events and self.events[0][0] <= now - self.window_s:
-                    self.events.popleft()
-                used_tokens = sum(value for _, value in self.events)
-                if len(self.events) < self.rpm and used_tokens + token_count <= self.tpm:
-                    self.events.append((now, token_count))
-                    return True
-                if not self.events:
-                    return False
-                delay = max(0.001, self.events[0][0] + self.window_s - now)
-            waiters = [asyncio.create_task(cancel_event.wait())]
-            if stop_event is not None:
-                waiters.append(asyncio.create_task(stop_event.wait()))
-            done, pending = await asyncio.wait(
-                waiters, timeout=delay, return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*waiters, return_exceptions=True)
-            if done:
-                return False
+                self.restore(token_reservation, _quota_age(attempt))
 
 
 class _BudgetLedger:
@@ -785,9 +832,10 @@ class _BudgetLedger:
             for attempt in record.attempts:
                 if attempt.actual_cost_rub is not None:
                     self.spent += attempt.actual_cost_rub
-                elif attempt.request_started and attempt.reserved_cost_rub is not None:
+                elif _possibly_dispatched(attempt):
                     # Unknown usage remains reserved after process restart.
-                    self.reserved += attempt.reserved_cost_rub
+                    # Legacy dispatch without a cost ceiling must fail closed.
+                    self.reserved += attempt.reserved_cost_rub if attempt.reserved_cost_rub is not None else cap
 
     async def reserve(self, amount: Decimal) -> bool:
         async with self._lock:
@@ -861,14 +909,9 @@ ProgressCallback = Callable[[ProgressEvent], None | Awaitable[None]]
 
 
 class PageOrchestrator:
-    def _region_pdf_points(self, pdf_path) -> dict[str, list[float]]:
-        with fitz.open(pdf_path) as document:
-            result = {}
-            for number, (x, y, width, height) in self.config.page_regions.items():
-                rect = document.load_page(number - 1).rect
-                result[str(number)] = [rect.x0 + x * rect.width, rect.y0 + y * rect.height,
-                                       rect.x0 + (x + width) * rect.width, rect.y0 + (y + height) * rect.height]
-            return result
+    async def _region_pdf_points(self, pdf_path) -> dict[str, list[float]]:
+        from averon_import.services.ai_first.pdf_render_worker import page_region_points_async
+        return await page_region_points_async(pdf_path, self.config.page_regions)
 
     def __init__(
         self,
@@ -902,6 +945,11 @@ class PageOrchestrator:
         retry_pages: set[int] | None = None,
         selected_pages: set[int] | None = None,
     ) -> OrchestrationReport:
+        if not self.checkpoint._execution_lock.acquire(blocking=False):
+            raise OrchestrationError("checkpoint_in_use")
+        if self.checkpoint._lock_stream is not None:
+            self.checkpoint._execution_lock.release()
+            raise OrchestrationError("checkpoint_in_use")
         try:
             return await self._run_impl(
                 pdf_path, cancel_event=cancel_event, retry_pages=retry_pages,
@@ -909,6 +957,7 @@ class PageOrchestrator:
             )
         finally:
             self.checkpoint.close()
+            self.checkpoint._execution_lock.release()
 
     async def _run_impl(
         self,
@@ -950,7 +999,9 @@ class PageOrchestrator:
                 raise OrchestrationError("adapter_page_limit_invalid")
             if len(page_selection) > adapter_page_limit:
                 raise OrchestrationError("adapter_page_limit_exceeded")
-        actual_identity = inspect_pdf(pdf_path, self.adapter, self.config, run_id=identity.run_id)
+        actual_identity = await inspect_pdf_async(
+            pdf_path, self.adapter, self.config, run_id=identity.run_id,
+        )
         if actual_identity != identity:
             raise OrchestrationError("source_or_configuration_identity_mismatch")
         records = self.checkpoint.open()
@@ -985,11 +1036,14 @@ class PageOrchestrator:
             window_s=self.rate_window_s, records=records,
         )
         budget = _BudgetLedger(self.config.max_budget_rub, records)
+        restore_quota = getattr(self.adapter, "restore_quota", None)
+        if restore_quota is not None:
+            restore_quota(identity, records)
         adapter_request_limit = getattr(self.adapter, "max_requests", None)
         request_limit = min(self.config.max_requests, adapter_request_limit or self.config.max_requests)
         requests_reserved = sum(
             1 for record in records.values() for attempt in record.attempts
-            if attempt.request_started
+            if _possibly_dispatched(attempt)
         )
         request_slots_lock = asyncio.Lock()
         queue: asyncio.Queue[int | None] = asyncio.Queue(maxsize=max(1, self.config.concurrency * 2))
@@ -1044,9 +1098,13 @@ class PageOrchestrator:
             current = records[number]
             try:
                 _assert_source_signature(pdf_path, identity)
-                image = await asyncio.to_thread(
-                    self.renderer.render, pdf_path, number, self.config.dpi, self.config,
-                )
+                async_render = getattr(self.renderer, "render_async", None)
+                if async_render is not None:
+                    image = await async_render(pdf_path, number, self.config.dpi, self.config)
+                else:
+                    image = await _render_sync_adapter(
+                        self.renderer, pdf_path, number, self.config.dpi, self.config,
+                    )
                 _assert_source_signature(pdf_path, identity)
             except OrchestrationError as exc:
                 if exc.code == "source_changed_during_run":
@@ -1154,7 +1212,11 @@ class PageOrchestrator:
             records[number] = running
             await self.checkpoint.write(running)
             await notify(number, "running")
+            rate_permit = None
+            slot_reserved = False
             async def stop_before_dispatch(code: str, *, terminal: bool = False) -> None:
+                if rate_permit:
+                    rate_permit.finish(request_started=False)
                 latest = running.attempts[-1].model_copy(update={
                     "state": "failed", "request_started": False,
                     "finished_at": _utc_now(), "safe_error_code": code,
@@ -1180,7 +1242,8 @@ class PageOrchestrator:
                 stop_scheduling.set()
                 await stop_before_dispatch(exc.code, terminal=True)
                 return
-            if not await rate_gate.acquire(estimate.reserved_input_tokens + estimate.reserved_output_tokens, cancel_event, stop_scheduling):
+            rate_permit = await rate_gate.acquire(estimate.reserved_input_tokens + estimate.reserved_output_tokens, cancel_event, stop_scheduling)
+            if not rate_permit:
                 code = "cancelled_before_dispatch" if cancel_event.is_set() else (
                     "budget_stopped_before_dispatch" if stop_code == "budget_exhausted"
                     else stop_code or "orchestration_stopped_before_dispatch"
@@ -1206,23 +1269,46 @@ class PageOrchestrator:
                 )
                 return
 
-            if not await reserve_request_slot():
-                stop_code = "request_limit_exhausted"
-                stop_scheduling.set()
-                await stop_before_dispatch(stop_code, terminal=True)
-                return
-
-            dispatched_at = _utc_now()
-            dispatched_attempt = running.attempts[-1].model_copy(update={
-                "request_started": True,
-                "dispatched_at": dispatched_at,
-            })
-            running = running.model_copy(update={
-                "attempts": [*running.attempts[:-1], dispatched_attempt],
-                "updated_at": dispatched_at,
-            })
-            records[number] = running
-            await self.checkpoint.write(running)
+            async def before_dispatch() -> None:
+                nonlocal running, slot_reserved, stop_code
+                code = None
+                if cancel_event.is_set():
+                    code = "cancelled_before_dispatch"
+                elif stop_scheduling.is_set() and not (
+                    stop_code == "budget_exhausted" and budget.spent + budget.reserved <= budget.cap
+                ):
+                    code = stop_code or "orchestration_stopped_before_dispatch"
+                if code is None:
+                    try:
+                        _assert_source_signature(pdf_path, identity)
+                    except OrchestrationError as exc:
+                        code = stop_code = exc.code
+                        stop_scheduling.set()
+                if code is None:
+                    if not await reserve_request_slot():
+                        code = stop_code = "request_limit_exhausted"
+                        stop_scheduling.set()
+                    else:
+                        slot_reserved = True
+                if code is not None:
+                    raise AdapterRequestError(code, outcome_unknown=False, request_started=False)
+                # This is durable intent, not evidence that a POST happened.
+                # A crash in the following handoff is necessarily ambiguous.
+                now = _utc_now()
+                intent = running.attempts[-1].model_copy(update={"dispatch_intent_at": now})
+                running = running.model_copy(update={
+                    "attempts": [*running.attempts[:-1], intent], "updated_at": now,
+                })
+                records[number] = running
+                await self.checkpoint.write(running)
+                if cancel_event.is_set():
+                    raise AdapterRequestError("cancelled_before_dispatch", outcome_unknown=False, request_started=False)
+                try:
+                    _assert_source_signature(pdf_path, identity)
+                except OrchestrationError as exc:
+                    stop_code = exc.code
+                    stop_scheduling.set()
+                    raise AdapterRequestError(exc.code, outcome_unknown=False, request_started=False) from None
 
             response: AdapterPageResult | None = None
             error_state: str | None = None
@@ -1232,10 +1318,19 @@ class PageOrchestrator:
             error_http_status: int | None = None
             error_finish_reason: str | None = None
             error_request_latency_ms: float | None = None
-            request_task = asyncio.create_task(self.adapter.extract(PageExtractionRequest(
+            request = PageExtractionRequest(
                 identity.source_document_id, number, image, identity.run_id,
-                cancel_event=cancel_event,
-            )))
+                cancel_event=cancel_event, before_dispatch=before_dispatch,
+                reservation_id=_quota_reservation_id(identity, number, len(current.attempts)),
+            )
+
+            async def extract():
+                if not getattr(self.adapter, "supports_dispatch_boundary", False):
+                    await before_dispatch()
+                    request.dispatch_started_at = _utc_now()
+                return await self.adapter.extract(request)
+
+            request_task = asyncio.create_task(extract())
             cancel_task = asyncio.create_task(cancel_event.wait())
             self._active_requests += 1
             self._max_active_requests = max(self._max_active_requests, self._active_requests)
@@ -1320,16 +1415,26 @@ class PageOrchestrator:
                     response = response.model_copy(update={"extraction": response.extraction.model_copy(
                         update={"extraction_fingerprint": scoped_fingerprint})})
 
-            if error_request_started is False:
+            attempt_request_started = (
+                request.dispatch_started_at is not None
+                if error_request_started is None else error_request_started
+            )
+            ambiguous = _possibly_dispatched(running.attempts[-1]) and error_state == "unknown_outcome"
+            if not attempt_request_started and not ambiguous:
+                if error_state == "unknown_outcome":
+                    error_state = "failed"
+                    error_code = ("cancelled_before_dispatch" if error_code == "cancelled_after_dispatch"
+                                  else "adapter_failed_before_dispatch")
+            if not attempt_request_started and slot_reserved and not ambiguous:
                 await release_request_slot()
+            rate_permit.finish(request_started=attempt_request_started or ambiguous)
 
             old_attempts = running.attempts
             final_state = error_state or "completed"
-            attempt_request_started = True if error_request_started is None else error_request_started
             updated_attempt = old_attempts[-1].model_copy(update={
                 "state": final_state,
                 "request_started": attempt_request_started,
-                "dispatched_at": old_attempts[-1].dispatched_at if attempt_request_started else None,
+                "dispatched_at": request.dispatch_started_at if attempt_request_started else None,
                 "finished_at": _utc_now(),
                 "actual_cost_rub": actual_cost,
                 "usage": usage,
@@ -1339,7 +1444,7 @@ class PageOrchestrator:
                 "safe_error_code": error_code,
                 "elapsed_s": time.perf_counter() - request_started_at,
             })
-            if await budget.settle(reserve, actual_cost, request_started=attempt_request_started):
+            if await budget.settle(reserve, actual_cost, request_started=attempt_request_started or ambiguous):
                 if stop_code is None:
                     stop_code = "budget_exhausted"
                 stop_scheduling.set()
@@ -1370,7 +1475,13 @@ class PageOrchestrator:
                     return
                 if cancel_event.is_set() or stop_scheduling.is_set():
                     return
-                await process_page(item)
+                if not await PAGE_CAPACITY.acquire(cancel_event, stop_scheduling):
+                    return
+                try:
+                    await process_page(item)
+                finally:
+                    self._active_images.pop(item, None)
+                    PAGE_CAPACITY.release()
 
         producer = asyncio.create_task(produce())
         workers = [asyncio.create_task(worker()) for _ in range(self.config.concurrency)]
@@ -1388,15 +1499,16 @@ class PageOrchestrator:
             # Running attempts left by cancellation are ambiguous and must not be retried.
             for number, record in list(records.items()):
                 if record.state == "running":
+                    ambiguous = _possibly_dispatched(record.attempts[-1])
                     latest = record.attempts[-1].model_copy(update={
-                        "state": "unknown_outcome", "finished_at": _utc_now(),
-                        "safe_error_code": "orchestrator_interrupted",
+                        "state": "unknown_outcome" if ambiguous else "failed", "finished_at": _utc_now(),
+                        "safe_error_code": "orchestrator_interrupted" if ambiguous else "cancelled_before_dispatch",
                     })
                     records[number] = record.model_copy(update={
-                        "state": "unknown_outcome", "attempts": [*record.attempts[:-1], latest],
+                        "state": "unknown_outcome" if ambiguous else "pending", "attempts": [*record.attempts[:-1], latest],
                         "updated_at": _utc_now(),
                     })
-                if record.state == "pending" or records[number].state == "unknown_outcome":
+                if records[number].state in {"pending", "unknown_outcome"}:
                     await self.checkpoint.write(records[number])
 
         source_integrity_verified, source_integrity_error_code = _verify_source_content(pdf_path, identity)
@@ -1477,6 +1589,13 @@ class PageOrchestrator:
                         else:
                             code = "page_not_processed"
                 draft_pages.append(failed_page(identity.source_document_id, record.page_number, code))
+        page_region_metadata = {}
+        if self.config.page_regions:
+            page_region_metadata = {
+                "page_regions": {str(number): list(region) for number, region in self.config.page_regions.items()},
+                "region_coordinate_system": "normalized_pdf_page",
+                "page_region_pdf_points": await self._region_pdf_points(pdf_path),
+            }
         draft = assemble_document_draft(
             identity.source_document_id,
             draft_pages,
@@ -1487,25 +1606,23 @@ class PageOrchestrator:
                 "run_id": identity.run_id,
                 "adapter_fingerprint": identity.adapter_fingerprint,
                 "processing_fingerprint": identity.processing_fingerprint,
-                **({"page_regions": {str(number): list(region) for number, region in self.config.page_regions.items()},
-                    "region_coordinate_system": "normalized_pdf_page",
-                    "page_region_pdf_points": self._region_pdf_points(pdf_path)} if self.config.page_regions else {}),
+                **page_region_metadata,
             },
         )
         all_attempts = [attempt for record in ordered_records for attempt in record.attempts]
         unknown_cost = sum((
-            (attempt.reserved_cost_rub or Decimal(0))
+            (attempt.reserved_cost_rub if attempt.reserved_cost_rub is not None else self.config.max_budget_rub)
             for attempt in all_attempts
-            if attempt.request_started and attempt.actual_cost_rub is None
+            if _possibly_dispatched(attempt) and attempt.actual_cost_rub is None
         ), Decimal(0))
         actual_known = sum((
             (attempt.actual_cost_rub or Decimal(0))
             for attempt in all_attempts if attempt.actual_cost_rub is not None
         ), Decimal(0))
         has_unknown_cost = any(
-            attempt.request_started and attempt.actual_cost_rub is None for attempt in all_attempts
+            _possibly_dispatched(attempt) and attempt.actual_cost_rub is None for attempt in all_attempts
         )
-        request_attempts = [attempt for attempt in all_attempts if attempt.request_started]
+        request_attempts = [attempt for attempt in all_attempts if _possibly_dispatched(attempt)]
         actual_total: Decimal | None = None if not request_attempts or has_unknown_cost else actual_known
 
         def usage_total(field_name: str) -> int | None:

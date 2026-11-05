@@ -7,7 +7,9 @@ process. It stores only an in-memory HMAC key, never the credential itself.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import contextvars
+from functools import partial
 import hashlib
 import hmac
 import json
@@ -15,7 +17,6 @@ import math
 import re
 import secrets as random_secrets
 import threading
-import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -24,7 +25,9 @@ from averon_import.services.ai_first.contracts import AIPageExtraction, AIReview
 from averon_import.services.ai_first.orchestration import (
     AdapterDescriptor, AdapterPageResult, AdapterRequestError, PageExtractionRequest,
     PageImage, RequestEstimate, TokenUsage,
+    _possibly_dispatched, _quota_age, _quota_reservation_id, _utc_now,
 )
+from averon_import.services.ai_first.dispatch import ProcessCapacity, RollingQuota
 from averon_import.services.ocr.qwen_vision_client import (
     USER_CONTEXT_POLICY_VERSION, QwenVisionClient, QwenVisionConfig,
     QwenVisionError, VisionCompletion, VisionLimits, validate_user_context,
@@ -35,44 +38,15 @@ from averon_import.services.secrets import SecretStore
 
 QWEN_VISION_PROMPT_VERSION = "qwen-vision-page-v1.4"
 QWEN_VISION_CONTEXT_WINDOW_TOKENS = 262144
+_HTTP_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="qwen-vision")
+_HTTP_CAPACITY = ProcessCapacity(10)
 
 
-class _SharedQuota:
+class _SharedQuota(RollingQuota):
     def __init__(self, requests_per_minute: int, tokens_per_minute: int, window_s: float):
         self.requests_per_minute = requests_per_minute
         self.tokens_per_minute = tokens_per_minute
-        self.window_s = window_s
-        self._events: deque[tuple[float, int]] = deque()
-        self._lock = threading.Lock()
-
-    async def acquire(self, token_reservation: int, cancel_event: asyncio.Event | None) -> bool:
-        if token_reservation > self.tokens_per_minute:
-            return False
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                return False
-            with self._lock:
-                now = time.monotonic()
-                while self._events and self._events[0][0] <= now - self.window_s:
-                    self._events.popleft()
-                used_tokens = sum(tokens for _, tokens in self._events)
-                if (
-                    len(self._events) < self.requests_per_minute
-                    and used_tokens + token_reservation <= self.tokens_per_minute
-                ):
-                    self._events.append((now, token_reservation))
-                    return True
-                if not self._events:
-                    return False
-                delay = max(0.001, self._events[0][0] + self.window_s - now)
-            if cancel_event is None:
-                await asyncio.sleep(delay)
-                continue
-            try:
-                await asyncio.wait_for(cancel_event.wait(), timeout=delay)
-                return False
-            except asyncio.TimeoutError:
-                continue
+        super().__init__(requests_per_minute, tokens_per_minute, window_s=window_s)
 
 
 class QwenVisionQuotaRegistry:
@@ -117,13 +91,28 @@ class QwenVisionQuotaRegistry:
         tokens_per_minute: int,
         token_reservation: int,
         cancel_event: asyncio.Event | None,
-    ) -> bool:
+        *, reservation_id: str | None = None,
+    ):
         quota = self._get(credential, requests_per_minute, tokens_per_minute)
-        return await quota.acquire(token_reservation, cancel_event)
+        return await quota.acquire(token_reservation, cancel_event, reservation_id=reservation_id)
 
 
 class QwenVisionAdapter:
     """Maps Qwen VisionPage results into V2A without semantic promotion."""
+
+    supports_dispatch_boundary = True
+
+    def restore_quota(self, identity, records):
+        quota = self._quota_registry._get(
+            self.client.config.api_key, self.requests_per_minute, self.tokens_per_minute,
+        )
+        for record in records.values():
+            for attempt_index, attempt in enumerate(record.attempts):
+                if _possibly_dispatched(attempt):
+                    tokens = (attempt.reserved_input_tokens + attempt.reserved_output_tokens
+                              if attempt.reserved_input_tokens is not None and attempt.reserved_output_tokens is not None
+                              else self.tokens_per_minute)
+                    quota.restore(tokens, _quota_age(attempt), _quota_reservation_id(identity, record.page_number, attempt_index))
 
     def __init__(
         self,
@@ -322,6 +311,7 @@ class QwenVisionAdapter:
                 self.tokens_per_minute,
                 token_reservation,
                 cancel_event,
+                reservation_id=request.reservation_id,
             )
         except asyncio.CancelledError:
             raise AdapterRequestError(
@@ -332,13 +322,26 @@ class QwenVisionAdapter:
             raise AdapterRequestError(code, outcome_unknown=False, request_started=False)
 
         thread_cancel = threading.Event()
-        call_task = asyncio.create_task(asyncio.to_thread(
-            self.client.extract,
-            request.image.data,
-            request.page_number,
+        loop = asyncio.get_running_loop()
+
+        def before_dispatch():
+            if request.before_dispatch is not None:
+                future = asyncio.run_coroutine_threadsafe(request.before_dispatch(), loop)
+                try:
+                    future.result()
+                except AdapterRequestError as exc:
+                    raise QwenVisionError(exc.safe_code) from None
+
+        def on_dispatch():
+            request.dispatch_started_at = _utc_now()
+
+        call_task = asyncio.create_task(self._call_client(
+            partial(self.client.extract, request.image.data, request.page_number,
             timeout_s=self.client.config.limits.request_timeout_s,
             cancel=thread_cancel,
             user_context=self._user_context,
+            before_dispatch=before_dispatch,
+            on_dispatch=on_dispatch), thread_cancel,
         ))
         try:
             completion = await asyncio.shield(call_task)
@@ -350,7 +353,26 @@ class QwenVisionAdapter:
                 return self._raise_client_error(exc, request)
         except QwenVisionError as exc:
             return self._raise_client_error(exc, request)
+        finally:
+            admitted.finish(request_started=request.dispatch_started_at is not None)
         return self._convert_completion(completion, request)
+
+    @staticmethod
+    async def _call_client(call, cancel):
+        # asyncio's default executor may have fewer than ten threads and is
+        # shared with unrelated app work. Bound both our pool and submissions.
+        if not await _HTTP_CAPACITY.acquire(cancel):
+            raise QwenVisionError("cancelled")
+        try:
+            context = contextvars.copy_context()
+            future = asyncio.get_running_loop().run_in_executor(_HTTP_POOL, context.run, call)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                cancel.set()
+                return await QwenVisionAdapter._wait_for_thread(future, cancel)
+        finally:
+            _HTTP_CAPACITY.release()
 
     @staticmethod
     async def _wait_for_thread(task: asyncio.Task, cancel: threading.Event) -> VisionCompletion:
