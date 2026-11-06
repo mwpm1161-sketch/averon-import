@@ -24,6 +24,8 @@ from .coordination_contracts import (
 from .coordination_schema import (
     APPLICATION_ID, RECONCILIATION_MIN_SCHEMA_VERSION, SCHEMA_SQL, SCHEMA_VERSION,
 )
+from .coordination_schema_v2 import schema_sql, capabilities as schema_capabilities
+from .coordination_maintenance import MaintenanceClient, _BorrowedMaintenance
 from .private_acl import (
     PrivateAclError, create_private_directory, secure_private_path,
     verify_private_path, verify_private_tree,
@@ -65,10 +67,10 @@ def _schema_digest(connection):
     )])
 
 
-def _expected_schema_digest():
+def _expected_schema_digest(version=1):
     connection = sqlite3.connect(":memory:")
     try:
-        connection.executescript(SCHEMA_SQL)
+        connection.executescript(schema_sql(version))
         return _schema_digest(connection)
     finally:
         connection.close()
@@ -123,6 +125,7 @@ class DispatcherLease:
                         fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
             finally:
                 self._stream.close()
+                self._ledger._release_use()
 
     def __enter__(self):
         return self
@@ -133,16 +136,33 @@ class DispatcherLease:
 
 class CoordinationLedger:
     def __init__(self, root, *, installation_id: str, clock=system_clock,
-                 busy_timeout_ms: int = 250, lease_ms: int = 30_000):
+                 busy_timeout_ms: int = 250, lease_ms: int = 30_000,
+                 schema_version: int = 1, maintenance_root=None, _maintenance=None):
         self.root = _safe_root(root)
         self.path, self.lock_path = self.root / "coordination.sqlite3", self.root / "dispatcher.lock"
         self.installation_id = uuid_hex(installation_id)
         self.clock = clock
         self.busy_timeout_ms = integer(busy_timeout_ms)
         self.lease_ms = integer(lease_ms, minimum=1)
-        self._schema_digest = _expected_schema_digest()
+        schema_sql(schema_version)
+        self.schema_version = schema_version
+        self._schema_digest = _expected_schema_digest(schema_version)
         self._db_identity = self._lock_identity = None
+        self._lifetime_guard = threading.RLock()
+        self._users, self._closed, self._maintenance = 0, False, None
         try:
+            if _maintenance is not None:
+                if type(_maintenance) is not _BorrowedMaintenance or maintenance_root is not None:
+                    raise CoordinationError("invalid_maintenance_lease")
+                session = _maintenance.session
+                if (session.layout.ledger_root != self.root
+                        or session.layout.installation_id != self.installation_id):
+                    raise CoordinationError("maintenance_binding_mismatch")
+                self._maintenance = _maintenance
+            elif maintenance_root is not None:
+                self._maintenance = MaintenanceClient(maintenance_root, self.root, self.installation_id)
+            elif schema_version == 2:
+                raise CoordinationError("maintenance_protocol_required")
             self._verify_storage()
             self._db_identity, self._lock_identity = _file_identity(self.path), _file_identity(self.lock_path)
             with self._connection() as connection:
@@ -152,14 +172,50 @@ class CoordinationLedger:
                     raise CoordinationError("ledger_corrupt")
                 if _schema_digest(connection) != self._schema_digest:
                     raise CoordinationError("schema_mismatch")
-        except (OSError, PrivateAclError, sqlite3.Error):
-            raise CoordinationError("ledger_unavailable") from None
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, (OSError, PrivateAclError, sqlite3.Error)):
+                raise CoordinationError("ledger_unavailable") from None
+            raise
+
+    def _retain_use(self):
+        with self._lifetime_guard:
+            if self._closed:
+                raise CoordinationError("ledger_closed")
+            self._users += 1
+
+    def _release_use(self):
+        with self._lifetime_guard:
+            self._users -= 1
+
+    def close(self):
+        with self._lifetime_guard:
+            if self._users:
+                raise CoordinationError("ledger_in_use")
+            if not self._closed:
+                self._closed = True
+                if self._maintenance is not None:
+                    self._maintenance.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @classmethod
     def bootstrap(cls, root, spec: Bootstrap, *, clock=system_clock, **options):
         """Explicit attested initialization into a NEW directory; never overwrite."""
         if type(spec) is not Bootstrap:
             raise CoordinationError("invalid_bootstrap")
+        if options.get("schema_version", 1) != 1:
+            raise CoordinationError("bootstrap_requires_schema_v1")
         root = _safe_root(root)
         if root.exists():
             raise CoordinationError("bootstrap_target_exists")
@@ -222,6 +278,8 @@ class CoordinationLedger:
         return cls(root, installation_id=spec.installation_id, clock=clock, **options)
 
     def _verify_storage(self):
+        if self._maintenance is not None:
+            self._maintenance.check()
         verify_private_path(self.root, directory=True)
         for path, expected in ((self.path, self._db_identity), (self.lock_path, self._lock_identity)):
             verify_private_path(path, directory=False)
@@ -242,6 +300,7 @@ class CoordinationLedger:
 
     @contextmanager
     def _connection(self):
+        self._retain_use()
         connection = None
         try:
             self._verify_storage()
@@ -253,14 +312,17 @@ class CoordinationLedger:
                     or connection.execute("PRAGMA synchronous").fetchone()[0] != 3):
                 raise CoordinationError("durability_unverified")
             if (connection.execute("PRAGMA journal_mode").fetchone()[0] != "delete"
-                    or connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                    or connection.execute("PRAGMA user_version").fetchone()[0] != self.schema_version
                     or connection.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID):
                 raise CoordinationError("schema_mismatch")
             meta = connection.execute("SELECT installation_id,schema_version FROM meta WHERE id=1").fetchone()
-            if meta != (self.installation_id, SCHEMA_VERSION):
+            if meta != (self.installation_id, self.schema_version):
                 raise CoordinationError("installation_mismatch")
             if _schema_digest(connection) != self._schema_digest:
                 raise CoordinationError("schema_mismatch")
+            if self.schema_version == 2 and connection.execute(
+                    "SELECT * FROM schema_capabilities").fetchall() != [(1, 1, 0)]:
+                raise CoordinationError("capability_mismatch")
             yield connection
         except (OSError, PrivateAclError):
             raise CoordinationError("storage_unverified") from None
@@ -269,8 +331,11 @@ class CoordinationLedger:
             raise CoordinationError("ledger_busy" if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
                                     else "ledger_unavailable") from None
         finally:
-            if connection is not None:
-                connection.close()
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                self._release_use()
 
     @contextmanager
     def _transaction(self, owner=None, *, acquiring=False):
@@ -319,6 +384,7 @@ class CoordinationLedger:
                     raise
 
     def dispatcher(self) -> DispatcherLease:
+        self._retain_use()
         stream = None
         transferred = False
         try:
@@ -356,6 +422,8 @@ class CoordinationLedger:
             # Ownership transfers to the returned lease only after durable commit.
             if stream is not None and not transferred:
                 stream.close()
+            if not transferred:
+                self._release_use()
 
     @staticmethod
     def _replay(connection, operation_id, kind, payload):
@@ -834,7 +902,7 @@ class CoordinationLedger:
         """Read-only compatibility contract, not an upgrade or B6 operation."""
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM schema_contract").fetchone()
-            expected = (SCHEMA_VERSION, RECONCILIATION_MIN_SCHEMA_VERSION,
+            expected = (self.schema_version, 2 if self.schema_version == 1 else 3,
                         "sealed_history", "explicit_transactional_migration")
             if row != expected:
                 raise CoordinationError("schema_contract_mismatch")
@@ -842,10 +910,17 @@ class CoordinationLedger:
                              "history_policy", "reconciliation_upgrade"), row))
 
     def require_reconciliation_schema(self):
-        """B6 must never reinterpret v1 immutable rows as mutable release state.
+        """Neither registered schema grants reconciliation, regardless of numbering."""
+        self.schema_contract()
+        if "b6_reconciliation" not in self.capabilities():
+            raise CoordinationError("reconciliation_requires_schema_v2" if self.schema_version == 1
+                                    else "reconciliation_requires_schema_v3")
 
-        A future v2 runtime/migrator is separately reviewed. This v1 binary
-        cannot open v2 and cannot authorize a reconciliation mutation.
-        """
-        if self.schema_contract()["reconciliation_min_schema_version"] > SCHEMA_VERSION:
-            raise CoordinationError("reconciliation_requires_schema_v2")
+    def capabilities(self):
+        # Validate real storage on every capability check; never trust a caller's version.
+        with self._connection():
+            return schema_capabilities(self.schema_version)
+
+    def require_capability(self, capability):
+        if capability not in self.capabilities():
+            raise CoordinationError("capability_not_authorized")
