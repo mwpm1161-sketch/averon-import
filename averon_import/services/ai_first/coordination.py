@@ -541,6 +541,207 @@ class CoordinationLedger:
         connection.execute("UPDATE quota_scopes SET blocked=1 WHERE scope_id IN (SELECT quota_scope_id FROM attempt_quota_reservations WHERE attempt_id=?)",
                            (attempt_id,))
 
+    def checkpoint_attempts(self, owner, expected_run: Run):
+        """Owner-validated dispatch history for checkpoint preparation recovery.
+
+        Absence is observed only in this verified existing ledger/current run.
+        This read neither settles money nor authorizes HTTP or historical replay.
+        """
+        if type(expected_run) is not Run:
+            raise CoordinationError("invalid_run")
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            run = connection.execute(
+                "SELECT r.body_json FROM runs r JOIN documents d USING(tenant_id,document_id)"
+                " WHERE r.run_id=? AND d.active_run_id=r.run_id AND d.generation=r.generation",
+                (expected_run.run_id,),
+            ).fetchone()
+            if run is None or run[0] != canonical(asdict(expected_run)):
+                raise CoordinationError("run_fenced")
+            return tuple(dict(row) for row in connection.execute(
+                "SELECT attempt_id,page_number,attempt_no,claim_seq,state,input_tokens,output_tokens,"
+                "reserve_units,actual_units,owner_epoch FROM attempts WHERE run_id=? ORDER BY page_number,attempt_no",
+                (expected_run.run_id,),
+            ))
+
+    def historical_evidence_facts(self, owner, attempt: Attempt, expected_run: Run):
+        """Verify immutable B1 facts for settlement of already-saved evidence.
+
+        This is deliberately independent of current run selection, binding
+        activity, current policy revisions, and current admission stops. It is
+        a read-only predicate under the current dispatcher owner; callers must
+        still pass the exact Outcome to record_outcome() for atomic replay and
+        mutation. It never authorizes dispatch.
+        """
+        if (type(attempt) is not Attempt or type(expected_run) is not Run
+                or expected_run.run_id != attempt.run_id):
+            raise CoordinationError("historical_identity_mismatch")
+        import json
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            quick_check = tuple(tuple(item) for item in connection.execute("PRAGMA quick_check").fetchall())
+            foreign_key_errors = tuple(tuple(item) for item in connection.execute("PRAGMA foreign_key_check").fetchall())
+            if quick_check != (("ok",),) or foreign_key_errors:
+                raise CoordinationError("ledger_corrupt")
+
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (expected_run.run_id,)).fetchone()
+            if (run is None or run["body_json"] != canonical(asdict(expected_run))
+                    or (run["tenant_id"], run["document_id"], run["generation"],
+                        run["budget_units"], run["request_cap"])
+                    != (expected_run.tenant_id, expected_run.document_id, expected_run.generation,
+                        expected_run.budget_units, expected_run.request_cap)):
+                raise CoordinationError("historical_run_mismatch")
+            document = connection.execute(
+                "SELECT generation FROM documents WHERE tenant_id=? AND document_id=?",
+                (expected_run.tenant_id, expected_run.document_id),
+            ).fetchone()
+            if document is None or document[0] < expected_run.generation:
+                raise CoordinationError("historical_run_mismatch")
+
+            row = connection.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt.attempt_id,)).fetchone()
+            expected_attempt = canonical(asdict(attempt))
+            if (row is None or row["body_json"] != expected_attempt
+                    or (row["operation_id"], row["run_id"], row["page_number"], row["attempt_no"],
+                        row["claim_seq"], row["binding_id"], row["binding_revision"],
+                        row["billing_scope_id"], row["billing_revision"], row["request_digest"],
+                        row["input_tokens"], row["output_tokens"], row["reserve_units"])
+                    != (attempt.operation_id, attempt.run_id, attempt.page_number, attempt.attempt_no,
+                        attempt.claim_seq, attempt.binding.binding_id, attempt.binding.revision,
+                        attempt.binding.billing_scope_id, attempt.billing_revision, attempt.request_digest,
+                        attempt.input_tokens, attempt.output_tokens, attempt.reserve_units)
+                    or row["state"] not in {"intent", "unknown", "terminal", "not_sent"}
+                    or type(row["owner_epoch"]) is not int or row["owner_epoch"] < 1):
+                raise CoordinationError("historical_attempt_mismatch")
+
+            binding = connection.execute(
+                "SELECT body_json,digest FROM credential_bindings WHERE binding_id=? AND revision=?",
+                (attempt.binding.binding_id, attempt.binding.revision),
+            ).fetchone()
+            if (binding is None or binding["body_json"] != canonical(asdict(attempt.binding))
+                    or binding["digest"] != attempt.binding.fingerprint):
+                raise CoordinationError("historical_binding_mismatch")
+            binding_edges = tuple(item[0] for item in connection.execute(
+                "SELECT quota_scope_id FROM binding_quotas WHERE binding_id=? AND binding_revision=?"
+                " ORDER BY quota_scope_id", (attempt.binding.binding_id, attempt.binding.revision),
+            ))
+            if binding_edges != attempt.binding.quota_scope_ids:
+                raise CoordinationError("historical_binding_mismatch")
+
+            billing = connection.execute(
+                "SELECT revision FROM billing_scopes WHERE scope_id=?",
+                (attempt.binding.billing_scope_id,),
+            ).fetchone()
+            if billing is None or billing[0] < attempt.billing_revision:
+                raise CoordinationError("historical_billing_scope_mismatch")
+
+            reservations = connection.execute(
+                "SELECT q.*,s.revision AS current_revision FROM attempt_quota_reservations q"
+                " LEFT JOIN quota_scopes s ON s.scope_id=q.quota_scope_id"
+                " WHERE q.attempt_id=? ORDER BY q.quota_scope_id",
+                (attempt.attempt_id,),
+            ).fetchall()
+            if len(reservations) != len(attempt.quota_revisions):
+                raise CoordinationError("historical_quota_reservation_mismatch")
+            policy_fields = {
+                "scope_id", "revision", "requests", "tokens", "concurrency", "window_ms",
+                "opening_requests", "opening_tokens", "opening_inflight", "opening_boot_id",
+                "opening_ended_ms", "opening_window_ms", "history_complete", "evidence_digest", "blocked",
+            }
+            for reservation, (scope_id, revision) in zip(reservations, attempt.quota_revisions):
+                try:
+                    policy = json.loads(reservation["policy_json"])
+                except (TypeError, ValueError, RecursionError):
+                    raise CoordinationError("historical_quota_reservation_mismatch") from None
+                if (type(policy) is not dict
+                        or reservation["quota_scope_id"] != scope_id
+                        or reservation["policy_revision"] != revision
+                        or reservation["current_revision"] is None
+                        or reservation["current_revision"] < revision
+                        or reservation["window_ms"] != policy.get("window_ms")
+                        or reservation["reserved_tokens"] != attempt.input_tokens + attempt.output_tokens
+                        or set(policy) != policy_fields
+                        or canonical(policy) != reservation["policy_json"]
+                        or policy.get("scope_id") != scope_id or policy.get("revision") != revision
+                        or any(type(policy.get(key)) is not int or policy[key] < 1 for key in (
+                            "requests", "tokens", "concurrency", "window_ms", "opening_window_ms",
+                        ))
+                        or any(type(policy.get(key)) is not int or policy[key] < 0 for key in (
+                            "opening_requests", "opening_tokens", "opening_inflight", "opening_ended_ms",
+                        ))
+                        or type(policy.get("history_complete")) is not int or policy["history_complete"] not in (0, 1)
+                        or type(policy.get("blocked")) is not int or policy["blocked"] not in (0, 1)
+                        or not isinstance(policy.get("opening_boot_id"), str)
+                        or not isinstance(policy.get("evidence_digest"), str)
+                        or len(policy["evidence_digest"]) != 64
+                        or any(character not in "0123456789abcdef" for character in policy["evidence_digest"])):
+                    raise CoordinationError("historical_quota_reservation_mismatch")
+                try:
+                    uuid_hex(policy["opening_boot_id"])
+                except CoordinationError:
+                    raise CoordinationError("historical_quota_reservation_mismatch") from None
+
+            receipt = connection.execute(
+                "SELECT kind,request_digest,request_json,result_json,epoch,boot_id,created_ms"
+                " FROM operations WHERE operation_id=?", (attempt.operation_id,),
+            ).fetchone()
+            expected_reservation = canonical({"attempt_id": attempt.attempt_id, "owner_epoch": row["owner_epoch"]})
+            if (receipt is None or receipt["kind"] != "reserve"
+                    or receipt["request_digest"] != fingerprint(asdict(attempt))
+                    or receipt["request_json"] != expected_attempt
+                    or receipt["result_json"] != expected_reservation
+                    or receipt["epoch"] != row["owner_epoch"]
+                    or type(receipt["created_ms"]) is not int or receipt["created_ms"] < 0):
+                raise CoordinationError("historical_reserve_receipt_mismatch")
+            try:
+                uuid_hex(receipt["boot_id"])
+            except CoordinationError:
+                raise CoordinationError("historical_reserve_receipt_mismatch") from None
+
+            return {
+                "owner_epoch": row["owner_epoch"],
+                "state": row["state"],
+                "actual_units": row["actual_units"],
+                "evidence_digest": row["evidence_digest"],
+            }
+
+    def validate_dispatch(self, owner, attempt: Attempt, *, expected_run: Run, evidence_only=False):
+        """Revalidate an existing intent at the B2 boundary; never mint a permit.
+
+        B2 separately requires a fresh reserve receipt and consumes its one-shot
+        process capability. This short transaction is not held during HTTP.
+        evidence_only validates old facts for settlement/checkpoint recovery;
+        it is never used to mint or consume a send capability.
+        """
+        if type(attempt) is not Attempt or type(expected_run) is not Run or expected_run.run_id != attempt.run_id:
+            raise CoordinationError("invalid_attempt")
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            row = connection.execute("SELECT * FROM attempts WHERE attempt_id=?",
+                                     (attempt.attempt_id,)).fetchone()
+            if (row is None or row["body_json"] != canonical(asdict(attempt))
+                    or (not evidence_only and (row["owner_epoch"] != owner.epoch or row["state"] != "intent"))):
+                raise CoordinationError("dispatch_intent_mismatch")
+            current = connection.execute(
+                "SELECT r.body_json FROM runs r JOIN documents d USING(tenant_id,document_id)"
+                " WHERE r.run_id=? AND d.active_run_id=r.run_id AND d.generation=r.generation",
+                (attempt.run_id,),
+            ).fetchone()
+            if current is None or current[0] != canonical(asdict(expected_run)):
+                raise CoordinationError("run_fenced")
+            binding = connection.execute(
+                "SELECT digest FROM credential_bindings WHERE binding_id=? AND revision=? AND active=1",
+                (attempt.binding.binding_id, attempt.binding.revision),
+            ).fetchone()
+            if binding is None or binding[0] != attempt.binding.fingerprint:
+                raise CoordinationError("binding_mismatch")
+            for table, scope, revision in (
+                ("billing_scopes", attempt.binding.billing_scope_id, attempt.billing_revision),
+                *(("quota_scopes", scope, revision) for scope, revision in attempt.quota_revisions),
+            ):
+                policy = connection.execute(f"SELECT revision,blocked FROM {table} WHERE scope_id=?",
+                                            (scope,)).fetchone()
+                if policy is None or policy["revision"] != revision:
+                    raise CoordinationError("policy_revision_mismatch")
+                if policy["blocked"] and not evidence_only:
+                    raise CoordinationError("needs_reconciliation")
+
     def record_outcome(self, owner, outcome: Outcome):
         """Trusted-core facts only. B2/B6 must validate artifact/provider evidence.
 

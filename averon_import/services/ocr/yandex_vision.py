@@ -443,6 +443,9 @@ class YandexVisionProvider:
                 request_timeout = float(timeout)
                 if deadline is not None:
                     request_timeout = min(request_timeout, max(0.001, deadline - self._now()))
+                if method.upper() == "POST":
+                    from averon_import.services.ai_first.dispatch_policy import deny_legacy_post
+                    deny_legacy_post()
                 response = self._http.request(
                     method,
                     url,

@@ -638,7 +638,7 @@ class CheckpointStore:
         self._io_lock = asyncio.Lock()
         self._execution_lock = threading.Lock()
 
-    def open(self) -> dict[int, PageRunRecord]:
+    def open(self, *, recover_running: bool = True) -> dict[int, PageRunRecord]:
         if self._lock_stream is not None:
             raise OrchestrationError("checkpoint_in_use")
         repo_root = Path(__file__).resolve().parents[3]
@@ -685,7 +685,7 @@ class CheckpointStore:
                     raise OrchestrationError("checkpoint_invalid")
                 if record.extraction is not None and record.extraction.source_document_id != self.identity.source_document_id:
                     raise OrchestrationError("checkpoint_invalid")
-                if record.state == "running":
+                if record.state == "running" and recover_running:
                     ambiguous = _possibly_dispatched(record.attempts[-1])
                     attempt = record.attempts[-1].model_copy(update={
                         "state": "unknown_outcome" if ambiguous else "failed",
@@ -923,6 +923,7 @@ class PageOrchestrator:
         logger: logging.Logger | None = None,
         progress: ProgressCallback | None = None,
         rate_window_s: float = 60.0,
+        durable_dispatch=None,
     ):
         self.adapter = adapter
         self.renderer = renderer
@@ -931,6 +932,13 @@ class PageOrchestrator:
         self.logger = logger or logging.getLogger(__name__)
         self.progress = progress
         self.rate_window_s = rate_window_s
+        if getattr(adapter, "durable_dispatch", None) is not durable_dispatch:
+            raise OrchestrationError("durable_composition_mismatch")
+        if durable_dispatch is not None:
+            from averon_import.services.ai_first.durable_qwen_adapter import DurableQwenVisionAdapter
+            if type(adapter) is not DurableQwenVisionAdapter or durable_dispatch is not adapter:
+                raise OrchestrationError("durable_composition_mismatch")
+        self.durable_dispatch = durable_dispatch
         self._active_requests = 0
         self._max_active_requests = 0
         self._active_images: dict[int, int] = {}
@@ -1004,7 +1012,14 @@ class PageOrchestrator:
         )
         if actual_identity != identity:
             raise OrchestrationError("source_or_configuration_identity_mismatch")
-        records = self.checkpoint.open()
+        # Durable recovery must consult SQLite before classifying a running
+        # preparation. A missing checkpoint marker is not proof of no intent.
+        records = (self.checkpoint.open() if self.durable_dispatch is None
+                   else self.checkpoint.open(recover_running=False))
+        if self.durable_dispatch is not None:
+            if retry_pages:
+                raise OrchestrationError("durable_retry_requires_new_run")
+            await self.durable_dispatch.start(identity, self.config, self.checkpoint, records)
         total = identity.page_count
         retry_pages = set(retry_pages or ())
         if any(type(page) is not int or page < 1 or page > total for page in retry_pages):
@@ -1031,11 +1046,11 @@ class PageOrchestrator:
             if record.state == "pending" and number in page_selection:
                 pending.append(number)
 
-        rate_gate = _RateGate(
+        rate_gate = None if self.durable_dispatch is not None else _RateGate(
             self.config.requests_per_minute, self.config.tokens_per_minute,
             window_s=self.rate_window_s, records=records,
         )
-        budget = _BudgetLedger(self.config.max_budget_rub, records)
+        budget = None if self.durable_dispatch is not None else _BudgetLedger(self.config.max_budget_rub, records)
         restore_quota = getattr(self.adapter, "restore_quota", None)
         if restore_quota is not None:
             restore_quota(identity, records)
@@ -1074,6 +1089,8 @@ class PageOrchestrator:
 
         async def reserve_request_slot() -> bool:
             nonlocal requests_reserved
+            if self.durable_dispatch is not None:
+                return True
             async with request_slots_lock:
                 if requests_reserved >= request_limit:
                     return False
@@ -1082,6 +1099,8 @@ class PageOrchestrator:
 
         async def release_request_slot() -> None:
             nonlocal requests_reserved
+            if self.durable_dispatch is not None:
+                return
             async with request_slots_lock:
                 requests_reserved = max(0, requests_reserved - 1)
 
@@ -1192,8 +1211,9 @@ class PageOrchestrator:
                 self._active_images.pop(number, None)
                 return
 
-            reserve = self.config.pricing.reserve_cost(estimate.reserved_input_tokens, estimate.reserved_output_tokens)
-            if not await budget.reserve(reserve):
+            reserve = (self.config.pricing.reserve_cost(estimate.reserved_input_tokens, estimate.reserved_output_tokens)
+                       if self.durable_dispatch is None else self.durable_dispatch.reserve_cost(estimate))
+            if budget is not None and not await budget.reserve(reserve):
                 self._active_images.pop(number, None)
                 stop_code = "budget_exhausted"
                 stop_scheduling.set()
@@ -1222,7 +1242,8 @@ class PageOrchestrator:
                     "finished_at": _utc_now(), "safe_error_code": code,
                     "elapsed_s": time.perf_counter() - request_started_at,
                 })
-                await budget.settle(reserve, None, request_started=False)
+                if budget is not None:
+                    await budget.settle(reserve, None, request_started=False)
                 records[number] = running.model_copy(update={
                     "state": "failed" if terminal else "pending",
                     "attempts": [*running.attempts[:-1], latest],
@@ -1242,8 +1263,9 @@ class PageOrchestrator:
                 stop_scheduling.set()
                 await stop_before_dispatch(exc.code, terminal=True)
                 return
-            rate_permit = await rate_gate.acquire(estimate.reserved_input_tokens + estimate.reserved_output_tokens, cancel_event, stop_scheduling)
-            if not rate_permit:
+            if rate_gate is not None:
+                rate_permit = await rate_gate.acquire(estimate.reserved_input_tokens + estimate.reserved_output_tokens, cancel_event, stop_scheduling)
+            if rate_gate is not None and not rate_permit:
                 code = "cancelled_before_dispatch" if cancel_event.is_set() else (
                     "budget_stopped_before_dispatch" if stop_code == "budget_exhausted"
                     else stop_code or "orchestration_stopped_before_dispatch"
@@ -1275,7 +1297,7 @@ class PageOrchestrator:
                 if cancel_event.is_set():
                     code = "cancelled_before_dispatch"
                 elif stop_scheduling.is_set() and not (
-                    stop_code == "budget_exhausted" and budget.spent + budget.reserved <= budget.cap
+                    budget is not None and stop_code == "budget_exhausted" and budget.spent + budget.reserved <= budget.cap
                 ):
                     code = stop_code or "orchestration_stopped_before_dispatch"
                 if code is None:
@@ -1380,7 +1402,9 @@ class PageOrchestrator:
                 self._active_images.pop(number, None)
 
             usage: TokenUsage | None = error_usage
-            actual_cost: Decimal | None = self.config.pricing.actual_cost(usage) if usage is not None else None
+            actual_cost: Decimal | None = (
+                self.config.pricing.actual_cost(usage) if usage is not None else None
+            ) if self.durable_dispatch is None else self.durable_dispatch.actual_cost(usage)
             http_status = error_http_status
             finish_reason = error_finish_reason
             request_latency_ms = error_request_latency_ms
@@ -1389,7 +1413,8 @@ class PageOrchestrator:
                 response = None
             if response is not None:
                 usage = response.usage
-                actual_cost = self.config.pricing.actual_cost(usage) if usage is not None else None
+                actual_cost = ((self.config.pricing.actual_cost(usage) if usage is not None else None)
+                               if self.durable_dispatch is None else self.durable_dispatch.actual_cost(usage))
                 http_status = response.http_status
                 finish_reason = response.finish_reason
                 request_latency_ms = response.request_latency_ms
@@ -1427,7 +1452,8 @@ class PageOrchestrator:
                                   else "adapter_failed_before_dispatch")
             if not attempt_request_started and slot_reserved and not ambiguous:
                 await release_request_slot()
-            rate_permit.finish(request_started=attempt_request_started or ambiguous)
+            if rate_permit is not None:
+                rate_permit.finish(request_started=attempt_request_started or ambiguous)
 
             old_attempts = running.attempts
             final_state = error_state or "completed"
@@ -1444,7 +1470,7 @@ class PageOrchestrator:
                 "safe_error_code": error_code,
                 "elapsed_s": time.perf_counter() - request_started_at,
             })
-            if await budget.settle(reserve, actual_cost, request_started=attempt_request_started or ambiguous):
+            if budget is not None and await budget.settle(reserve, actual_cost, request_started=attempt_request_started or ambiguous):
                 if stop_code is None:
                     stop_code = "budget_exhausted"
                 stop_scheduling.set()
@@ -1610,15 +1636,16 @@ class PageOrchestrator:
             },
         )
         all_attempts = [attempt for record in ordered_records for attempt in record.attempts]
-        unknown_cost = sum((
+        sum_costs = (lambda values: sum(values, Decimal(0))) if self.durable_dispatch is None else self.durable_dispatch.sum_costs
+        unknown_cost = sum_costs((
             (attempt.reserved_cost_rub if attempt.reserved_cost_rub is not None else self.config.max_budget_rub)
             for attempt in all_attempts
             if _possibly_dispatched(attempt) and attempt.actual_cost_rub is None
-        ), Decimal(0))
-        actual_known = sum((
+        ))
+        actual_known = sum_costs((
             (attempt.actual_cost_rub or Decimal(0))
             for attempt in all_attempts if attempt.actual_cost_rub is not None
-        ), Decimal(0))
+        ))
         has_unknown_cost = any(
             _possibly_dispatched(attempt) and attempt.actual_cost_rub is None for attempt in all_attempts
         )

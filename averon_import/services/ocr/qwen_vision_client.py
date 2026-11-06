@@ -319,10 +319,15 @@ Use the supplied source page number. Empty tables/rows arrays are valid when not
 
 class QwenVisionClient:
     def __init__(self, config: QwenVisionConfig, *, transport: VisionTransport | None = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, dispatch_boundary=None):
         self.config = config
         self._transport = transport if transport is not None else _HttpsTransport()
         self._clock = clock
+        if dispatch_boundary is not None:
+            from averon_import.services.ai_first.durable_dispatch import DurableDispatcher
+            if type(dispatch_boundary) is not DurableDispatcher:
+                raise ValueError("invalid_dispatch_boundary")
+        self._dispatch_boundary = dispatch_boundary
 
     @property
     def prompt_sha256(self) -> str:
@@ -393,6 +398,7 @@ class QwenVisionClient:
         cancel: threading.Event | None = None, user_context: str | None = None,
         before_dispatch: Callable[[], None] | None = None,
         on_dispatch: Callable[[], None] | None = None,
+        dispatch_call=None,
     ) -> VisionCompletion:
         limits = self.config.limits
         diagnostics: dict[str, Any] = {
@@ -400,6 +406,10 @@ class QwenVisionClient:
         }
         started = self._clock()
         try:
+            from averon_import.services.ai_first.dispatch_policy import deny_legacy_post
+            from averon_import.services.ai_first.coordination_contracts import CoordinationError
+            if self._dispatch_boundary is None:
+                deny_legacy_post()
             _check_cancel(cancel)
             user_context = validate_user_context(user_context)
             if not self.config.configured:
@@ -437,24 +447,40 @@ class QwenVisionClient:
             if self.config.folder_id:
                 headers["OpenAI-Project"] = self.config.folder_id
             _check_cancel(cancel)
-            if before_dispatch is not None:
+            if self._dispatch_boundary is None and before_dispatch is not None:
                 before_dispatch()
             _check_cancel(cancel)
             # Quota/checkpoint waiting is outside the provider's HTTP timeout.
             # A dispatch callback may block, so start its deadline afterwards.
-            if on_dispatch is not None:
-                on_dispatch()
-            diagnostics.update(request_attempted=True, client_request_id=client_id, request_bytes=len(body))
-            call_started = self._clock()
-            call_deadline = call_started + timeout
+            call_started = call_deadline = None
+            def mark_dispatch():
+                nonlocal call_started, call_deadline
+                call_started = self._clock()
+                call_deadline = call_started + timeout
+                if on_dispatch is not None:
+                    on_dispatch()
+                diagnostics.update(request_attempted=True, client_request_id=client_id, request_bytes=len(body))
+
             try:
-                response = self._transport.post(
-                    self.config.base_url + "/chat/completions", body=body, headers=headers,
-                    timeout_s=timeout, max_response_bytes=limits.max_response_bytes, cancel=cancel,
-                )
+                if self._dispatch_boundary is not None:
+                    response = self._dispatch_boundary.post(
+                        self, dispatch_call, url=self.config.base_url + "/chat/completions",
+                        body=body, headers=headers, on_dispatch=mark_dispatch, before_dispatch=before_dispatch,
+                        timeout_s=timeout, max_response_bytes=limits.max_response_bytes, cancel=cancel,
+                    )
+                else:
+                    deny_legacy_post()
+                    mark_dispatch()
+                    response = self._transport.post(
+                        self.config.base_url + "/chat/completions", body=body, headers=headers,
+                        timeout_s=timeout, max_response_bytes=limits.max_response_bytes, cancel=cancel,
+                    )
             finally:
-                diagnostics["latency_ms"] = round(max(0, self._clock() - call_started) * 1000, 3)
+                if call_started is not None:
+                    diagnostics["latency_ms"] = round(max(0, self._clock() - call_started) * 1000, 3)
             _check_cancel(cancel)
+            if call_started is None:
+                raise QwenVisionError("dispatch_not_authorized")
             if self._clock() - call_started >= timeout:
                 raise QwenVisionError("timeout")
             diagnostics["http_status"] = response.status if type(response.status) is int else None
@@ -519,6 +545,9 @@ class QwenVisionClient:
             if self._clock() >= call_deadline:
                 raise QwenVisionError("timeout")
             return VisionCompletion(extracted, diagnostics)
+        except CoordinationError as exc:
+            diagnostics["error_code"] = exc.code
+            raise QwenVisionError(exc.code, diagnostics) from None
         except QwenVisionError as exc:
             diagnostics["error_code"] = exc.code
             raise QwenVisionError(exc.code, diagnostics) from None

@@ -93,6 +93,9 @@ class OpenAICompatibleProvider:
         url = f"{self.settings.base_url}/chat/completions"
         payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
 
+        from averon_import.services.ai_first.dispatch_policy import deny_legacy_post
+        deny_legacy_post()
+
         auth_schemes = self.settings.auth_schemes if self.settings.api_key else ("",)
         last_error: Exception | None = None
         for index, scheme in enumerate(auth_schemes):
@@ -102,6 +105,7 @@ class OpenAICompatibleProvider:
             request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             started = time.perf_counter()
             try:
+                deny_legacy_post()
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                     raw_body = response.read()
                     self.last_call_diagnostics = _response_diagnostics(
