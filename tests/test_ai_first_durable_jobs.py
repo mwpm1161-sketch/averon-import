@@ -61,6 +61,31 @@ def stored_rows(case):
                 for name in ("durable_job_snapshots", "durable_jobs", "durable_job_pages", "durable_job_commands")}
 
 
+def execution_file(case, receipt):
+    with sqlite3.connect(case.ledger.path) as connection:
+        row = connection.execute("SELECT execution_id,execution_digest,execution_bytes"
+                                 " FROM durable_jobs WHERE job_id=?", (receipt.job_id,)).fetchone()
+    parent, final, pending = case.execution_store._paths(receipt.job_id, row[0])
+    return parent, final, pending
+
+
+def pause_for_restart(case, receipt):
+    with sqlite3.connect(case.ledger.path) as connection:
+        connection.execute("UPDATE durable_jobs SET state='paused_restart',revision=revision+1"
+                           " WHERE job_id=?", (receipt.job_id,))
+
+
+def resume_command_count(case):
+    with sqlite3.connect(case.ledger.path) as connection:
+        return connection.execute("SELECT COUNT(*) FROM durable_job_commands"
+                                  " WHERE kind='resume'").fetchone()[0]
+
+
+def attempt_count(case):
+    with sqlite3.connect(case.ledger.path) as connection:
+        return connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+
+
 def test_submit_snapshots_exact_financial_preimages_and_bounded_public_status(case):
     receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
                                   execution_profile=case.profile)
@@ -357,6 +382,171 @@ def test_resume_cannot_turn_unknown_page_into_a_new_paid_attempt(case):
     assert case.backend.get_status(case.actor, receipt.job_id).pages[0].state == "unknown_outcome"
 
 
+def test_new_generation_blocks_stale_queued_job_without_financial_side_effects(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    before = stored_rows(case)
+    actor2, _run2 = new_generation(case, document_id=case.actor.document_id)
+    with pytest.raises(CoordinationError, match="execution_source_changed"):
+        case.backend.read_execution_input(actor2, receipt.job_id)
+    status = case.backend.get_status(actor2, receipt.job_id)
+    assert status.state == "blocked"
+    assert all(page.state == "blocked" for page in status.pages)
+    assert all(page.safe_code == "execution_source_changed" for page in status.pages)
+    assert stored_rows(case) == before
+    assert attempt_count(case) == 0
+
+
+def test_cancelled_stale_generation_frees_document_for_current_generation(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    actor2, _run2 = new_generation(case, document_id=case.actor.document_id)
+    with pytest.raises(CoordinationError, match="execution_source_changed"):
+        case.backend.read_execution_input(actor2, receipt.job_id)
+    stale = case.backend.get_status(actor2, receipt.job_id)
+    cancelled = case.backend.cancel(actor2, receipt.job_id, uuid4().hex, stale.revision)
+    assert cancelled.state == "cancelled"
+    accepted = case.backend.submit(actor2, replace(case.request, operation_id=uuid4().hex),
+        financial=case.current_financial, execution_profile=case.profile)
+    assert accepted.job_id != receipt.job_id
+    assert case.backend.get_status(actor2, accepted.job_id).state == "queued"
+    assert attempt_count(case) == 0
+
+
+@pytest.mark.parametrize("damage,code", [
+    ("missing", "execution_input_missing"), ("tampered", "execution_input_corrupt"),
+])
+def test_paused_restart_without_attempts_blocks_on_unusable_execution_input(case, damage, code):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    pause_for_restart(case, receipt)
+    _parent, final, _pending = execution_file(case, receipt)
+    if damage == "missing":
+        final.unlink()
+    else:
+        final.write_bytes(b"tampered private execution input")
+        secure_private_path(final, directory=False)
+    before_snapshots = stored_rows(case)["durable_job_snapshots"]
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    with pytest.raises(CoordinationError, match=code):
+        case.backend.resume(case.actor, receipt.job_id, uuid4().hex, status.revision)
+    blocked = case.backend.get_status(case.actor, receipt.job_id)
+    assert blocked.state == "blocked"
+    assert all(page.state == "blocked" for page in blocked.pages)
+    assert resume_command_count(case) == 0
+    assert stored_rows(case)["durable_job_snapshots"] == before_snapshots
+    assert attempt_count(case) == 0
+
+
+@pytest.mark.parametrize("failure,code", [
+    ("source", "execution_source_changed"), ("acl", "execution_source_unverified"),
+])
+def test_resume_source_identity_or_acl_failure_blocks_without_side_effects(case, monkeypatch,
+                                                                          failure, code):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    pause_for_restart(case, receipt)
+    if failure == "source":
+        case.pdf.write_bytes(b"changed source bytes")
+    else:
+        def deny(*_args, **_kwargs):
+            raise PrivateAclError("synthetic acl failure")
+        monkeypatch.setattr(jobs, "verify_private_path", deny)
+    before_snapshots = stored_rows(case)["durable_job_snapshots"]
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    with pytest.raises(CoordinationError, match=code):
+        case.backend.resume(case.actor, receipt.job_id, uuid4().hex, status.revision)
+    blocked = case.backend.get_status(case.actor, receipt.job_id)
+    assert blocked.state == "blocked"
+    assert all(page.state == "blocked" for page in blocked.pages)
+    assert resume_command_count(case) == 0
+    assert stored_rows(case)["durable_job_snapshots"] == before_snapshots
+    assert attempt_count(case) == 0
+
+
+def test_paused_restart_with_significant_attempt_keeps_recovery_stop(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    pause_for_restart(case, receipt)
+    with sqlite3.connect(case.ledger.path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        candidate, run_id = connection.execute("SELECT candidate_attempt_id,run_id"
+            " FROM durable_job_pages WHERE job_id=? AND page_number=1", (receipt.job_id,)).fetchone()
+        connection.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (candidate, uuid4().hex, run_id, 1, 1, 1, 1,
+             case.financial.binding.binding_id, case.financial.binding.revision,
+             case.financial.binding.billing_scope_id, 1, fingerprint(["synthetic-attempt"]), "{}",
+             0, 0, 1, None, "intent", None, None, None))
+        connection.execute("UPDATE durable_job_pages SET attempt_id=?,state='claimed',claim_seq=1,"
+            "owner_epoch=1,revision=revision+1 WHERE job_id=? AND page_number=1",
+            (candidate, receipt.job_id))
+    final = execution_file(case, receipt)[1]
+    final.unlink()
+    before = stored_rows(case)
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    with pytest.raises(CoordinationError, match="execution_input_requires_attempt_recovery"):
+        case.backend.resume(case.actor, receipt.job_id, uuid4().hex, status.revision)
+    current = case.backend.get_status(case.actor, receipt.job_id)
+    assert current.state == "paused_restart"
+    assert current.pages[0].state == "claimed"
+    assert stored_rows(case) == before
+    assert resume_command_count(case) == 0
+    assert attempt_count(case) == 1
+
+
+def test_repeated_resume_after_blocked_error_adds_no_commands(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    pause_for_restart(case, receipt)
+    execution_file(case, receipt)[1].unlink()
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    with pytest.raises(CoordinationError, match="execution_input_missing"):
+        case.backend.resume(case.actor, receipt.job_id, uuid4().hex, status.revision)
+    blocked = case.backend.get_status(case.actor, receipt.job_id)
+    assert blocked.state == "blocked"
+    with pytest.raises(CoordinationError, match="job_not_resumable"):
+        case.backend.resume(case.actor, receipt.job_id, uuid4().hex, blocked.revision)
+    assert case.backend.get_status(case.actor, receipt.job_id).revision == blocked.revision
+    assert resume_command_count(case) == 0
+    assert attempt_count(case) == 0
+
+
+def test_document_over_max_pages_is_rejected_before_t0(case):
+    from averon_import.services.ai_first.coordination_contracts import Run
+    from averon_import.services.ai_first.durable_job_contracts import _verified_document_context
+    from averon_import.services.ai_first.durable_qwen_adapter import configuration_digest
+    config = case.financial.config.model_copy(update={"max_pages": case.actor.page_count - 1})
+    binding = case.financial.binding
+    run = Run(uuid4().hex, case.actor.tenant_id, case.actor.document_id, 2,
+              case.actor.source_digest, configuration_digest(config, binding),
+              case.financial.run.budget_units, case.financial.run.request_cap)
+    with case.ledger.dispatcher() as dispatcher:
+        case.ledger.register_run(dispatcher, uuid4().hex, run)
+    actor = _verified_document_context(tenant_id=case.actor.tenant_id, owner_id=case.actor.owner_id,
+        document_id=case.actor.document_id, generation=2, source_digest=case.actor.source_digest,
+        source_size_bytes=case.actor.source_size_bytes, source_mtime_ns=case.actor.source_mtime_ns,
+        page_count=case.actor.page_count, source_path=case.actor.source_path,
+        authorization_digest=fingerprint(["over-max-pages"]))
+    request = SubmissionRequest(uuid4().hex, case.actor.document_id, (PageSelection(1),), "")
+    with pytest.raises(CoordinationError, match="document_identity_mismatch"):
+        case.backend.submit(actor, request, financial=FinancialSnapshotInput(run, config, binding),
+                            execution_profile=case.profile)
+    assert not any(stored_rows(case).values())
+    assert attempt_count(case) == 0
+
+
+def test_repr_hides_user_context_and_prompt(case):
+    request_text = repr(case.request)
+    profile_text = repr(case.profile)
+    execution_text = repr(exact_input(case))
+    assert case.request.user_context not in request_text
+    assert case.profile.prompt_template not in profile_text
+    assert case.request.user_context not in execution_text
+    assert case.profile.prompt_template not in execution_text
+    assert "user_context" not in request_text
+    assert "prompt_template" not in profile_text
+
+
 def _release_workers(workers):
     for child in workers:
         child.stdin.write("GO\n")
@@ -499,23 +689,6 @@ def test_surrogate_text_is_rejected_as_typed_input_error():
         "pages": [{"page_number": 1, "crop": None}], "user_context": "\ud800"})
     with pytest.raises(CoordinationError, match="durable_input_invalid"):
         parse_submission_request(raw)
-
-
-def test_large_page_status_is_bounded_and_cursor_stable(tmp_path):
-    case = make_case(tmp_path / "large-status", pages=128)
-    try:
-        request = SubmissionRequest(uuid4().hex, case.actor.document_id,
-            tuple(PageSelection(page) for page in range(1, 129)), "")
-        receipt = case.backend.submit(case.actor, request, financial=case.financial,
-                                      execution_profile=case.profile)
-        first = case.backend.get_status(case.actor, receipt.job_id, page_limit=100)
-        assert len(first.pages) == 100 and first.next_page_cursor == 100
-        second = case.backend.get_status(case.actor, receipt.job_id, page_after=100,
-            page_limit=100, expected_revision=first.revision)
-        assert len(second.pages) == 28 and second.next_page_cursor is None
-        assert first.publication_state == second.publication_state == "not_published"
-    finally:
-        close_case(case)
 
 
 def test_large_page_status_is_bounded_and_cursor_stable(tmp_path):

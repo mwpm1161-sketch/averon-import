@@ -26,6 +26,11 @@ _PAGE_NAMESPACE = UUID("0189d75a-9155-5a17-94ba-71e15b0f4888")
 _ACTIVE_SQL = "'preparing_input','queued','running','cancelling','paused_restart','blocked'"
 _ACTIVE = ("preparing_input", "queued", "running", "cancelling", "paused_restart", "blocked")
 _UNKNOWN_PAGES = ("intent", "send_committed", "settlement_pending", "unknown_outcome")
+_BLOCKING_EXECUTION_CODES = frozenset({
+    "execution_input_missing", "execution_input_corrupt", "execution_input_mismatch",
+    "execution_source_changed", "execution_source_mismatch", "execution_source_unverified",
+    "execution_storage_unverified", "financial_snapshot_corrupt",
+})
 QUEUE_LIMITS = QueueLimits()  # Deployment-wide compiled policy; never per-request.
 
 
@@ -372,9 +377,7 @@ class DurableJobStore:
             if staged.document_id != actor.document_id:
                 raise CoordinationError("execution_source_mismatch")
         except CoordinationError as exc:
-            if exc.code in {"execution_input_missing", "execution_input_corrupt", "execution_input_mismatch",
-                            "execution_source_mismatch", "execution_source_changed",
-                            "execution_source_unverified", "execution_storage_unverified"}:
+            if exc.code in _BLOCKING_EXECUTION_CODES:
                 self._block_execution_input(actor, receipt.job_id, exc.code)
             raise
         self._commit_ready(actor, receipt)
@@ -451,7 +454,8 @@ class DurableJobStore:
             raise CoordinationError("durable_receipt_corrupt") from None
 
     def _block_execution_input(self, actor, job_id, safe_code):
-        safe = "execution_input_missing" if safe_code == "execution_input_missing" else "execution_input_corrupt"
+        safe = safe_code if safe_code in {"execution_input_missing", "execution_input_corrupt",
+            "execution_source_changed", "execution_source_mismatch"} else "execution_input_corrupt"
         now = _now()
 
         def block(connection):
@@ -507,6 +511,39 @@ class DurableJobStore:
         self._complete_staging(actor, receipt, recovery_input, allow_create=recovery_input is not None)
         return receipt
 
+    def _read_execution_artifact(self, actor, job, *, identity_code="execution_source_changed"):
+        """Single source-identity and immutable-artifact gate for private reads.
+
+        Every controlled failure blocks the job and only its safe pages when no
+        financially significant attempt exists. Existing attempts preserve the
+        reconciliation stop (``execution_input_requires_attempt_recovery``).
+        """
+        try:
+            if (actor.generation != job["generation"] or actor.source_digest != job["source_digest"]):
+                raise CoordinationError(identity_code)
+            self._verify_source(actor)
+            value = self.execution_store.read(job["job_id"], job["execution_id"],
+                job["execution_digest"], job["execution_bytes"])
+            if (value.tenant_id, value.document_id, value.generation, value.run_id,
+                    value.source_sha256) != (actor.tenant_id, actor.document_id,
+                    job["generation"], job["run_id"], job["source_digest"]):
+                raise CoordinationError("execution_input_corrupt")
+            if fingerprint({"document_id": value.document_id,
+                    "pages": [asdict(page) for page in value.pages],
+                    "user_context": value.user_context}) != job["request_digest"]:
+                raise CoordinationError("execution_input_corrupt")
+            restored_run, restored_config = self.load_financial_snapshot(actor, job["job_id"]).materialize()
+            if (restored_run.run_id != value.run_id or restored_run.source_digest != value.source_sha256
+                    or restored_config.dpi != value.dpi
+                    or restored_config.max_image_bytes != value.max_image_bytes
+                    or restored_config.max_image_pixels != value.max_image_pixels):
+                raise CoordinationError("execution_input_corrupt")
+            return value
+        except CoordinationError as exc:
+            if exc.code in _BLOCKING_EXECUTION_CODES:
+                self._block_execution_input(actor, job["job_id"], exc.code)
+            raise
+
     def read_execution_input(self, actor: AuthorizedDocumentContext, job_id: str) -> ExecutionInput:
         """Validate and return private execution input for trusted B3 storage callers.
 
@@ -518,34 +555,7 @@ class DurableJobStore:
         job = self._get_private_job(actor, job_id)
         if job["state"] == "preparing_input":
             raise CoordinationError("execution_input_not_ready")
-        if (actor.generation != job["generation"] or actor.source_digest != job["source_digest"]):
-            raise CoordinationError("execution_source_changed")
-        try:
-            self._verify_source(actor)
-            value = self.execution_store.read(job_id, job["execution_id"],
-                job["execution_digest"], job["execution_bytes"])
-            if (value.tenant_id, value.document_id, value.generation, value.run_id,
-                    value.source_sha256) != (actor.tenant_id, actor.document_id,
-                    job["generation"], job["run_id"], job["source_digest"]):
-                raise CoordinationError("execution_input_corrupt")
-            if fingerprint({"document_id": value.document_id,
-                    "pages": [asdict(page) for page in value.pages],
-                    "user_context": value.user_context}) != job["request_digest"]:
-                raise CoordinationError("execution_input_corrupt")
-            restored_run, restored_config = self.load_financial_snapshot(actor, job_id).materialize()
-            if (restored_run.run_id != value.run_id or restored_run.source_digest != value.source_sha256
-                    or restored_config.dpi != value.dpi
-                    or restored_config.max_image_bytes != value.max_image_bytes
-                    or restored_config.max_image_pixels != value.max_image_pixels):
-                raise CoordinationError("execution_input_corrupt")
-            return value
-        except CoordinationError as exc:
-            if exc.code in {"execution_input_missing", "execution_input_corrupt",
-                            "execution_input_mismatch", "execution_storage_unverified",
-                            "financial_snapshot_corrupt", "execution_source_changed",
-                            "execution_source_unverified"}:
-                self._block_execution_input(actor, job_id, exc.code)
-            raise
+        return self._read_execution_artifact(actor, job)
 
     def _preparing_record(self, actor, job_id):
         def query(connection):
@@ -661,11 +671,7 @@ class DurableJobStore:
             raise CoordinationError("job_not_resumable")
         if any(page in _UNKNOWN_PAGES for page in job["page_states"]):
             raise CoordinationError("unknown_outcome_not_resumable")
-        if actor.generation != job["generation"] or actor.source_digest != job["source_digest"]:
-            self._block_execution_input(actor, job_id, "execution_source_mismatch")
-            raise CoordinationError("execution_source_changed")
-        self._verify_source(actor)
-        self.execution_store.read(job_id, job["execution_id"], job["execution_digest"], job["execution_bytes"])
+        self._read_execution_artifact(actor, job, identity_code="execution_source_mismatch")
         now = _now()
 
         def change(connection):

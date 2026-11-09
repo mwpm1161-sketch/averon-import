@@ -138,7 +138,7 @@ class SubmissionRequest:
     operation_id: str
     document_id: str
     pages: tuple[PageSelection, ...]
-    user_context: str = ""
+    user_context: str = field(default="", repr=False)
 
     def __post_init__(self):
         uuid_hex(self.operation_id)
@@ -203,7 +203,7 @@ class ExecutionProfile:
     model_version: str
     schema_version: str
     prompt_version: str
-    prompt_template: str
+    prompt_template: str = field(repr=False)
 
     def __post_init__(self):
         for value in (self.provider_id, self.model_id, self.model_version,
@@ -329,6 +329,7 @@ def build_execution_input(context: AuthorizedDocumentContext, request: Submissio
     if ((context.tenant_id, context.document_id, context.generation, context.source_digest)
             != (run.tenant_id, run.document_id, run.generation, run.source_digest)
             or request.document_id != context.document_id
+            or context.page_count > config.max_pages
             or any(page.page_number > context.page_count for page in request.pages)):
         raise CoordinationError("document_identity_mismatch")
     prompt_digest = hashlib.sha256(profile.prompt_template.encode("utf-8")).hexdigest()
