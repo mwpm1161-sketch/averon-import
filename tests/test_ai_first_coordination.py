@@ -20,7 +20,7 @@ import pytest
 from averon_import.services.ai_first import coordination as core
 from averon_import.services.ai_first.coordination import CoordinationLedger, system_clock
 from averon_import.services.ai_first.coordination_contracts import (
-    Attempt, BillingScope, Binding, Bootstrap, ClockStamp, CoordinationError,
+    Attempt, BillingScope, Binding, Bootstrap, ClockStamp, CommitReceiptUncertain, CoordinationError,
     MAX_INTEGER, Outcome, QuotaScope, Run, fingerprint, rub_units,
 )
 from averon_import.services.ai_first.private_acl import (
@@ -715,7 +715,7 @@ def test_slow_commit_cannot_return_fresh_receipt_after_lease_expiry(tmp_path, mo
 
         with monkeypatch.context() as patch:
             patch.setattr(core.sqlite3, "connect", connect)
-            with pytest.raises(CoordinationError, match="owner_fenced"):
+            with pytest.raises(CommitReceiptUncertain, match="owner_fenced"):
                 ledger.reserve(owner, item)
     finally:
         owner.close()

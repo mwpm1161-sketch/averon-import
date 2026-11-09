@@ -343,56 +343,90 @@ class CoordinationLedger:
         with guard:
             if not acquiring and type(owner) is not DispatcherLease:
                 raise CoordinationError("owner_required")
-            with self._connection() as connection:
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    connection.row_factory = sqlite3.Row
-                    meta = connection.execute("SELECT * FROM meta WHERE id=1").fetchone()
-                    stamp = self.clock()
-                    if type(stamp) is not ClockStamp:
-                        raise CoordinationError("clock_unverified")
-                    if stamp.boot_id == meta["boot_id"] and stamp.milliseconds < meta["high_water_ms"]:
-                        raise CoordinationError("clock_regressed")
-                    if not acquiring:
-                        owner._check(self)
-                        if (meta["epoch"] != owner.epoch or meta["owner_nonce"] != owner._nonce
-                                or stamp.boot_id != meta["boot_id"]
-                                or stamp.milliseconds >= meta["lease_until_ms"]):
-                            raise CoordinationError("owner_fenced")
-                        connection.execute("UPDATE meta SET high_water_ms=? WHERE id=1", (stamp.milliseconds,))
-                    yield connection, stamp, meta
-                    if not acquiring:
-                        owner._check(self)
-                        end = self.clock()
-                        if (end.boot_id != stamp.boot_id or end.milliseconds < stamp.milliseconds
-                                or end.milliseconds >= connection.execute(
-                                    "SELECT lease_until_ms FROM meta WHERE id=1").fetchone()[0]):
-                            raise CoordinationError("owner_fenced")
-                    self._verify_storage()
+            committed = False
+            try:
+                with self._connection() as connection:
                     try:
-                        connection.commit()
-                    except BaseException:
-                        if connection.in_transaction:
-                            # SQLite confirms that the transaction is still
-                            # open, so _transaction's handler can roll it back.
+                        connection.execute("BEGIN IMMEDIATE")
+                        connection.row_factory = sqlite3.Row
+                        meta = connection.execute("SELECT * FROM meta WHERE id=1").fetchone()
+                        stamp = self.clock()
+                        if type(stamp) is not ClockStamp:
+                            raise CoordinationError("clock_unverified")
+                        if stamp.boot_id == meta["boot_id"] and stamp.milliseconds < meta["high_water_ms"]:
+                            raise CoordinationError("clock_regressed")
+                        if not acquiring:
+                            owner._check(self)
+                            if (meta["epoch"] != owner.epoch or meta["owner_nonce"] != owner._nonce
+                                    or stamp.boot_id != meta["boot_id"]
+                                    or stamp.milliseconds >= meta["lease_until_ms"]):
+                                raise CoordinationError("owner_fenced")
+                            connection.execute("UPDATE meta SET high_water_ms=? WHERE id=1",
+                                               (stamp.milliseconds,))
+                        yield connection, stamp, meta
+                        if not acquiring:
+                            owner._check(self)
+                            end = self.clock()
+                            if (end.boot_id != stamp.boot_id or end.milliseconds < stamp.milliseconds
+                                    or end.milliseconds >= connection.execute(
+                                        "SELECT lease_until_ms FROM meta WHERE id=1").fetchone()[0]):
+                                raise CoordinationError("owner_fenced")
+                        self._verify_storage()
+                        try:
+                            connection.commit()
+                        except BaseException:
+                            # A failed COMMIT is definitive only if SQLite
+                            # still reports an open transaction and rollback
+                            # below then succeeds.
+                            try:
+                                transaction_open = connection.in_transaction
+                            except BaseException:
+                                raise CommitReceiptUncertain("commit_receipt_uncertain") from None
+                            if not transaction_open:
+                                raise CommitReceiptUncertain("commit_receipt_uncertain") from None
                             raise
-                        # sqlite3 can report an I/O error after the durable
-                        # commit reached disk. The caller cannot safely infer
-                        # rollback from the exception or issue a replacement
-                        # reservation/send; preserve the ambiguous liability.
-                        raise CommitReceiptUncertain("commit_receipt_uncertain") from None
-                    # A slow fsync must not return a usable new receipt after
-                    # lease expiry. The committed operation remains replayable
-                    # as history, never as a second newly-created reservation.
-                    completed = self.clock()
-                    until = connection.execute("SELECT lease_until_ms FROM meta WHERE id=1").fetchone()[0]
-                    if (completed.boot_id != stamp.boot_id or completed.milliseconds < stamp.milliseconds
-                            or completed.milliseconds >= until):
-                        raise CommitReceiptUncertain("owner_fenced")
-                except BaseException:
-                    if connection.in_transaction:
-                        connection.rollback()
-                    raise
+                        committed = True
+                        # A slow fsync must not return a usable receipt after
+                        # lease expiry. All checks here happen after durable
+                        # state changed, so every exception is ambiguous.
+                        try:
+                            completed = self.clock()
+                            until = connection.execute(
+                                "SELECT lease_until_ms FROM meta WHERE id=1").fetchone()[0]
+                            if (completed.boot_id != stamp.boot_id
+                                    or completed.milliseconds < stamp.milliseconds
+                                    or completed.milliseconds >= until):
+                                raise CoordinationError("owner_fenced")
+                        except CommitReceiptUncertain:
+                            raise
+                        except CoordinationError as exc:
+                            # The post-commit phase itself proves this is an
+                            # uncertain receipt, even when lease validation
+                            # has a familiar deterministic code.
+                            raise CommitReceiptUncertain(exc.code) from None
+                        except BaseException:
+                            raise CommitReceiptUncertain("post_commit_receipt_uncertain") from None
+                    except BaseException:
+                        try:
+                            transaction_open = connection.in_transaction
+                        except BaseException:
+                            raise CommitReceiptUncertain("rollback_receipt_uncertain") from None
+                        if transaction_open:
+                            try:
+                                connection.rollback()
+                            except BaseException:
+                                # A failed rollback does not prove the write
+                                # was undone, so callers must retain liability.
+                                raise CommitReceiptUncertain("rollback_receipt_uncertain") from None
+                        raise
+            except CommitReceiptUncertain:
+                raise
+            except BaseException:
+                # Also cover exceptions raised while _connection closes or
+                # releases storage after a successful commit.
+                if committed:
+                    raise CommitReceiptUncertain("post_commit_receipt_uncertain") from None
+                raise
 
     def dispatcher(self) -> DispatcherLease:
         self._retain_use()

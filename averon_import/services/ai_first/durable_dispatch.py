@@ -538,12 +538,16 @@ class DurableDispatcher:
                     )
                 except DispatchGateRejected:
                     raise
+                except CommitReceiptUncertain:
+                    call.uncertain = True
+                    self._failed.set()
+                    raise
                 except BaseException:
                     # A lost commit receipt must never become a retryable POST.
                     # Retain the intent and fail this dispatcher closed.
                     call.uncertain = True
                     self._failed.set()
-                    raise CoordinationError("job_send_gate_receipt_uncertain") from None
+                    raise CommitReceiptUncertain("job_send_gate_receipt_uncertain") from None
                 call.gate_committed = True
                 # From this point onward local cancellation cannot revoke SQL
                 # authorization. A failure before transport is ambiguous, not
