@@ -459,7 +459,8 @@ class DurableJobStore:
         now = _now()
 
         def block(connection):
-            job = connection.execute("SELECT state FROM durable_jobs WHERE job_id=? AND tenant_id=? AND owner_id=?",
+            job = connection.execute("SELECT state,execution_state FROM durable_jobs"
+                " WHERE job_id=? AND tenant_id=? AND owner_id=?",
                 (job_id, actor.tenant_id, actor.owner_id)).fetchone()
             if job is None or job["state"] in ("cancelled", "completed", "completed_with_errors", "failed"):
                 return
@@ -467,6 +468,10 @@ class DurableJobStore:
                     " (attempt_id IS NOT NULL OR state IN ('claimed','intent','send_committed','settlement_pending',"
                     "'completed','incomplete','failed','unknown_outcome')) LIMIT 1", (job_id,)).fetchone():
                 raise CoordinationError("execution_input_requires_attempt_recovery")
+            if job["state"] == "blocked" and job["execution_state"] == "blocked":
+                # Idempotent safe block: preserve the original safe code and
+                # revisions. Re-entering blocking is not a new state change.
+                return
             connection.execute("UPDATE durable_jobs SET state='blocked',execution_state='blocked',revision=revision+1,"
                 "updated_at=? WHERE job_id=?", (now, job_id))
             connection.execute("UPDATE durable_job_pages SET state='blocked',safe_code=?,revision=revision+1"
@@ -611,11 +616,11 @@ class DurableJobStore:
             if replay:
                 cleanup = None
                 if replay.state == "cancelled":
-                    row = connection.execute("SELECT execution_id,execution_digest,execution_bytes"
-                        " FROM durable_jobs WHERE job_id=? AND tenant_id=? AND owner_id=?",
+                    row = connection.execute("SELECT execution_id FROM durable_jobs"
+                        " WHERE job_id=? AND tenant_id=? AND owner_id=?",
                         (job_id, actor.tenant_id, actor.owner_id)).fetchone()
                     if row is not None:
-                        cleanup = (row["execution_id"], row["execution_digest"], row["execution_bytes"])
+                        cleanup = row["execution_id"]
                 return replay, cleanup
             job = connection.execute("SELECT * FROM durable_jobs WHERE job_id=? AND tenant_id=? AND owner_id=? AND document_id=?",
                 (job_id, actor.tenant_id, actor.owner_id, actor.document_id)).fetchone()
@@ -644,12 +649,12 @@ class DurableJobStore:
             connection.execute("INSERT INTO durable_job_commands VALUES(?,?,?,?,?,?,?)",
                 (actor.tenant_id, actor.owner_id, operation_id, "cancel", job_id, payload_digest,
                  canonical(asdict(receipt))))
-            cleanup = (job["execution_id"], job["execution_digest"], job["execution_bytes"]) if target == "cancelled" else None
+            cleanup = job["execution_id"] if target == "cancelled" else None
             return receipt, cleanup
 
         receipt, cleanup = self._write(change)
         if cleanup is not None:
-            self.execution_store.remove_pending(job_id, *cleanup)
+            self.execution_store.remove_pending_after_cancel(job_id, cleanup)
         return receipt
 
     def resume(self, actor: AuthorizedDocumentContext, job_id: str, operation_id: str,

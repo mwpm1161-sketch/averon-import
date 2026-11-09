@@ -86,6 +86,55 @@ def attempt_count(case):
         return connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
 
 
+def job_and_page_revisions(case, job_id):
+    with sqlite3.connect(case.ledger.path) as connection:
+        job = connection.execute("SELECT state,execution_state,revision,cancel_revision,updated_at"
+                                 " FROM durable_jobs WHERE job_id=?", (job_id,)).fetchone()
+        pages = connection.execute("SELECT page_number,state,revision,safe_code"
+                                   " FROM durable_job_pages WHERE job_id=? ORDER BY page_number",
+                                   (job_id,)).fetchall()
+        commands = connection.execute("SELECT COUNT(*) FROM durable_job_commands"
+                                      " WHERE job_id=?", (job_id,)).fetchone()[0]
+    return job, pages, commands
+
+
+def financial_and_liability_rows(case):
+    with sqlite3.connect(case.ledger.path) as connection:
+        return {
+            "snapshots": connection.execute(
+                "SELECT * FROM durable_job_snapshots ORDER BY snapshot_id").fetchall(),
+            "attempts": connection.execute(
+                "SELECT * FROM attempts ORDER BY attempt_id").fetchall(),
+            "unknown_pages": connection.execute(
+                "SELECT job_id,page_number,state,attempt_id FROM durable_job_pages"
+                " WHERE state IN ('intent','send_committed','settlement_pending','unknown_outcome')"
+                " ORDER BY job_id,page_number").fetchall(),
+        }
+
+
+def prepare_pending_after_failed_staging(case):
+    def lost_t0(point):
+        if point == "after_t0_commit":
+            raise OSError("synthetic lost submission receipt")
+    submit_backend = jobs.DurableJobStore(case.ledger, case.execution_store, _fault_hook=lost_t0)
+    receipt = submit_backend.submit(case.actor, case.request, financial=case.financial,
+                                    execution_profile=case.profile)
+    assert submit_backend.get_status(case.actor, receipt.job_id).state == "preparing_input"
+
+    def pause_after_pending(point):
+        if point == "after_pending_fsync":
+            raise OSError("synthetic cancellation barrier")
+    paused_store = PrivateExecutionStore(case.execution_store.root, case.installation_id,
+                                         _fault_hook=pause_after_pending)
+    paused_backend = jobs.DurableJobStore(case.ledger, paused_store)
+    with pytest.raises(CoordinationError, match="execution_stage_write_failed"):
+        paused_backend.recover_preparing(case.actor, receipt.job_id,
+                                         recovery_input=exact_input(case))
+    _parent, final, pending = execution_file(case, receipt)
+    assert pending.exists() and not final.exists()
+    return receipt, final, pending
+
+
 def test_submit_snapshots_exact_financial_preimages_and_bounded_public_status(case):
     receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
                                   execution_profile=case.profile)
@@ -395,6 +444,128 @@ def test_new_generation_blocks_stale_queued_job_without_financial_side_effects(c
     assert all(page.safe_code == "execution_source_changed" for page in status.pages)
     assert stored_rows(case) == before
     assert attempt_count(case) == 0
+
+
+def test_repeated_stale_generation_reads_keep_blocked_revisions(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    actor2, _run2 = new_generation(case, document_id=case.actor.document_id)
+    before_financial = financial_and_liability_rows(case)
+    with pytest.raises(CoordinationError, match="execution_source_changed"):
+        case.backend.read_execution_input(actor2, receipt.job_id)
+    blocked = case.backend.get_status(actor2, receipt.job_id)
+    assert blocked.state == "blocked"
+    assert all(page.state == "blocked" and page.safe_code == "execution_source_changed"
+               for page in blocked.pages)
+    revisions = job_and_page_revisions(case, receipt.job_id)
+    for _attempt in range(3):
+        with pytest.raises(CoordinationError, match="execution_source_changed"):
+            case.backend.read_execution_input(actor2, receipt.job_id)
+        assert job_and_page_revisions(case, receipt.job_id) == revisions
+        assert financial_and_liability_rows(case) == before_financial
+
+
+def test_cancel_with_corrupt_final_removes_pending_and_preserves_final(case):
+    receipt, final, pending = prepare_pending_after_failed_staging(case)
+    corrupt = b"synthetic corrupt immutable execution final"
+    final.write_bytes(corrupt)
+    secure_private_path(final, directory=False)
+    before_financial = financial_and_liability_rows(case)
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    operation = uuid4().hex
+    cancelled = case.backend.cancel(case.actor, receipt.job_id, operation, status.revision)
+    assert cancelled.state == "cancelled" and cancelled.kind == "cancel"
+    assert case.backend.get_status(case.actor, receipt.job_id).state == "cancelled"
+    assert not pending.exists()
+    assert final.read_bytes() == corrupt
+    assert financial_and_liability_rows(case) == before_financial
+    assert attempt_count(case) == 0
+    with sqlite3.connect(case.ledger.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM durable_job_commands"
+                                  " WHERE kind='cancel'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("failure", ["io", "acl"])
+def test_cancel_returns_saved_receipt_when_pending_cleanup_fails_after_commit(
+        case, monkeypatch, failure):
+    receipt, _final, pending = prepare_pending_after_failed_staging(case)
+    if failure == "io":
+        original_unlink = Path.unlink
+        def deny_pending(self, *args, **kwargs):
+            if self.name.endswith(".pending"):
+                raise OSError("synthetic pending cleanup I/O failure")
+            return original_unlink(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "unlink", deny_pending)
+    else:
+        from averon_import.services.ai_first import durable_execution_store as execution_store_module
+        original_verify = execution_store_module.verify_private_path
+        def deny_pending(path, directory=False):
+            if Path(path).name.endswith(".pending"):
+                raise PrivateAclError("synthetic pending cleanup ACL failure")
+            return original_verify(path, directory=directory)
+        monkeypatch.setattr(execution_store_module, "verify_private_path", deny_pending)
+    before_financial = financial_and_liability_rows(case)
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    operation = uuid4().hex
+    cancelled = case.backend.cancel(case.actor, receipt.job_id, operation, status.revision)
+    assert cancelled.state == "cancelled"
+    assert case.backend.get_status(case.actor, receipt.job_id).state == "cancelled"
+    assert pending.exists()  # left as a private orphan for later strict cleanup
+    after_commit = job_and_page_revisions(case, receipt.job_id)
+    replay = case.backend.cancel(case.actor, receipt.job_id, operation, status.revision)
+    assert replay == cancelled
+    assert job_and_page_revisions(case, receipt.job_id) == after_commit
+    assert pending.exists()
+    assert financial_and_liability_rows(case) == before_financial
+    with sqlite3.connect(case.ledger.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM durable_job_commands"
+                                  " WHERE kind='cancel'").fetchone()[0] == 1
+
+
+def test_repeated_cancel_returns_saved_receipt_without_new_operation(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    operation = uuid4().hex
+    first = case.backend.cancel(case.actor, receipt.job_id, operation, status.revision)
+    after_first = job_and_page_revisions(case, receipt.job_id)
+    replay = case.backend.cancel(case.actor, receipt.job_id, operation, status.revision)
+    assert replay == first
+    assert job_and_page_revisions(case, receipt.job_id) == after_first
+    with sqlite3.connect(case.ledger.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM durable_job_commands"
+                                  " WHERE kind='cancel'").fetchone()[0] == 1
+
+
+def test_cancel_cleanup_preserves_financial_attempts_snapshots_and_unknown_liabilities(case):
+    receipt = case.backend.submit(case.actor, case.request, financial=case.financial,
+                                  execution_profile=case.profile)
+    pause_for_restart(case, receipt)
+    with sqlite3.connect(case.ledger.path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        candidate, run_id = connection.execute("SELECT candidate_attempt_id,run_id"
+            " FROM durable_job_pages WHERE job_id=? AND page_number=1", (receipt.job_id,)).fetchone()
+        connection.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (candidate, uuid4().hex, run_id, 1, 1, 1, 1,
+             case.financial.binding.binding_id, case.financial.binding.revision,
+             case.financial.binding.billing_scope_id, 1, fingerprint(["synthetic-attempt"]), "{}",
+             0, 0, 1, None, "intent", None, None, None))
+        connection.execute("UPDATE durable_job_pages SET attempt_id=?,state='claimed',claim_seq=1,"
+            "owner_epoch=1,revision=revision+1 WHERE job_id=? AND page_number=1",
+            (candidate, receipt.job_id))
+        connection.execute("UPDATE durable_job_pages SET state='unknown_outcome',revision=revision+1"
+            " WHERE job_id=? AND page_number=2", (receipt.job_id,))
+    before_financial = financial_and_liability_rows(case)
+    before = stored_rows(case)
+    status = case.backend.get_status(case.actor, receipt.job_id)
+    cancelled = case.backend.cancel(case.actor, receipt.job_id, uuid4().hex, status.revision)
+    assert cancelled.state == "cancelling"
+    assert financial_and_liability_rows(case) == before_financial
+    assert attempt_count(case) == 1
+    current = case.backend.get_status(case.actor, receipt.job_id)
+    assert current.pages[0].state == "claimed"
+    assert current.pages[1].state == "unknown_outcome"
+    assert stored_rows(case)["durable_job_commands"] == before["durable_job_commands"] + 1
 
 
 def test_cancelled_stale_generation_frees_document_for_current_generation(case):

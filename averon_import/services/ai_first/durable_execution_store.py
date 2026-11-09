@@ -362,7 +362,12 @@ class PrivateExecutionStore:
         return self._read_one(final, expected_digest, expected_bytes)
 
     def remove_pending(self, job_id, execution_id, expected_digest, expected_bytes):
-        """Cancellation cleanup of temp bytes only; immutable final input is retained."""
+        """Strict explicit cleanup of temp bytes only; immutable final input is retained.
+
+        This path verifies the final artifact before touching the pending file.
+        Post-cancellation cleanup must not use it: a damaged final has already
+        been sealed by a committed cancellation. See ``remove_pending_after_cancel``.
+        """
         parent, final, pending = self._paths(job_id, execution_id)
         with self.lock():
             self._check_root()
@@ -376,4 +381,29 @@ class PrivateExecutionStore:
                     raise CoordinationError("execution_storage_unverified")
                 pending.unlink()
                 self._sync_parent(parent)
+
+    def remove_pending_after_cancel(self, job_id, execution_id):
+        """Best-effort cleanup after a cancellation is already durably committed.
+
+        Only the private temporary ``.pending`` file is considered. The immutable
+        final artifact is never read or removed, so a corrupt final cannot
+        retroactively fail the cancellation. Unverifiable pending paths are left
+        as private orphans for a later strict cleanup; ACL/I/O failures are
+        intentionally swallowed because the durable cancellation already stands.
+        """
+        try:
+            parent, _final, pending = self._paths(job_id, execution_id)
+            with self.lock():
+                self._check_root()
+                self._verify_parent(parent)
+                if not pending.exists():
+                    return
+                _reject_reparse(pending)
+                verify_private_path(pending, directory=False)
+                if not pending.is_file() or pending.stat().st_size > MAX_EXECUTION_BYTES:
+                    return
+                pending.unlink()
+                self._sync_parent(parent)
+        except (CoordinationError, OSError, PrivateAclError):
+            return
 
