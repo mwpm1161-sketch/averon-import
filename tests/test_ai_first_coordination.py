@@ -460,7 +460,8 @@ def test_sqlite_write_failure_and_lost_commit_receipt_fail_closed(tmp_path, monk
 
         with monkeypatch.context() as patch:
             patch.setattr(core.sqlite3, "connect", connect)
-            with pytest.raises(CoordinationError, match="ledger_unavailable"):
+            expected = "commit_receipt_uncertain" if failure == "after_commit" else "ledger_unavailable"
+            with pytest.raises(CoordinationError, match=expected):
                 ledger.reserve(owner, item)
         replay = ledger.reserve(owner, item)
         assert replay.newly_created == (failure != "after_commit")

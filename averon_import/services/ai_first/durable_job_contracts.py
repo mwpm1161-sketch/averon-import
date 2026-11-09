@@ -28,6 +28,35 @@ _SECRET_TEXT = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class JobPageDispatchClaim:
+    """Trusted internal scheduler-to-dispatcher fence for one durable page."""
+    tenant_id: str
+    owner_id: str
+    document_id: str
+    job_id: str
+    run_id: str
+    generation: int
+    page_number: int
+    candidate_attempt_id: str
+    claim_seq: int
+    page_revision: int
+    owner_epoch: int
+    cancel_revision: int
+
+    def __post_init__(self):
+        for value in (self.tenant_id, self.owner_id, self.document_id):
+            identifier(value)
+        if (type(self.job_id) is not str or not re.fullmatch(r"dj_[0-9a-f]{32}", self.job_id)):
+            raise CoordinationError("invalid_job_dispatch_claim")
+        for value in (self.run_id, self.candidate_attempt_id):
+            uuid_hex(value)
+        for value in (self.generation, self.page_number, self.claim_seq,
+                      self.page_revision, self.owner_epoch):
+            integer(value, minimum=1)
+        integer(self.cancel_revision)
+
+
 def _json_bytes(value, maximum):
     try:
         raw = canonical(value).encode("utf-8")
@@ -441,4 +470,3 @@ def validate_snapshot(run: Run, config: OrchestrationConfig, binding: Binding):
     snapshot_digest = fingerprint({"version": 1, "run": asdict(run), "config": config.model_dump(mode="json"),
                                    "binding": asdict(binding), "pricing_digest": pricing_digest})
     return canonical(asdict(run)), config_json, canonical(asdict(binding)), pricing_digest, snapshot_digest
-

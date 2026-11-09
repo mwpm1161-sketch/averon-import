@@ -232,7 +232,8 @@ class DurableQwenVisionAdapter(QwenVisionAdapter):
                 request.image.data, request.page_number, self._user_context)).hexdigest())
             if cancelled:
                 raise AdapterRequestError("cancelled_before_dispatch", outcome_unknown=False, request_started=False)
-            call = self.dispatcher.call(self.client, request.page_number, digest, estimate)
+            call = self.dispatcher.call(self.client, request.page_number, digest, estimate,
+                                        job_claim=request.job_claim)
             loop = asyncio.get_running_loop()
 
             def before_dispatch():
@@ -262,6 +263,8 @@ class DurableQwenVisionAdapter(QwenVisionAdapter):
                     completion = await self._wait_for_thread(task, thread_cancel)
                 result = self._convert_completion(completion, request)
             except QwenVisionError as exc:
+                if call.deferred is not None:
+                    raise call.deferred
                 try:
                     result = self._raise_client_error(exc, request)
                 except AdapterRequestError as failure:

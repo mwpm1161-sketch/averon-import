@@ -56,7 +56,11 @@ def open_runtime(payload, transport=None):
                             limits=VisionLimits(max_output_tokens=100, max_pages=100, max_requests=100, dpi=72))
     dispatcher = DurableDispatcher(payload["ledger"], installation_id=payload["installation_id"],
                                    evidence_root=payload["evidence"], enabled=True,
-                                   **({"lease_ms": payload["lease_ms"]} if "lease_ms" in payload else {}))
+                                   **({"lease_ms": payload["lease_ms"]} if "lease_ms" in payload else {}),
+                                   **({"schema_version": payload["schema_version"]}
+                                      if "schema_version" in payload else {}),
+                                   **({"maintenance_root": payload["maintenance_root"]}
+                                      if "maintenance_root" in payload else {}))
     try:
         transport = transport or FakeTransport()
         client = QwenVisionClient(wire, transport=transport, dispatch_boundary=dispatcher)

@@ -19,6 +19,18 @@ class CoordinationError(RuntimeError):
         super().__init__(code)
 
 
+class DeferredWithoutIntent(CoordinationError):
+    """A proven pre-insert capacity refusal; no financial intent was created."""
+
+
+class DispatchGateRejected(CoordinationError):
+    """A deterministic pre-commit rejection of a job-managed send gate."""
+
+
+class CommitReceiptUncertain(CoordinationError):
+    """The SQLite operation may have committed but its receipt was not observed."""
+
+
 def integer(value: int, *, minimum: int = 0) -> int:
     if type(value) is not int or not minimum <= value <= MAX_INTEGER:
         raise CoordinationError("invalid_integer")

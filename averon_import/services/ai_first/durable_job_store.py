@@ -16,7 +16,7 @@ from .durable_execution_store import PrivateExecutionStore, _open_readonly
 from .private_acl import PrivateAclError, verify_private_path, _reject_reparse
 from .durable_job_contracts import (
     AuthorizedDocumentContext, CommandReceipt, ExecutionInput, ExecutionProfile,
-    FinancialSnapshotInput, JobStatusSnapshot, PageStatus, QueueLimits, SubmissionReceipt,
+    FinancialSnapshotInput, JobPageDispatchClaim, JobStatusSnapshot, PageStatus, QueueLimits, SubmissionReceipt,
     SubmissionRequest, build_execution_input, execution_bytes, public_safe_code,
     validate_snapshot,
 )
@@ -479,6 +479,87 @@ class DurableJobStore:
 
         self._write(block)
 
+    def _claim_page_for_dispatch(self, actor: AuthorizedDocumentContext, owner, job_id: str,
+                                 page_number: int) -> JobPageDispatchClaim:
+        """Internal scheduler seam: fence one page under the current B1 owner.
+
+        No financial intent or permit is created here. Reclaiming a page before
+        an intent exists advances only the page revision; the B1 claim sequence
+        continues to be derived from persisted attempts.
+        """
+        self._check_actor(actor)
+        if (self.ledger.schema_version != 2 or type(job_id) is not str
+                or len(job_id) != 35 or not job_id.startswith("dj_")
+                or type(page_number) is not int or page_number < 1):
+            raise CoordinationError("invalid_job_dispatch_claim")
+
+        def claim(connection):
+            job = connection.execute(
+                "SELECT j.job_id,j.tenant_id,j.owner_id,j.document_id,j.run_id,j.generation,j.execution_state,"
+                "j.state,j.revision,j.authorized_owner_epoch,j.cancel_revision,r.body_json,d.generation AS current_generation,"
+                "d.active_run_id FROM durable_jobs j JOIN runs r ON r.run_id=j.run_id "
+                "JOIN documents d USING(tenant_id,document_id) "
+                "WHERE j.job_id=? AND j.tenant_id=? AND j.owner_id=? AND j.document_id=?",
+                (job_id, actor.tenant_id, actor.owner_id, actor.document_id),
+            ).fetchone()
+            page = connection.execute(
+                "SELECT run_id,page_number,candidate_attempt_id,attempt_id,state,claim_seq,owner_epoch,revision "
+                "FROM durable_job_pages WHERE job_id=? AND page_number=?",
+                (job_id, page_number),
+            ).fetchone()
+            if job is None or page is None:
+                raise CoordinationError("durable_job_page_not_found")
+            if (job["generation"] != actor.generation or job["execution_state"] != "ready"
+                    or job["state"] not in ("queued", "running")
+                    or job["current_generation"] != job["generation"]
+                    or job["active_run_id"] != job["run_id"]):
+                raise CoordinationError("durable_job_not_dispatchable")
+            candidate = uuid5(_PAGE_NAMESPACE, f"{job['run_id']}:{page_number}:1").hex
+            if page["candidate_attempt_id"] != candidate or page["run_id"] != job["run_id"]:
+                raise CoordinationError("durable_job_page_identity_mismatch")
+            attempts = connection.execute(
+                "SELECT COUNT(*),COALESCE(MAX(claim_seq),0) FROM attempts WHERE run_id=? AND page_number=?",
+                (job["run_id"], page_number),
+            ).fetchone()
+            if attempts[0] != 0:
+                raise CoordinationError("durable_job_attempt_already_exists")
+            if page["attempt_id"] is not None:
+                raise CoordinationError("durable_job_attempt_already_linked")
+            if page["state"] not in ("queued", "quota_wait", "claimed"):
+                raise CoordinationError("durable_job_page_not_claimable")
+            claim_seq = attempts[1] + 1
+            if page["state"] == "claimed" and page["claim_seq"] != claim_seq:
+                raise CoordinationError("durable_job_claim_sequence_mismatch")
+
+            if job["state"] != "running" or job["authorized_owner_epoch"] != owner.epoch:
+                changed = connection.execute(
+                    "UPDATE durable_jobs SET state='running',authorized_owner_epoch=?,revision=revision+1,updated_at=? "
+                    "WHERE job_id=? AND tenant_id=? AND owner_id=? AND document_id=? AND run_id=? AND generation=? "
+                    "AND execution_state='ready' AND state IN ('queued','running') AND cancel_revision=? "
+                    "AND revision=?",
+                    (owner.epoch, _now(), job_id, actor.tenant_id, actor.owner_id, actor.document_id,
+                     job["run_id"], job["generation"], job["cancel_revision"], job["revision"]),
+                ).rowcount
+                if changed != 1:
+                    raise CoordinationError("durable_job_claim_stale")
+            changed = connection.execute(
+                "UPDATE durable_job_pages SET state='claimed',claim_seq=?,owner_epoch=?,revision=revision+1 "
+                "WHERE job_id=? AND run_id=? AND page_number=? AND candidate_attempt_id=? AND attempt_id IS NULL "
+                "AND state=? AND claim_seq=? AND revision=?",
+                (claim_seq, owner.epoch, job_id, job["run_id"], page_number, candidate,
+                 page["state"], page["claim_seq"], page["revision"]),
+            ).rowcount
+            if changed != 1:
+                raise CoordinationError("durable_job_claim_stale")
+            return JobPageDispatchClaim(
+                actor.tenant_id, actor.owner_id, actor.document_id, job_id, job["run_id"],
+                job["generation"], page_number, candidate, claim_seq, page["revision"] + 1,
+                owner.epoch, job["cancel_revision"],
+            )
+
+        with self.ledger._transaction(owner) as (connection, _stamp, _meta):
+            return claim(connection)
+
     def recover_preparing(self, actor: AuthorizedDocumentContext, job_id: str,
                           *, recovery_input: ExecutionInput | None = None) -> SubmissionReceipt:
         """Complete from valid final/pending bytes or exact-hash re-supply; else block.
@@ -795,4 +876,3 @@ class DurableJobStore:
             except Exception:
                 raise CoordinationError("financial_snapshot_corrupt") from None
         return self._read(query)
-

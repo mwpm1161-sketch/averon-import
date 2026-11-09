@@ -17,8 +17,8 @@ import time
 from uuid import UUID, uuid4
 
 from .coordination_contracts import (
-    Attempt, BillingScope, Binding, Bootstrap, ClockStamp, CoordinationError,
-    Outcome, Reservation, Run, canonical, fingerprint,
+    Attempt, BillingScope, Binding, Bootstrap, ClockStamp, CommitReceiptUncertain, CoordinationError,
+    DeferredWithoutIntent, DispatchGateRejected, Outcome, Reservation, Run, canonical, fingerprint,
     identifier, integer, uuid_hex,
 )
 from .coordination_schema import (
@@ -369,7 +369,18 @@ class CoordinationLedger:
                                     "SELECT lease_until_ms FROM meta WHERE id=1").fetchone()[0]):
                             raise CoordinationError("owner_fenced")
                     self._verify_storage()
-                    connection.commit()
+                    try:
+                        connection.commit()
+                    except BaseException:
+                        if connection.in_transaction:
+                            # SQLite confirms that the transaction is still
+                            # open, so _transaction's handler can roll it back.
+                            raise
+                        # sqlite3 can report an I/O error after the durable
+                        # commit reached disk. The caller cannot safely infer
+                        # rollback from the exception or issue a replacement
+                        # reservation/send; preserve the ambiguous liability.
+                        raise CommitReceiptUncertain("commit_receipt_uncertain") from None
                     # A slow fsync must not return a usable new receipt after
                     # lease expiry. The committed operation remains replayable
                     # as history, never as a second newly-created reservation.
@@ -377,7 +388,7 @@ class CoordinationLedger:
                     until = connection.execute("SELECT lease_until_ms FROM meta WHERE id=1").fetchone()[0]
                     if (completed.boot_id != stamp.boot_id or completed.milliseconds < stamp.milliseconds
                             or completed.milliseconds >= until):
-                        raise CoordinationError("owner_fenced")
+                        raise CommitReceiptUncertain("owner_fenced")
                 except BaseException:
                     if connection.in_transaction:
                         connection.rollback()
@@ -535,20 +546,41 @@ class CoordinationLedger:
         return requests, tokens, inflight
 
     def reserve(self, owner, attempt: Attempt) -> Reservation:
+        return self._reserve(owner, attempt, job_claim=None)
+
+    def reserve_job_managed(self, owner, attempt: Attempt, job_claim) -> Reservation:
+        """Reserve the B1 intent for one validated B3 job/page claim."""
+        return self._reserve(owner, attempt, job_claim=job_claim)
+
+    def _reserve(self, owner, attempt: Attempt, *, job_claim):
         if type(attempt) is not Attempt:
             raise CoordinationError("invalid_attempt")
+        if job_claim is not None:
+            from .durable_job_contracts import JobPageDispatchClaim
+            if type(job_claim) is not JobPageDispatchClaim:
+                raise CoordinationError("invalid_job_dispatch_claim")
         payload = asdict(attempt)
         with self._transaction(owner) as (connection, stamp, meta):
             replay = self._replay(connection, attempt.operation_id, "reserve", payload)
             if replay is not None:
                 return Reservation(replay["attempt_id"], replay["owner_epoch"], False)
+            managed = False
+            if self.schema_version == 2:
+                managed = connection.execute("SELECT 1 FROM durable_jobs WHERE run_id=? LIMIT 1",
+                                              (attempt.run_id,)).fetchone() is not None
+            if managed and job_claim is None:
+                raise CoordinationError("job_dispatch_claim_required")
+            if job_claim is not None:
+                if not managed:
+                    raise CoordinationError("job_dispatch_claim_mismatch")
+                self._validate_job_page_claim(connection, owner, job_claim, attempt=attempt)
             run = connection.execute("SELECT r.* FROM runs r JOIN documents d USING(tenant_id,document_id)"
                                      " WHERE r.run_id=? AND d.active_run_id=r.run_id AND d.generation=r.generation",
                                      (attempt.run_id,)).fetchone()
             if run is None:
                 raise CoordinationError("run_fenced")
             if connection.execute("SELECT COUNT(*) FROM attempts WHERE state IN ('intent','unknown')").fetchone()[0] >= meta["global_concurrency"]:
-                raise CoordinationError("global_capacity_exhausted")
+                raise DeferredWithoutIntent("global_capacity_exhausted")
             binding = connection.execute("SELECT digest FROM credential_bindings WHERE binding_id=? AND revision=? AND active=1",
                                          (attempt.binding.binding_id, attempt.binding.revision)).fetchone()
             if binding is None or binding[0] != attempt.binding.fingerprint:
@@ -583,7 +615,7 @@ class CoordinationLedger:
                 requests, tokens, inflight = self._quota_usage(connection, scope, stamp, meta)
                 if (requests + 1 > scope["requests"] or inflight + 1 > scope["concurrency"]
                         or tokens + attempt.input_tokens + attempt.output_tokens > scope["tokens"]):
-                    raise CoordinationError("quota_exhausted")
+                    raise DeferredWithoutIntent("quota_exhausted")
                 policies.append(scope)
             connection.execute("INSERT INTO attempts(attempt_id,operation_id,run_id,page_number,attempt_no,claim_seq,"
                                "owner_epoch,binding_id,binding_revision,billing_scope_id,billing_revision,request_digest,"
@@ -601,6 +633,43 @@ class CoordinationLedger:
             self._receipt(connection, owner, stamp, attempt.operation_id, "reserve", payload,
                           {"attempt_id": attempt.attempt_id, "owner_epoch": owner.epoch})
             return Reservation(attempt.attempt_id, owner.epoch, True)
+
+    @staticmethod
+    def _validate_job_page_claim(connection, owner, claim, *, attempt=None):
+        """Validate a durable page claim while the caller holds BEGIN IMMEDIATE."""
+        from .durable_job_contracts import JobPageDispatchClaim
+        if type(claim) is not JobPageDispatchClaim:
+            raise CoordinationError("invalid_job_dispatch_claim")
+        if claim.owner_epoch != owner.epoch:
+            raise CoordinationError("job_dispatch_claim_stale")
+        job = connection.execute(
+            "SELECT job_id,tenant_id,owner_id,document_id,run_id,generation,execution_state,state,"
+            "authorized_owner_epoch,cancel_revision FROM durable_jobs WHERE job_id=?",
+            (claim.job_id,),
+        ).fetchone()
+        page = connection.execute(
+            "SELECT run_id,page_number,candidate_attempt_id,attempt_id,state,claim_seq,owner_epoch,revision "
+            "FROM durable_job_pages WHERE job_id=? AND page_number=?",
+            (claim.job_id, claim.page_number),
+        ).fetchone()
+        if (job is None or page is None
+                or (job["tenant_id"], job["owner_id"], job["document_id"], job["run_id"], job["generation"])
+                != (claim.tenant_id, claim.owner_id, claim.document_id, claim.run_id, claim.generation)
+                or job["execution_state"] != "ready" or job["state"] not in ("queued", "running")
+                or job["authorized_owner_epoch"] != owner.epoch
+                or job["cancel_revision"] != claim.cancel_revision
+                or (page["run_id"], page["page_number"], page["candidate_attempt_id"],
+                    page["state"], page["claim_seq"], page["owner_epoch"], page["revision"])
+                != (claim.run_id, claim.page_number, claim.candidate_attempt_id,
+                    "claimed", claim.claim_seq, owner.epoch, claim.page_revision)
+                or page["attempt_id"] is not None):
+            raise CoordinationError("job_dispatch_claim_stale")
+        if attempt is not None and (
+                attempt.run_id != claim.run_id or attempt.page_number != claim.page_number
+                or attempt.attempt_id != claim.candidate_attempt_id
+                or attempt.claim_seq != claim.claim_seq or attempt.attempt_no != 1):
+            raise CoordinationError("job_dispatch_attempt_mismatch")
+        return job, page
 
     @staticmethod
     def _block_attempt(connection, attempt_id):
@@ -810,7 +879,132 @@ class CoordinationLedger:
                 if policy["blocked"] and not evidence_only:
                     raise CoordinationError("needs_reconciliation")
 
-    def record_outcome(self, owner, outcome: Outcome):
+    def commit_job_send_gate(self, owner, attempt: Attempt, *, expected_run: Run, claim):
+        """Atomically authorize a job-managed send and consume its page claim.
+
+        This is the cancel/send linearization point. It validates all B1 intent,
+        owner, run, binding and current-policy facts together with the durable
+        job/page fences, then commits ``claimed -> send_committed`` in this same
+        BEGIN IMMEDIATE transaction. It never creates a financial intent or
+        performs transport work.
+        """
+        from .durable_job_contracts import JobPageDispatchClaim
+        if (type(attempt) is not Attempt or type(expected_run) is not Run
+                or type(claim) is not JobPageDispatchClaim
+                or expected_run.run_id != attempt.run_id):
+            raise DispatchGateRejected("invalid_job_send_gate")
+        try:
+            with self._transaction(owner) as (connection, _stamp, _meta):
+                row = connection.execute("SELECT * FROM attempts WHERE attempt_id=?",
+                                         (attempt.attempt_id,)).fetchone()
+                if (row is None or row["body_json"] != canonical(asdict(attempt))
+                        or (row["operation_id"], row["run_id"], row["page_number"], row["attempt_no"],
+                            row["claim_seq"], row["owner_epoch"], row["binding_id"],
+                            row["binding_revision"], row["billing_scope_id"], row["billing_revision"],
+                            row["request_digest"], row["input_tokens"], row["output_tokens"],
+                            row["reserve_units"], row["state"])
+                        != (attempt.operation_id, attempt.run_id, attempt.page_number, attempt.attempt_no,
+                            attempt.claim_seq, owner.epoch, attempt.binding.binding_id,
+                            attempt.binding.revision, attempt.binding.billing_scope_id,
+                            attempt.billing_revision, attempt.request_digest, attempt.input_tokens,
+                            attempt.output_tokens, attempt.reserve_units, "intent")):
+                    raise CoordinationError("dispatch_intent_mismatch")
+
+                reserve_receipt = connection.execute(
+                    "SELECT kind,request_digest,request_json,result_json,epoch FROM operations WHERE operation_id=?",
+                    (attempt.operation_id,),
+                ).fetchone()
+                expected_result = canonical({"attempt_id": attempt.attempt_id, "owner_epoch": owner.epoch})
+                if (reserve_receipt is None or reserve_receipt["kind"] != "reserve"
+                        or reserve_receipt["request_digest"] != fingerprint(asdict(attempt))
+                        or reserve_receipt["request_json"] != canonical(asdict(attempt))
+                        or reserve_receipt["result_json"] != expected_result
+                        or reserve_receipt["epoch"] != owner.epoch):
+                    raise CoordinationError("dispatch_reserve_receipt_mismatch")
+
+                run = connection.execute(
+                    "SELECT r.body_json,r.tenant_id,r.document_id,r.generation,d.generation AS current_generation,"
+                    "d.active_run_id FROM runs r JOIN documents d USING(tenant_id,document_id) WHERE r.run_id=?",
+                    (attempt.run_id,),
+                ).fetchone()
+                if (run is None or run["body_json"] != canonical(asdict(expected_run))
+                        or (run["tenant_id"], run["document_id"], run["generation"],
+                            run["current_generation"], run["active_run_id"])
+                        != (claim.tenant_id, claim.document_id, claim.generation,
+                            claim.generation, claim.run_id)
+                        or (expected_run.tenant_id, expected_run.document_id, expected_run.generation,
+                            expected_run.source_digest)
+                        != (claim.tenant_id, claim.document_id, claim.generation,
+                            expected_run.source_digest)):
+                    raise CoordinationError("run_fenced")
+
+                binding = connection.execute(
+                    "SELECT body_json,digest,active,billing_scope_id FROM credential_bindings "
+                    "WHERE binding_id=? AND revision=?",
+                    (attempt.binding.binding_id, attempt.binding.revision),
+                ).fetchone()
+                quota_edges = tuple(item[0] for item in connection.execute(
+                    "SELECT quota_scope_id FROM binding_quotas WHERE binding_id=? AND binding_revision=? "
+                    "ORDER BY quota_scope_id", (attempt.binding.binding_id, attempt.binding.revision)))
+                if (binding is None or binding["active"] != 1
+                        or binding["body_json"] != canonical(asdict(attempt.binding))
+                        or binding["digest"] != attempt.binding.fingerprint
+                        or binding["billing_scope_id"] != attempt.binding.billing_scope_id
+                        or quota_edges != attempt.binding.quota_scope_ids):
+                    raise CoordinationError("binding_mismatch")
+
+                billing = connection.execute(
+                    "SELECT revision,blocked FROM billing_scopes WHERE scope_id=?",
+                    (attempt.binding.billing_scope_id,),
+                ).fetchone()
+                if billing is None or billing["revision"] != attempt.billing_revision:
+                    raise CoordinationError("policy_revision_mismatch")
+                if billing["blocked"]:
+                    raise CoordinationError("needs_reconciliation")
+                quota_holds = connection.execute(
+                    "SELECT quota_scope_id,policy_revision,window_ms,reserved_tokens,policy_json "
+                    "FROM attempt_quota_reservations WHERE attempt_id=? ORDER BY quota_scope_id",
+                    (attempt.attempt_id,),
+                ).fetchall()
+                if len(quota_holds) != len(attempt.quota_revisions):
+                    raise CoordinationError("dispatch_quota_hold_mismatch")
+                for hold, (scope_id, revision) in zip(quota_holds, attempt.quota_revisions):
+                    scope = connection.execute("SELECT * FROM quota_scopes WHERE scope_id=?",
+                                               (scope_id,)).fetchone()
+                    if (scope is None or scope["revision"] != revision
+                            or hold["quota_scope_id"] != scope_id
+                            or hold["policy_revision"] != revision
+                            or hold["window_ms"] != scope["window_ms"]
+                            or hold["reserved_tokens"] != attempt.input_tokens + attempt.output_tokens
+                            or hold["policy_json"] != canonical(dict(scope))):
+                        raise CoordinationError("policy_revision_mismatch")
+                    if scope["blocked"]:
+                        raise CoordinationError("needs_reconciliation")
+
+                self._validate_job_page_claim(connection, owner, claim, attempt=attempt)
+                changed = connection.execute(
+                    "UPDATE durable_job_pages SET state='send_committed',attempt_id=?,revision=revision+1 "
+                    "WHERE job_id=? AND run_id=? AND page_number=? AND candidate_attempt_id=? "
+                    "AND attempt_id IS NULL AND state='claimed' AND claim_seq=? AND owner_epoch=? AND revision=? "
+                    "AND EXISTS (SELECT 1 FROM durable_jobs j WHERE j.job_id=? AND j.tenant_id=? "
+                    "AND j.owner_id=? AND j.document_id=? AND j.run_id=? AND j.generation=? "
+                    "AND j.execution_state='ready' AND j.state IN ('queued','running') "
+                    "AND j.authorized_owner_epoch=? AND j.cancel_revision=?)",
+                    (claim.candidate_attempt_id, claim.job_id, claim.run_id, claim.page_number,
+                     claim.candidate_attempt_id, claim.claim_seq, owner.epoch, claim.page_revision,
+                     claim.job_id, claim.tenant_id, claim.owner_id, claim.document_id, claim.run_id,
+                     claim.generation, owner.epoch, claim.cancel_revision),
+                ).rowcount
+                if changed != 1:
+                    raise CoordinationError("job_dispatch_claim_stale")
+        except (DispatchGateRejected, CommitReceiptUncertain):
+            raise
+        except CoordinationError as exc:
+            # Predicate failures happen before commit and are distinguishable
+            # from an ambiguous SQLite commit receipt at the B2 boundary.
+            raise DispatchGateRejected(exc.code) from None
+
+    def record_outcome(self, owner, outcome: Outcome, *, job_claim=None):
         """Trusted-core facts only. B2/B6 must validate artifact/provider evidence.
 
         This API does not read files, infer terminality from an HTTP status, or
@@ -818,6 +1012,10 @@ class CoordinationLedger:
         """
         if type(outcome) is not Outcome:
             raise CoordinationError("invalid_outcome")
+        if job_claim is not None:
+            from .durable_job_contracts import JobPageDispatchClaim
+            if type(job_claim) is not JobPageDispatchClaim or job_claim.candidate_attempt_id != outcome.attempt_id:
+                raise CoordinationError("invalid_job_dispatch_claim")
         payload = asdict(outcome)
         with self._transaction(owner) as (connection, stamp, _):
             replay = self._replay(connection, outcome.operation_id, "outcome", payload)
@@ -839,6 +1037,23 @@ class CoordinationLedger:
                     outcome.state, outcome.actual_units, outcome.evidence_digest, stamp.boot_id,
                     stamp.milliseconds, outcome.attempt_id,
                 ))
+                if outcome.state == "not_sent" and job_claim is not None:
+                    # A durable cancel that won before the gate has already
+                    # invalidated the claim. Link the proven no-send result to
+                    # the canceled page in the same financial transaction.
+                    connection.execute(
+                        "UPDATE durable_job_pages SET state='cancelled',safe_code='cancelled',revision=revision+1 "
+                        "WHERE job_id=? AND run_id=? AND page_number=? AND candidate_attempt_id=? "
+                        "AND attempt_id IS NULL AND state='claimed' AND claim_seq=? AND owner_epoch=? AND revision=? "
+                        "AND EXISTS (SELECT 1 FROM durable_jobs j WHERE j.job_id=? AND j.tenant_id=? "
+                        "AND j.owner_id=? AND j.document_id=? AND j.run_id=? AND j.generation=? "
+                        "AND j.state IN ('cancelling','cancelled') AND j.cancel_revision>?)",
+                        (job_claim.job_id, job_claim.run_id, job_claim.page_number,
+                         job_claim.candidate_attempt_id, job_claim.claim_seq, job_claim.owner_epoch,
+                         job_claim.page_revision, job_claim.job_id, job_claim.tenant_id,
+                         job_claim.owner_id, job_claim.document_id, job_claim.run_id,
+                         job_claim.generation, job_claim.cancel_revision),
+                    )
                 if outcome.actual_units is not None and outcome.actual_units > attempt["reserve_units"]:
                     self._block_attempt(connection, outcome.attempt_id)
             return self._receipt(connection, owner, stamp, outcome.operation_id, "outcome", payload,

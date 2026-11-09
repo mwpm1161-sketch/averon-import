@@ -277,13 +277,14 @@ class RequestEstimate(_StrictModel):
 
 class PageExtractionRequest:
     __slots__ = ("source_document_id", "page_number", "image", "run_id", "cancel_event",
-                 "before_dispatch", "dispatch_started_at", "reservation_id")
+                 "before_dispatch", "dispatch_started_at", "reservation_id", "job_claim")
 
     def __init__(
         self, source_document_id: str, page_number: int, image: PageImage, run_id: str,
         cancel_event: asyncio.Event | None = None,
         before_dispatch: Callable[[], Awaitable[None]] | None = None,
         reservation_id: str | None = None,
+        job_claim=None,
     ):
         self.source_document_id = source_document_id
         self.page_number = page_number
@@ -293,6 +294,7 @@ class PageExtractionRequest:
         self.before_dispatch = before_dispatch
         self.dispatch_started_at: str | None = None
         self.reservation_id = reservation_id
+        self.job_claim = job_claim
 
 
 class AdapterPageResult(_StrictModel):

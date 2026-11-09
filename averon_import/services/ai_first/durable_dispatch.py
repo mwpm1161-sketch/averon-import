@@ -21,7 +21,8 @@ from uuid import UUID, uuid5
 
 from .coordination import CoordinationLedger, _safe_root
 from .coordination_contracts import (
-    Attempt, Binding, CoordinationError, Outcome, RUB_SCALE, Run, canonical,
+    Attempt, Binding, CommitReceiptUncertain, CoordinationError, DeferredWithoutIntent,
+    DispatchGateRejected, Outcome, RUB_SCALE, Run, canonical,
     digest, fingerprint, integer, rub_units, uuid_hex,
 )
 from .dispatch_policy import durable_required
@@ -157,10 +158,13 @@ class HistoricalSettlementContext:
 
 
 class DispatchCall:
-    def __init__(self, grant, page, body_digest, estimate, pricing_digest):
+    def __init__(self, grant, page, body_digest, estimate, pricing_digest, job_claim=None):
         self.grant, self.page, self.body_digest, self.estimate = grant, page, body_digest, estimate
+        self.job_claim = job_claim
         self.attempt = self.permit = self.response = None
         self.fresh = self.delegated = self.uncertain = False
+        self.gate_committed = False
+        self.deferred = None
         self.finished = False
         self.error = None
         self.pricing_digest = pricing_digest
@@ -429,7 +433,7 @@ class DurableDispatcher:
             raise CoordinationError("dispatcher_unavailable")
         self._owner._check(self.ledger)
 
-    def call(self, client, page, body_digest, estimate):
+    def call(self, client, page, body_digest, estimate, *, job_claim=None):
         with self._condition:
             self._check()
             if client not in self._registered:
@@ -437,7 +441,13 @@ class DurableDispatcher:
             caller, grant = self._clients[client]
             if CALLER.get() is not caller:
                 raise CoordinationError("dispatch_caller_mismatch")
-            call = DispatchCall(grant, page, body_digest, estimate, self._pricing[client])
+            if job_claim is not None:
+                from .durable_job_contracts import JobPageDispatchClaim
+                if (type(job_claim) is not JobPageDispatchClaim
+                        or job_claim.run_id != grant.run.run_id
+                        or job_claim.page_number != page):
+                    raise CoordinationError("invalid_job_dispatch_claim")
+            call = DispatchCall(grant, page, body_digest, estimate, self._pricing[client], job_claim)
             self._calls += 1
             return call
 
@@ -464,10 +474,12 @@ class DurableDispatcher:
             raise CoordinationError("dispatch_request_mismatch")
         digest = fingerprint({"body_sha256": call.body_digest, "target": grant.binding.target_digest,
                               "binding": grant.binding.fingerprint, "run": fingerprint(asdict(grant.run)), "method": "POST"})
-        identity = self.attempt_id(grant.run.run_id, call.page)
+        identity = (call.job_claim.candidate_attempt_id if call.job_claim is not None
+                    else self.attempt_id(grant.run.run_id, call.page))
+        claim_seq = call.job_claim.claim_seq if call.job_claim is not None else 1
         estimate = call.estimate
         return Attempt(uuid5(UUID(identity), "reserve").hex, identity, grant.run.run_id,
-                       call.page, 1, 1, grant.binding, grant.billing_revision, grant.quota_revisions,
+                       call.page, 1, claim_seq, grant.binding, grant.billing_revision, grant.quota_revisions,
                        digest, estimate.reserved_input_tokens, estimate.reserved_output_tokens,
                        reserve_units(grant.pricing, estimate.reserved_input_tokens,
                                      estimate.reserved_output_tokens))
@@ -478,7 +490,13 @@ class DurableDispatcher:
         item = self._request(client, call, url, body, headers)
         call.attempt = item
         try:
-            receipt = self.ledger.reserve(self._owner, item)
+            if call.job_claim is None:
+                receipt = self.ledger.reserve(self._owner, item)
+            else:
+                receipt = self.ledger.reserve_job_managed(self._owner, item, call.job_claim)
+        except DeferredWithoutIntent as exc:
+            call.deferred = exc
+            raise
         except BaseException as exc:
             call.uncertain = True
             self._failed.set()
@@ -512,9 +530,29 @@ class DurableDispatcher:
             if (call.permit is not permit or permit.epoch != self._owner.epoch
                     or self._request(client, call, url, body, headers) != permit.attempt):
                 raise CoordinationError("dispatch_request_mismatch")
-            self.ledger.validate_dispatch(self._owner, permit.attempt, expected_run=call.grant.run)
-            if cancel is not None and cancel.is_set():
-                raise CoordinationError("cancelled_before_dispatch")
+            if call.job_claim is not None:
+                try:
+                    self.ledger.commit_job_send_gate(
+                        self._owner, permit.attempt, expected_run=call.grant.run,
+                        claim=call.job_claim,
+                    )
+                except DispatchGateRejected:
+                    raise
+                except BaseException:
+                    # A lost commit receipt must never become a retryable POST.
+                    # Retain the intent and fail this dispatcher closed.
+                    call.uncertain = True
+                    self._failed.set()
+                    raise CoordinationError("job_send_gate_receipt_uncertain") from None
+                call.gate_committed = True
+                # From this point onward local cancellation cannot revoke SQL
+                # authorization. A failure before transport is ambiguous, not
+                # proof that no send was admitted.
+                call.delegated = True
+            else:
+                self.ledger.validate_dispatch(self._owner, permit.attempt, expected_run=call.grant.run)
+                if cancel is not None and cancel.is_set():
+                    raise CoordinationError("cancelled_before_dispatch")
 
     def post(self, client, call, *, url, body, headers, on_dispatch, before_dispatch=None, **kwargs):
         self._check()
@@ -524,9 +562,11 @@ class DurableDispatcher:
         if before_dispatch is not None:
             before_dispatch()
         self.consume(permit, client, call, url, body, headers, kwargs.get("cancel"))
-        self._check()
+        if not call.gate_committed:
+            self._check()
         on_dispatch()
-        call.delegated = True
+        if not call.gate_committed:
+            call.delegated = True
         # All transports, including injected ones, pass this boundary.
         call.response = client._transport.post(url, body=body, headers=headers, **kwargs)
         return call.response
@@ -571,7 +611,10 @@ class DurableDispatcher:
             if state != "terminal":
                 raise CoordinationError("result_without_terminal_evidence")
             self.evidence.write(call.attempt, self._owner.epoch, result, outcome, proof)
-        self.ledger.record_outcome(self._owner, outcome)
+        if call.job_claim is None:
+            self.ledger.record_outcome(self._owner, outcome)
+        else:
+            self.ledger.record_outcome(self._owner, outcome, job_claim=call.job_claim)
         if result is not None:
             # Account for a late response even after supersession, but do not
             # return that page as a current success. Immutable evidence stays.
