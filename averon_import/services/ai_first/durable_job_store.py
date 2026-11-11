@@ -542,6 +542,9 @@ class DurableJobStore:
                 ).rowcount
                 if changed != 1:
                     raise CoordinationError("durable_job_claim_stale")
+                job_revision = job["revision"] + 1
+            else:
+                job_revision = job["revision"]
             changed = connection.execute(
                 "UPDATE durable_job_pages SET state='claimed',claim_seq=?,owner_epoch=?,revision=revision+1 "
                 "WHERE job_id=? AND run_id=? AND page_number=? AND candidate_attempt_id=? AND attempt_id IS NULL "
@@ -554,7 +557,7 @@ class DurableJobStore:
             return JobPageDispatchClaim(
                 actor.tenant_id, actor.owner_id, actor.document_id, job_id, job["run_id"],
                 job["generation"], page_number, candidate, claim_seq, page["revision"] + 1,
-                owner.epoch, job["cancel_revision"],
+                owner.epoch, job["cancel_revision"], job_revision,
             )
 
         with self.ledger._transaction(owner) as (connection, _stamp, _meta):
@@ -682,6 +685,38 @@ class DurableJobStore:
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
             raise CoordinationError("durable_receipt_corrupt") from None
 
+    @staticmethod
+    def _cancel_target(connection, job_id):
+        """Derive the post-cancel job target from persisted financial state."""
+        pages = connection.execute(
+            "SELECT state,attempt_id FROM durable_job_pages WHERE job_id=?", (job_id,)).fetchall()
+        attempts = connection.execute(
+            "SELECT a.state,a.actual_units,a.reserve_units,a.billing_scope_id FROM attempts a"
+            " JOIN durable_job_pages p ON p.run_id=a.run_id AND p.page_number=a.page_number"
+            " WHERE p.job_id=?", (job_id,)).fetchall()
+        unknown = (any(p["state"] == "unknown_outcome" for p in pages)
+                   or any(a["state"] == "unknown" for a in attempts))
+        overage = any(a["state"] == "terminal" and a["actual_units"] is not None
+                      and a["actual_units"] > a["reserve_units"] for a in attempts)
+        billing = {a["billing_scope_id"] for a in attempts}
+        quotas = {row[0] for row in connection.execute(
+            "SELECT DISTINCT q.quota_scope_id FROM attempt_quota_reservations q"
+            " JOIN attempts a USING(attempt_id) JOIN durable_job_pages p"
+            " ON p.run_id=a.run_id AND p.page_number=a.page_number WHERE p.job_id=?", (job_id,))}
+        blocked_scope = overage
+        for table, scopes in (("billing_scopes", billing), ("quota_scopes", quotas)):
+            for scope in scopes:
+                row = connection.execute(
+                    f"SELECT blocked FROM {table} WHERE scope_id=?", (scope,)).fetchone()
+                if row is not None and row[0]:
+                    blocked_scope = True
+        if unknown or blocked_scope:
+            return "blocked"
+        unsettled = (any(p["state"] in ("intent", "send_committed", "settlement_pending")
+                         for p in pages)
+                     or any(a["state"] in ("intent", "unknown") for a in attempts))
+        return "cancelling" if unsettled else "cancelled"
+
     def cancel(self, actor: AuthorizedDocumentContext, job_id: str, operation_id: str,
                expected_revision: int) -> CommandReceipt:
         self._check_actor(actor)
@@ -711,21 +746,25 @@ class DurableJobStore:
                 raise CoordinationError("job_revision_conflict")
             if job["state"] in ("completed", "completed_with_errors", "cancelled", "failed"):
                 raise CoordinationError("job_not_cancellable")
-            pages = connection.execute("SELECT state,attempt_id FROM durable_job_pages WHERE job_id=?", (job_id,)).fetchall()
-            safe_preintent = (job["state"] == "preparing_input" and all(p["attempt_id"] is None for p in pages))
-            safe_blocked = (job["state"] == "blocked" and all(p["state"] not in _UNKNOWN_PAGES
-                                                                  and p["attempt_id"] is None for p in pages))
-            target = "cancelled" if safe_preintent or safe_blocked else "cancelling"
-            changed = job["state"] != target
-            revision = expected_revision + int(changed)
+            # Fence first: advance both revisions before any page decision so a
+            # gate not already committed must fail.
+            revision = expected_revision + 1
             cancel_revision = job["cancel_revision"] + 1
-            if changed:
-                connection.execute("UPDATE durable_jobs SET state=?,revision=?,cancel_revision=?,updated_at=? WHERE job_id=?",
-                                   (target, revision, cancel_revision, now, job_id))
-                if target == "cancelled":
-                    connection.execute("UPDATE durable_job_pages SET state='cancelled',safe_code='cancelled',"
-                        "revision=revision+1 WHERE job_id=? AND attempt_id IS NULL AND state IN ('queued','quota_wait','blocked')",
-                        (job_id,))
+            connection.execute(
+                "UPDATE durable_jobs SET revision=?,cancel_revision=?,updated_at=? WHERE job_id=?",
+                (revision, cancel_revision, now, job_id))
+            # Cancel only no-attempt pages with no persisted B1 attempt. A
+            # legacy claimed page can already have a B1 intent and must survive.
+            connection.execute(
+                "UPDATE durable_job_pages SET state='cancelled',safe_code='cancelled',"
+                "revision=revision+1 WHERE job_id=? AND attempt_id IS NULL "
+                "AND state IN ('queued','quota_wait','claimed','blocked') "
+                "AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.run_id=durable_job_pages.run_id "
+                "AND a.page_number=durable_job_pages.page_number)", (job_id,))
+            target = self._cancel_target(connection, job_id)
+            if target != job["state"]:
+                connection.execute("UPDATE durable_jobs SET state=?,updated_at=? WHERE job_id=?",
+                                   (target, now, job_id))
             receipt = CommandReceipt(operation_id, job_id, "cancel", revision, target, payload_digest)
             connection.execute("INSERT INTO durable_job_commands VALUES(?,?,?,?,?,?,?)",
                 (actor.tenant_id, actor.owner_id, operation_id, "cancel", job_id, payload_digest,
@@ -773,8 +812,15 @@ class DurableJobStore:
                 raise CoordinationError("job_revision_conflict")
             if row["state"] != "paused_restart" or row["execution_state"] != "ready":
                 raise CoordinationError("job_not_resumable")
-            if connection.execute("SELECT 1 FROM durable_job_pages WHERE job_id=? AND state IN "
-                    "('intent','send_committed','settlement_pending','unknown_outcome') LIMIT 1", (job_id,)).fetchone():
+            if connection.execute("SELECT 1 FROM durable_job_pages WHERE job_id=? AND "
+                    "(state IN ('intent','send_committed','settlement_pending','unknown_outcome') "
+                    "OR (attempt_id IS NOT NULL AND state IN ('queued','quota_wait','claimed'))) LIMIT 1",
+                    (job_id,)).fetchone():
+                raise CoordinationError("unknown_outcome_not_resumable")
+            if connection.execute("SELECT 1 FROM attempts a JOIN durable_job_pages p"
+                    " ON p.run_id=a.run_id AND p.page_number=a.page_number"
+                    " WHERE p.job_id=? AND a.state IN ('intent','unknown') LIMIT 1",
+                    (job_id,)).fetchone():
                 raise CoordinationError("unknown_outcome_not_resumable")
             connection.execute("UPDATE durable_jobs SET state='queued',revision=revision+1,updated_at=? WHERE job_id=?",
                                (now, job_id))

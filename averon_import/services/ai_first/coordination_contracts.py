@@ -296,4 +296,9 @@ class Reservation:
     attempt_id: str
     owner_epoch: int
     newly_created: bool
+    # B3.4a job-managed projection fields. They are None for legacy B2 reserves.
+    page_revision: int | None = None
+    claim_seq: int | None = None
+    claim_cancel_revision: int | None = None
+    job_revision: int | None = None
     # A B1 ledger receipt. It is NOT an HTTP permission/capability.

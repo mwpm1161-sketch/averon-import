@@ -9,12 +9,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 import ctypes
 from dataclasses import asdict
+from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import sqlite3
 import threading
 import time
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from .coordination_contracts import (
     Attempt, BillingScope, Binding, Bootstrap, ClockStamp, CommitReceiptUncertain, CoordinationError,
@@ -59,6 +61,14 @@ def system_clock() -> ClockStamp:
 def _file_identity(path):
     info = path.stat()
     return info.st_dev, info.st_ino
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _settlement_operation_id(attempt_id):
+    return uuid5(UUID(attempt_id), "settlement").hex
 
 
 def _schema_digest(connection):
@@ -429,6 +439,20 @@ class CoordinationLedger:
                 raise
 
     def dispatcher(self) -> DispatcherLease:
+        """Legacy B2 acquisition: blanket ``intent -> unknown`` is preserved."""
+        return self._acquire(legacy=True)
+
+    def dispatcher_for_jobs(self) -> DispatcherLease:
+        """B3.4 durable-job acquisition: advance the owner without touching B1.
+
+        The caller must run owner adoption, publication recovery and
+        ``recover_unsettled`` before opening any claim. No old ``intent`` row is
+        converted to ``unknown`` here; classification needs page identity and
+        final evidence first.
+        """
+        return self._acquire(legacy=False)
+
+    def _acquire(self, *, legacy: bool) -> DispatcherLease:
         self._retain_use()
         stream = None
         transferred = False
@@ -447,11 +471,12 @@ class CoordinationLedger:
                 raise CoordinationError("dispatcher_busy") from None
             with self._transaction(acquiring=True) as (connection, stamp, meta):
                 epoch, nonce = integer(meta["epoch"] + 1), uuid4().hex
-                # Every prior un-settled intent is ambiguous, regardless of TTL.
-                intents = connection.execute("SELECT attempt_id FROM attempts WHERE state='intent'").fetchall()
-                for row in intents:
-                    self._block_attempt(connection, row[0])
-                connection.execute("UPDATE attempts SET state='unknown' WHERE state='intent'")
+                if legacy:
+                    # Every prior un-settled intent is ambiguous, regardless of TTL.
+                    intents = connection.execute("SELECT attempt_id FROM attempts WHERE state='intent'").fetchall()
+                    for row in intents:
+                        self._block_attempt(connection, row[0])
+                    connection.execute("UPDATE attempts SET state='unknown' WHERE state='intent'")
                 boot_started = stamp.milliseconds if stamp.boot_id != meta["boot_id"] else meta["boot_started_ms"]
                 connection.execute("UPDATE meta SET epoch=?,owner_nonce=?,boot_id=?,boot_started_ms=?,"
                                    "high_water_ms=?,lease_until_ms=? WHERE id=1", (
@@ -597,7 +622,11 @@ class CoordinationLedger:
         with self._transaction(owner) as (connection, stamp, meta):
             replay = self._replay(connection, attempt.operation_id, "reserve", payload)
             if replay is not None:
-                return Reservation(replay["attempt_id"], replay["owner_epoch"], False)
+                return Reservation(
+                    replay["attempt_id"], replay["owner_epoch"], False,
+                    replay.get("page_revision"), replay.get("claim_seq"),
+                    replay.get("claim_cancel_revision"), replay.get("job_revision"),
+                )
             managed = False
             if self.schema_version == 2:
                 managed = connection.execute("SELECT 1 FROM durable_jobs WHERE run_id=? LIMIT 1",
@@ -607,7 +636,7 @@ class CoordinationLedger:
             if job_claim is not None:
                 if not managed:
                     raise CoordinationError("job_dispatch_claim_mismatch")
-                self._validate_job_page_claim(connection, owner, job_claim, attempt=attempt)
+                self._validate_job_page_claim(connection, owner, job_claim, attempt=attempt, for_gate=False)
             run = connection.execute("SELECT r.* FROM runs r JOIN documents d USING(tenant_id,document_id)"
                                      " WHERE r.run_id=? AND d.active_run_id=r.run_id AND d.generation=r.generation",
                                      (attempt.run_id,)).fetchone()
@@ -664,13 +693,58 @@ class CoordinationLedger:
                     attempt.attempt_id, scope["scope_id"], scope["revision"], scope["window_ms"],
                     attempt.input_tokens + attempt.output_tokens, canonical(dict(scope)),
                 ))
-            self._receipt(connection, owner, stamp, attempt.operation_id, "reserve", payload,
-                          {"attempt_id": attempt.attempt_id, "owner_epoch": owner.epoch})
-            return Reservation(attempt.attempt_id, owner.epoch, True)
+            if job_claim is None:
+                result = {"attempt_id": attempt.attempt_id, "owner_epoch": owner.epoch}
+                self._receipt(connection, owner, stamp, attempt.operation_id, "reserve", payload, result)
+                return Reservation(attempt.attempt_id, owner.epoch, True)
+            # B3.4a reserve: the B1 attempt and the immutable page identity are
+            # one transaction. A partial visible state is never permitted.
+            changed = connection.execute(
+                "UPDATE durable_job_pages SET state='intent',attempt_id=?,revision=revision+1 "
+                "WHERE job_id=? AND run_id=? AND page_number=? AND candidate_attempt_id=? "
+                "AND attempt_id IS NULL AND state='claimed' AND claim_seq=? AND owner_epoch=? AND revision=?",
+                (job_claim.candidate_attempt_id, job_claim.job_id, job_claim.run_id,
+                 job_claim.page_number, job_claim.candidate_attempt_id, job_claim.claim_seq,
+                 owner.epoch, job_claim.page_revision),
+            ).rowcount
+            if changed != 1:
+                raise CoordinationError("job_dispatch_claim_stale")
+            job_revision = job_claim.job_revision
+            if job_revision is None:
+                row = connection.execute("SELECT revision FROM durable_jobs WHERE job_id=?",
+                                         (job_claim.job_id,)).fetchone()
+                if row is None:
+                    raise CoordinationError("job_dispatch_claim_stale")
+                job_revision = row[0]
+            changed = connection.execute(
+                "UPDATE durable_jobs SET revision=revision+1,updated_at=? WHERE job_id=? "
+                "AND state='running' AND authorized_owner_epoch=? AND cancel_revision=? AND revision=?",
+                (_now_iso(), job_claim.job_id, owner.epoch, job_claim.cancel_revision, job_revision),
+            ).rowcount
+            if changed != 1:
+                raise CoordinationError("job_dispatch_claim_stale")
+            job_revision += 1
+            page_revision = job_claim.page_revision + 1
+            result = {
+                "attempt_id": attempt.attempt_id,
+                "owner_epoch": owner.epoch,
+                "page_revision": page_revision,
+                "claim_seq": job_claim.claim_seq,
+                "claim_cancel_revision": job_claim.cancel_revision,
+                "job_revision": job_revision,
+            }
+            self._receipt(connection, owner, stamp, attempt.operation_id, "reserve", payload, result)
+            return Reservation(attempt.attempt_id, owner.epoch, True, page_revision,
+                               job_claim.claim_seq, job_claim.cancel_revision, job_revision)
 
     @staticmethod
-    def _validate_job_page_claim(connection, owner, claim, *, attempt=None):
-        """Validate a durable page claim while the caller holds BEGIN IMMEDIATE."""
+    def _validate_job_page_claim(connection, owner, claim, *, attempt=None, for_gate=False):
+        """Validate a durable page claim while the caller holds BEGIN IMMEDIATE.
+
+        ``for_gate=False`` is the pre-reserve claim (``claimed`` with no attempt).
+        ``for_gate=True`` requires the post-reserve exact ``intent`` page whose
+        immutable ``attempt_id`` already equals the candidate identity.
+        """
         from .durable_job_contracts import JobPageDispatchClaim
         if type(claim) is not JobPageDispatchClaim:
             raise CoordinationError("invalid_job_dispatch_claim")
@@ -678,7 +752,7 @@ class CoordinationLedger:
             raise CoordinationError("job_dispatch_claim_stale")
         job = connection.execute(
             "SELECT job_id,tenant_id,owner_id,document_id,run_id,generation,execution_state,state,"
-            "authorized_owner_epoch,cancel_revision FROM durable_jobs WHERE job_id=?",
+            "authorized_owner_epoch,cancel_revision,revision FROM durable_jobs WHERE job_id=?",
             (claim.job_id,),
         ).fetchone()
         page = connection.execute(
@@ -686,6 +760,8 @@ class CoordinationLedger:
             "FROM durable_job_pages WHERE job_id=? AND page_number=?",
             (claim.job_id, claim.page_number),
         ).fetchone()
+        expected_state = "intent" if for_gate else "claimed"
+        expected_attempt = claim.candidate_attempt_id if for_gate else None
         if (job is None or page is None
                 or (job["tenant_id"], job["owner_id"], job["document_id"], job["run_id"], job["generation"])
                 != (claim.tenant_id, claim.owner_id, claim.document_id, claim.run_id, claim.generation)
@@ -695,8 +771,8 @@ class CoordinationLedger:
                 or (page["run_id"], page["page_number"], page["candidate_attempt_id"],
                     page["state"], page["claim_seq"], page["owner_epoch"], page["revision"])
                 != (claim.run_id, claim.page_number, claim.candidate_attempt_id,
-                    "claimed", claim.claim_seq, owner.epoch, claim.page_revision)
-                or page["attempt_id"] is not None):
+                    expected_state, claim.claim_seq, owner.epoch, claim.page_revision)
+                or page["attempt_id"] != expected_attempt):
             raise CoordinationError("job_dispatch_claim_stale")
         if attempt is not None and (
                 attempt.run_id != claim.run_id or attempt.page_number != claim.page_number
@@ -948,12 +1024,19 @@ class CoordinationLedger:
                     "SELECT kind,request_digest,request_json,result_json,epoch FROM operations WHERE operation_id=?",
                     (attempt.operation_id,),
                 ).fetchone()
-                expected_result = canonical({"attempt_id": attempt.attempt_id, "owner_epoch": owner.epoch})
+                expected_result = canonical({
+                    "attempt_id": attempt.attempt_id,
+                    "owner_epoch": claim.owner_epoch,
+                    "page_revision": claim.page_revision,
+                    "claim_seq": claim.claim_seq,
+                    "claim_cancel_revision": claim.cancel_revision,
+                    "job_revision": claim.job_revision,
+                })
                 if (reserve_receipt is None or reserve_receipt["kind"] != "reserve"
                         or reserve_receipt["request_digest"] != fingerprint(asdict(attempt))
                         or reserve_receipt["request_json"] != canonical(asdict(attempt))
                         or reserve_receipt["result_json"] != expected_result
-                        or reserve_receipt["epoch"] != owner.epoch):
+                        or reserve_receipt["epoch"] != claim.owner_epoch):
                     raise CoordinationError("dispatch_reserve_receipt_mismatch")
 
                 run = connection.execute(
@@ -1015,17 +1098,18 @@ class CoordinationLedger:
                     if scope["blocked"]:
                         raise CoordinationError("needs_reconciliation")
 
-                self._validate_job_page_claim(connection, owner, claim, attempt=attempt)
+                self._validate_job_page_claim(connection, owner, claim, attempt=attempt, for_gate=True)
                 changed = connection.execute(
-                    "UPDATE durable_job_pages SET state='send_committed',attempt_id=?,revision=revision+1 "
+                    "UPDATE durable_job_pages SET state='send_committed',revision=revision+1 "
                     "WHERE job_id=? AND run_id=? AND page_number=? AND candidate_attempt_id=? "
-                    "AND attempt_id IS NULL AND state='claimed' AND claim_seq=? AND owner_epoch=? AND revision=? "
+                    "AND attempt_id=? AND state='intent' AND claim_seq=? AND owner_epoch=? AND revision=? "
                     "AND EXISTS (SELECT 1 FROM durable_jobs j WHERE j.job_id=? AND j.tenant_id=? "
                     "AND j.owner_id=? AND j.document_id=? AND j.run_id=? AND j.generation=? "
                     "AND j.execution_state='ready' AND j.state IN ('queued','running') "
                     "AND j.authorized_owner_epoch=? AND j.cancel_revision=?)",
-                    (claim.candidate_attempt_id, claim.job_id, claim.run_id, claim.page_number,
-                     claim.candidate_attempt_id, claim.claim_seq, owner.epoch, claim.page_revision,
+                    (claim.job_id, claim.run_id, claim.page_number,
+                     claim.candidate_attempt_id, claim.candidate_attempt_id,
+                     claim.claim_seq, owner.epoch, claim.page_revision,
                      claim.job_id, claim.tenant_id, claim.owner_id, claim.document_id, claim.run_id,
                      claim.generation, owner.epoch, claim.cancel_revision),
                 ).rowcount
@@ -1092,6 +1176,803 @@ class CoordinationLedger:
                     self._block_attempt(connection, outcome.attempt_id)
             return self._receipt(connection, owner, stamp, outcome.operation_id, "outcome", payload,
                                  {"attempt_id": outcome.attempt_id, "state": outcome.state})
+
+    # ------------------------------------------------------------------
+    # B3.4a durable-job lifecycle: adoption, atomic settlement, recovery.
+    # All writes below are owner-fenced; B1 attempt identity is never rewritten.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _job_relevant_scopes(connection, job_id):
+        """Derive scope membership only from this job's persisted B1 attempts."""
+        billing = tuple(row[0] for row in connection.execute(
+            "SELECT DISTINCT a.billing_scope_id FROM attempts a"
+            " JOIN durable_job_pages p ON p.run_id=a.run_id AND p.page_number=a.page_number"
+            " WHERE p.job_id=? ORDER BY a.billing_scope_id", (job_id,)))
+        quotas = tuple(row[0] for row in connection.execute(
+            "SELECT DISTINCT q.quota_scope_id FROM attempt_quota_reservations q"
+            " JOIN attempts a USING(attempt_id)"
+            " JOIN durable_job_pages p ON p.run_id=a.run_id AND p.page_number=a.page_number"
+            " WHERE p.job_id=? ORDER BY q.quota_scope_id", (job_id,)))
+        return billing, quotas
+
+    @staticmethod
+    def _terminal_target(states):
+        if all(state == "completed" for state in states):
+            return "completed"
+        if any(state in ("completed", "incomplete") for state in states):
+            return "completed_with_errors"
+        return "failed"
+
+    @classmethod
+    def _rollup_job(cls, connection, job_id):
+        """Recompute the job projection from the transaction snapshot."""
+        job = connection.execute("SELECT state,revision FROM durable_jobs WHERE job_id=?",
+                                 (job_id,)).fetchone()
+        if job is None:
+            raise CoordinationError("durable_job_not_found")
+        states = tuple(row[0] for row in connection.execute(
+            "SELECT state FROM durable_job_pages WHERE job_id=? ORDER BY page_number", (job_id,)))
+        attempt_states = tuple(row[0] for row in connection.execute(
+            "SELECT a.state FROM attempts a JOIN durable_job_pages p"
+            " ON p.run_id=a.run_id AND p.page_number=a.page_number WHERE p.job_id=?", (job_id,)))
+        billing, quotas = cls._job_relevant_scopes(connection, job_id)
+        blocked_scope = False
+        for scope in billing:
+            row = connection.execute("SELECT blocked FROM billing_scopes WHERE scope_id=?",
+                                     (scope,)).fetchone()
+            if row is not None and row[0]:
+                blocked_scope = True
+        for scope in quotas:
+            row = connection.execute("SELECT blocked FROM quota_scopes WHERE scope_id=?",
+                                     (scope,)).fetchone()
+            if row is not None and row[0]:
+                blocked_scope = True
+        overage = connection.execute(
+            "SELECT 1 FROM attempts a JOIN durable_job_pages p"
+            " ON p.run_id=a.run_id AND p.page_number=a.page_number"
+            " WHERE p.job_id=? AND a.state='terminal' AND a.actual_units>a.reserve_units LIMIT 1",
+            (job_id,)).fetchone() is not None
+        unknown = ("unknown_outcome" in states or "unknown" in attempt_states
+                   or blocked_scope or overage)
+        current = job["state"]
+        if unknown:
+            target = "blocked"
+        elif current in ("completed", "completed_with_errors", "cancelled", "failed"):
+            target = current
+        elif current == "cancelling":
+            unsettled = (any(state in ("intent", "send_committed", "settlement_pending")
+                             for state in states) or "intent" in attempt_states)
+            target = "cancelling" if unsettled else "cancelled"
+        elif current == "blocked":
+            target = "blocked"
+        else:
+            nonterminal = any(state in ("queued", "claimed", "quota_wait", "intent",
+                                        "send_committed", "settlement_pending") for state in states)
+            if nonterminal:
+                if current == "paused_restart":
+                    target = "paused_restart"
+                else:
+                    target = current if current in ("queued", "running") else "running"
+            else:
+                target = cls._terminal_target(states)
+        if target != current:
+            finished = (_now_iso() if target in
+                        ("completed", "completed_with_errors", "cancelled", "failed") else None)
+            connection.execute(
+                "UPDATE durable_jobs SET state=?,revision=revision+1,updated_at=?,finished_at=?"
+                " WHERE job_id=?", (target, _now_iso(), finished, job_id))
+        return target
+
+    @staticmethod
+    def _mark_paused_restart_tx(connection, job_id):
+        row = connection.execute("SELECT state FROM durable_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row is not None and row[0] in ("queued", "running"):
+            connection.execute(
+                "UPDATE durable_jobs SET state='paused_restart',revision=revision+1,updated_at=?"
+                " WHERE job_id=?", (_now_iso(), job_id))
+            return True
+        return False
+
+    @staticmethod
+    def _pre_gate_proof(attempt_id, run_id, page, claim_seq, prior_owner_epoch, page_state):
+        return fingerprint({
+            "attempt_id": attempt_id, "run_id": run_id, "page": page,
+            "claim_seq": claim_seq, "prior_owner_epoch": prior_owner_epoch,
+            "page_state": page_state, "reason": "pre_gate_not_sent",
+        })
+
+    @staticmethod
+    def _reserve_claim_cancel_revision(connection, attempt_operation_id):
+        row = connection.execute("SELECT result_json FROM operations WHERE operation_id=?",
+                                 (attempt_operation_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row[0]).get("claim_cancel_revision")
+        except (TypeError, ValueError):
+            return None
+        return value if type(value) is int and value >= 0 else None
+
+    def adopt_job_owner_epochs(self, owner, *, batch_size: int = 50):
+        """Guarded, idempotent adoption of prior-epoch ``running`` jobs (A3)."""
+        from .durable_job_contracts import AdoptionReport
+        integer(batch_size, minimum=1)
+        adopted, quarantined = [], []
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            rows = connection.execute(
+                "SELECT j.job_id,j.revision,j.authorized_owner_epoch,j.run_id,j.generation,"
+                "j.execution_state,d.active_run_id,d.generation AS current_generation"
+                " FROM durable_jobs j JOIN documents d USING(tenant_id,document_id)"
+                " WHERE j.state='running' AND (j.authorized_owner_epoch IS NULL"
+                " OR j.authorized_owner_epoch<?) ORDER BY j.job_id LIMIT ?",
+                (owner.epoch, batch_size)).fetchall()
+            for row in rows:
+                if (row["authorized_owner_epoch"] is None
+                        or row["authorized_owner_epoch"] >= owner.epoch
+                        or row["execution_state"] != "ready"
+                        or row["active_run_id"] != row["run_id"]
+                        or row["current_generation"] != row["generation"]):
+                    quarantined.append((row["job_id"], "job_adoption_integrity"))
+                    continue
+                changed = connection.execute(
+                    "UPDATE durable_jobs SET authorized_owner_epoch=?,revision=revision+1,updated_at=?"
+                    " WHERE job_id=? AND state='running' AND revision=?"
+                    " AND authorized_owner_epoch=?",
+                    (owner.epoch, _now_iso(), row["job_id"], row["revision"],
+                     row["authorized_owner_epoch"])).rowcount
+                if changed == 1:
+                    adopted.append(row["job_id"])
+                else:
+                    quarantined.append((row["job_id"], "job_adoption_stale"))
+        return AdoptionReport(tuple(adopted), tuple(quarantined))
+
+    def verify_registered_run(self, owner, run: Run):
+        """Read-only run adoption probe used by ``register()`` (IN-12/13/14).
+
+        Returns ``exact``, ``absent`` or ``conflict``; never mutates.
+        """
+        if type(run) is not Run:
+            raise CoordinationError("invalid_run")
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            row = connection.execute(
+                "SELECT r.body_json,r.tenant_id,r.document_id,r.generation,"
+                "d.active_run_id,d.generation AS current_generation FROM runs r"
+                " JOIN documents d USING(tenant_id,document_id) WHERE r.run_id=?",
+                (run.run_id,)).fetchone()
+            if row is None:
+                return "absent"
+            if (row["body_json"] == canonical(asdict(run))
+                    and (row["tenant_id"], row["document_id"], row["generation"])
+                    == (run.tenant_id, run.document_id, run.generation)
+                    and row["active_run_id"] == run.run_id
+                    and row["current_generation"] == run.generation):
+                return "exact"
+            return "conflict"
+
+    def claim_for_attempt(self, owner, attempt_id):
+        """Reconstruct the exact persisted claim identity for settlement.
+
+        Settlement must never trust a mutable caller claim object: a stale or
+        forged in-memory claim can only cause the gate to reject. The immutable
+        B1 attempt, page identity and reserve receipt are the authority here.
+        """
+        from .durable_job_contracts import JobPageDispatchClaim
+        uuid_hex(attempt_id)
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            attempt = connection.execute(
+                "SELECT run_id,page_number,claim_seq,owner_epoch,operation_id FROM attempts"
+                " WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if attempt is None:
+                raise CoordinationError("historical_attempt_mismatch")
+            page = connection.execute(
+                "SELECT p.job_id,p.run_id,p.page_number,p.candidate_attempt_id,p.attempt_id,"
+                "p.claim_seq,p.revision,j.tenant_id,j.owner_id,j.document_id,j.generation,"
+                "j.cancel_revision FROM durable_job_pages p JOIN durable_jobs j USING(job_id)"
+                " WHERE p.run_id=? AND p.page_number=?",
+                (attempt["run_id"], attempt["page_number"])).fetchone()
+            if (page is None or page["attempt_id"] != attempt_id
+                    or page["candidate_attempt_id"] != attempt_id
+                    or (page["run_id"], page["page_number"], page["claim_seq"])
+                    != (attempt["run_id"], attempt["page_number"], attempt["claim_seq"])):
+                raise CoordinationError("job_dispatch_claim_stale")
+            receipt = {}
+            row = connection.execute("SELECT result_json FROM operations WHERE operation_id=?",
+                                     (attempt["operation_id"],)).fetchone()
+            if row is not None:
+                try:
+                    loaded = json.loads(row[0])
+                    receipt = loaded if type(loaded) is dict else {}
+                except (TypeError, ValueError):
+                    receipt = {}
+            cancel_revision = receipt.get("claim_cancel_revision")
+            page_revision = receipt.get("page_revision")
+            job_revision = receipt.get("job_revision")
+            return JobPageDispatchClaim(
+                page["tenant_id"], page["owner_id"], page["document_id"], page["job_id"],
+                page["run_id"], page["generation"], page["page_number"],
+                page["candidate_attempt_id"], page["claim_seq"],
+                page_revision if type(page_revision) is int and page_revision >= 1 else page["revision"],
+                attempt["owner_epoch"],
+                cancel_revision if type(cancel_revision) is int and cancel_revision >= 0 else 0,
+                job_revision if type(job_revision) is int and job_revision >= 1 else None,
+            )
+
+    def record_job_outcome(self, owner, outcome: Outcome, *, job_claim, page,
+                           generation: int | None = None):
+        """Atomic B1 attempt + durable page + job roll-up settlement."""
+        from .durable_job_contracts import JobPageDispatchClaim, PageOutcomeProjection
+        if (type(outcome) is not Outcome or type(job_claim) is not JobPageDispatchClaim
+                or (page is not None and type(page) is not PageOutcomeProjection)):
+            raise CoordinationError("invalid_job_outcome")
+        with self._transaction(owner) as (connection, stamp, _meta):
+            return self._record_job_outcome_tx(connection, owner, stamp, outcome,
+                                               job_claim, page, generation)
+
+    def _record_job_outcome_tx(self, connection, owner, stamp, outcome, claim, page, generation):
+        from .durable_job_contracts import PageOutcomeProjection
+        existing = connection.execute(
+            "SELECT kind,request_json,result_json FROM operations WHERE operation_id=?",
+            (outcome.operation_id,)).fetchone()
+        if existing is not None:
+            if existing["kind"] != "outcome":
+                raise CoordinationError("operation_conflict")
+            try:
+                saved = json.loads(existing["request_json"])
+            except (TypeError, ValueError):
+                raise CoordinationError("historical_outcome_conflict") from None
+            if (saved.get("attempt_id") != outcome.attempt_id
+                    or saved.get("request_digest") != outcome.request_digest
+                    or saved.get("resulting_attempt_state") != outcome.state
+                    or saved.get("proof_or_evidence_digest") != outcome.evidence_digest
+                    or saved.get("expected_attempt_state") != "intent"):
+                raise CoordinationError("historical_outcome_conflict")
+            return json.loads(existing["result_json"])
+        attempt = connection.execute("SELECT * FROM attempts WHERE attempt_id=?",
+                                     (outcome.attempt_id,)).fetchone()
+        if attempt is None or attempt["request_digest"] != outcome.request_digest:
+            raise CoordinationError("evidence_mismatch")
+        if attempt["state"] in ("terminal", "not_sent"):
+            raise CoordinationError("outcome_conflict")
+        page_row = connection.execute(
+            "SELECT p.*,j.state AS job_state,j.cancel_revision AS job_cancel_revision,"
+            "j.generation AS job_generation FROM durable_job_pages p"
+            " JOIN durable_jobs j USING(job_id) WHERE p.job_id=? AND p.page_number=?",
+            (claim.job_id, claim.page_number)).fetchone()
+        if page_row is None:
+            raise CoordinationError("job_dispatch_claim_stale")
+        # A legacy page may still have attempt_id NULL while an immutable B1
+        # attempt exists (R-02/R-23/R-25/R-30). Recovery attaches it atomically.
+        if (page_row["run_id"], page_row["candidate_attempt_id"], page_row["claim_seq"]) != (
+                claim.run_id, claim.candidate_attempt_id, claim.claim_seq
+        ) or page_row["attempt_id"] not in (None, outcome.attempt_id):
+            raise CoordinationError("job_dispatch_claim_stale")
+        if generation is not None and page_row["job_generation"] != generation:
+            raise CoordinationError("job_dispatch_claim_stale")
+        prior_state = attempt["state"]
+        reserve_cancel_revision = self._reserve_claim_cancel_revision(
+            connection, attempt["operation_id"])
+        if reserve_cancel_revision is None:
+            reserve_cancel_revision = claim.cancel_revision
+        if outcome.state == "not_sent":
+            if prior_state != "intent" or page_row["state"] not in (
+                    "intent", "claimed", "failed", "cancelled"):
+                raise CoordinationError("not_sent_unproven")
+            cancel_won = (page_row["job_state"] in ("cancelling", "cancelled", "blocked")
+                          and page_row["job_cancel_revision"] > reserve_cancel_revision)
+            projection = PageOutcomeProjection(
+                "cancelled" if cancel_won else "failed",
+                "cancelled_pre_gate" if cancel_won else "not_sent_pre_gate",
+                0, outcome.evidence_digest)
+        elif outcome.state == "terminal":
+            if prior_state != "intent" or page is None:
+                raise CoordinationError("outcome_conflict")
+            if page_row["state"] not in ("send_committed", "settlement_pending"):
+                raise CoordinationError("job_dispatch_claim_stale")
+            projection = page
+        elif outcome.state == "unknown":
+            if prior_state not in ("intent", "unknown"):
+                raise CoordinationError("outcome_conflict")
+            if page is None:
+                projection = None
+            else:
+                if page_row["state"] not in ("send_committed", "unknown_outcome", "blocked"):
+                    raise CoordinationError("job_dispatch_claim_stale")
+                projection = page
+        else:
+            raise CoordinationError("invalid_outcome")
+        if outcome.state == "unknown":
+            self._block_attempt(connection, outcome.attempt_id)
+            connection.execute(
+                "UPDATE attempts SET state='unknown',evidence_digest=? WHERE attempt_id=?",
+                (outcome.evidence_digest, outcome.attempt_id))
+        elif outcome.state == "not_sent":
+            connection.execute(
+                "UPDATE attempts SET state='not_sent',evidence_digest=?,ended_boot_id=?,ended_ms=?"
+                " WHERE attempt_id=?", (outcome.evidence_digest, stamp.boot_id,
+                                        stamp.milliseconds, outcome.attempt_id))
+        else:
+            connection.execute(
+                "UPDATE attempts SET state='terminal',actual_units=?,evidence_digest=?,"
+                "ended_boot_id=?,ended_ms=? WHERE attempt_id=?",
+                (outcome.actual_units, outcome.evidence_digest, stamp.boot_id,
+                 stamp.milliseconds, outcome.attempt_id))
+            if outcome.actual_units is not None and outcome.actual_units > attempt["reserve_units"]:
+                self._block_attempt(connection, outcome.attempt_id)
+        if projection is not None:
+            changed = connection.execute(
+                "UPDATE durable_job_pages SET attempt_id=?,state=?,safe_code=?,result_bytes=?,"
+                "evidence_digest=?,revision=revision+1 WHERE job_id=? AND page_number=? "
+                "AND (attempt_id IS NULL OR attempt_id=?) AND revision=?",
+                (outcome.attempt_id, projection.state, projection.safe_code,
+                 projection.result_bytes, projection.evidence_digest, claim.job_id,
+                 claim.page_number, outcome.attempt_id, page_row["revision"])).rowcount
+            if changed != 1:
+                raise CoordinationError("job_dispatch_claim_stale")
+        job_state = self._rollup_job(connection, claim.job_id)
+        payload = {
+            "version": 1,
+            "operation_id": outcome.operation_id,
+            "attempt_id": outcome.attempt_id,
+            "run_id": claim.run_id,
+            "job_id": claim.job_id,
+            "generation": generation if generation is not None else page_row["job_generation"],
+            "page_number": claim.page_number,
+            "attempt_no": attempt["attempt_no"],
+            "claim_seq": claim.claim_seq,
+            "request_digest": outcome.request_digest,
+            "prior_owner_epoch": attempt["owner_epoch"],
+            "expected_attempt_state": prior_state,
+            "resulting_attempt_state": outcome.state,
+            "claim_cancel_revision": reserve_cancel_revision,
+            "proof_or_evidence_digest": outcome.evidence_digest,
+            "page_projection": None if projection is None else {
+                "state": projection.state, "safe_code": projection.safe_code,
+                "result_bytes": projection.result_bytes},
+        }
+        result = {"attempt_id": outcome.attempt_id, "state": outcome.state,
+                  "job_state": job_state}
+        return self._receipt(connection, owner, stamp, outcome.operation_id, "outcome",
+                             payload, result)
+
+    def settle_pre_gate_not_sent(self, owner, *, attempt_id, claim, page_state="intent",
+                                 proof=None):
+        """Current-owner or recovery pre-gate settlement using the canonical identity."""
+        from .durable_job_contracts import PageOutcomeProjection
+        with self._transaction(owner) as (connection, stamp, _meta):
+            attempt = connection.execute(
+                "SELECT request_digest,run_id,page_number,claim_seq,owner_epoch FROM attempts"
+                " WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if attempt is None:
+                raise CoordinationError("historical_attempt_mismatch")
+            if proof is None:
+                proof = self._pre_gate_proof(attempt_id, attempt["run_id"],
+                                             attempt["page_number"], attempt["claim_seq"],
+                                             attempt["owner_epoch"], page_state)
+            outcome = Outcome(_settlement_operation_id(attempt_id), attempt_id,
+                              attempt["request_digest"], proof, "not_sent", None)
+            return self._record_job_outcome_tx(
+                connection, owner, stamp, outcome, claim,
+                PageOutcomeProjection("failed", "not_sent_pre_gate", 0, proof), None)
+
+    @staticmethod
+    def _claim_from_recovery_row(row, owner_epoch):
+        from .durable_job_contracts import JobPageDispatchClaim
+        return JobPageDispatchClaim(
+            row["tenant_id"], row["owner_id"], row["document_id"], row["job_id"],
+            row["run_id"], row["job_generation"], row["page_number"],
+            row["candidate_attempt_id"], row["page_claim_seq"], row["page_revision"],
+            owner_epoch, row.get("claim_cancel_revision") or 0, None)
+
+    def _evidence_page_projection(self, payload):
+        from .durable_job_contracts import PageOutcomeProjection
+        settlement = payload.get("settlement")
+        result = payload.get("result")
+        result_bytes = 0
+        if result is not None:
+            result_bytes = len(canonical(result).encode("utf-8"))
+        if type(settlement) is dict:
+            state = settlement.get("page_state")
+            safe_code = settlement.get("safe_code")
+            if state not in ("completed", "incomplete", "failed"):
+                raise CoordinationError("result_evidence_invalid")
+            stored_bytes = settlement.get("result_bytes", result_bytes)
+            if type(stored_bytes) is not int or not 0 <= stored_bytes <= 16_000_000:
+                raise CoordinationError("result_evidence_invalid")
+            return PageOutcomeProjection(state, safe_code, stored_bytes,
+                                         payload["outcome"]["evidence_digest"])
+        status = None
+        if type(result) is dict:
+            extraction = result.get("extraction")
+            if type(extraction) is dict:
+                status = extraction.get("status")
+                safe_code = extraction.get("error_code")
+            else:
+                safe_code = None
+        else:
+            safe_code = None
+        if status in ("extracted", "no_specification"):
+            state = "completed"
+        elif status == "incomplete":
+            state = "incomplete"
+        elif status == "failed":
+            state = "failed"
+        else:
+            state = "failed"
+            safe_code = safe_code or "result_invalid"
+        return PageOutcomeProjection(state, safe_code, result_bytes,
+                                     payload["outcome"]["evidence_digest"])
+
+    def _legacy_receipts(self, connection, attempt):
+        reserve = connection.execute(
+            "SELECT kind,request_digest,request_json,result_json FROM operations"
+            " WHERE operation_id=?", (attempt["operation_id"],)).fetchone()
+        outcome = connection.execute(
+            "SELECT kind,request_digest,request_json,result_json FROM operations"
+            " WHERE operation_id=?", (_settlement_operation_id(attempt["attempt_id"]),)).fetchone()
+        return reserve, outcome
+
+    @staticmethod
+    def _receipt_matches(receipt, kind, attempt, expected_state):
+        if receipt is None or receipt["kind"] != kind:
+            return False
+        try:
+            request = json.loads(receipt["request_json"])
+            result = json.loads(receipt["result_json"])
+        except (TypeError, ValueError):
+            return False
+        if kind == "reserve":
+            return (request.get("attempt_id") == attempt["attempt_id"]
+                    and request.get("owner_epoch") == attempt["owner_epoch"]
+                    and result.get("attempt_id") == attempt["attempt_id"])
+        return (request.get("attempt_id") == attempt["attempt_id"]
+                and request.get("state") == expected_state
+                and result.get("attempt_id") == attempt["attempt_id"]
+                and result.get("state") == expected_state)
+
+    def _recover_one(self, connection, owner, stamp, row, final_payload, legacy_gate_proof):
+        from .durable_job_contracts import PageOutcomeProjection
+        job_id, page = row["job_id"], row["page_number"]
+        page_state, attempt_state = row["page_state"], row["attempt_state"]
+        attempt_id = row["attempt_id"] or row["page_attempt_id"]
+        if attempt_id is None:
+            if page_state == "claimed":
+                if (row["page_owner_epoch"] is not None
+                        and row["page_owner_epoch"] < owner.epoch):
+                    changed = connection.execute(
+                        "UPDATE durable_job_pages SET state='queued',owner_epoch=NULL,"
+                        "revision=revision+1 WHERE job_id=? AND page_number=?"
+                        " AND state='claimed' AND attempt_id IS NULL AND revision=?",
+                        (job_id, page, row["page_revision"])).rowcount
+                    if changed == 1:
+                        self._rollup_job(connection, job_id)
+                        return "released", None
+                    return "quarantine", "recovery_state_conflict"
+            return "noop", None
+        if attempt_state is None:
+            return "quarantine", "recovery_state_conflict"
+        if (attempt_id != row["candidate_attempt_id"]
+                or row["page_attempt_id"] not in (None, attempt_id)):
+            return "quarantine", "recovery_identity_conflict"
+        claim_cancel = self._reserve_claim_cancel_revision(connection, row["operation_id"])
+        row["claim_cancel_revision"] = claim_cancel
+        claim = self._claim_from_recovery_row(row, owner.epoch)
+        attempt = connection.execute("SELECT * FROM attempts WHERE attempt_id=?",
+                                     (attempt_id,)).fetchone()
+        if attempt_state == "intent":
+            if page_state == "intent":
+                if final_payload is not None:
+                    return self._quarantine_unknown(connection, row, "recovery_evidence_conflict")
+                return self._recover_pre_gate(connection, owner, stamp, row, claim, "intent")
+            if page_state == "claimed":
+                if final_payload is not None:
+                    return self._quarantine_unknown(connection, row, "recovery_evidence_conflict")
+                if legacy_gate_proof is not None and legacy_gate_proof(row):
+                    return self._recover_pre_gate(connection, owner, stamp, row, claim, "claimed")
+                return self._quarantine_unknown(connection, row, "recovery_state_conflict")
+            if page_state == "send_committed":
+                if final_payload is not None:
+                    return self._settle_from_evidence(connection, owner, stamp, row, claim,
+                                                      final_payload)
+                return self._quarantine_unknown(connection, row, "dispatch_unknown")
+            if page_state == "blocked":
+                return self._quarantine_unknown(connection, row, "recovery_state_conflict")
+            return "quarantine", "recovery_state_conflict"
+        if attempt_state == "terminal":
+            if page_state in ("completed", "incomplete"):
+                if payload is None:
+                    # R-10: a success projection without reconstructible final
+                    # evidence is downgraded, never trusted.
+                    changed = connection.execute(
+                        "UPDATE durable_job_pages SET state='failed',safe_code='evidence_missing',"
+                        "revision=revision+1 WHERE job_id=? AND page_number=? AND state=?"
+                        " AND revision=?", (job_id, page, page_state,
+                                            row["page_revision"])).rowcount
+                    if changed != 1:
+                        return "quarantine", "recovery_state_conflict"
+                self._rollup_job(connection, job_id)
+                return "repaired", None
+            if page_state == "failed":
+                self._rollup_job(connection, job_id)
+                return "repaired", None
+            if page_state == "send_committed":
+                return self._repair_legacy_terminal(connection, row, attempt, final_payload)
+            if page_state in ("unknown_outcome", "blocked"):
+                return "noop", None
+            return "quarantine", "recovery_state_conflict"
+        if attempt_state == "not_sent":
+            if page_state == "failed":
+                return "noop", None
+            if page_state == "cancelled":
+                if row["page_attempt_id"] is None:
+                    return self._repair_legacy_cancelled(connection, row, attempt)
+                return "noop", None
+            if page_state == "claimed":
+                return self._repair_legacy_claimed_not_sent(connection, row, attempt,
+                                                            final_payload)
+            return "quarantine", "recovery_state_conflict"
+        if attempt_state == "unknown":
+            if page_state == "claimed":
+                return self._repair_legacy_unknown(connection, row, attempt)
+            if page_state == "send_committed":
+                changed = connection.execute(
+                    "UPDATE durable_job_pages SET state='unknown_outcome',safe_code='dispatch_unknown',"
+                    "revision=revision+1 WHERE job_id=? AND page_number=? AND attempt_id=?"
+                    " AND state='send_committed' AND revision=?",
+                    (job_id, page, attempt_id, row["page_revision"])).rowcount
+                if changed != 1:
+                    return "quarantine", "recovery_state_conflict"
+                self._rollup_job(connection, job_id)
+                return "repaired", None
+            if page_state in ("unknown_outcome", "blocked"):
+                return "noop", None
+            return "quarantine", "recovery_state_conflict"
+        return "quarantine", "recovery_state_conflict"
+
+    def _recover_pre_gate(self, connection, owner, stamp, row, claim, page_state):
+        from .durable_job_contracts import PageOutcomeProjection
+        attempt_id = row["attempt_id"]
+        proof = self._pre_gate_proof(attempt_id, row["run_id"], row["page_number"],
+                                     row["attempt_claim_seq"], row["attempt_owner_epoch"],
+                                     page_state)
+        outcome = Outcome(_settlement_operation_id(attempt_id), attempt_id,
+                          row["request_digest"], proof, "not_sent", None)
+        result = self._record_job_outcome_tx(
+            connection, owner, stamp, outcome, claim,
+            PageOutcomeProjection("failed", "not_sent_pre_gate", 0, proof), None)
+        if result["job_state"] == "running":
+            schedulable = connection.execute(
+                "SELECT 1 FROM durable_job_pages WHERE job_id=? AND state IN"
+                " ('queued','quota_wait') LIMIT 1", (row["job_id"],)).fetchone()
+            if schedulable and self._mark_paused_restart_tx(connection, row["job_id"]):
+                return "paused", None
+        return "settled", None
+
+    def _settle_from_evidence(self, connection, owner, stamp, row, claim, payload):
+        try:
+            outcome = Outcome(**payload["outcome"])
+            projection = self._evidence_page_projection(payload)
+        except (KeyError, TypeError, ValueError):
+            return "quarantine", "result_evidence_invalid"
+        if (outcome.attempt_id != row["attempt_id"]
+                or outcome.state != "terminal"):
+            return "quarantine", "result_evidence_identity_mismatch"
+        try:
+            self._record_job_outcome_tx(connection, owner, stamp, outcome, claim,
+                                        projection, row["job_generation"])
+        except CoordinationError as exc:
+            return "quarantine", exc.code
+        return "settled", None
+
+    def _quarantine_unknown(self, connection, row, safe_code):
+        attempt_id = row["attempt_id"]
+        if row["attempt_state"] == "intent":
+            self._block_attempt(connection, attempt_id)
+            connection.execute("UPDATE attempts SET state='unknown' WHERE attempt_id=?",
+                               (attempt_id,))
+        if row["page_attempt_id"] is None:
+            changed = connection.execute(
+                "UPDATE durable_job_pages SET attempt_id=?,state='blocked',safe_code=?,"
+                "revision=revision+1 WHERE job_id=? AND page_number=? AND attempt_id IS NULL"
+                " AND revision=?", (attempt_id, safe_code, row["job_id"],
+                                    row["page_number"], row["page_revision"])).rowcount
+            if changed != 1:
+                return "quarantine", "recovery_state_conflict"
+        else:
+            connection.execute(
+                "UPDATE durable_job_pages SET state='blocked',safe_code=?,revision=revision+1"
+                " WHERE job_id=? AND page_number=? AND attempt_id=? AND revision=?",
+                (safe_code, row["job_id"], row["page_number"], attempt_id,
+                 row["page_revision"]))
+        self._rollup_job(connection, row["job_id"])
+        return "quarantine", safe_code
+
+    def _block_legacy_page(self, connection, row, safe_code):
+        """Projection-only quarantine: attach exact identity and block the page.
+
+        B1 attempt state, owner epoch, evidence digest and receipts are never
+        written by this path.
+        """
+        attempt_id = row["attempt_id"] or row["candidate_attempt_id"]
+        if row["page_attempt_id"] is None:
+            changed = connection.execute(
+                "UPDATE durable_job_pages SET attempt_id=?,state='blocked',safe_code=?,"
+                "revision=revision+1 WHERE job_id=? AND page_number=? AND attempt_id IS NULL"
+                " AND revision=?", (attempt_id, safe_code, row["job_id"],
+                                    row["page_number"], row["page_revision"])).rowcount
+        else:
+            changed = connection.execute(
+                "UPDATE durable_job_pages SET state='blocked',safe_code=?,revision=revision+1"
+                " WHERE job_id=? AND page_number=? AND attempt_id=? AND revision=?",
+                (safe_code, row["job_id"], row["page_number"], attempt_id,
+                 row["page_revision"])).rowcount
+        if changed != 1:
+            return "quarantine", "recovery_state_conflict"
+        # R-24/R-26/R-28/R-29 quarantine owns the job projection: the job must
+        # be blocked, not silently left running/completed.
+        connection.execute(
+            "UPDATE durable_jobs SET state='blocked',revision=revision+1,updated_at=?,"
+            "finished_at=NULL WHERE job_id=?", (_now_iso(), row["job_id"]))
+        return "quarantine", safe_code
+
+    def _repair_legacy_terminal(self, connection, row, attempt, payload):
+        reserve, outcome_receipt = self._legacy_receipts(connection, attempt)
+        if (not self._receipt_matches(reserve, "reserve", attempt, None)
+                or not self._receipt_matches(outcome_receipt, "outcome", attempt, "terminal")
+                or payload is None):
+            return self._block_legacy_page(connection, row, "recovery_receipt_conflict")
+        try:
+            projection = self._evidence_page_projection(payload)
+            saved_outcome = Outcome(**payload["outcome"])
+        except (KeyError, TypeError, ValueError):
+            return self._block_legacy_page(connection, row, "result_evidence_invalid")
+        if (saved_outcome.attempt_id != attempt["attempt_id"]
+                or saved_outcome.evidence_digest != attempt["evidence_digest"]
+                or saved_outcome.actual_units != attempt["actual_units"]):
+            return self._block_legacy_page(connection, row, "historical_outcome_conflict")
+        changed = connection.execute(
+            "UPDATE durable_job_pages SET state=?,safe_code=?,result_bytes=?,evidence_digest=?,"
+            "revision=revision+1 WHERE job_id=? AND page_number=? AND attempt_id=?"
+            " AND state='send_committed' AND revision=?",
+            (projection.state, projection.safe_code, projection.result_bytes,
+             projection.evidence_digest, row["job_id"], row["page_number"],
+             attempt["attempt_id"], row["page_revision"])).rowcount
+        if changed != 1:
+            return "quarantine", "recovery_state_conflict"
+        self._rollup_job(connection, row["job_id"])
+        return "repaired", None
+
+    def _repair_legacy_claimed_not_sent(self, connection, row, attempt, payload):
+        reserve, outcome_receipt = self._legacy_receipts(connection, attempt)
+        if payload is not None:
+            # R-24: final evidence contradicts an immutable not_sent.
+            return self._block_legacy_page(connection, row, "recovery_evidence_conflict")
+        if (not self._receipt_matches(reserve, "reserve", attempt, None)
+                or not self._receipt_matches(outcome_receipt, "outcome", attempt, "not_sent")):
+            return self._block_legacy_page(connection, row, "recovery_receipt_conflict")
+        changed = connection.execute(
+            "UPDATE durable_job_pages SET attempt_id=?,state='failed',safe_code='not_sent_pre_gate',"
+            "revision=revision+1 WHERE job_id=? AND page_number=? AND attempt_id IS NULL"
+            " AND state='claimed' AND revision=?", (attempt["attempt_id"], row["job_id"],
+                                                   row["page_number"], row["page_revision"])).rowcount
+        if changed != 1:
+            return "quarantine", "recovery_state_conflict"
+        self._rollup_job(connection, row["job_id"])
+        return "repaired", None
+
+    def _repair_legacy_cancelled(self, connection, row, attempt):
+        reserve, outcome_receipt = self._legacy_receipts(connection, attempt)
+        if (not self._receipt_matches(reserve, "reserve", attempt, None)
+                or not self._receipt_matches(outcome_receipt, "outcome", attempt, "not_sent")):
+            return self._block_legacy_page(connection, row, "recovery_receipt_conflict")
+        command = connection.execute(
+            "SELECT receipt_json FROM durable_job_commands WHERE job_id=? AND kind='cancel'"
+            " ORDER BY rowid DESC LIMIT 1", (row["job_id"],)).fetchone()
+        if command is None:
+            return self._block_legacy_page(connection, row, "recovery_receipt_conflict")
+        changed = connection.execute(
+            "UPDATE durable_job_pages SET attempt_id=?,revision=revision+1 WHERE job_id=?"
+            " AND page_number=? AND attempt_id IS NULL AND state='cancelled' AND revision=?",
+            (attempt["attempt_id"], row["job_id"], row["page_number"],
+             row["page_revision"])).rowcount
+        if changed != 1:
+            return "quarantine", "recovery_state_conflict"
+        self._rollup_job(connection, row["job_id"])
+        return "repaired", None
+
+    def _repair_legacy_unknown(self, connection, row, attempt):
+        reserve, _outcome_receipt = self._legacy_receipts(connection, attempt)
+        if not self._receipt_matches(reserve, "reserve", attempt, None):
+            return "quarantine", "recovery_receipt_conflict"
+        changed = connection.execute(
+            "UPDATE durable_job_pages SET attempt_id=?,state='blocked',safe_code='recovery_state_conflict',"
+            "revision=revision+1 WHERE job_id=? AND page_number=? AND attempt_id IS NULL"
+            " AND state='claimed' AND revision=?", (attempt["attempt_id"], row["job_id"],
+                                                   row["page_number"], row["page_revision"])).rowcount
+        if changed != 1:
+            return "quarantine", "recovery_state_conflict"
+        self._rollup_job(connection, row["job_id"])
+        return "repaired", None
+
+    def recover_unsettled(self, owner, *, evidence, batch_size: int = 50,
+                          legacy_gate_proof=None):
+        """Classify prior-owner attempts; settle new ones and repair legacy projections."""
+        from .durable_job_contracts import RecoveryReport
+        integer(batch_size, minimum=1)
+        with self._connection() as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN")
+            candidates = [dict(row) for row in connection.execute(
+                "SELECT p.job_id,p.run_id,p.page_number,p.state AS page_state,"
+                "p.attempt_id AS page_attempt_id,p.candidate_attempt_id,"
+                "p.claim_seq AS page_claim_seq,p.owner_epoch AS page_owner_epoch,"
+                "p.revision AS page_revision,p.evidence_digest AS page_evidence_digest,"
+                "j.tenant_id,j.owner_id,j.document_id,j.state AS job_state,"
+                "j.cancel_revision AS job_cancel_revision,j.generation AS job_generation,"
+                "a.attempt_id,a.state AS attempt_state,a.attempt_no,"
+                "a.claim_seq AS attempt_claim_seq,a.owner_epoch AS attempt_owner_epoch,"
+                "a.request_digest,a.operation_id"
+                " FROM durable_job_pages p JOIN durable_jobs j USING(job_id)"
+                " LEFT JOIN attempts a ON a.run_id=p.run_id AND a.page_number=p.page_number"
+                " WHERE j.state IN ('queued','running','cancelling','paused_restart','blocked')"
+                " AND (a.attempt_id IS NOT NULL OR p.attempt_id IS NOT NULL OR p.state='claimed')"
+                " ORDER BY p.job_id,p.page_number LIMIT ?", (batch_size,))]
+            connection.commit()
+        cache = {}
+        for row in candidates:
+            attempt_id = row["attempt_id"] or row["page_attempt_id"]
+            if attempt_id is not None and attempt_id not in cache:
+                try:
+                    cache[attempt_id] = evidence.read(attempt_id)
+                except CoordinationError:
+                    # Unvalidatable evidence is never proof of success; the
+                    # classifier below quarantines a gated page as unknown.
+                    cache[attempt_id] = None
+        settled, repaired, quarantined, released, paused = [], [], [], [], []
+        for row in candidates:
+            attempt_id = row["attempt_id"] or row["page_attempt_id"]
+            payload = cache.get(attempt_id) if attempt_id is not None else None
+            try:
+                with self._transaction(owner) as (connection, stamp, _meta):
+                    outcome, code = self._recover_one(connection, owner, stamp, row,
+                                                      payload, legacy_gate_proof)
+            except CoordinationError as exc:
+                quarantined.append((row["job_id"], exc.code))
+                continue
+            key = row["job_id"]
+            if outcome == "settled":
+                settled.append(key)
+            elif outcome == "repaired":
+                repaired.append(key)
+            elif outcome == "released":
+                released.append(key)
+            elif outcome == "paused":
+                paused.append(key)
+            elif outcome == "quarantine":
+                quarantined.append((key, code))
+        return RecoveryReport(tuple(settled), tuple(repaired), tuple(quarantined),
+                              tuple(released), tuple(paused))
+
+    def startup_barrier(self, owner):
+        """Return the unsettled prior-epoch identities blocking scheduler admission."""
+        with self._transaction(owner) as (connection, _stamp, _meta):
+            unauthorized = tuple(row[0] for row in connection.execute(
+                "SELECT job_id FROM durable_jobs WHERE state='running'"
+                " AND (authorized_owner_epoch IS NULL OR authorized_owner_epoch<?)"
+                " ORDER BY job_id", (owner.epoch,)))
+            unsettled = tuple(row[0] for row in connection.execute(
+                "SELECT a.attempt_id FROM attempts a JOIN durable_job_pages p"
+                " ON p.run_id=a.run_id AND p.page_number=a.page_number"
+                " JOIN durable_jobs j USING(job_id) WHERE j.state IN"
+                " ('queued','running','cancelling','paused_restart','blocked')"
+                " AND a.state='intent' AND p.state NOT IN ('failed','cancelled','blocked')"
+                " ORDER BY a.attempt_id"))
+            stale_claims = tuple(row[0] for row in connection.execute(
+                "SELECT p.job_id FROM durable_job_pages p WHERE p.state='claimed'"
+                " AND p.attempt_id IS NULL AND p.owner_epoch IS NOT NULL AND p.owner_epoch<?"
+                " ORDER BY p.job_id", (owner.epoch,)))
+        return {"unauthorized": unauthorized, "unsettled": unsettled,
+                "stale_claims": stale_claims}
 
     def revise_billing(self, owner, operation_id, scope_id, expected_revision, ceiling_units):
         identifier(scope_id)

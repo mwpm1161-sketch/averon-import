@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from fractions import Fraction
 import hashlib
@@ -30,6 +30,41 @@ from .private_acl import secure_private_path, verify_private_path
 
 CALLER = contextvars.ContextVar("averon_durable_dispatch_caller", default=None)
 _MINT = object()
+
+_RETRYABLE = frozenset({"ledger_busy", "dispatcher_busy", "database_locked"})
+_PAGE_LOCAL = frozenset({
+    "job_dispatch_claim_stale", "job_not_cancellable", "document_generation_changed",
+    "billing_budget_exhausted", "request_cap_exhausted", "durable_job_not_dispatchable",
+    "durable_job_page_not_claimable", "durable_job_claim_sequence_mismatch",
+})
+_INTENT_MISMATCH = frozenset({"dispatch_intent_mismatch", "dispatch_reserve_receipt_mismatch"})
+_INTEGRITY = frozenset({
+    "result_evidence_conflict", "historical_outcome_conflict", "outcome_conflict",
+    "evidence_mismatch", "schema_mismatch", "capability_mismatch", "installation_mismatch",
+    "storage_unverified", "owner_fenced", "clock_regressed", "dispatch_request_mismatch",
+    "dispatch_caller_mismatch", "durable_authorization_required", "binding_mismatch",
+    "policy_revision_mismatch", "result_evidence_invalid", "result_evidence_identity_mismatch",
+})
+
+
+def classify_fault(error):
+    """§10.7 classifier: retry | retry_after | page_terminal | job_blocked | fatal."""
+    if isinstance(error, DeferredWithoutIntent):
+        return "retry"
+    if isinstance(error, CommitReceiptUncertain):
+        return "fatal"
+    if isinstance(error, DispatchGateRejected):
+        return "page_terminal"
+    if isinstance(error, CoordinationError):
+        if error.code in _RETRYABLE:
+            return "retry"
+        if error.code in _PAGE_LOCAL:
+            return "page_terminal"
+        if error.code in _INTENT_MISMATCH:
+            return "job_blocked"
+        if error.code in _INTEGRITY:
+            return "fatal"
+    return "fatal"
 
 
 def target_digest(config):
@@ -203,25 +238,59 @@ class ResultEvidence:
             finally:
                 os.close(descriptor)
 
-    def write(self, attempt, epoch, result, outcome, proof):
-        self._verify()
-        payload = {"version": 1, "attempt": asdict(attempt), "owner_epoch": epoch,
-                   "result": result.model_dump(mode="json"), "outcome": asdict(outcome), "proof": proof}
+    def _payload_bytes(self, payload):
         envelope = canonical({"payload": payload, "sha256": fingerprint(payload)}).encode()
         if len(envelope) > self.max_bytes:
             raise CoordinationError("result_evidence_size_limit")
+        return envelope
+
+    def _read_raw(self, path):
+        verify_private_path(path, directory=False)
+        with path.open("rb") as stream:
+            raw = stream.read(self.max_bytes + 1)
+        if len(raw) > self.max_bytes:
+            raise CoordinationError("result_evidence_size_limit")
+        return raw
+
+    def write(self, attempt, epoch, result, outcome, proof, settlement=None):
+        """Idempotent no-overwrite publication (v1 legacy, v2 job-managed)."""
+        self._verify()
+        version = 2 if (settlement is not None or result is None) else 1
+        payload = {"version": version, "attempt": asdict(attempt), "owner_epoch": epoch,
+                   "result": result.model_dump(mode="json") if result is not None else None,
+                   "outcome": asdict(outcome), "proof": proof}
+        if version == 2:
+            payload["settlement"] = settlement
+        envelope = self._payload_bytes(payload)
         final = self.path(attempt.attempt_id)
         pending = final.with_suffix(".pending")
-        descriptor = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            secure_private_path(pending, directory=False)
-            stream.write(envelope)
-            stream.flush()
-            os.fsync(stream.fileno())
+        if final.exists():
+            if self._read_raw(final) != envelope:
+                raise CoordinationError("result_evidence_conflict")
+            if pending.exists():
+                if self._read_raw(pending) != envelope:
+                    raise CoordinationError("result_evidence_conflict")
+                pending.unlink()
+                self._sync_directory()
+            return
+        if pending.exists():
+            if self._read_raw(pending) != envelope:
+                raise CoordinationError("result_evidence_conflict")
+        else:
+            descriptor = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                secure_private_path(pending, directory=False)
+                stream.write(envelope)
+                stream.flush()
+                os.fsync(stream.fileno())
         self._verify()
-        # link is atomic and refuses replacement. A crash can leave .pending;
-        # it never becomes a reason to resend or to trust incomplete evidence.
-        os.link(pending, final)
+        try:
+            # link is atomic and refuses replacement. A crash can leave .pending;
+            # it never becomes a reason to resend or to trust incomplete evidence.
+            os.link(pending, final)
+        except FileExistsError:
+            if self._read_raw(final) != envelope:
+                raise CoordinationError("result_evidence_conflict") from None
         self._sync_directory()
         pending.unlink()
         self._sync_directory()
@@ -231,26 +300,74 @@ class ResultEvidence:
         path = self.path(attempt_id)
         if not path.exists():
             return None
-        verify_private_path(path, directory=False)
-        with path.open("rb") as stream:
-            raw = stream.read(self.max_bytes + 1)
-        if len(raw) > self.max_bytes:
-            raise CoordinationError("result_evidence_size_limit")
+        return self._validate_payload(self._read_raw(path), attempt_id)
+
+    def _validate_payload(self, raw, attempt_id):
         try:
             from averon_import.services.ocr.qwen_vision_client import _json
             envelope = _json(raw)
             payload = envelope["payload"]
-            if (set(envelope) != {"payload", "sha256"} or type(payload["version"]) is not int or payload["version"] != 1
-                    or set(payload) != {"version", "attempt", "owner_epoch", "result", "outcome", "proof"}
-                    or any(type(payload[key]) is not dict for key in ("attempt", "result", "outcome", "proof"))
-                    or set(payload["proof"]) != {"attempt", "state", "usage", "status", "response_sha256", "result_sha256", "pricing_sha256"}
-                    or type(payload["owner_epoch"]) is not int or payload["owner_epoch"] < 1
+            version = payload["version"]
+            if (set(envelope) != {"payload", "sha256"}
+                    or type(version) is not int or version not in (1, 2)
                     or fingerprint(payload) != envelope["sha256"]
+                    or type(payload.get("attempt")) is not dict
                     or payload["attempt"]["attempt_id"] != attempt_id):
+                raise ValueError
+            base = {"version", "attempt", "owner_epoch", "result", "outcome", "proof"}
+            if version == 1:
+                if set(payload) != base or type(payload["result"]) is not dict:
+                    raise ValueError
+            else:
+                settlement = payload.get("settlement")
+                if (set(payload) != base | {"settlement"} or type(settlement) is not dict
+                        or set(settlement) != {"page_state", "safe_code", "result_bytes"}
+                        or settlement["page_state"] not in ("completed", "incomplete", "failed")
+                        or (settlement["safe_code"] is not None
+                            and type(settlement["safe_code"]) is not str)
+                        or type(settlement["result_bytes"]) is not int
+                        or not 0 <= settlement["result_bytes"] <= 16_000_000
+                        or (payload["result"] is not None and type(payload["result"]) is not dict)):
+                    raise ValueError
+            if (any(type(payload[key]) is not dict for key in ("attempt", "outcome", "proof"))
+                    or set(payload["proof"]) != {"attempt", "state", "usage", "status",
+                                                 "response_sha256", "result_sha256", "pricing_sha256"}
+                    or type(payload["owner_epoch"]) is not int or payload["owner_epoch"] < 1):
                 raise ValueError
             return payload
         except (ValueError, TypeError, KeyError, RecursionError):
             raise CoordinationError("result_evidence_invalid") from None
+
+    def recover_publication(self):
+        """Promote only validated pending files; never settle or index pending."""
+        self._verify()
+        published, conflicts = [], []
+        for pending in sorted(self.root.glob("*.pending")):
+            if not re.fullmatch(r"[0-9a-f]{32}\.pending", pending.name):
+                raise CoordinationError("evidence_root_not_dedicated")
+            attempt_id = pending.name[:-len(".pending")]
+            try:
+                raw = self._read_raw(pending)
+                self._validate_payload(raw, attempt_id)
+                final = self.path(attempt_id)
+                if final.exists():
+                    if self._read_raw(final) != raw:
+                        raise CoordinationError("result_evidence_conflict")
+                else:
+                    try:
+                        os.link(pending, final)
+                    except FileExistsError:
+                        if self._read_raw(final) != raw:
+                            raise CoordinationError("result_evidence_conflict") from None
+                    self._sync_directory()
+                # Independently re-read and validate the immutable final path.
+                self._validate_payload(self._read_raw(final), attempt_id)
+                pending.unlink()
+                self._sync_directory()
+                published.append(attempt_id)
+            except CoordinationError as exc:
+                conflicts.append((attempt_id, exc.code))
+        return tuple(published), tuple(conflicts)
 
 
 class DurableDispatcher:
@@ -259,14 +376,24 @@ class DurableDispatcher:
     Construct/close off-loop. The evidence root must be provisioned separately;
     neither it nor a missing financial ledger is initialized here.
     """
-    def __init__(self, root, *, installation_id, evidence_root, enabled=False, **ledger_options):
+    def __init__(self, root, *, installation_id, evidence_root, enabled=False,
+                 job_managed=False, **ledger_options):
         if enabled is not True or not durable_required():
             raise CoordinationError("durable_mode_required")
+        if type(job_managed) is not bool:
+            raise CoordinationError("invalid_job_managed_mode")
         self.ledger = CoordinationLedger(root, installation_id=installation_id, **ledger_options)
         self.evidence = ResultEvidence(evidence_root)
         if self.evidence.root.is_relative_to(self.ledger.root) or self.ledger.root.is_relative_to(self.evidence.root):
             raise CoordinationError("evidence_ledger_roots_overlap")
-        self._owner = self.ledger.dispatcher()
+        self.job_managed = job_managed
+        # Legacy B2 keeps the blanket intent->unknown acquisition. Job-managed
+        # mode must acquire without mutating any old attempt; recovery below
+        # classifies those attempts from page identity and final evidence.
+        self._owner = (self.ledger.dispatcher_for_jobs() if job_managed
+                       else self.ledger.dispatcher())
+        self._admission_open = not job_managed
+        self.startup = None
         self._pid = os.getpid()
         self._condition = threading.Condition()
         self._calls = 0
@@ -279,9 +406,33 @@ class DurableDispatcher:
         self._heartbeat = threading.Thread(target=self._renew, name="durable-dispatch-lease", daemon=True)
         try:
             self._heartbeat.start()
+            if job_managed:
+                self.startup = self.startup_recovery()
         except BaseException:
+            self._stop.set()
+            self._heartbeat.join(timeout=5)
             self._owner.close()
             raise
+
+    def startup_recovery(self):
+        """Owner adoption, publication recovery and unsettled classification.
+
+        Scheduler admission stays closed unless every prior-epoch job was
+        adopted and every prior-epoch attempt classified without quarantine.
+        """
+        if not self.job_managed:
+            raise CoordinationError("job_managed_required")
+        adoption = self.ledger.adopt_job_owner_epochs(self._owner)
+        published, conflicts = self.evidence.recover_publication()
+        recovery = self.ledger.recover_unsettled(self._owner, evidence=self.evidence)
+        barrier = self.ledger.startup_barrier(self._owner)
+        clean = (adoption.clean and recovery.clean and not conflicts
+                 and not barrier["unauthorized"] and not barrier["unsettled"]
+                 and not barrier["stale_claims"])
+        self._admission_open = clean
+        return {"adoption": adoption, "published": published,
+                "publication_conflicts": conflicts, "recovery": recovery,
+                "barrier": barrier, "admission_open": clean}
 
     def __reduce__(self):
         raise TypeError("durable_dispatcher_is_process_bound")
@@ -339,7 +490,18 @@ class DurableDispatcher:
     def register(self, client):
         self._check()
         _caller, grant = self._clients[client]
-        self.ledger.register_run(self._owner, uuid5(UUID(grant.run.run_id), "register").hex, grant.run)
+        state = self.ledger.verify_registered_run(self._owner, grant.run)
+        if state == "absent":
+            try:
+                self.ledger.register_run(
+                    self._owner, uuid5(UUID(grant.run.run_id), "register").hex, grant.run)
+            except CoordinationError as exc:
+                # A concurrent identical registration is adopted, never failed.
+                if (exc.code not in ("generation_conflict", "run_identity_conflict")
+                        or self.ledger.verify_registered_run(self._owner, grant.run) != "exact"):
+                    raise
+        elif state != "exact":
+            raise CoordinationError("generation_conflict")
         with self._condition:
             self._registered.add(client)
 
@@ -498,8 +660,17 @@ class DurableDispatcher:
             call.deferred = exc
             raise
         except BaseException as exc:
+            fault = classify_fault(exc)
+            if self.job_managed and fault == "retry":
+                # Busy/backpressure: no attempt was created and the dispatcher
+                # stays alive for a bounded retry.
+                call.uncertain = False
+                raise
             call.uncertain = True
-            self._failed.set()
+            # Legacy B2 preserves its fail-closed behavior for every
+            # non-deferred preparation error.
+            if not self.job_managed or fault == "fatal":
+                self._failed.set()
             if isinstance(exc, CoordinationError):
                 try:
                     history = self.ledger.checkpoint_attempts(self._owner, call.grant.run)
@@ -512,6 +683,19 @@ class DurableDispatcher:
             raise
         if not receipt.newly_created:
             raise CoordinationError("dispatch_already_reserved")
+        if call.job_claim is not None:
+            # Reserve committed the page as intent and advanced its revision.
+            # The gate must use that exact post-reserve projection.
+            if receipt.page_revision is None or receipt.job_revision is None:
+                raise CoordinationError("dispatch_reserve_receipt_mismatch")
+            call.job_claim = replace(
+                call.job_claim,
+                page_revision=receipt.page_revision,
+                job_revision=receipt.job_revision,
+                claim_seq=receipt.claim_seq,
+                cancel_revision=receipt.claim_cancel_revision,
+                owner_epoch=receipt.owner_epoch,
+            )
         call.fresh = True
         call.permit = DispatchPermit(_MINT, item, receipt.owner_epoch, client, CALLER.get())
         return call.permit
@@ -582,8 +766,9 @@ class DurableDispatcher:
             call.finished = True
         try:
             return self._settle(call, result, error)
-        except BaseException:
-            self._failed.set()
+        except BaseException as exc:
+            if not self.job_managed or classify_fault(exc) == "fatal":
+                self._failed.set()
             raise
         finally:
             with self._condition:
@@ -609,17 +794,55 @@ class DurableDispatcher:
                              "response_sha256": hashlib.sha256(call.response.body).hexdigest() if call.response is not None else None,
                              "result_sha256": fingerprint(result.model_dump(mode="json")) if result is not None else None,
                              "pricing_sha256": call.pricing_digest}
+        claim = (self.ledger.claim_for_attempt(self._owner, call.attempt.attempt_id)
+                 if call.job_claim is not None else None)
+        evidence_digest = fingerprint(proof)
+        if claim is not None and state == "not_sent":
+            # Current worker and recovery must emit the identical canonical
+            # pre-gate proof, derived only from persisted immutable identity.
+            evidence_digest = CoordinationLedger._pre_gate_proof(
+                call.attempt.attempt_id, call.attempt.run_id, call.attempt.page_number,
+                claim.claim_seq, claim.owner_epoch, "intent")
         outcome = Outcome(uuid5(UUID(call.attempt.attempt_id), "settlement").hex,
-                          call.attempt.attempt_id, call.attempt.request_digest, fingerprint(proof), state, actual_units)
-        if result is not None:
+                          call.attempt.attempt_id, call.attempt.request_digest,
+                          evidence_digest, state, actual_units)
+        projection = (self._page_projection(result, outcome)
+                      if claim is not None and state == "terminal" else None)
+        if result is not None or projection is not None:
             if state != "terminal":
                 raise CoordinationError("result_without_terminal_evidence")
-            self.evidence.write(call.attempt, self._owner.epoch, result, outcome, proof)
-        if call.job_claim is None:
+            settlement = (None if projection is None else {
+                "page_state": projection.state, "safe_code": projection.safe_code,
+                "result_bytes": projection.result_bytes})
+            self.evidence.write(call.attempt, self._owner.epoch, result, outcome, proof,
+                                settlement)
+        if claim is None:
             self.ledger.record_outcome(self._owner, outcome)
         else:
-            self.ledger.record_outcome(self._owner, outcome, job_claim=call.job_claim)
+            self.ledger.record_job_outcome(
+                self._owner, outcome, job_claim=claim, page=projection,
+                generation=call.grant.run.generation,
+            )
         if result is not None:
             # Account for a late response even after supersession, but do not
             # return that page as a current success. Immutable evidence stays.
             self.ledger.validate_dispatch(self._owner, call.attempt, expected_run=call.grant.run, evidence_only=True)
+
+    @staticmethod
+    def _page_projection(result, outcome):
+        """Deterministic page projection from the canonical final result."""
+        from .durable_job_contracts import PageOutcomeProjection
+        if result is None:
+            return PageOutcomeProjection("failed", "result_invalid", 0,
+                                         outcome.evidence_digest)
+        extraction = result.extraction
+        if extraction.status in ("extracted", "no_specification"):
+            state, code = "completed", None
+        elif extraction.status == "incomplete":
+            state, code = "incomplete", None
+        elif extraction.status == "failed":
+            state, code = "failed", extraction.error_code or "result_invalid"
+        else:
+            raise CoordinationError("result_evidence_invalid")
+        size = len(canonical(result.model_dump(mode="json")).encode("utf-8"))
+        return PageOutcomeProjection(state, code, size, outcome.evidence_digest)

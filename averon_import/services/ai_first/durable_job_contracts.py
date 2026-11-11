@@ -43,6 +43,7 @@ class JobPageDispatchClaim:
     page_revision: int
     owner_epoch: int
     cancel_revision: int
+    job_revision: int | None = None
 
     def __post_init__(self):
         for value in (self.tenant_id, self.owner_id, self.document_id):
@@ -55,6 +56,79 @@ class JobPageDispatchClaim:
                       self.page_revision, self.owner_epoch):
             integer(value, minimum=1)
         integer(self.cancel_revision)
+        if self.job_revision is not None:
+            integer(self.job_revision, minimum=1)
+
+
+_TERMINAL_PAGE_STATES = frozenset({"completed", "incomplete", "failed", "cancelled",
+                                   "blocked", "unknown_outcome"})
+
+
+@dataclass(frozen=True)
+class PageOutcomeProjection:
+    """The page part of one atomic B1/page/job settlement or projection repair."""
+    state: str
+    safe_code: str | None = None
+    result_bytes: int = 0
+    evidence_digest: str | None = None
+
+    def __post_init__(self):
+        if self.state not in _TERMINAL_PAGE_STATES:
+            raise CoordinationError("invalid_page_projection")
+        if self.safe_code is not None:
+            if (type(self.safe_code) is not str or not re.fullmatch(r"[a-z0-9_]{1,64}", self.safe_code)):
+                raise CoordinationError("invalid_page_projection")
+        integer(self.result_bytes, minimum=0)
+        if self.result_bytes > 16_000_000:
+            raise CoordinationError("invalid_page_projection")
+        if self.evidence_digest is not None:
+            digest(self.evidence_digest)
+
+
+@dataclass(frozen=True)
+class EvidenceIdentity:
+    """Explicit immutable evidence identity; never inferred from a file name."""
+    attempt_id: str
+    run_id: str
+    page_number: int
+    attempt_no: int
+    claim_seq: int
+    job_id: str | None = None
+    generation: int | None = None
+
+    def __post_init__(self):
+        for value in (self.attempt_id, self.run_id):
+            uuid_hex(value)
+        for value in (self.page_number, self.attempt_no, self.claim_seq):
+            integer(value, minimum=1)
+        if self.job_id is not None:
+            if (type(self.job_id) is not str or not re.fullmatch(r"dj_[0-9a-f]{32}", self.job_id)):
+                raise CoordinationError("invalid_evidence_identity")
+        if self.generation is not None:
+            integer(self.generation, minimum=1)
+
+
+@dataclass(frozen=True)
+class AdoptionReport:
+    adopted: tuple[str, ...] = ()
+    quarantined: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def clean(self):
+        return not self.quarantined
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    settled: tuple[str, ...] = ()
+    repaired: tuple[str, ...] = ()
+    quarantined: tuple[tuple[str, str], ...] = ()
+    released: tuple[str, ...] = ()
+    paused: tuple[str, ...] = ()
+
+    @property
+    def clean(self):
+        return not self.quarantined
 
 
 def _json_bytes(value, maximum):

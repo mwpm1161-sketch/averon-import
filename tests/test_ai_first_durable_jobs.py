@@ -204,7 +204,7 @@ def test_same_operation_id_cannot_be_reused_for_cancel_or_another_owner(case):
     other_actor, _ = new_generation(case, owner="other-owner")
     with pytest.raises(CoordinationError, match="durable_job_not_found"):
         case.backend.get_status(other_actor, receipt.job_id)
-    assert cancel.state == "cancelling"
+    assert cancel.state == "cancelled"
 
 
 def test_duplicate_json_keys_unknown_execution_fields_and_credentials_are_rejected(case):
@@ -559,7 +559,9 @@ def test_cancel_cleanup_preserves_financial_attempts_snapshots_and_unknown_liabi
     before = stored_rows(case)
     status = case.backend.get_status(case.actor, receipt.job_id)
     cancelled = case.backend.cancel(case.actor, receipt.job_id, uuid4().hex, status.revision)
-    assert cancelled.state == "cancelling"
+    # B3.4a: a page with unknown_outcome makes the cancelled job blocked; the
+    # command transaction never settles B1 or clears the unknown liability.
+    assert cancelled.state == "blocked"
     assert financial_and_liability_rows(case) == before_financial
     assert attempt_count(case) == 1
     current = case.backend.get_status(case.actor, receipt.job_id)
@@ -829,7 +831,7 @@ def test_concurrent_cancel_uses_optimistic_revision_and_one_command(case):
         results = list(pool.map(lambda _index: cancel(), range(2)))
     assert sum(type(item) is str and item == "job_revision_conflict" for item in results) == 1
     status = case.backend.get_status(case.actor, receipt.job_id)
-    assert status.state == "cancelling" and status.cancel_revision == 1
+    assert status.state == "cancelled" and status.cancel_revision == 1
     with sqlite3.connect(case.ledger.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM durable_job_commands WHERE kind='cancel'").fetchone()[0] == 1
 

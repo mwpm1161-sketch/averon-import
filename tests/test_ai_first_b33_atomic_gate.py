@@ -224,7 +224,8 @@ def test_reserve_commit_receipt_loss_keeps_liability_and_never_posts(job_case, m
 
     assert len(runtime.dispatcher.ledger.snapshot()["attempts"]) == 1
     assert runtime.dispatcher.ledger.snapshot()["attempts"][0]["state"] == "intent"
-    assert _page(case, receipt.job_id)["state"] == "claimed"
+    # B3.4a reserve commits the B1 intent and the page identity atomically.
+    assert _page(case, receipt.job_id)["state"] == "intent"
 
 
 def test_gate_commit_receipt_loss_fails_closed_after_page_commit(job_case, monkeypatch):
@@ -384,7 +385,9 @@ def test_stale_claim_fences_are_rejected_before_http(job_case, field):
     try:
         claim, call, body, headers, url = _prepared(case, receipt, runtime)
         runtime.dispatcher.prepare(runtime.client, call, url, body, headers)
-        call.job_claim = replace(claim, **{field: getattr(claim, field) + 1})
+        # The post-reserve claim carries the page/job revisions written by the
+        # atomic reserve; mutate that authoritative object to test stale fences.
+        call.job_claim = replace(call.job_claim, **{field: getattr(call.job_claim, field) + 1})
         with pytest.raises(CoordinationError):
             runtime.dispatcher.consume(call.permit, runtime.client, call, url, body, headers, None)
         assert not call.uncertain and not call.delegated
@@ -504,8 +507,10 @@ def test_cancel_after_gate_allows_one_fake_http_post_and_drains(job_case):
     result = asyncio.run(runtime.adapter.extract(request))
     assert result.extraction.page_number == 1
     assert len(transport.calls) == 1
-    assert case.backend.get_status(case.actor, receipt.job_id).state == "cancelling"
-    assert _page(case, receipt.job_id)["state"] == "send_committed"
+    # B3.4a projects the terminal page and rolls up the cancelling job in the
+    # same settlement: no page is left at send_committed.
+    assert case.backend.get_status(case.actor, receipt.job_id).state == "cancelled"
+    assert _page(case, receipt.job_id)["state"] == "completed"
     assert runtime.dispatcher.ledger.snapshot()["attempts"][0]["state"] == "terminal"
 
 
